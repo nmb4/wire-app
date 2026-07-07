@@ -9,6 +9,7 @@ use tracing::{debug, info};
 
 use super::{AudioFormat, SAMPLE_RATE};
 use crate::audio::{DURATION_10MS, DURATION_20MS, ENGINE_FORMAT};
+use crate::codec::opus::AudioQuality;
 
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
@@ -18,6 +19,8 @@ pub struct AudioConfig {
     pub output_device: Option<String>,
     /// If true, audio processing with echo cancellation is enabled.
     pub processing_enabled: bool,
+    /// Audio quality / bandwidth setting.
+    pub quality: AudioQuality,
 }
 
 impl Default for AudioConfig {
@@ -36,6 +39,7 @@ impl Default for AudioConfig {
             input_device,
             output_device,
             processing_enabled: true,
+            quality: AudioQuality::default(),
         }
     }
 }

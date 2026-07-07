@@ -1,15 +1,24 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use async_channel::{Receiver, Sender};
 use callme::{
-    audio::{AudioConfig, AudioContext},
+    audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
 };
 use eframe::NativeOptions;
 use egui::{Color32, RichText, Ui};
 use iroh::{protocol::Router, Endpoint, KeyParsingError, NodeId};
 use tokio::task::JoinSet;
+use tokio::time;
 use tracing::{info, warn};
 
 const DEFAULT: &str = "<default>";
@@ -32,12 +41,15 @@ struct AppState {
     devices: callme::audio::Devices,
     audio_config: UiAudioConfig,
     calls: BTreeMap<NodeId, CallState>,
+    volumes: BTreeMap<NodeId, VolumeHandle>,
+    rtts: BTreeMap<NodeId, Duration>,
 }
 
 struct UiAudioConfig {
     selected_input: String,
     selected_output: String,
     processing_enabled: bool,
+    quality: AudioQuality,
 }
 
 impl From<&UiAudioConfig> for AudioConfig {
@@ -56,6 +68,7 @@ impl From<&UiAudioConfig> for AudioConfig {
             input_device,
             output_device,
             processing_enabled: value.processing_enabled,
+            quality: value.quality,
         }
     }
 }
@@ -66,6 +79,7 @@ impl Default for UiAudioConfig {
             selected_input: DEFAULT.to_string(),
             selected_output: DEFAULT.to_string(),
             processing_enabled: true,
+            quality: AudioQuality::default(),
         }
     }
 }
@@ -102,6 +116,8 @@ impl App {
             devices,
             audio_config: Default::default(),
             calls: Default::default(),
+            volumes: Default::default(),
+            rtts: Default::default(),
         };
 
         let app = App {
@@ -121,9 +137,17 @@ impl AppState {
                 Event::SetCallState(node_id, call_state) => {
                     if matches!(call_state, CallState::Aborted) {
                         self.calls.remove(&node_id);
+                        self.volumes.remove(&node_id);
+                        self.rtts.remove(&node_id);
                     } else {
                         self.calls.insert(node_id, call_state);
                     }
+                }
+                Event::VolumeHandle(node_id, volume) => {
+                    self.volumes.insert(node_id, volume);
+                }
+                Event::SetRtt(node_id, rtt) => {
+                    self.rtts.insert(node_id, rtt);
                 }
             }
         }
@@ -212,24 +236,52 @@ impl AppState {
         ui.vertical(|ui| {
             for (node_id, state) in &self.calls {
                 let node_id = *node_id;
-                ui.horizontal(|ui| {
-                    ui.label(fmt_node_id(&node_id.fmt_short()));
-                    ui.label(format!("{}", state));
-                    if matches!(state, CallState::Incoming) {
-                        if ui.button("Accept").clicked() {
-                            self.cmd(Command::HandleIncoming {
-                                node_id,
-                                accept: true,
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                        ui.label(format!("{}", state));
+                        if matches!(state, CallState::Incoming) {
+                            if ui.button("Accept").clicked() {
+                                self.cmd(Command::HandleIncoming {
+                                    node_id,
+                                    accept: true,
+                                });
+                            }
+                            if ui.button("Decline").clicked() {
+                                self.cmd(Command::HandleIncoming {
+                                    node_id,
+                                    accept: false,
+                                });
+                            }
+                        } else if ui.button("Drop").clicked() {
+                            self.cmd(Command::Abort { node_id });
+                        }
+                    });
+                    if matches!(state, CallState::Active) {
+                        if let Some(volume) = self.volumes.get(&node_id) {
+                            let mut vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                            ui.horizontal(|ui| {
+                                ui.label("Vol:");
+                                ui.add(
+                                    egui::Slider::new(&mut vol, 0.0..=2.0)
+                                        .text("")
+                                        .fixed_decimals(1),
+                                )
+                                .on_hover_text("Adjust volume for this participant");
+                            });
+                            volume.store(vol.to_bits(), Ordering::Relaxed);
+                        }
+                        if let Some(rtt) = self.rtts.get(&node_id) {
+                            ui.horizontal(|ui| {
+                                if rtt.as_millis() < 100 {
+                                    ui.colored_label(Color32::GREEN, fmt_rtt(rtt));
+                                } else if rtt.as_millis() < 300 {
+                                    ui.colored_label(Color32::YELLOW, fmt_rtt(rtt));
+                                } else {
+                                    ui.colored_label(Color32::LIGHT_RED, fmt_rtt(rtt));
+                                }
                             });
                         }
-                        if ui.button("Decline").clicked() {
-                            self.cmd(Command::HandleIncoming {
-                                node_id,
-                                accept: false,
-                            });
-                        }
-                    } else if ui.button("Drop").clicked() {
-                        self.cmd(Command::Abort { node_id });
                     }
                 });
             }
@@ -290,6 +342,25 @@ impl AppState {
                 "Enable echo cancellation",
             );
 
+            egui::ComboBox::from_label("Audio quality")
+                .selected_text(self.audio_config.quality.label())
+                .show_ui(ui, |ui| {
+                    for quality in &[
+                        AudioQuality::Low,
+                        AudioQuality::Medium,
+                        AudioQuality::High,
+                        AudioQuality::Ultra,
+                    ] {
+                        let label = format!("{} ({})", quality.label(), quality.bandwidth_human());
+                        if ui
+                            .selectable_label(self.audio_config.quality == *quality, &label)
+                            .clicked()
+                        {
+                            self.audio_config.quality = *quality;
+                        }
+                    }
+                });
+
             if ui.button("Save & start").clicked() {
                 let audio_config = self.audio_config();
                 self.cmd(Command::SetAudioConfig { audio_config });
@@ -310,9 +381,15 @@ fn fmt_error(text: &str) -> RichText {
     egui::RichText::new(text).color(Color32::LIGHT_RED)
 }
 
+fn fmt_rtt(dur: &Duration) -> String {
+    format!("{}ms", dur.as_millis())
+}
+
 enum Event {
     EndpointBound(NodeId),
     SetCallState(NodeId, CallState),
+    VolumeHandle(NodeId, VolumeHandle),
+    SetRtt(NodeId, Duration),
 }
 
 #[derive(strum::Display)]
@@ -343,6 +420,7 @@ struct Worker {
     command_rx: Receiver<Command>,
     event_tx: Sender<Event>,
     active_calls: BTreeMap<NodeId, CallInfo>,
+    volumes: BTreeMap<NodeId, VolumeHandle>,
     update_callback: Option<UpdateCallback>,
     endpoint: Endpoint,
     handler: RtcProtocol,
@@ -350,6 +428,7 @@ struct Worker {
     connect_tasks: JoinSet<(NodeId, Result<(RtcConnection, MediaTrack)>)>,
     _router: Router,
     audio_context: Option<AudioContext>,
+    rtt_interval: time::Interval,
 }
 
 struct WorkerHandle {
@@ -404,6 +483,7 @@ impl Worker {
             command_rx,
             event_tx,
             active_calls: Default::default(),
+            volumes: Default::default(),
             call_tasks: JoinSet::new(),
             connect_tasks: JoinSet::new(),
             endpoint,
@@ -411,6 +491,7 @@ impl Worker {
             _router,
             audio_context: None,
             update_callback: None,
+            rtt_interval: time::interval(Duration::from_secs(1)),
         })
     }
 
@@ -439,12 +520,16 @@ impl Worker {
                         info!("connection with {} closed", node_id.fmt_short());
                     }
                     self.active_calls.remove(&node_id);
+                    self.volumes.remove(&node_id);
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
                 Some(res) = self.connect_tasks.join_next(), if !self.connect_tasks.is_empty() => {
                     let (node_id, res) = res.expect("connect task panicked");
                     self.handle_connected(node_id, res).await?;
+                }
+                _ = self.rtt_interval.tick() => {
+                    self.query_rtts().await?;
                 }
             }
         }
@@ -472,6 +557,7 @@ impl Worker {
             Err(err) => {
                 warn!("connection to {} failed: {err:?}", node_id);
                 self.active_calls.remove(&node_id);
+                self.volumes.remove(&node_id);
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -481,6 +567,9 @@ impl Worker {
 
     async fn accept_from_connect(&mut self, conn: RtcConnection, track: MediaTrack) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        self.volumes.insert(node_id, volume.clone());
+        self.emit(Event::VolumeHandle(node_id, volume.clone())).await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -492,7 +581,7 @@ impl Worker {
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
             let fut = async {
-                audio_context.play_track(track).await?;
+                audio_context.play_track_with_volume(track, volume).await?;
                 let capture_track = audio_context.capture_track().await?;
                 conn.send_track(capture_track).await?;
                 #[allow(clippy::redundant_pattern_matching)]
@@ -508,6 +597,9 @@ impl Worker {
 
     async fn accept_from_accept(&mut self, conn: RtcConnection) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        self.volumes.insert(node_id, volume.clone());
+        self.emit(Event::VolumeHandle(node_id, volume.clone())).await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -530,7 +622,7 @@ impl Worker {
                     );
                     match remote_track.kind() {
                         TrackKind::Audio => {
-                            audio_context.play_track(remote_track).await?;
+                            audio_context.play_track_with_volume(remote_track, volume.clone()).await?;
                         }
                         TrackKind::Video => unimplemented!(),
                     }
@@ -541,6 +633,18 @@ impl Worker {
             info!("connection with {} closed: {:?}", node_id.fmt_short(), res);
             (node_id, res)
         });
+        Ok(())
+    }
+
+    async fn query_rtts(&mut self) -> Result<()> {
+        for (node_id, info) in &self.active_calls {
+            if let Some(rtt) = match info {
+                CallInfo::Active(conn) => Some(conn.transport().rtt()),
+                _ => None,
+            } {
+                self.emit(Event::SetRtt(*node_id, rtt)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -587,6 +691,7 @@ impl Worker {
             }
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
+                    self.volumes.remove(&node_id);
                     match state {
                         CallInfo::Calling => {}
                         CallInfo::Active(conn) => {

@@ -2,6 +2,7 @@ use self::opus::OpusChannels;
 use crate::rtc::TrackKind;
 
 pub mod opus;
+pub use opus::AudioQuality;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]

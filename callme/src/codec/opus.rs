@@ -6,6 +6,7 @@ use ringbuf::{
     traits::{Consumer as _, Observer, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tracing::{debug, info, trace};
 
@@ -31,6 +32,89 @@ impl From<OpusChannels> for ::opus::Channels {
         match value {
             OpusChannels::Mono => ::opus::Channels::Mono,
             OpusChannels::Stereo => ::opus::Channels::Stereo,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AudioQuality {
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+impl AudioQuality {
+    pub fn bitrate(&self) -> i32 {
+        match self {
+            AudioQuality::Low => 16_000,
+            AudioQuality::Medium => 40_000,
+            AudioQuality::High => 80_000,
+            AudioQuality::Ultra => 160_000,
+        }
+    }
+
+    pub fn channels(&self) -> OpusChannels {
+        match self {
+            AudioQuality::Low | AudioQuality::Medium => OpusChannels::Mono,
+            AudioQuality::High | AudioQuality::Ultra => OpusChannels::Stereo,
+        }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            AudioQuality::Low => 16_000,
+            AudioQuality::Medium => 48_000,
+            AudioQuality::High => 48_000,
+            AudioQuality::Ultra => 48_000,
+        }
+    }
+
+    pub fn bandwidth_human(&self) -> &'static str {
+        match self {
+            AudioQuality::Low => "~16 kbps",
+            AudioQuality::Medium => "~40 kbps",
+            AudioQuality::High => "~80 kbps",
+            AudioQuality::Ultra => "~160 kbps",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AudioQuality::Low => "Low (16 kbps, mono)",
+            AudioQuality::Medium => "Medium (40 kbps, mono)",
+            AudioQuality::High => "High (80 kbps, stereo)",
+            AudioQuality::Ultra => "Ultra (160 kbps, stereo)",
+        }
+    }
+}
+
+impl Default for AudioQuality {
+    fn default() -> Self {
+        AudioQuality::High
+    }
+}
+
+impl std::fmt::Display for AudioQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioQuality::Low => write!(f, "low"),
+            AudioQuality::Medium => write!(f, "medium"),
+            AudioQuality::High => write!(f, "high"),
+            AudioQuality::Ultra => write!(f, "ultra"),
+        }
+    }
+}
+
+impl std::str::FromStr for AudioQuality {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(AudioQuality::Low),
+            "medium" => Ok(AudioQuality::Medium),
+            "high" => Ok(AudioQuality::High),
+            "ultra" => Ok(AudioQuality::Ultra),
+            _ => Err(format!("unknown quality '{s}', expected low, medium, high, or ultra")),
         }
     }
 }
@@ -177,18 +261,13 @@ pub struct MediaTrackOpusEncoder {
 }
 
 impl MediaTrackOpusEncoder {
-    pub fn new(track_channel_cap: usize, audio_format: AudioFormat) -> Result<(Self, MediaTrack)> {
-        debug_assert_eq!(audio_format.sample_rate.0, OPUS_SAMPLE_RATE);
+    pub fn new(track_channel_cap: usize, _audio_format: AudioFormat, quality: AudioQuality) -> Result<(Self, MediaTrack)> {
         let (sender, receiver) = broadcast::channel(track_channel_cap);
-        let channels = match audio_format.channel_count {
-            1 => OpusChannels::Mono,
-            2 => OpusChannels::Stereo,
-            _ => bail!("unsupported channel count"),
-        };
+        let channels = quality.channels();
         let track = MediaTrack::new(receiver, Codec::Opus { channels }, TrackKind::Audio);
         let encoder = MediaTrackOpusEncoder {
             sender,
-            encoder: OpusEncoder::new(channels),
+            encoder: OpusEncoder::new(quality),
         };
         Ok((encoder, track))
     }
@@ -226,10 +305,13 @@ pub struct OpusEncoder {
 }
 
 impl OpusEncoder {
-    pub fn new(channels: OpusChannels) -> Self {
-        let format = AudioFormat::new2(OPUS_SAMPLE_RATE, channels as u16);
+    pub fn new(quality: AudioQuality) -> Self {
+        let channels = quality.channels();
+        let sample_rate = quality.sample_rate();
+        let format = AudioFormat::new2(sample_rate, channels as u16);
         let mut encoder =
-            opus::Encoder::new(OPUS_SAMPLE_RATE, channels.into(), opus::Application::Voip).unwrap();
+            opus::Encoder::new(sample_rate, channels.into(), opus::Application::Voip).unwrap();
+        encoder.set_bitrate(opus::Bitrate::Bits(quality.bitrate())).ok();
         debug!(
             "initialized opus encoder: channels {} bitrate {:?} bandwidth {:?}",
             channels as u16,

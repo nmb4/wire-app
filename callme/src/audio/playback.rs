@@ -1,7 +1,10 @@
 use std::{
     num::NonZeroUsize,
     ops::ControlFlow,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -29,6 +32,27 @@ use crate::{
 
 pub trait AudioSource: Send + 'static {
     fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>>;
+}
+
+/// Shared volume control for a playback source. 1.0 = normal.
+pub type VolumeHandle = Arc<AtomicU32>;
+
+pub struct GainSource {
+    inner: Box<dyn AudioSource>,
+    volume: VolumeHandle,
+}
+
+impl AudioSource for GainSource {
+    fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>> {
+        let result = self.inner.tick(buf)?;
+        if let ControlFlow::Continue(count) = &result {
+            let gain = f32::from_bits(self.volume.load(Ordering::Relaxed));
+            for sample in buf[..*count].iter_mut() {
+                *sample *= gain;
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[derive(derive_more::Debug, Clone)]
@@ -79,6 +103,15 @@ impl AudioPlayback {
     pub async fn add_track(&self, track: MediaTrack) -> Result<()> {
         let decoder = MediaTrackOpusDecoder::new(track)?;
         self.add_source(decoder).await
+    }
+
+    pub async fn add_track_with_volume(&self, track: MediaTrack, volume: VolumeHandle) -> Result<()> {
+        let decoder = MediaTrackOpusDecoder::new(track)?;
+        self.add_source(GainSource {
+            inner: Box::new(decoder),
+            volume,
+        })
+        .await
     }
 
     pub async fn add_source(&self, source: impl AudioSource) -> Result<()> {

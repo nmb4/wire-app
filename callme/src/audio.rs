@@ -11,8 +11,9 @@ use self::{
 pub use self::{
     capture::AudioSink,
     device::{AudioConfig, Devices, Direction},
-    playback::AudioSource,
+    playback::{AudioSource, VolumeHandle},
 };
+pub use crate::codec::opus::AudioQuality;
 use crate::rtc::MediaTrack;
 
 #[cfg(feature = "audio-processing")]
@@ -59,7 +60,7 @@ impl AudioContext {
         let processor = WebrtcAudioProcessor;
 
         let capture =
-            AudioCapture::build(&host, config.input_device.as_deref(), processor.clone()).await?;
+            AudioCapture::build(&host, config.input_device.as_deref(), processor.clone(), config.quality).await?;
         let playback =
             AudioPlayback::build(&host, config.output_device.as_deref(), processor.clone()).await?;
         Ok(Self { playback, capture })
@@ -71,6 +72,11 @@ impl AudioContext {
 
     pub async fn play_track(&self, track: MediaTrack) -> Result<()> {
         self.playback.add_track(track).await?;
+        Ok(())
+    }
+
+    pub async fn play_track_with_volume(&self, track: MediaTrack, volume: VolumeHandle) -> Result<()> {
+        self.playback.add_track_with_volume(track, volume).await?;
         Ok(())
     }
 

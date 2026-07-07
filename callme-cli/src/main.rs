@@ -1,5 +1,5 @@
 use callme::{
-    audio::{AudioConfig, AudioContext},
+    audio::{AudioConfig, AudioContext, AudioQuality},
     net,
     rtc::{handle_connection_with_audio_context, RtcConnection, RtcProtocol},
     NodeId,
@@ -22,6 +22,9 @@ struct Args {
     /// If set, audio processing and echo cancellation will be disabled.
     #[arg(long)]
     disable_processing: bool,
+    /// Audio quality preset (low, medium, high, ultra).
+    #[arg(long, default_value = "high", value_parser = |s: &str| -> Result<AudioQuality, String> { s.parse() })]
+    quality: AudioQuality,
     #[clap(subcommand)]
     command: Command,
 }
@@ -60,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         input_device: args.input_device,
         output_device: args.output_device,
         processing_enabled: !args.disable_processing,
+        quality: args.quality,
     };
     let mut endpoint_shutdown = None;
     let fut = async {

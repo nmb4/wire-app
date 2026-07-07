@@ -29,7 +29,7 @@ use super::{
     AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
-    codec::opus::MediaTrackOpusEncoder,
+    codec::opus::{AudioQuality, MediaTrackOpusEncoder},
     rtc::{MediaFrame, MediaTrack, TrackKind},
 };
 
@@ -40,6 +40,7 @@ pub trait AudioSink: Send + 'static {
 #[derive(Debug, Clone)]
 pub struct AudioCapture {
     sink_sender: mpsc::Sender<Box<dyn AudioSink>>,
+    quality: AudioQuality,
 }
 
 impl AudioCapture {
@@ -47,6 +48,7 @@ impl AudioCapture {
         host: &cpal::Host,
         device: Option<&str>,
         processor: WebrtcAudioProcessor,
+        quality: AudioQuality,
     ) -> Result<Self> {
         let device = find_device(host, Direction::Capture, device)?;
 
@@ -86,7 +88,7 @@ impl AudioCapture {
             drop(stream);
         });
         init_rx.await??;
-        let handle = AudioCapture { sink_sender };
+        let handle = AudioCapture { sink_sender, quality };
         Ok(handle)
     }
 
@@ -98,7 +100,10 @@ impl AudioCapture {
     }
 
     pub async fn create_opus_track(&self) -> Result<MediaTrack> {
-        let (encoder, track) = MediaTrackOpusEncoder::new(16, ENGINE_FORMAT)?;
+        let sample_rate = self.quality.sample_rate();
+        let channels = self.quality.channels() as u16;
+        let audio_format = AudioFormat::new2(sample_rate, channels);
+        let (encoder, track) = MediaTrackOpusEncoder::new(16, audio_format, self.quality)?;
         self.add_sink(encoder).await?;
         Ok(track)
     }
