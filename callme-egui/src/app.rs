@@ -13,6 +13,7 @@ use async_channel::{Receiver, Sender};
 use callme::{
     audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
+    video::{codec::VideoDecoder, transport, VideoConfig, VideoResolution},
 };
 use eframe::NativeOptions;
 use egui::{Color32, RichText, Ui};
@@ -40,9 +41,21 @@ struct AppState {
     our_node_id: Option<NodeId>,
     devices: callme::audio::Devices,
     audio_config: UiAudioConfig,
+    video_config: VideoConfig,
     calls: BTreeMap<NodeId, CallState>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
     rtts: BTreeMap<NodeId, Duration>,
+    video_frames: BTreeMap<NodeId, VideoFrameState>,
+    selected_video_participant: Option<NodeId>,
+    sharing_active: bool,
+}
+
+struct VideoFrameState {
+    width: u32,
+    height: u32,
+    generation: u64,
+    data: Arc<Vec<u8>>,
+    texture: Option<egui::TextureHandle>,
 }
 
 struct UiAudioConfig {
@@ -115,9 +128,13 @@ impl App {
             our_node_id: None,
             devices,
             audio_config: Default::default(),
+            video_config: Default::default(),
             calls: Default::default(),
             volumes: Default::default(),
             rtts: Default::default(),
+            video_frames: Default::default(),
+            selected_video_participant: None,
+            sharing_active: false,
         };
 
         let app = App {
@@ -148,6 +165,30 @@ impl AppState {
                 }
                 Event::SetRtt(node_id, rtt) => {
                     self.rtts.insert(node_id, rtt);
+                }
+                Event::VideoFrame {
+                    node_id,
+                    data,
+                    width,
+                    height,
+                } => {
+                    let state = self
+                        .video_frames
+                        .entry(node_id)
+                        .or_insert_with(|| VideoFrameState {
+                            width: 0,
+                            height: 0,
+                            generation: 0,
+                            data: Arc::new(Vec::new()),
+                            texture: None,
+                        });
+                    state.width = width;
+                    state.height = height;
+                    state.data = data;
+                    state.generation += 1;
+                }
+                Event::SharingToggled(active) => {
+                    self.sharing_active = active;
                 }
             }
         }
@@ -229,6 +270,85 @@ impl AppState {
                     }
                 }
             });
+        }
+
+        ui.add_space(8.);
+        ui.heading("Screen Sharing");
+        ui.horizontal(|ui| {
+            if self.sharing_active {
+                if ui.button("Stop Sharing").clicked() {
+                    self.cmd(Command::ToggleSharing { enabled: false });
+                }
+            } else if ui.button("Start Sharing").clicked() {
+                self.cmd(Command::ToggleSharing { enabled: true });
+            }
+        });
+
+        let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
+        if !share_targets.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("View:");
+                let selected = self.selected_video_participant.unwrap_or(share_targets[0]);
+                egui::ComboBox::from_id_salt("video_source")
+                    .selected_text(
+                        share_targets
+                            .iter()
+                            .find(|n| **n == selected)
+                            .map(|n| n.fmt_short())
+                            .unwrap_or_default(),
+                    )
+                    .show_ui(ui, |ui| {
+                        for node_id in &share_targets {
+                            let label = node_id.fmt_short();
+                            if ui.selectable_label(selected == *node_id, &label).clicked() {
+                                self.selected_video_participant = Some(*node_id);
+                            }
+                        }
+                    });
+            });
+
+            if let Some(participant) = self.selected_video_participant {
+                let needs_upload = self
+                    .video_frames
+                    .get(&participant)
+                    .map(|f| !f.data.is_empty() && f.width > 0 && f.height > 0)
+                    .unwrap_or(false);
+                if needs_upload {
+                    let (w, h, data) = {
+                        let f = self.video_frames.get(&participant).unwrap();
+                        (f.width, f.height, f.data.clone())
+                    };
+                    let tex = if let Some(mut t) = self.video_frames.get(&participant).unwrap().texture.clone() {
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &data,
+                        );
+                        t.set(color_image, egui::TextureOptions::default());
+                        t
+                    } else {
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &data,
+                        );
+                        let t = ui.ctx().load_texture(
+                            "video",
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
+                        self.video_frames.get_mut(&participant).unwrap().texture = Some(t.clone());
+                        t
+                    };
+                    let aspect = w as f32 / h as f32;
+                    let max_w = ui.available_width().min(400.0);
+                    ui.add(
+                        egui::Image::new(&tex)
+                            .max_width(max_w)
+                            .max_height(max_w / aspect),
+                    );
+                }
+            }
+        } else {
+            ui.label("No video streams available");
         }
 
         ui.add_space(8.);
@@ -361,9 +481,41 @@ impl AppState {
                     }
                 });
 
+            ui.add_space(8.);
+            ui.separator();
+            ui.heading("Screen Sharing Config");
+
+            egui::ComboBox::from_label("Resolution")
+                .selected_text(self.video_config.resolution.label())
+                .show_ui(ui, |ui| {
+                    for res in VideoResolution::all() {
+                        if ui
+                            .selectable_label(self.video_config.resolution == *res, res.label())
+                            .clicked()
+                        {
+                            self.video_config.resolution = *res;
+                        }
+                    }
+                });
+
+            egui::ComboBox::from_label("Framerate")
+                .selected_text(format!("{} fps", self.video_config.framerate))
+                .show_ui(ui, |ui| {
+                    for fps in [15u32, 30] {
+                        if ui
+                            .selectable_label(self.video_config.framerate == fps, format!("{fps} fps"))
+                            .clicked()
+                        {
+                            self.video_config.framerate = fps;
+                        }
+                    }
+                });
+
             if ui.button("Save & start").clicked() {
                 let audio_config = self.audio_config();
+                let video_config = self.video_config;
                 self.cmd(Command::SetAudioConfig { audio_config });
+                self.cmd(Command::SetVideoConfig { video_config });
                 self.section = UiSection::Main;
             }
         });
@@ -390,6 +542,13 @@ enum Event {
     SetCallState(NodeId, CallState),
     VolumeHandle(NodeId, VolumeHandle),
     SetRtt(NodeId, Duration),
+    VideoFrame {
+        node_id: NodeId,
+        width: u32,
+        height: u32,
+        data: Arc<Vec<u8>>,
+    },
+    SharingToggled(bool),
 }
 
 #[derive(strum::Display)]
@@ -411,9 +570,11 @@ type UpdateCallback = Box<dyn Fn() + Send + 'static>;
 enum Command {
     SetUpdateCallback { callback: UpdateCallback },
     SetAudioConfig { audio_config: AudioConfig },
+    SetVideoConfig { video_config: VideoConfig },
     Call { node_id: NodeId },
     HandleIncoming { node_id: NodeId, accept: bool },
     Abort { node_id: NodeId },
+    ToggleSharing { enabled: bool },
 }
 
 struct Worker {
@@ -429,6 +590,10 @@ struct Worker {
     _router: Router,
     audio_context: Option<AudioContext>,
     rtt_interval: time::Interval,
+    video_config: VideoConfig,
+    video_frame_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    capture_task: Option<tokio::task::JoinHandle<()>>,
+    sharing_active: bool,
 }
 
 struct WorkerHandle {
@@ -479,6 +644,7 @@ impl Worker {
             .accept(RtcProtocol::ALPN, handler.clone())
             .spawn()
             .await?;
+        let (video_frame_tx, _) = tokio::sync::broadcast::channel(4);
         Ok(Self {
             command_rx,
             event_tx,
@@ -492,6 +658,10 @@ impl Worker {
             audio_context: None,
             update_callback: None,
             rtt_interval: time::interval(Duration::from_secs(1)),
+            video_config: VideoConfig::default(),
+            video_frame_tx,
+            capture_task: None,
+            sharing_active: false,
         })
     }
 
@@ -578,14 +748,78 @@ impl Worker {
             .audio_context
             .clone()
             .context("missing audio context")?;
+
+        let video_frame_tx = self.video_frame_tx.clone();
+        let sharing_active = self.sharing_active;
+        let event_tx = self.event_tx.clone();
+
+        let audio_conn = conn.clone();
+        let recv_conn = conn.clone();
+        let send_conn = conn.clone();
+
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
+
+            if sharing_active {
+                let tx = video_frame_tx.clone();
+                let nid = node_id;
+                tokio::spawn(async move {
+                    let result: Result<()> = async {
+                        let (mut send, _) = send_conn.transport().open_bi().await?;
+                        let mut rx = tx.subscribe();
+                        loop {
+                            let frame = rx.recv().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                            transport::send_frame(&mut send, &frame).await?;
+                        }
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        info!("video send for {} stopped: {e:?}", nid.fmt_short());
+                    }
+                });
+            }
+
+            let recv_event_tx = event_tx.clone();
+            let nid = node_id;
+            tokio::spawn(async move {
+                let result: Result<()> = async {
+                    let (_, mut recv) = recv_conn.transport().accept_bi().await?;
+                    let mut decoder = VideoDecoder::new()?;
+                    loop {
+                        let Some(data) = transport::recv_frame(&mut recv).await? else {
+                            break;
+                        };
+                        match decoder.decode(&data) {
+                            Ok((rgba, w, h)) => {
+                                recv_event_tx
+                                    .send(Event::VideoFrame {
+                                        node_id: nid,
+                                        data: Arc::new(rgba),
+                                        width: w,
+                                        height: h,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            Err(e) => {
+                                info!("video decode error for {}: {e:?}", nid.fmt_short());
+                            }
+                        }
+                    }
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(e) = result {
+                    info!("video recv for {} stopped: {e:?}", nid.fmt_short());
+                }
+            });
+
             let fut = async {
                 audio_context.play_track_with_volume(track, volume).await?;
                 let capture_track = audio_context.capture_track().await?;
-                conn.send_track(capture_track).await?;
+                audio_conn.send_track(capture_track).await?;
                 #[allow(clippy::redundant_pattern_matching)]
-                while let Some(_) = conn.recv_track().await? {}
+                while let Some(_) = audio_conn.recv_track().await? {}
                 anyhow::Ok(())
             };
             let res = fut.await;
@@ -608,13 +842,77 @@ impl Worker {
             .audio_context
             .clone()
             .context("missing audio context")?;
+
+        let video_frame_tx = self.video_frame_tx.clone();
+        let sharing_active = self.sharing_active;
+        let event_tx = self.event_tx.clone();
+
+        let audio_conn = conn.clone();
+        let recv_conn = conn.clone();
+        let send_conn = conn.clone();
+
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
+
+            if sharing_active {
+                let tx = video_frame_tx.clone();
+                let nid = node_id;
+                tokio::spawn(async move {
+                    let result: Result<()> = async {
+                        let (mut send, _) = send_conn.transport().open_bi().await?;
+                        let mut rx = tx.subscribe();
+                        loop {
+                            let frame = rx.recv().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                            transport::send_frame(&mut send, &frame).await?;
+                        }
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        info!("video send for {} stopped: {e:?}", nid.fmt_short());
+                    }
+                });
+            }
+
+            let recv_event_tx = event_tx.clone();
+            let nid = node_id;
+            tokio::spawn(async move {
+                let result: Result<()> = async {
+                    let (_, mut recv) = recv_conn.transport().accept_bi().await?;
+                    let mut decoder = VideoDecoder::new()?;
+                    loop {
+                        let Some(data) = transport::recv_frame(&mut recv).await? else {
+                            break;
+                        };
+                        match decoder.decode(&data) {
+                            Ok((rgba, w, h)) => {
+                                recv_event_tx
+                                    .send(Event::VideoFrame {
+                                        node_id: nid,
+                                        data: Arc::new(rgba),
+                                        width: w,
+                                        height: h,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            Err(e) => {
+                                info!("video decode error for {}: {e:?}", nid.fmt_short());
+                            }
+                        }
+                    }
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(e) = result {
+                    info!("video recv for {} stopped: {e:?}", nid.fmt_short());
+                }
+            });
+
             let fut = async {
                 let capture_track = audio_context.capture_track().await?;
-                conn.send_track(capture_track).await?;
+                audio_conn.send_track(capture_track).await?;
                 info!("added capture track to rtc connection");
-                while let Some(remote_track) = conn.recv_track().await? {
+                while let Some(remote_track) = audio_conn.recv_track().await? {
                     info!(
                         "new remote track: {:?} {:?}",
                         remote_track.kind(),
@@ -648,6 +946,66 @@ impl Worker {
         Ok(())
     }
 
+    fn start_capture(&mut self) -> Result<()> {
+        let config = self.video_config;
+        use callme::video::codec::VideoEncoder;
+
+        let tx = self.video_frame_tx.clone();
+
+        let handle = tokio::task::spawn_blocking(move || {
+            let capture_result: Result<()> = (|| {
+                let monitors = xcap::Monitor::all()
+                    .map_err(|e| anyhow::anyhow!("failed to enumerate monitors: {e}"))?;
+                let primary = monitors
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no monitors found"))?;
+
+                let mut encoder = VideoEncoder::new(&config)?;
+                let interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
+
+                loop {
+                    let img = primary
+                        .capture_image()
+                        .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
+                    let rgba = img.into_raw();
+                    match encoder.encode(&rgba) {
+                        Ok(encoded) => {
+                            let _ = tx.send(Arc::new(encoded));
+                        }
+                        Err(e) => {
+                            info!("video encode error: {e:?}");
+                        }
+                    }
+                    std::thread::sleep(interval);
+                }
+            })();
+            if let Err(e) = capture_result {
+                info!("screen capture stopped: {e:?}");
+            }
+        });
+
+        self.capture_task = Some(tokio::task::spawn(async move {
+            handle.await.ok();
+        }));
+        self.sharing_active = true;
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn(async move {
+            let _ = event_tx.send(Event::SharingToggled(true)).await;
+        });
+        Ok(())
+    }
+
+    fn stop_capture(&mut self) {
+        if let Some(handle) = self.capture_task.take() {
+            handle.abort();
+        }
+        self.sharing_active = false;
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn(async move {
+            let _ = event_tx.send(Event::SharingToggled(false)).await;
+        });
+    }
+
     async fn handle_command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::SetUpdateCallback { callback } => {
@@ -656,6 +1014,16 @@ impl Worker {
             Command::SetAudioConfig { audio_config } => {
                 let audio_context = AudioContext::new(audio_config).await?;
                 self.audio_context = Some(audio_context);
+            }
+            Command::SetVideoConfig { video_config } => {
+                self.video_config = video_config;
+            }
+            Command::ToggleSharing { enabled } => {
+                if enabled && !self.sharing_active {
+                    self.start_capture()?;
+                } else if !enabled && self.sharing_active {
+                    self.stop_capture();
+                }
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {
