@@ -1,10 +1,24 @@
 use anyhow::{Context, Result};
 use openh264::decoder::Decoder;
-use openh264::encoder::{Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
+    RateControlMode, UsageType,
+};
 use openh264::formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer, YUVSource};
 use openh264::OpenH264API;
+use tracing::info;
 
-use crate::video::VideoConfig;
+use crate::video::{default_bitrate, VideoConfig, VideoResolution};
+
+fn h264_level(resolution: VideoResolution, framerate: u32) -> Level {
+    match resolution {
+        VideoResolution::P720 => Level::Level_3_1,
+        VideoResolution::P1080 if framerate > 30 => Level::Level_4_1,
+        VideoResolution::P1080 => Level::Level_4_0,
+        VideoResolution::P1440 if framerate > 30 => Level::Level_5_1,
+        VideoResolution::P1440 => Level::Level_5_0,
+    }
+}
 
 pub struct VideoEncoder {
     encoder: Encoder,
@@ -16,13 +30,25 @@ impl VideoEncoder {
     pub fn new(config: &VideoConfig) -> Result<Self> {
         let width = config.resolution.width();
         let height = config.resolution.height();
+        let bitrate_bps = default_bitrate(config.resolution, config.framerate);
         let enc_config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .complexity(Complexity::Low)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(bitrate_bps))
+            .complexity(Complexity::Medium)
+            .skip_frames(false)
             .num_threads(0)
             .max_frame_rate(FrameRate::from_hz(config.framerate as f32))
             .intra_frame_period(IntraFramePeriod::from_num_frames(config.framerate * 2))
+            .profile(Profile::High)
+            .level(h264_level(config.resolution, config.framerate))
+            .scene_change_detect(true)
             .background_detection(false);
+        info!(
+            "OpenH264 encoder: {width}x{height} @ {} fps, {} kbps",
+            config.framerate,
+            bitrate_bps / 1000
+        );
         let encoder =
             Encoder::with_api_config(OpenH264API::from_source(), enc_config)
                 .context("failed to create H.264 encoder")?;

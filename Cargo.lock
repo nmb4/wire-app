@@ -1050,6 +1050,7 @@ dependencies = [
  "image 0.25.5",
  "iroh",
  "n0-future",
+ "rayon",
  "scopeguard",
  "strum 0.27.1",
  "tokio",

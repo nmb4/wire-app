@@ -893,20 +893,14 @@ fn rtt_label(rtt: Duration) -> RichText {
     RichText::new(text).color(color).small()
 }
 
-fn video_display_size(available: Vec2, aspect: f32, fill_window: bool) -> Vec2 {
+fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 {
     if available.x <= 0.0 || available.y <= 0.0 || aspect <= 0.0 {
         return available;
     }
-    if fill_window {
-        if available.x / available.y > aspect {
-            Vec2::new(available.y * aspect, available.y)
-        } else {
-            Vec2::new(available.x, available.x / aspect)
-        }
+    if available.x / available.y > aspect {
+        Vec2::new(available.y * aspect, available.y)
     } else {
-        let max_h = available.y.min(480.0);
-        let max_w = available.x.min(max_h * aspect);
-        Vec2::new(max_w, max_w / aspect)
+        Vec2::new(available.x, available.x / aspect)
     }
 }
 
