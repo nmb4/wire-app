@@ -712,14 +712,21 @@ fn process_output_once_sample(
     }
 }
 
-/// Read the NV12 decoder output, normalizing for bottom-up (negative stride)
-/// samples so the color conversion always receives a top-down image. MF H.264
-/// decoder outputs are frequently bottom-up, which otherwise renders upside down.
-fn read_nv12_topdown(sample: &IMFSample, width: u32, height: u32) -> Result<Vec<u8>> {
+/// Read an image sample, normalizing for bottom-up (negative stride) buffers so
+/// the result is always top-down. MF video buffers are frequently bottom-up,
+/// which otherwise renders upside down. `is_nv12` selects the NV12 (3/2) versus
+/// RGB32 (4 bpp) plane layout. Non-2D (compressed) buffers fall back to a raw copy.
+fn read_sample_topdown(
+    sample: &IMFSample,
+    width: u32,
+    height: u32,
+    is_nv12: bool,
+) -> Result<Vec<u8>> {
     let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
     let w = width as usize;
     let h = height as usize;
-    let mut out = vec![0u8; w * h * 3 / 2];
+    let out_len = if is_nv12 { w * h * 3 / 2 } else { w * h * 4 };
+    let mut out = vec![0u8; out_len];
 
     if let Ok(buf2d) = unsafe { buffer.cast::<IMF2DBuffer>() } {
         let mut ptr = std::ptr::null_mut();
@@ -729,26 +736,38 @@ fn read_nv12_topdown(sample: &IMFSample, width: u32, height: u32) -> Result<Vec<
         }
         let bottom_up = stride < 0;
         let stride = stride.unsigned_abs() as usize;
-        let rows = h + h / 2;
-        let len = (rows * stride) as usize;
-        let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-        for y in 0..h {
-            let src_row = if bottom_up {
-                (h - 1 - y) * stride
-            } else {
-                y * stride
-            };
-            out[y * w..(y + 1) * w].copy_from_slice(&src[src_row..src_row + w]);
-        }
-        let uv_rows = h / 2;
-        for cy in 0..uv_rows {
-            let src_row = if bottom_up {
-                (h + uv_rows - 1 - cy) * stride
-            } else {
-                (h + cy) * stride
-            };
-            let dst = w * h + cy * w;
-            out[dst..dst + w].copy_from_slice(&src[src_row..src_row + w]);
+        let src = unsafe {
+            std::slice::from_raw_parts(ptr as *const u8, ((h + h / 2) * stride) as usize)
+        };
+        if is_nv12 {
+            for y in 0..h {
+                let src_row = if bottom_up {
+                    (h - 1 - y) * stride
+                } else {
+                    y * stride
+                };
+                out[y * w..(y + 1) * w].copy_from_slice(&src[src_row..src_row + w]);
+            }
+            let uv_rows = h / 2;
+            for cy in 0..uv_rows {
+                let src_row = if bottom_up {
+                    (h + uv_rows - 1 - cy) * stride
+                } else {
+                    (h + cy) * stride
+                };
+                let dst = w * h + cy * w;
+                out[dst..dst + w].copy_from_slice(&src[src_row..src_row + w]);
+            }
+        } else {
+            for y in 0..h {
+                let src_row = if bottom_up {
+                    (h - 1 - y) * stride
+                } else {
+                    y * stride
+                };
+                let dst = y * w * 4;
+                out[dst..dst + w * 4].copy_from_slice(&src[src_row..src_row + w * 4]);
+            }
         }
         unsafe {
             buf2d.Unlock2D()?;
@@ -801,6 +820,9 @@ fn force_keyframe(transform: &IMFTransform) {
 
 struct MfColorConverter {
     transform: IMFTransform,
+    width: u32,
+    height: u32,
+    output_is_nv12: bool,
     scratch: Vec<u8>,
 }
 
@@ -814,13 +836,17 @@ impl MfColorConverter {
         let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0);
         let transform = find_transform(MFT_CATEGORY_VIDEO_PROCESSOR, input, output, flags)?;
         configure_processor(&transform, input, output, width, height)?;
-        let scratch_len = if output == MFVideoFormat_NV12 {
+        let output_is_nv12 = output == MFVideoFormat_NV12;
+        let scratch_len = if output_is_nv12 {
             (width * height * 3 / 2) as usize
         } else {
             (width * height * 4) as usize
         };
         Ok(Self {
             transform,
+            width,
+            height,
+            output_is_nv12,
             scratch: vec![0u8; scratch_len],
         })
     }
@@ -830,15 +856,16 @@ impl MfColorConverter {
         unsafe {
             self.transform.ProcessInput(0, &sample, 0)?;
         }
-        let packets = drain_output(&self.transform, 0)?;
-        let Some(packet) = packets.into_iter().next() else {
-            return Ok(None);
-        };
-        if packet.len() > self.scratch.len() {
-            self.scratch.resize(packet.len(), 0);
+        let out_sample = process_output_once_sample(&self.transform, 0)?
+            .ok_or_else(|| anyhow!("MF color converter produced no output"))?;
+        // Normalize orientation: MF image buffers are often bottom-up, so read
+        // the output top-down regardless of which direction we are converting.
+        let out = read_sample_topdown(&out_sample, self.width, self.height, self.output_is_nv12)?;
+        if out.len() > self.scratch.len() {
+            self.scratch.resize(out.len(), 0);
         }
-        self.scratch[..packet.len()].copy_from_slice(&packet);
-        Ok(Some(&self.scratch[..packet.len()]))
+        self.scratch[..out.len()].copy_from_slice(&out);
+        Ok(Some(&self.scratch[..out.len()]))
     }
 }
 
@@ -1345,7 +1372,7 @@ impl MfH264Decoder {
 
         let sample = process_output_once_sample(&self.transform, 0)?
             .ok_or_else(|| anyhow!("MF decoder produced no output"))?;
-        let nv12 = read_nv12_topdown(&sample, self.width, self.height)?;
+        let nv12 = read_sample_topdown(&sample, self.width, self.height, true)?;
 
         let w = self.width;
         let h = self.height;

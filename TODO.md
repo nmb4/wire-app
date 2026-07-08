@@ -5,13 +5,18 @@ Video streaming issue tracker. Log-analysis driven; see commit history for conte
 ## Open
 
 ### 1. Receiving stream is upside down
-- **Status:** in progress
+- **Status:** fixed (needs verification)
 - **Symptom:** Remote video decoded via the MF hardware H.264 decoder renders vertically flipped.
-- **Root cause:** MF H.264 decoder output samples use a negative (bottom-up) stride;
-  `read_sample_bytes` flattens them as if top-down, so the NV12 fed to the
-  NV12->RGBA conversion is upside down. The OpenH264 software path is unaffected.
-- **Fix:** Read decoder output with stride awareness and normalize to top-down
-  before color conversion (in `MfH264Decoder::decode`, `win_mf_codec.rs`).
+- **Root cause:** MF image buffers (both the decoder's NV12 output and the color
+  converter's RGB32 output) use a negative (bottom-up) stride, but they were read
+  via `read_sample_bytes` (ConvertToContiguousBuffer) which flattens them
+  top-down. Normalizing only the decoder NV12 input was insufficient — the
+  converter's own output also needed normalizing. OpenH264 software path is
+  unaffected (separate code, top-down).
+- **Fix:** Added `read_sample_topdown` (stride-aware, normalizes to top-down for
+  both NV12 and RGB32 image samples) and use it for the decoder output and the
+  color converter output in `win_mf_codec.rs`. Also normalizes the encode
+  direction (converter NV12 output), so sent video is correctly oriented too.
 
 ### 2. Stopping then restarting screen sharing does not restart
 - **Status:** deferred (not working on this yet, per user)
