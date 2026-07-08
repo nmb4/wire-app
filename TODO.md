@@ -4,19 +4,27 @@ Video streaming issue tracker. Log-analysis driven; see commit history for conte
 
 ## Open
 
-### 1. Receiving stream is upside down
-- **Status:** fixed (needs verification)
-- **Symptom:** Remote video decoded via the MF hardware H.264 decoder renders vertically flipped.
-- **Root cause:** MF image buffers (both the decoder's NV12 output and the color
-  converter's RGB32 output) use a negative (bottom-up) stride, but they were read
-  via `read_sample_bytes` (ConvertToContiguousBuffer) which flattens them
-  top-down. Normalizing only the decoder NV12 input was insufficient — the
-  converter's own output also needed normalizing. OpenH264 software path is
-  unaffected (separate code, top-down).
-- **Fix:** Added `read_sample_topdown` (stride-aware, normalizes to top-down for
-  both NV12 and RGB32 image samples) and use it for the decoder output and the
-  color converter output in `win_mf_codec.rs`. Also normalizes the encode
-  direction (converter NV12 output), so sent video is correctly oriented too.
+### 1. Receiving stream is upside down + stalls
+- **Status:** fixed by reverting receive decode to OpenH264 (needs verification)
+- **Symptom:** Remote video was vertically flipped, then after a few frames the
+  receiver stalled with no new frames.
+- **Root cause (proper diagnosis from logs):** The MF hardware H.264 decoder has
+  an MFT state machine we were not driving correctly. Logs showed, after the
+  first keyframe:
+  - `MF_E_TRANSFORM_STREAM_CHANGE (0xC00D6D61)` — a stream/SPS change requires
+    renegotiating the output media type.
+  - `MF_E_NOTACCEPTING (0xC00D36B5)` — the decoder will not accept more input
+    until pending output is drained.
+  Our `decode()` never renegotiated on stream change nor drained output on
+  NOTACCEPTING, so after a few frames the decoder rejected all input → permanent
+  stall. The flip was a secondary symptom of the same MF image-buffer stride
+  handling.
+- **Fix:** Receive decoding now uses the **OpenH264 software decoder** (proven
+  reliable and orientation-correct at 1080p; it worked well before the MF decoder
+  was forced in). The MF hardware decoder (`win_mf_codec::MfH264Decoder`) is kept
+  but only used as a last resort until its state machine (stream-change
+  renegotiation + NOTACCEPTING draining) is implemented. The stride/orientation
+  helpers (`read_sample_topdown`) remain and still improve the encode direction.
 
 ### 2. Stopping then restarting screen sharing does not restart
 - **Status:** deferred (not working on this yet, per user)

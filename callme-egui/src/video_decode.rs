@@ -69,16 +69,24 @@ impl FrameDecoder for MfDecoder {
 }
 
 fn make_decoder() -> Result<Box<dyn FrameDecoder>> {
+    // Use the OpenH264 software decoder for receiving. It is reliable and
+    // orientation-correct. The MF hardware H.264 decoder (win_mf_codec) has an
+    // MFT state machine (MF_E_TRANSFORM_STREAM_CHANGE renegotiation and
+    // MF_E_NOTACCEPTING draining) that is not handled yet; using it stalls the
+    // receiver after a stream change. It is only a last resort if OpenH264 is
+    // unavailable.
+    match OpenH264Decoder::try_new() {
+        Ok(decoder) => return Ok(Box::new(decoder)),
+        Err(e) => warn!("OpenH264 decoder unavailable, trying MF hardware decoder: {e:?}"),
+    }
     #[cfg(windows)]
     {
-        match MfDecoder::try_new() {
-            Ok(decoder) => return Ok(Box::new(decoder)),
-            Err(e) => {
-                warn!("MF hardware H.264 decoder unavailable, falling back to OpenH264: {e:?}")
-            }
-        }
+        Ok(Box::new(MfDecoder::try_new()?))
     }
-    Ok(Box::new(OpenH264Decoder::try_new()?))
+    #[cfg(not(windows))]
+    {
+        Err(anyhow::anyhow!("no video decoder available"))
+    }
 }
 
 /// Bounded hand-off between the QUIC receive task and the decode thread. Small on
@@ -160,9 +168,8 @@ where
     let mut decoded = 0u64;
     let mut decode_errors = 0u64;
     // A freshly joined stream starts mid-GOP, so the decoder cannot produce a
-    // frame until the next keyframe arrives (keyframe interval is <= 2s). Don't
-    // mistake that expected warm-up for a broken decoder.
-    let stream_start = Instant::now();
+    // frame until the next keyframe arrives (keyframe interval is <= 2s). Pre-
+    // keyframe decode errors are expected and not a sign of a broken decoder.
     let mut window_decoded = 0u64;
     let mut window_bytes = 0u64;
     let mut window_decode_ms = 0.0;
@@ -200,23 +207,6 @@ where
                 decode_errors += 1;
                 if decode_errors <= 5 || decode_errors % 60 == 0 {
                     warn!("video decode error (#{decode_errors}): {e:?}");
-                }
-                // Only give up on the current decoder if it has never produced a
-                // single frame AND we've waited past a full keyframe interval
-                // (keyframe period is <= 2s). A decoder that has already produced
-                // a frame is proven working and is never replaced mid-stream.
-                if decoded == 0
-                    && decode_errors >= 10
-                    && stream_start.elapsed() >= Duration::from_secs(3)
-                {
-                    warn!("decode backend produced no frames after keyframe interval; falling back to OpenH264 software decoder");
-                    match OpenH264Decoder::try_new() {
-                        Ok(sw) => {
-                            decoder = Box::new(sw);
-                            decode_errors = 0;
-                        }
-                        Err(e2) => warn!("OpenH264 fallback also failed: {e2:?}"),
-                    }
                 }
             }
         }
