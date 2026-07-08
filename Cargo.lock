@@ -1059,6 +1059,7 @@ dependencies = [
  "tracing-android",
  "tracing-subscriber",
  "windows 0.60.0",
+ "windows-capture",
  "xcap",
  "zed-scap",
 ]

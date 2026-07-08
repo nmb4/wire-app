@@ -7,6 +7,8 @@ mod scap_capture;
 mod screen_capture;
 mod video_decode;
 #[cfg(windows)]
+mod win_capture;
+#[cfg(windows)]
 mod win_gdi_capture;
 #[cfg(windows)]
 pub mod win_mf_codec;

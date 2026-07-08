@@ -76,6 +76,7 @@ windows = { version = "0.60", features = [
 ] }
 scopeguard = "1.2"
 rayon = "1.12"
+windows-capture = "1.4.4"
 
 [features]
 default = ["audio-processing"]

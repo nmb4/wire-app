@@ -25,6 +25,8 @@ use image::DynamicImage;
 #[cfg(windows)]
 use crate::scap_capture::ScapCapturer;
 #[cfg(windows)]
+use crate::win_capture::WindowsCapturer;
+#[cfg(windows)]
 use crate::win_mf_codec::MfH264Encoder;
 
 const FRAME_CHANNEL_DEPTH: usize = 3;
@@ -157,6 +159,8 @@ pub fn start(
 
 enum CaptureSource {
     #[cfg(windows)]
+    Windows(WindowsCapturer),
+    #[cfg(windows)]
     Scap(ScapCapturer),
     #[cfg(windows)]
     Gdi {
@@ -176,6 +180,13 @@ enum CaptureSource {
 fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<CaptureSource> {
     #[cfg(windows)]
     {
+        // Prefer the direct Windows Graphics Capture path: it avoids zed-scap's unconditional
+        // full-frame buffer_crop call for display capture.
+        match WindowsCapturer::try_new(target_w, target_h) {
+            Ok(capturer) => return Ok(CaptureSource::Windows(capturer)),
+            Err(e) => info!("direct WGC capture unavailable, trying zed-scap: {e:?}"),
+        }
+
         // Prefer WGC: GDI StretchBlt blocks the desktop compositor and causes system-wide stutter.
         if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate) {
             return Ok(CaptureSource::Scap(scap));
@@ -203,6 +214,8 @@ fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<C
 
 fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Result<Vec<u8>> {
     match source {
+        #[cfg(windows)]
+        CaptureSource::Windows(capturer) => capturer.capture_bgra(),
         #[cfg(windows)]
         CaptureSource::Scap(scap) => scap.capture_bgra(),
         #[cfg(windows)]
