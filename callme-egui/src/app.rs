@@ -16,7 +16,7 @@ use callme::{
     video::{codec::VideoDecoder, transport, VideoConfig, VideoResolution},
 };
 use eframe::NativeOptions;
-use egui::{Color32, RichText, Ui};
+use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use iroh::{protocol::Router, Endpoint, KeyParsingError, NodeId};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -29,14 +29,25 @@ pub struct App {
     state: AppState,
 }
 
-enum UiSection {
-    Config,
-    Main,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamViewMode {
+    Normal,
+    FillWindow,
+    Fullscreen,
+}
+
+impl StreamViewMode {
+    fn is_fullscreen(self) -> bool {
+        matches!(self, Self::Fullscreen)
+    }
 }
 
 struct AppState {
-    section: UiSection,
+    configured: bool,
+    show_settings: bool,
+    stream_view_mode: StreamViewMode,
     remote_node_id: Option<Result<NodeId, KeyParsingError>>,
+    remote_node_input: String,
     worker: WorkerHandle,
     our_node_id: Option<NodeId>,
     devices: callme::audio::Devices,
@@ -114,7 +125,6 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_first_update {
             self.is_first_update = false;
-            ctx.set_zoom_factor(1.5);
             let ctx = ctx.clone();
             let callback = Arc::new(move || ctx.request_repaint());
             self.state.cmd(Command::SetUpdateCallback { callback });
@@ -135,8 +145,11 @@ impl App {
         let devices =
             callme::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
         let state = AppState {
-            section: UiSection::Config,
+            configured: false,
+            show_settings: true,
+            stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
+            remote_node_input: String::new(),
             worker: handle,
             our_node_id: None,
             devices,
@@ -160,6 +173,37 @@ impl App {
 }
 impl AppState {
     fn update(&mut self, ctx: &egui::Context) {
+        self.process_events();
+        self.handle_view_mode_input(ctx);
+
+        let immersive = self.stream_view_mode != StreamViewMode::Normal;
+
+        if !self.stream_view_mode.is_fullscreen() {
+            self.ui_top_bar(ctx);
+        }
+
+        if !immersive {
+            egui::SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(300.0)
+                .frame(Frame::side_top_panel(&ctx.style()).inner_margin(12.0))
+                .show(ctx, |ui| self.ui_sidebar(ui));
+        }
+
+        egui::CentralPanel::default()
+            .frame(if immersive {
+                Frame::NONE
+            } else {
+                Frame::central_panel(&ctx.style()).inner_margin(12.0)
+            })
+            .show(ctx, |ui| self.ui_stream_panel(ui, ctx));
+
+        if self.show_settings || !self.configured {
+            self.ui_settings_window(ctx);
+        }
+    }
+
+    fn process_events(&mut self) {
         while let Ok(event) = self.worker.event_rx.try_recv() {
             match event {
                 Event::EndpointBound(node_id) => {
@@ -171,6 +215,9 @@ impl AppState {
                         self.volumes.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
+                        if self.selected_video_participant == Some(node_id) {
+                            self.selected_video_participant = self.video_frames.keys().next().copied();
+                        }
                     } else {
                         self.calls.insert(node_id, call_state);
                     }
@@ -235,248 +282,27 @@ impl AppState {
                 }
             }
         }
+    }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.section {
-            UiSection::Config => self.ui_section_config(ui),
-            UiSection::Main => self.ui_section_call(ui),
-        });
+    fn handle_view_mode_input(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+        }
+    }
+
+    fn set_stream_view_mode(&mut self, ctx: &egui::Context, mode: StreamViewMode) {
+        if self.stream_view_mode == StreamViewMode::Fullscreen && mode != StreamViewMode::Fullscreen
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        if mode == StreamViewMode::Fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+        self.stream_view_mode = mode;
     }
 
     fn audio_config(&self) -> AudioConfig {
         (&self.audio_config).into()
-    }
-
-    fn ui_section_call(&mut self, ui: &mut Ui) {
-        ui.heading("Call a remote node");
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button("📋 Paste node id")
-                    .on_hover_text("Click to paste")
-                    .clicked()
-                {
-                    #[cfg(not(target_os = "android"))]
-                    let pasted = {
-                        arboard::Clipboard::new()
-                            .expect("failed to access clipboard")
-                            .get_text()
-                            .expect("failed to get text from clipboard")
-                    };
-
-                    #[cfg(target_os = "android")]
-                    let pasted = {
-                        android_clipboard::get_text().expect("failed to get text from clipboard")
-                    };
-
-                    let node_id = NodeId::from_str(&pasted);
-                    self.remote_node_id = Some(node_id);
-                }
-            });
-            if let Some(node_id) = self.remote_node_id.as_ref() {
-                ui.horizontal(|ui| match node_id {
-                    Ok(node_id) => {
-                        if ui.button("Call").clicked() {
-                            self.cmd(Command::Call { node_id: *node_id });
-                        }
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
-                    }
-                    Err(err) => {
-                        ui.label(fmt_error(&format!("Invalid node id: {err}")));
-                    }
-                });
-            }
-        });
-
-        ui.add_space(8.);
-        ui.heading("Accept calls");
-        if let Some(node_id) = &self.our_node_id {
-            ui.horizontal(|ui| {
-                ui.label("Our node id:".to_string());
-                ui.label(fmt_node_id(&node_id.fmt_short()));
-                if ui
-                    .button("📋 Copy")
-                    .on_hover_text("Click to copy")
-                    .clicked()
-                {
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        if let Err(err) = arboard::Clipboard::new()
-                            .expect("failed to get clipboard")
-                            .set_text(node_id.to_string())
-                        {
-                            warn!("failed to copy text to clipboard: {err}");
-                        }
-                    }
-                    #[cfg(target_os = "android")]
-                    if let Err(err) = android_clipboard::set_text(node_id.to_string()) {
-                        warn!("failed to copy text to clipboard: {err}");
-                    }
-                }
-            });
-        }
-
-        ui.add_space(8.);
-        ui.heading("Screen Sharing");
-        ui.horizontal(|ui| {
-            if self.sharing_active {
-                if ui.button("Stop Sharing").clicked() {
-                    self.cmd(Command::ToggleSharing { enabled: false });
-                }
-            } else if ui.button("Start Sharing").clicked() {
-                self.cmd(Command::ToggleSharing { enabled: true });
-            }
-        });
-
-        if let Some(preview) = &mut self.preview {
-            ui.label("Preview:");
-            ui.horizontal(|ui| {
-                ui.label(format!("{:.0}x{:.0}", preview.width, preview.height));
-                ui.separator();
-                ui.label(format!("{:.1} FPS", preview.actual_fps));
-                ui.separator();
-                ui.label(format!("encode {:.1}ms", preview.encode_time_ms));
-            });
-            if preview.uploaded_generation != preview.generation {
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [preview.width as usize, preview.height as usize],
-                    &preview.data,
-                );
-                if let Some(tex) = &mut preview.texture {
-                    tex.set(color_image, egui::TextureOptions::default());
-                } else {
-                    preview.texture = Some(ui.ctx().load_texture(
-                        "preview",
-                        color_image,
-                        egui::TextureOptions::default(),
-                    ));
-                }
-                preview.uploaded_generation = preview.generation;
-            }
-            if let Some(tex) = &preview.texture {
-                let aspect = preview.width as f32 / preview.height as f32;
-                let max_w = ui.available_width().min(400.0);
-                ui.add(
-                    egui::Image::new(tex)
-                        .max_width(max_w)
-                        .max_height(max_w / aspect),
-                );
-            }
-        }
-
-        let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
-        if !share_targets.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label("View:");
-                let selected = self.selected_video_participant.unwrap_or(share_targets[0]);
-                egui::ComboBox::from_id_salt("video_source")
-                    .selected_text(
-                        share_targets
-                            .iter()
-                            .find(|n| **n == selected)
-                            .map(|n| n.fmt_short())
-                            .unwrap_or_default(),
-                    )
-                    .show_ui(ui, |ui| {
-                        for node_id in &share_targets {
-                            let label = node_id.fmt_short();
-                            if ui.selectable_label(selected == *node_id, &label).clicked() {
-                                self.selected_video_participant = Some(*node_id);
-                            }
-                        }
-                    });
-            });
-
-            let participant = self
-                .selected_video_participant
-                .unwrap_or(share_targets[0]);
-            if let Some(frame) = self.video_frames.get_mut(&participant) {
-                if !frame.data.is_empty() && frame.width > 0 && frame.height > 0 {
-                    if frame.uploaded_generation != frame.generation {
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            &frame.data,
-                        );
-                        if let Some(tex) = &mut frame.texture {
-                            tex.set(color_image, egui::TextureOptions::default());
-                        } else {
-                            frame.texture = Some(ui.ctx().load_texture(
-                                format!("video-{}", participant),
-                                color_image,
-                                egui::TextureOptions::default(),
-                            ));
-                        }
-                        frame.uploaded_generation = frame.generation;
-                    }
-                    if let Some(tex) = &frame.texture {
-                        let aspect = frame.width as f32 / frame.height as f32;
-                        let max_w = ui.available_width().min(400.0);
-                        ui.add(
-                            egui::Image::new(tex)
-                                .max_width(max_w)
-                                .max_height(max_w / aspect),
-                        );
-                    }
-                }
-            }
-        } else {
-            ui.label("No video streams available");
-        }
-
-        ui.add_space(8.);
-        ui.heading("Active calls");
-        ui.vertical(|ui| {
-            for (node_id, state) in &self.calls {
-                let node_id = *node_id;
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
-                        ui.label(format!("{}", state));
-                        if matches!(state, CallState::Incoming) {
-                            if ui.button("Accept").clicked() {
-                                self.cmd(Command::HandleIncoming {
-                                    node_id,
-                                    accept: true,
-                                });
-                            }
-                            if ui.button("Decline").clicked() {
-                                self.cmd(Command::HandleIncoming {
-                                    node_id,
-                                    accept: false,
-                                });
-                            }
-                        } else if ui.button("Drop").clicked() {
-                            self.cmd(Command::Abort { node_id });
-                        }
-                    });
-                    if matches!(state, CallState::Active) {
-                        if let Some(volume) = self.volumes.get(&node_id) {
-                            let mut vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                            ui.horizontal(|ui| {
-                                ui.label("Vol:");
-                                ui.add(
-                                    egui::Slider::new(&mut vol, 0.0..=2.0)
-                                        .text("")
-                                        .fixed_decimals(1),
-                                )
-                                .on_hover_text("Adjust volume for this participant");
-                            });
-                            volume.store(vol.to_bits(), Ordering::Relaxed);
-                        }
-                        if let Some(rtt) = self.rtts.get(&node_id) {
-                            ui.horizontal(|ui| {
-                                if rtt.as_millis() < 100 {
-                                    ui.colored_label(Color32::GREEN, fmt_rtt(rtt));
-                                } else if rtt.as_millis() < 300 {
-                                    ui.colored_label(Color32::YELLOW, fmt_rtt(rtt));
-                                } else {
-                                    ui.colored_label(Color32::LIGHT_RED, fmt_rtt(rtt));
-                                }
-                            });
-                        }
-                    }
-                });
-            }
-        });
     }
 
     fn cmd(&self, command: Command) {
@@ -486,110 +312,655 @@ impl AppState {
             .expect("worker thread is dead");
     }
 
-    fn ui_section_config(&mut self, ui: &mut Ui) {
-        ui.heading("Audio config");
-        ui.vertical(|ui| {
-            egui::ComboBox::from_label("Capture device")
-                .selected_text(&self.audio_config.selected_input)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.audio_config.selected_input == DEFAULT, DEFAULT)
-                        .clicked()
-                    {
-                        self.audio_config.selected_input = DEFAULT.to_string();
+    fn ui_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top_bar")
+            .frame(Frame::new().inner_margin(egui::Margin::symmetric(16, 10)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Callme").strong().size(18.0));
+                    ui.separator();
+                    if let Some(node_id) = &self.our_node_id {
+                        ui.label("Node");
+                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                    } else {
+                        ui.label(RichText::new("Connecting…").weak());
                     }
-                    for device in &self.devices.input {
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .selectable_label(&self.audio_config.selected_input == device, device)
+                            .button("Settings")
+                            .on_hover_text("Audio and screen sharing options")
                             .clicked()
                         {
-                            self.audio_config.selected_input = device.to_string()
+                            self.show_settings = true;
                         }
+                        let active_calls = self
+                            .calls
+                            .values()
+                            .filter(|s| matches!(s, CallState::Active))
+                            .count();
+                        if active_calls > 0 {
+                            ui.label(
+                                RichText::new(format!("{active_calls} active call(s)"))
+                                    .color(Color32::from_rgb(100, 200, 120)),
+                            );
+                        }
+                        if self.sharing_active {
+                            ui.label(
+                                RichText::new("Sharing screen")
+                                    .color(Color32::from_rgb(120, 170, 255)),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_sidebar(&mut self, ui: &mut Ui) {
+        self.ui_identity_card(ui);
+        ui.add_space(12.0);
+        self.ui_dial_card(ui);
+        ui.add_space(12.0);
+        self.ui_calls_card(ui);
+        ui.add_space(12.0);
+        self.ui_sharing_card(ui);
+    }
+
+    fn ui_identity_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Your identity", |ui| {
+            if let Some(node_id) = &self.our_node_id {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(fmt_node_id(&node_id.fmt_short()));
+                    if ui.small_button("Copy").clicked() {
+                        copy_to_clipboard(&node_id.to_string());
                     }
                 });
-
-            egui::ComboBox::from_label("Playback device")
-                .selected_text(&self.audio_config.selected_output)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.audio_config.selected_output == DEFAULT, DEFAULT)
-                        .clicked()
-                    {
-                        self.audio_config.selected_output = DEFAULT.to_string();
-                    }
-                    for device in &self.devices.output {
-                        if ui
-                            .selectable_label(&self.audio_config.selected_output == device, device)
-                            .clicked()
-                        {
-                            self.audio_config.selected_output = device.to_string()
-                        }
-                    }
-                });
-
-            #[cfg(feature = "audio-processing")]
-            ui.checkbox(
-                &mut self.audio_config.processing_enabled,
-                "Enable echo cancellation",
-            );
-
-            egui::ComboBox::from_label("Audio quality")
-                .selected_text(self.audio_config.quality.label())
-                .show_ui(ui, |ui| {
-                    for quality in &[
-                        AudioQuality::Low,
-                        AudioQuality::Medium,
-                        AudioQuality::High,
-                        AudioQuality::Ultra,
-                    ] {
-                        let label = format!("{} ({})", quality.label(), quality.bandwidth_human());
-                        if ui
-                            .selectable_label(self.audio_config.quality == *quality, &label)
-                            .clicked()
-                        {
-                            self.audio_config.quality = *quality;
-                        }
-                    }
-                });
-
-            ui.add_space(8.);
-            ui.separator();
-            ui.heading("Screen Sharing Config");
-
-            egui::ComboBox::from_label("Resolution")
-                .selected_text(self.video_config.resolution.label())
-                .show_ui(ui, |ui| {
-                    for res in VideoResolution::all() {
-                        if ui
-                            .selectable_label(self.video_config.resolution == *res, res.label())
-                            .clicked()
-                        {
-                            self.video_config.resolution = *res;
-                        }
-                    }
-                });
-
-            egui::ComboBox::from_label("Framerate")
-                .selected_text(format!("{} fps", self.video_config.framerate))
-                .show_ui(ui, |ui| {
-                    for fps in [15u32, 30] {
-                        if ui
-                            .selectable_label(self.video_config.framerate == fps, format!("{fps} fps"))
-                            .clicked()
-                        {
-                            self.video_config.framerate = fps;
-                        }
-                    }
-                });
-
-            if ui.button("Save & start").clicked() {
-                let audio_config = self.audio_config();
-                let video_config = self.video_config;
-                self.cmd(Command::SetAudioConfig { audio_config });
-                self.cmd(Command::SetVideoConfig { video_config });
-                self.section = UiSection::Main;
+                ui.label(
+                    RichText::new("Share this ID so others can call you.")
+                        .small()
+                        .weak(),
+                );
+            } else {
+                ui.label(RichText::new("Waiting for network…").weak());
             }
         });
+    }
+
+    fn ui_dial_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Place a call", |ui| {
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.remote_node_input)
+                        .hint_text("Paste remote node ID")
+                        .desired_width(ui.available_width() - 64.0),
+                );
+                if response.changed() {
+                    self.remote_node_id = if self.remote_node_input.is_empty() {
+                        None
+                    } else {
+                        Some(NodeId::from_str(self.remote_node_input.trim()))
+                    };
+                }
+                if ui.button("Paste").clicked() {
+                    if let Some(text) = read_clipboard() {
+                        self.remote_node_input = text;
+                        self.remote_node_id = Some(NodeId::from_str(self.remote_node_input.trim()));
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                let can_call = matches!(self.remote_node_id, Some(Ok(_)));
+                ui.add_enabled_ui(can_call, |ui| {
+                    if ui.button("Call").clicked() {
+                        if let Some(Ok(node_id)) = self.remote_node_id {
+                            self.cmd(Command::Call { node_id });
+                        }
+                    }
+                });
+                match &self.remote_node_id {
+                    Some(Ok(node_id)) => {
+                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                    }
+                    Some(Err(err)) => {
+                        ui.label(fmt_error(&format!("Invalid ID: {err}")));
+                    }
+                    None => {
+                        ui.label(RichText::new("Enter a node ID to call").weak());
+                    }
+                }
+            });
+        });
+    }
+
+    fn ui_calls_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Calls", |ui| {
+            if self.calls.is_empty() {
+                ui.label(RichText::new("No active calls").weak());
+                return;
+            }
+
+            let calls: Vec<_> = self.calls.iter().collect();
+            for (node_id, state) in calls {
+                let node_id = *node_id;
+                Frame::new()
+                    .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(10.0)
+                    .stroke(Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(fmt_node_id(&node_id.fmt_short()));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                call_state_badge(ui, state);
+                            });
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            match state {
+                                CallState::Incoming => {
+                                    if ui.button("Accept").clicked() {
+                                        self.cmd(Command::HandleIncoming {
+                                            node_id,
+                                            accept: true,
+                                        });
+                                    }
+                                    if ui.button("Decline").clicked() {
+                                        self.cmd(Command::HandleIncoming {
+                                            node_id,
+                                            accept: false,
+                                        });
+                                    }
+                                }
+                                CallState::Calling | CallState::Active => {
+                                    if ui.small_button("End").clicked() {
+                                        self.cmd(Command::Abort { node_id });
+                                    }
+                                }
+                                CallState::Aborted => {}
+                            }
+                        });
+
+                        if matches!(state, CallState::Active) {
+                            if let Some(volume) = self.volumes.get(&node_id) {
+                                let mut vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                                ui.horizontal(|ui| {
+                                    ui.label("Volume");
+                                    ui.add(
+                                        egui::Slider::new(&mut vol, 0.0..=2.0)
+                                            .show_value(false)
+                                            .fixed_decimals(1),
+                                    );
+                                });
+                                volume.store(vol.to_bits(), Ordering::Relaxed);
+                            }
+                            if let Some(rtt) = self.rtts.get(&node_id) {
+                                ui.label(rtt_label(*rtt));
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+            }
+        });
+    }
+
+    fn ui_sharing_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Screen sharing", |ui| {
+            ui.horizontal(|ui| {
+                if self.sharing_active {
+                    if ui.button("Stop sharing").clicked() {
+                        self.cmd(Command::ToggleSharing { enabled: false });
+                    }
+                    ui.label(
+                        RichText::new("Live")
+                            .color(Color32::from_rgb(100, 200, 120)),
+                    );
+                } else if ui.button("Start sharing").clicked() {
+                    self.cmd(Command::ToggleSharing { enabled: true });
+                }
+            });
+
+            if let Some(preview) = &mut self.preview {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Outgoing preview").small().weak());
+                ui.horizontal(|ui| {
+                    ui.label(format!("{:.0}×{:.0}", preview.width, preview.height));
+                    ui.separator();
+                    ui.label(format!("{:.0} fps", preview.actual_fps));
+                });
+                sync_rgba_texture(
+                    ui,
+                    "preview",
+                    preview.width,
+                    preview.height,
+                    &preview.data,
+                    preview.generation,
+                    &mut preview.uploaded_generation,
+                    &mut preview.texture,
+                );
+                if let Some(tex) = &preview.texture {
+                    let max_w = ui.available_width();
+                    let aspect = preview.width as f32 / preview.height as f32;
+                    ui.add(
+                        egui::Image::new(tex)
+                            .max_width(max_w)
+                            .max_height(max_w / aspect),
+                    );
+                }
+            }
+        });
+    }
+
+    fn ui_stream_panel(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let immersive = self.stream_view_mode != StreamViewMode::Normal;
+        let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
+        let has_stream = share_targets.iter().any(|id| {
+            self.video_frames
+                .get(id)
+                .is_some_and(|f| f.width > 0 && f.height > 0 && !f.data.is_empty())
+        });
+
+        if immersive {
+            self.ui_stream_toolbar(ui, ctx, &share_targets, has_stream, true);
+            ui.add_space(4.0);
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Remote screen").strong().size(16.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.ui_stream_toolbar(ui, ctx, &share_targets, has_stream, false);
+                });
+            });
+            ui.add_space(8.0);
+        }
+
+        if !has_stream {
+            let available = ui.available_size();
+            let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 8.0, ui.visuals().extreme_bg_color);
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                if share_targets.is_empty() {
+                    "Waiting for a remote screen share"
+                } else {
+                    "Receiving video…"
+                },
+                egui::FontId::proportional(16.0),
+                ui.visuals().weak_text_color(),
+            );
+            return;
+        }
+
+        let participant = self
+            .selected_video_participant
+            .filter(|id| share_targets.contains(id))
+            .unwrap_or(share_targets[0]);
+
+        if let Some(frame) = self.video_frames.get_mut(&participant) {
+            sync_rgba_texture(
+                ui,
+                &format!("video-{participant}"),
+                frame.width,
+                frame.height,
+                &frame.data,
+                frame.generation,
+                &mut frame.uploaded_generation,
+                &mut frame.texture,
+            );
+
+            if let Some(tex) = &frame.texture {
+                let available = ui.available_size();
+                let aspect = frame.width as f32 / frame.height as f32;
+                let (area, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+
+                if immersive {
+                    ui.painter()
+                        .rect_filled(area, 0.0, Color32::from_rgb(12, 12, 14));
+                }
+
+                let size = video_display_size(area.size(), aspect, immersive);
+                let image_rect = egui::Rect::from_center_size(area.center(), size);
+                ui.painter().image(
+                    tex.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+
+                if !immersive {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} — {}×{}",
+                            participant.fmt_short(),
+                            frame.width,
+                            frame.height
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn ui_stream_toolbar(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        share_targets: &[NodeId],
+        has_stream: bool,
+        compact: bool,
+    ) {
+        if !share_targets.is_empty() {
+            let selected = self
+                .selected_video_participant
+                .filter(|id| share_targets.contains(id))
+                .unwrap_or(share_targets[0]);
+            egui::ComboBox::from_id_salt("video_source")
+                .selected_text(selected.fmt_short())
+                .width(if compact { 140.0 } else { 180.0 })
+                .show_ui(ui, |ui| {
+                    for node_id in share_targets {
+                        if ui
+                            .selectable_label(selected == *node_id, node_id.fmt_short())
+                            .clicked()
+                        {
+                            self.selected_video_participant = Some(*node_id);
+                        }
+                    }
+                });
+        }
+
+        if has_stream {
+            let fill_selected = self.stream_view_mode == StreamViewMode::FillWindow;
+            if ui
+                .selectable_label(fill_selected, if compact { "Fill" } else { "Fill window" })
+                .on_hover_text("Expand stream to fill the client window")
+                .clicked()
+            {
+                self.set_stream_view_mode(
+                    ctx,
+                    if fill_selected {
+                        StreamViewMode::Normal
+                    } else {
+                        StreamViewMode::FillWindow
+                    },
+                );
+            }
+
+            let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
+            if ui
+                .selectable_label(fs_selected, if compact { "Fullscreen" } else { "Fullscreen" })
+                .on_hover_text("Enter native fullscreen (Esc to exit)")
+                .clicked()
+            {
+                self.set_stream_view_mode(
+                    ctx,
+                    if fs_selected {
+                        StreamViewMode::Normal
+                    } else {
+                        StreamViewMode::Fullscreen
+                    },
+                );
+            }
+        }
+
+        if compact && self.stream_view_mode != StreamViewMode::Normal {
+            if ui
+                .button("Exit")
+                .on_hover_text("Return to normal layout (Esc)")
+                .clicked()
+            {
+                self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+            }
+        }
+    }
+
+    fn ui_settings_window(&mut self, ctx: &egui::Context) {
+        let can_close = self.configured;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Audio").strong());
+                ui.add_space(4.0);
+
+                egui::ComboBox::from_label("Microphone")
+                    .selected_text(&self.audio_config.selected_input)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.audio_config.selected_input == DEFAULT, DEFAULT)
+                            .clicked()
+                        {
+                            self.audio_config.selected_input = DEFAULT.to_string();
+                        }
+                        for device in &self.devices.input {
+                            if ui
+                                .selectable_label(
+                                    &self.audio_config.selected_input == device,
+                                    device,
+                                )
+                                .clicked()
+                            {
+                                self.audio_config.selected_input = device.to_string();
+                            }
+                        }
+                    });
+
+                egui::ComboBox::from_label("Speakers")
+                    .selected_text(&self.audio_config.selected_output)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.audio_config.selected_output == DEFAULT, DEFAULT)
+                            .clicked()
+                        {
+                            self.audio_config.selected_output = DEFAULT.to_string();
+                        }
+                        for device in &self.devices.output {
+                            if ui
+                                .selectable_label(
+                                    &self.audio_config.selected_output == device,
+                                    device,
+                                )
+                                .clicked()
+                            {
+                                self.audio_config.selected_output = device.to_string();
+                            }
+                        }
+                    });
+
+                #[cfg(feature = "audio-processing")]
+                ui.checkbox(
+                    &mut self.audio_config.processing_enabled,
+                    "Echo cancellation",
+                );
+
+                egui::ComboBox::from_label("Audio quality")
+                    .selected_text(self.audio_config.quality.label())
+                    .show_ui(ui, |ui| {
+                        for quality in &[
+                            AudioQuality::Low,
+                            AudioQuality::Medium,
+                            AudioQuality::High,
+                            AudioQuality::Ultra,
+                        ] {
+                            let label =
+                                format!("{} ({})", quality.label(), quality.bandwidth_human());
+                            if ui
+                                .selectable_label(self.audio_config.quality == *quality, &label)
+                                .clicked()
+                            {
+                                self.audio_config.quality = *quality;
+                            }
+                        }
+                    });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Screen sharing").strong());
+                ui.add_space(4.0);
+
+                egui::ComboBox::from_label("Resolution")
+                    .selected_text(self.video_config.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for res in VideoResolution::all() {
+                            if ui
+                                .selectable_label(self.video_config.resolution == *res, res.label())
+                                .clicked()
+                            {
+                                self.video_config.resolution = *res;
+                            }
+                        }
+                    });
+
+                egui::ComboBox::from_label("Framerate")
+                    .selected_text(format!("{} fps", self.video_config.framerate))
+                    .show_ui(ui, |ui| {
+                        for fps in [15u32, 30] {
+                            if ui
+                                .selectable_label(
+                                    self.video_config.framerate == fps,
+                                    format!("{fps} fps"),
+                                )
+                                .clicked()
+                            {
+                                self.video_config.framerate = fps;
+                            }
+                        }
+                    });
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        let audio_config = self.audio_config();
+                        let video_config = self.video_config;
+                        self.cmd(Command::SetAudioConfig { audio_config });
+                        self.cmd(Command::SetVideoConfig { video_config });
+                        self.configured = true;
+                        self.show_settings = false;
+                    }
+                    if can_close && ui.button("Cancel").clicked() {
+                        self.show_settings = false;
+                    }
+                });
+            });
+    }
+}
+
+fn section_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .fill(ui.visuals().widgets.noninteractive.weak_bg_fill)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(12.0)
+        .stroke(Stroke::new(
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong());
+            ui.add_space(8.0);
+            add_contents(ui)
+        })
+        .inner
+}
+
+fn call_state_badge(ui: &mut Ui, state: &CallState) {
+    let (text, color) = match state {
+        CallState::Incoming => ("Incoming", Color32::from_rgb(255, 200, 80)),
+        CallState::Calling => ("Calling…", Color32::from_rgb(120, 170, 255)),
+        CallState::Active => ("Active", Color32::from_rgb(100, 200, 120)),
+        CallState::Aborted => ("Ended", Color32::GRAY),
+    };
+    ui.label(RichText::new(text).color(color).small());
+}
+
+fn rtt_label(rtt: Duration) -> RichText {
+    let text = fmt_rtt(&rtt);
+    let color = if rtt.as_millis() < 100 {
+        Color32::GREEN
+    } else if rtt.as_millis() < 300 {
+        Color32::YELLOW
+    } else {
+        Color32::LIGHT_RED
+    };
+    RichText::new(text).color(color).small()
+}
+
+fn video_display_size(available: Vec2, aspect: f32, fill_window: bool) -> Vec2 {
+    if available.x <= 0.0 || available.y <= 0.0 || aspect <= 0.0 {
+        return available;
+    }
+    if fill_window {
+        if available.x / available.y > aspect {
+            Vec2::new(available.y * aspect, available.y)
+        } else {
+            Vec2::new(available.x, available.x / aspect)
+        }
+    } else {
+        let max_h = available.y.min(480.0);
+        let max_w = available.x.min(max_h * aspect);
+        Vec2::new(max_w, max_w / aspect)
+    }
+}
+
+fn sync_rgba_texture(
+    ui: &Ui,
+    id: &str,
+    width: u32,
+    height: u32,
+    data: &Arc<Vec<u8>>,
+    generation: u64,
+    uploaded_generation: &mut u64,
+    texture: &mut Option<egui::TextureHandle>,
+) {
+    if *uploaded_generation == generation || width == 0 || height == 0 || data.is_empty() {
+        return;
+    }
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        data,
+    );
+    let options = egui::TextureOptions::LINEAR;
+    if let Some(tex) = texture {
+        tex.set(color_image, options);
+    } else {
+        *texture = Some(ui.ctx().load_texture(id.to_string(), color_image, options));
+    }
+    *uploaded_generation = generation;
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Err(err) = arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text.to_string()))
+        {
+            warn!("failed to copy to clipboard: {err}");
+        }
+    }
+    #[cfg(target_os = "android")]
+    if let Err(err) = android_clipboard::set_text(text.to_string()) {
+        warn!("failed to copy to clipboard: {err}");
+    }
+}
+
+fn read_clipboard() -> Option<String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut c| c.get_text().ok())
+    }
+    #[cfg(target_os = "android")]
+    {
+        android_clipboard::get_text().ok()
     }
 }
 
