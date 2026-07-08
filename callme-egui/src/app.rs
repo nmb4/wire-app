@@ -1616,29 +1616,19 @@ async fn run_video_send(
                 }
             }
             let send_start = std::time::Instant::now();
-            match time::timeout(
-                VIDEO_SEND_LATENCY_BUDGET,
-                transport::send_frame(&mut send, &latest),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    resets += 1;
+            if let Err(e) = transport::send_frame(&mut send, &latest).await {
+                return Err(e);
+            }
+            let send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
+            if send_ms > 1000.0 {
+                resets += 1;
+                if resets <= 3 || resets % 30 == 0 {
                     warn!(
-                        "video send to {} exceeded {}ms while sending {} bytes; resetting stale stream (#{resets})",
+                        "video send to {} took {:.0}ms for {} bytes (backpressured by receiver/network)",
                         node_id.fmt_short(),
-                        VIDEO_SEND_LATENCY_BUDGET.as_millis(),
+                        send_ms,
                         latest.len()
                     );
-                    let _ = send.reset(VIDEO_STREAM_RESET_CODE);
-                    let (new_send, recv) = conn.transport().open_bi().await?;
-                    send = new_send;
-                    let _ = send.set_priority(10);
-                    tokio::spawn(drain_quic_recv(recv));
-                    let _ = keyframe_tx.send(());
-                    continue;
                 }
             }
             sent += 1;

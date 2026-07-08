@@ -687,6 +687,86 @@ fn read_sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     }
 }
 
+fn process_output_once_sample(
+    transform: &IMFTransform,
+    output_stream_id: u32,
+) -> Result<Option<IMFSample>> {
+    let output_sample = create_output_sample(transform, output_stream_id)?;
+    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: output_stream_id,
+        pSample: std::mem::ManuallyDrop::new(output_sample),
+        dwStatus: 0,
+        pEvents: std::mem::ManuallyDrop::new(None),
+    };
+    let mut status = 0u32;
+    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) } {
+        Ok(()) => {
+            let sample = buffer
+                .pSample
+                .take()
+                .ok_or_else(|| anyhow!("MFT output missing sample"))?;
+            Ok(Some(sample))
+        }
+        Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the NV12 decoder output, normalizing for bottom-up (negative stride)
+/// samples so the color conversion always receives a top-down image. MF H.264
+/// decoder outputs are frequently bottom-up, which otherwise renders upside down.
+fn read_nv12_topdown(sample: &IMFSample, width: u32, height: u32) -> Result<Vec<u8>> {
+    let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u8; w * h * 3 / 2];
+
+    if let Ok(buf2d) = unsafe { buffer.cast::<IMF2DBuffer>() } {
+        let mut ptr = std::ptr::null_mut();
+        let mut stride: i32 = 0;
+        unsafe {
+            buf2d.Lock2D(&mut ptr, &mut stride)?;
+        }
+        let bottom_up = stride < 0;
+        let stride = stride.unsigned_abs() as usize;
+        let rows = h + h / 2;
+        let len = (rows * stride) as usize;
+        let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        for y in 0..h {
+            let src_row = if bottom_up {
+                (h - 1 - y) * stride
+            } else {
+                y * stride
+            };
+            out[y * w..(y + 1) * w].copy_from_slice(&src[src_row..src_row + w]);
+        }
+        let uv_rows = h / 2;
+        for cy in 0..uv_rows {
+            let src_row = if bottom_up {
+                (h + uv_rows - 1 - cy) * stride
+            } else {
+                (h + cy) * stride
+            };
+            let dst = w * h + cy * w;
+            out[dst..dst + w].copy_from_slice(&src[src_row..src_row + w]);
+        }
+        unsafe {
+            buf2d.Unlock2D()?;
+        }
+        Ok(out)
+    } else {
+        let mut p = std::ptr::null_mut();
+        let mut max_len = 0u32;
+        let mut cur_len = 0u32;
+        unsafe {
+            buffer.Lock(&mut p, Some(&mut max_len), Some(&mut cur_len))?;
+            let data = std::slice::from_raw_parts(p as *const u8, cur_len as usize).to_vec();
+            buffer.Unlock()?;
+            Ok(data)
+        }
+    }
+}
+
 fn configure_processor(
     transform: &IMFTransform,
     input: windows::core::GUID,
@@ -1263,11 +1343,9 @@ impl MfH264Decoder {
             }
         }
 
-        let packets = drain_output(&self.transform, 0)?;
-        let nv12 = packets
-            .into_iter()
-            .next()
+        let sample = process_output_once_sample(&self.transform, 0)?
             .ok_or_else(|| anyhow!("MF decoder produced no output"))?;
+        let nv12 = read_nv12_topdown(&sample, self.width, self.height)?;
 
         let w = self.width;
         let h = self.height;
