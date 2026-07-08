@@ -66,7 +66,8 @@ impl VideoDecoder {
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-        for packet in openh264::nal_units(data) {
+        let data = crate::video::bitstream::normalize_h264_for_decode(data);
+        for packet in openh264::nal_units(&data) {
             if let Ok(Some(image)) = self.decoder.decode(packet) {
                 let (w, h) = image.dimensions();
                 let mut rgba = vec![0u8; image.rgba8_len()];

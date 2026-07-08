@@ -1195,6 +1195,7 @@ impl Worker {
     async fn handle_incoming(&mut self, conn: RtcConnection) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         info!("incoming connection from {}", node_id.fmt_short());
+        self.ensure_video_streams(node_id, conn.clone()).await;
         self.active_calls.insert(node_id, CallInfo::Incoming(conn));
         self.emit(Event::SetCallState(node_id, CallState::Incoming))
             .await?;

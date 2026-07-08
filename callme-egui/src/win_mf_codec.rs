@@ -110,6 +110,8 @@ fn find_transform(
     Ok(transform)
 }
 
+const H264_PROFILE_BASELINE: u32 = 66;
+
 fn configure_encoder(
     transform: &IMFTransform,
     width: u32,
@@ -121,16 +123,31 @@ fn configure_encoder(
     let input_type = create_video_media_type(MFVideoFormat_NV12, width, height, framerate, None)?;
 
     unsafe {
+        output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_BASELINE)?;
         transform.SetOutputType(0, &output_type, 0)?;
         transform.SetInputType(0, &input_type, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
     }
+    enable_low_latency(transform);
     Ok(())
 }
 
-fn create_media_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
+fn enable_low_latency(transform: &IMFTransform) {
+    unsafe {
+        if let Ok(api) = transform.cast::<ICodecAPI>() {
+            let mut variant = VARIANT::default();
+            let inner = &mut *variant.Anonymous.Anonymous;
+            inner.vt = VT_BOOL;
+            inner.Anonymous.boolVal = VARIANT_TRUE;
+            let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &variant);
+            let _ = VariantClear(&mut variant);
+        }
+    }
+}
+
+fn create_media_sample(data: &[u8], timestamp: i64, duration: i64) -> Result<IMFSample> {
     let buffer = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
     unsafe {
         let mut ptr = std::ptr::null_mut();
@@ -146,7 +163,7 @@ fn create_media_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
     unsafe {
         sample.AddBuffer(&buffer)?;
         sample.SetSampleTime(timestamp)?;
-        sample.SetSampleDuration(0)?;
+        sample.SetSampleDuration(duration)?;
     }
     Ok(sample)
 }
@@ -268,21 +285,20 @@ impl MfColorConverter {
         })
     }
 
-    fn convert(&mut self, input: &[u8], timestamp: i64) -> Result<&[u8]> {
-        let sample = create_media_sample(input, timestamp)?;
+    fn convert(&mut self, input: &[u8], timestamp: i64, duration: i64) -> Result<Option<&[u8]>> {
+        let sample = create_media_sample(input, timestamp, duration)?;
         unsafe {
             self.transform.ProcessInput(0, &sample, 0)?;
         }
         let packets = drain_output(&self.transform)?;
-        let packet = packets
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("MF color converter produced no output"))?;
+        let Some(packet) = packets.into_iter().next() else {
+            return Ok(None);
+        };
         if packet.len() > self.scratch.len() {
             self.scratch.resize(packet.len(), 0);
         }
         self.scratch[..packet.len()].copy_from_slice(&packet);
-        Ok(&self.scratch[..packet.len()])
+        Ok(Some(&self.scratch[..packet.len()]))
     }
 }
 
@@ -293,6 +309,7 @@ pub struct MfH264Encoder {
     nv12: Vec<u8>,
     bgra_to_nv12: Option<MfColorConverter>,
     frame_index: i64,
+    frame_duration: i64,
     hardware: bool,
 }
 
@@ -346,6 +363,8 @@ impl MfH264Encoder {
             hardware
         );
 
+        let frame_duration = 10_000_000i64 / config.framerate.max(1) as i64;
+
         Ok(Self {
             transform,
             width,
@@ -353,6 +372,7 @@ impl MfH264Encoder {
             nv12: vec![0u8; (width * height * 3 / 2) as usize],
             bgra_to_nv12,
             frame_index: 0,
+            frame_duration,
             hardware,
         })
     }
@@ -366,13 +386,20 @@ impl MfH264Encoder {
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
-        let nv12 = if let Some(conv) = &mut self.bgra_to_nv12 {
-            conv.convert(bgra, self.frame_index)?
+        let timestamp = self.frame_index * self.frame_duration;
+        let nv12: &[u8] = if let Some(conv) = &mut self.bgra_to_nv12 {
+            match conv.convert(bgra, timestamp, self.frame_duration)? {
+                Some(nv12) => nv12,
+                None => {
+                    self.frame_index += 1;
+                    return Ok(Vec::new());
+                }
+            }
         } else {
             bgra_to_nv12(bgra, self.width, self.height, &mut self.nv12);
             &self.nv12
         };
-        let sample = create_media_sample(nv12, self.frame_index)?;
+        let sample = create_media_sample(nv12, timestamp, self.frame_duration)?;
         self.frame_index += 1;
 
         unsafe {
@@ -382,9 +409,6 @@ impl MfH264Encoder {
         let mut out = Vec::new();
         for packet in drain_output(&self.transform)? {
             out.extend_from_slice(&packet);
-        }
-        if out.is_empty() {
-            anyhow::bail!("MF encoder produced no output");
         }
         Ok(out)
     }
@@ -485,7 +509,9 @@ impl MfH264Decoder {
             self.rgba.resize(len, 0);
         }
         if let Some(conv) = &mut self.nv12_to_rgb {
-            let bgra = conv.convert(&nv12, 0)?;
+            let bgra = conv
+                .convert(&nv12, 0, 0)?
+                .ok_or_else(|| anyhow!("MF NV12->RGB converter produced no output"))?;
             bgra_to_rgba(bgra, &mut self.rgba);
         } else {
             nv12_to_rgba(&nv12, w, h, &mut self.rgba);

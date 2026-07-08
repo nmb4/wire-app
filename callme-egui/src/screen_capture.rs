@@ -10,7 +10,7 @@ use anyhow::Context;
 use async_channel::Sender;
 use callme::video::{codec::VideoEncoder, VideoConfig};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(not(windows))]
 use fast_image_resize as fr;
@@ -248,6 +248,8 @@ fn run_encode_loop(
     let mut encoder = FrameEncoder::try_new(&config)?;
     let mut keyframe_rx = keyframe_tx.subscribe();
     let mut frame_count = 0u64;
+    let mut encoded_count = 0u64;
+    let mut encode_errors = 0u64;
     let loop_start = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -267,11 +269,19 @@ fn run_encode_loop(
 
         let encode_start = Instant::now();
         match encoder.encode_frame(&bgra, cfg!(windows)) {
+            Ok(encoded) if encoded.is_empty() => {}
             Ok(encoded) => {
+                encoded_count += 1;
+                if encoded_count == 1 {
+                    info!("encoded first video frame ({} bytes)", encoded.len());
+                }
                 let _ = encoded_tx.send(Arc::new(encoded));
             }
             Err(e) => {
-                info!("video encode error: {e:?}");
+                encode_errors += 1;
+                if encode_errors <= 5 || encode_errors % 60 == 0 {
+                    warn!("video encode error (#{encode_errors}): {e:?}");
+                }
             }
         }
         let encode_time = encode_start.elapsed();
