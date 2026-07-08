@@ -1375,6 +1375,7 @@ impl Worker {
                 let frame_tx = self.video_frame_tx.clone();
                 let keyframe_tx = self.keyframe_tx.clone();
                 let nid = node_id;
+                info!("starting video send task for {}", node_id.fmt_short());
                 let handle = tokio::spawn(async move {
                     run_video_send(send_conn, frame_tx, keyframe_tx, nid).await;
                 });
@@ -1458,8 +1459,13 @@ impl Worker {
 
         self.capture_thread = Some(thread);
         self.capture_stop_flag = Some(stop_flag);
-        self.sharing_active = true;
-        info!("screen sharing started ({}x{} @ {}fps)", target_w, target_h, config.framerate);
+        info!(
+            "screen capture started ({}x{} @ {}fps, {} active call(s))",
+            target_w,
+            target_h,
+            config.framerate,
+            self.video_peers.len()
+        );
         let event_tx = self.event_tx.clone();
         tokio::task::spawn(async move {
             let _ = event_tx.send(Event::SharingToggled(true)).await;
@@ -1497,8 +1503,9 @@ impl Worker {
             }
             Command::ToggleSharing { enabled } => {
                 if enabled && !self.sharing_active {
-                    self.start_capture()?;
+                    self.sharing_active = true;
                     self.attach_video_to_active_calls().await;
+                    self.start_capture()?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture();
                 }

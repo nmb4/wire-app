@@ -38,6 +38,8 @@ pub struct PreviewUpdate {
     pub encode_time_ms: f64,
 }
 
+const MF_EMPTY_FALLBACK: u32 = 8;
+
 enum FrameEncoder {
     #[cfg(windows)]
     MediaFoundation(MfH264Encoder),
@@ -46,14 +48,33 @@ enum FrameEncoder {
 
 impl FrameEncoder {
     fn try_new(config: &VideoConfig) -> Result<Self> {
-        #[cfg(windows)]
-        {
-            match MfH264Encoder::try_new(config) {
-                Ok(enc) => return Ok(Self::MediaFoundation(enc)),
-                Err(e) => info!("MF hardware encoder unavailable, using OpenH264: {e:?}"),
+        info!("using OpenH264 software encoder");
+        Ok(Self::OpenH264(VideoEncoder::new(config)?))
+    }
+
+    #[cfg(windows)]
+    fn try_new_with_mf(config: &VideoConfig) -> Result<Self> {
+        match MfH264Encoder::try_new(config) {
+            Ok(enc) => {
+                info!("using MF hardware encoder");
+                Ok(Self::MediaFoundation(enc))
+            }
+            Err(e) => {
+                info!("MF hardware encoder unavailable, using OpenH264: {e:?}");
+                Self::try_new(config)
             }
         }
-        Ok(Self::OpenH264(VideoEncoder::new(config)?))
+    }
+
+    fn is_media_foundation(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, Self::MediaFoundation(_))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     fn force_keyframe(&mut self) {
@@ -149,23 +170,14 @@ enum CaptureSource {
 fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<CaptureSource> {
     #[cfg(windows)]
     {
-        let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
-        let needs_downscale =
-            src_w as u32 > target_w + 64 || src_h as u32 > target_h + 64;
-
-        // zed-scap WGC on Windows always captures native resolution; downscaling every
-        // frame is expensive on 4K displays. GDI StretchBlt downscales in one pass.
-        if needs_downscale {
-            info!(
-                "capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi downscale)"
-            );
-            return Ok(CaptureSource::Gdi { x, y, src_w, src_h });
-        }
-
+        // Prefer WGC: GDI StretchBlt blocks the desktop compositor and causes system-wide stutter.
         if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate) {
             return Ok(CaptureSource::Scap(scap));
         }
-        info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
+        let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
+        info!(
+            "capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)"
+        );
         Ok(CaptureSource::Gdi { x, y, src_w, src_h })
     }
     #[cfg(not(windows))]
@@ -245,11 +257,16 @@ fn run_encode_loop(
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let mut encoder = FrameEncoder::try_new_with_mf(&config)?;
+    #[cfg(not(windows))]
     let mut encoder = FrameEncoder::try_new(&config)?;
     let mut keyframe_rx = keyframe_tx.subscribe();
     let mut frame_count = 0u64;
     let mut encoded_count = 0u64;
     let mut encode_errors = 0u64;
+    let mut mf_empty_streak = 0u32;
+    let mut no_subscriber_logged = false;
     let loop_start = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -269,18 +286,43 @@ fn run_encode_loop(
 
         let encode_start = Instant::now();
         match encoder.encode_frame(&bgra, cfg!(windows)) {
-            Ok(encoded) if encoded.is_empty() => {}
+            Ok(encoded) if encoded.is_empty() => {
+                if encoder.is_media_foundation() {
+                    mf_empty_streak += 1;
+                    if mf_empty_streak == MF_EMPTY_FALLBACK {
+                        warn!(
+                            "MF encoder produced no output for {MF_EMPTY_FALLBACK} frames, switching to OpenH264"
+                        );
+                        encoder = FrameEncoder::try_new(&config)?;
+                        mf_empty_streak = 0;
+                    }
+                }
+            }
             Ok(encoded) => {
+                mf_empty_streak = 0;
                 encoded_count += 1;
                 if encoded_count == 1 {
                     info!("encoded first video frame ({} bytes)", encoded.len());
                 }
-                let _ = encoded_tx.send(Arc::new(encoded));
+                if encoded_tx.send(Arc::new(encoded)).is_err() {
+                    if !no_subscriber_logged {
+                        warn!("encoded frames ready but no video send task is subscribed yet");
+                        no_subscriber_logged = true;
+                    }
+                } else {
+                    no_subscriber_logged = false;
+                }
             }
             Err(e) => {
                 encode_errors += 1;
                 if encode_errors <= 5 || encode_errors % 60 == 0 {
                     warn!("video encode error (#{encode_errors}): {e:?}");
+                }
+                #[cfg(windows)]
+                if encoder.is_media_foundation() && encode_errors >= 5 {
+                    warn!("switching to OpenH264 after repeated MF encode errors");
+                    encoder = FrameEncoder::try_new(&config)?;
+                    encode_errors = 0;
                 }
             }
         }

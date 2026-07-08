@@ -488,7 +488,8 @@ impl MfH264Decoder {
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-        let sample = create_h264_sample(data)?;
+        let data = callme::video::bitstream::normalize_h264_for_decode(data);
+        let sample = create_h264_sample(&data)?;
         unsafe {
             self.transform.ProcessInput(0, &sample, 0)?;
         }
