@@ -91,7 +91,6 @@ pub fn capture_monitor_scaled(
         }
     }
 
-    bgra_to_rgba(&mut buffer);
     Ok(buffer)
 }
 

@@ -26,6 +26,7 @@ fast_image_resize = { version = "5.1", features = ["image"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "std"] }
 strum = { version = "0.27.1", features = ["derive"] }
+zed-scap = { version = "0.0.8-zed", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_clipboard = "0.1.0"
@@ -62,6 +63,8 @@ windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
 ] }
 scopeguard = "1.2"
 

@@ -13,7 +13,7 @@ use async_channel::{Receiver, Sender};
 use callme::{
     audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
-    video::{codec::VideoDecoder, transport, VideoConfig, VideoResolution},
+    video::{codec::VideoDecoder, transport, StreamPreset, VideoConfig},
 };
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
@@ -806,34 +806,32 @@ impl AppState {
                 ui.label(RichText::new("Screen sharing").strong());
                 ui.add_space(4.0);
 
-                egui::ComboBox::from_label("Resolution")
-                    .selected_text(self.video_config.resolution.label())
+                let preset_label = StreamPreset::matches(&self.video_config)
+                    .map(|p| p.label)
+                    .unwrap_or("Custom");
+                egui::ComboBox::from_label("Stream quality")
+                    .selected_text(preset_label)
                     .show_ui(ui, |ui| {
-                        for res in VideoResolution::all() {
-                            if ui
-                                .selectable_label(self.video_config.resolution == *res, res.label())
-                                .clicked()
-                            {
-                                self.video_config.resolution = *res;
+                        for preset in StreamPreset::all() {
+                            let selected = self.video_config.resolution == preset.resolution
+                                && self.video_config.framerate == preset.framerate;
+                            if ui.selectable_label(selected, preset.label).clicked() {
+                                self.video_config.resolution = preset.resolution;
+                                self.video_config.framerate = preset.framerate;
                             }
                         }
                     });
 
-                egui::ComboBox::from_label("Framerate")
-                    .selected_text(format!("{} fps", self.video_config.framerate))
-                    .show_ui(ui, |ui| {
-                        for fps in [15u32, 30] {
-                            if ui
-                                .selectable_label(
-                                    self.video_config.framerate == fps,
-                                    format!("{fps} fps"),
-                                )
-                                .clicked()
-                            {
-                                self.video_config.framerate = fps;
-                            }
-                        }
-                    });
+                ui.label(
+                    RichText::new(format!(
+                        "{}×{} @ {} fps",
+                        self.video_config.resolution.width(),
+                        self.video_config.resolution.height(),
+                        self.video_config.framerate
+                    ))
+                    .small()
+                    .weak(),
+                );
 
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use openh264::decoder::Decoder;
 use openh264::encoder::{Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType};
-use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 
 use crate::video::VideoConfig;
@@ -43,6 +43,13 @@ impl VideoEncoder {
         let rgb_slice =
             RgbaSliceU8::new(rgba_data, (self.width as usize, self.height as usize));
         let yuv = YUVBuffer::from_rgb_source(rgb_slice);
+        let bitstream = self.encoder.encode(&yuv)?;
+        Ok(bitstream.to_vec())
+    }
+
+    pub fn encode_bgra(&mut self, bgra_data: &[u8]) -> Result<Vec<u8>> {
+        let bgra = BgraSliceU8::new(bgra_data, (self.width as usize, self.height as usize));
+        let yuv = YUVBuffer::from_rgb_source(bgra);
         let bitstream = self.encoder.encode(&yuv)?;
         Ok(bitstream.to_vec())
     }

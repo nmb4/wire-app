@@ -21,9 +21,14 @@ use fr::{PixelType, Resizer};
 #[cfg(not(windows))]
 use image::DynamicImage;
 
-const FRAME_CHANNEL_DEPTH: usize = 2;
-const PREVIEW_EVERY_N_FRAMES: u64 = 2;
-const PREVIEW_DIVISOR: u32 = 2;
+#[cfg(windows)]
+use crate::win_mf_codec::MfH264Encoder;
+#[cfg(windows)]
+use crate::scap_capture::ScapCapturer;
+
+const FRAME_CHANNEL_DEPTH: usize = 3;
+const PREVIEW_EVERY_N_FRAMES: u64 = 4;
+const PREVIEW_DIVISOR: u32 = 3;
 
 pub struct PreviewUpdate {
     pub data: Arc<Vec<u8>>,
@@ -33,8 +38,48 @@ pub struct PreviewUpdate {
     pub encode_time_ms: f64,
 }
 
+enum FrameEncoder {
+    #[cfg(windows)]
+    MediaFoundation(MfH264Encoder),
+    OpenH264(VideoEncoder),
+}
+
+impl FrameEncoder {
+    fn try_new(config: &VideoConfig) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            match MfH264Encoder::try_new(config) {
+                Ok(enc) => return Ok(Self::MediaFoundation(enc)),
+                Err(e) => info!("MF hardware encoder unavailable, using OpenH264: {e:?}"),
+            }
+        }
+        Ok(Self::OpenH264(VideoEncoder::new(config)?))
+    }
+
+    fn force_keyframe(&mut self) {
+        match self {
+            #[cfg(windows)]
+            Self::MediaFoundation(enc) => enc.force_keyframe(),
+            Self::OpenH264(enc) => enc.force_keyframe(),
+        }
+    }
+
+    fn encode_frame(&mut self, frame: &[u8], bgra: bool) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(windows)]
+            Self::MediaFoundation(enc) => enc.encode_bgra(frame),
+            Self::OpenH264(enc) => {
+                if bgra {
+                    enc.encode_bgra(frame)
+                } else {
+                    enc.encode(frame)
+                }
+            }
+        }
+    }
+}
+
 /// Runs capture+resize and encode in parallel threads.
-/// Returns a join handle for the coordinator thread.
 pub fn start(
     config: VideoConfig,
     stop_flag: Arc<AtomicBool>,
@@ -50,12 +95,14 @@ pub fn start(
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(FRAME_CHANNEL_DEPTH);
 
         let capture_stop = stop_flag.clone();
+        let capture_fps = config.framerate;
         let capture_handle = thread::spawn(move || {
             if let Err(e) = run_capture_loop(
                 &capture_stop,
                 target_w,
                 target_h,
                 target_interval,
+                capture_fps,
                 &frame_tx,
             ) {
                 info!("capture thread stopped: {e:?}");
@@ -83,6 +130,8 @@ pub fn start(
 
 enum CaptureSource {
     #[cfg(windows)]
+    Scap(ScapCapturer),
+    #[cfg(windows)]
     Gdi {
         x: i32,
         y: i32,
@@ -97,13 +146,14 @@ enum CaptureSource {
     },
 }
 
-fn init_capture_source(target_w: u32, target_h: u32) -> Result<CaptureSource> {
+fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<CaptureSource> {
     #[cfg(windows)]
     {
+        if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate) {
+            return Ok(CaptureSource::Scap(scap));
+        }
         let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
-        info!(
-            "capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi stretch)"
-        );
+        info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
         Ok(CaptureSource::Gdi { x, y, src_w, src_h })
     }
     #[cfg(not(windows))]
@@ -115,9 +165,6 @@ fn init_capture_source(target_w: u32, target_h: u32) -> Result<CaptureSource> {
             .or(monitors.first())
             .context("no monitors found")?
             .clone();
-        if let (Ok(w), Ok(h)) = (monitor.width(), monitor.height()) {
-            info!("capturing primary monitor {w}x{h} -> {target_w}x{target_h} (xcap+resize)");
-        }
         Ok(CaptureSource::Xcap {
             monitor,
             resizer: Resizer::new(),
@@ -128,6 +175,8 @@ fn init_capture_source(target_w: u32, target_h: u32) -> Result<CaptureSource> {
 
 fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Result<Vec<u8>> {
     match source {
+        #[cfg(windows)]
+        CaptureSource::Scap(scap) => scap.capture_bgra(),
         #[cfg(windows)]
         CaptureSource::Gdi { x, y, src_w, src_h } => {
             crate::win_gdi_capture::capture_monitor_scaled(*x, *y, *src_w, *src_h, target_w, target_h)
@@ -151,15 +200,16 @@ fn run_capture_loop(
     target_w: u32,
     target_h: u32,
     target_interval: Duration,
+    framerate: u32,
     frame_tx: &mpsc::SyncSender<Vec<u8>>,
 ) -> Result<()> {
-    let mut source = init_capture_source(target_w, target_h)?;
+    let mut source = init_capture_source(target_w, target_h, framerate)?;
 
     while !stop_flag.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
 
-        let rgba = capture_frame(&mut source, target_w, target_h)?;
-        if frame_tx.send(rgba).is_err() {
+        let bgra = capture_frame(&mut source, target_w, target_h)?;
+        if frame_tx.send(bgra).is_err() {
             break;
         }
 
@@ -181,7 +231,7 @@ fn run_encode_loop(
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
 ) -> Result<()> {
-    let mut encoder = VideoEncoder::new(&config)?;
+    let mut encoder = FrameEncoder::try_new(&config)?;
     let mut keyframe_rx = keyframe_tx.subscribe();
     let mut frame_count = 0u64;
     let loop_start = Instant::now();
@@ -191,14 +241,18 @@ fn run_encode_loop(
             encoder.force_keyframe();
         }
 
-        let rgba = match frame_rx.recv_timeout(Duration::from_millis(50)) {
+        let mut bgra = match frame_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        while let Ok(newer) = frame_rx.try_recv() {
+            bgra = newer;
+        }
+
         let encode_start = Instant::now();
-        match encoder.encode(&rgba) {
+        match encoder.encode_frame(&bgra, cfg!(windows)) {
             Ok(encoded) => {
                 let _ = encoded_tx.send(Arc::new(encoded));
             }
@@ -217,8 +271,7 @@ fn run_encode_loop(
         };
 
         if frame_count % PREVIEW_EVERY_N_FRAMES == 0 {
-            let (preview_data, preview_w, preview_h) =
-                make_preview(&rgba, target_w, target_h);
+            let (preview_data, preview_w, preview_h) = make_preview(&bgra, target_w, target_h);
             let update = PreviewUpdate {
                 data: Arc::new(preview_data),
                 width: preview_w,
@@ -232,7 +285,7 @@ fn run_encode_loop(
     Ok(())
 }
 
-fn make_preview(rgba: &[u8], src_w: u32, src_h: u32) -> (Vec<u8>, u32, u32) {
+fn make_preview(bgra: &[u8], src_w: u32, src_h: u32) -> (Vec<u8>, u32, u32) {
     let dst_w = (src_w / PREVIEW_DIVISOR).max(1);
     let dst_h = (src_h / PREVIEW_DIVISOR).max(1);
     let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
@@ -242,7 +295,7 @@ fn make_preview(rgba: &[u8], src_w: u32, src_h: u32) -> (Vec<u8>, u32, u32) {
             let sy = y * src_h / dst_h;
             let src_i = ((sy * src_w + sx) * 4) as usize;
             let dst_i = ((y * dst_w + x) * 4) as usize;
-            out[dst_i..dst_i + 4].copy_from_slice(&rgba[src_i..src_i + 4]);
+            out[dst_i..dst_i + 4].copy_from_slice(&bgra[src_i..src_i + 4]);
         }
     }
     (out, dst_w, dst_h)

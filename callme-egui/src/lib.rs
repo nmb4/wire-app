@@ -4,7 +4,13 @@ use egui_winit::winit;
 pub mod app;
 mod screen_capture;
 #[cfg(windows)]
-pub mod win_gdi_capture;
+mod scap_capture;
+#[cfg(windows)]
+mod win_gdi_capture;
+#[cfg(windows)]
+mod win_mf_codec;
+#[cfg(windows)]
+mod yuv_convert;
 
 #[cfg(target_os = "android")]
 #[no_mangle]

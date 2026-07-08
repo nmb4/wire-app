@@ -1,0 +1,369 @@
+//! Windows Media Foundation hardware H.264 encoder/decoder.
+
+use std::sync::Once;
+
+use anyhow::{anyhow, Context, Result};
+use callme::video::{default_bitrate, VideoConfig};
+use tracing::info;
+use windows::core::Interface;
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+use crate::yuv_convert::{bgra_to_nv12, nv12_to_rgba};
+
+static MF_INIT: Once = Once::new();
+
+fn ensure_media_foundation() -> Result<()> {
+    let mut err = Ok(());
+    MF_INIT.call_once(|| {
+        err = unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .context("CoInitializeEx failed")
+                .and_then(|_| MFStartup(MF_VERSION, MFSTARTUP_LITE).context("MFStartup failed"))
+        };
+    });
+    err
+}
+
+fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
+    ((numerator as u64) << 32) | denominator as u64
+}
+
+fn pack_size(width: u32, height: u32) -> u64 {
+    ((width as u64) << 32) | height as u64
+}
+
+fn create_video_media_type(
+    subtype: windows::core::GUID,
+    width: u32,
+    height: u32,
+    framerate: u32,
+    bitrate: Option<u32>,
+) -> Result<IMFMediaType> {
+    let media_type = unsafe { MFCreateMediaType()? };
+    unsafe {
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_size(width, height))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(framerate, 1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        if let Some(bitrate) = bitrate {
+            media_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+        }
+    }
+    Ok(media_type)
+}
+
+fn find_transform(
+    category: windows::core::GUID,
+    input: windows::core::GUID,
+    output: windows::core::GUID,
+    prefer_hardware: bool,
+) -> Result<IMFTransform> {
+    let input_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: input,
+    };
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: output,
+    };
+
+    let mut flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0);
+    if prefer_hardware {
+        flags = MFT_ENUM_FLAG(flags.0 | MFT_ENUM_FLAG_HARDWARE.0);
+    }
+
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        MFTEnumEx(
+            category,
+            flags,
+            Some(&input_info),
+            Some(&output_info),
+            &mut activates,
+            &mut count,
+        )?;
+    }
+
+    if count == 0 {
+        if prefer_hardware {
+            return find_transform(category, input, output, false);
+        }
+        return Err(anyhow!("no Media Foundation transform found"));
+    }
+
+    let transform = unsafe {
+        let activate = (*activates.add(0))
+            .as_ref()
+            .ok_or_else(|| anyhow!("null MFT activate"))?;
+        let transform: IMFTransform = activate.ActivateObject()?;
+        CoTaskMemFree(Some(activates as *const _ as *mut _));
+        transform
+    };
+
+    Ok(transform)
+}
+
+fn configure_encoder(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    framerate: u32,
+    bitrate: u32,
+) -> Result<()> {
+    let output_type = create_video_media_type(MFVideoFormat_H264, width, height, framerate, Some(bitrate))?;
+    let input_type = create_video_media_type(MFVideoFormat_NV12, width, height, framerate, None)?;
+
+    unsafe {
+        transform.SetOutputType(0, &output_type, 0)?;
+        transform.SetInputType(0, &input_type, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+    }
+    Ok(())
+}
+
+fn create_nv12_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
+    let buffer = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        let mut max_len = 0u32;
+        let mut cur_len = 0u32;
+        buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        buffer.Unlock()?;
+        buffer.SetCurrentLength(data.len() as u32)?;
+    }
+
+    let sample = unsafe { MFCreateSample()? };
+    unsafe {
+        sample.AddBuffer(&buffer)?;
+        sample.SetSampleTime(timestamp)?;
+        sample.SetSampleDuration(0)?;
+    }
+    Ok(sample)
+}
+
+fn create_h264_sample(data: &[u8]) -> Result<IMFSample> {
+    let buffer = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        let mut max_len = 0u32;
+        let mut cur_len = 0u32;
+        buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        buffer.Unlock()?;
+        buffer.SetCurrentLength(data.len() as u32)?;
+    }
+    let sample = unsafe { MFCreateSample()? };
+    unsafe {
+        sample.AddBuffer(&buffer)?;
+    }
+    Ok(sample)
+}
+
+fn drain_output(transform: &IMFTransform) -> Result<Vec<Vec<u8>>> {
+    let mut packets = Vec::new();
+    loop {
+        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        let result = unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        match result {
+            Ok(()) => {
+                let sample = unsafe { buffer.pSample.take() }
+                    .ok_or_else(|| anyhow!("MFT output missing sample"))?;
+                packets.push(read_sample_bytes(&sample)?);
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(packets)
+}
+
+fn read_sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
+    let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
+    let mut ptr = std::ptr::null_mut();
+    let mut max_len = 0u32;
+    let mut cur_len = 0u32;
+    unsafe {
+        buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
+        let data = std::slice::from_raw_parts(ptr, cur_len as usize).to_vec();
+        buffer.Unlock()?;
+        Ok(data)
+    }
+}
+
+fn force_keyframe(transform: &IMFTransform) {
+    let _ = unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) };
+}
+
+pub struct MfH264Encoder {
+    transform: IMFTransform,
+    width: u32,
+    height: u32,
+    nv12: Vec<u8>,
+    frame_index: i64,
+    hardware: bool,
+}
+
+impl MfH264Encoder {
+    pub fn try_new(config: &VideoConfig) -> Result<Self> {
+        ensure_media_foundation()?;
+        let width = config.resolution.width();
+        let height = config.resolution.height();
+        let bitrate = default_bitrate(config.resolution, config.framerate);
+
+        let transform = find_transform(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFVideoFormat_NV12,
+            MFVideoFormat_H264,
+            true,
+        )?;
+
+        let hardware = unsafe {
+            transform
+                .GetAttributes()
+                .ok()
+                .and_then(|attrs| attrs.GetUINT32(&MFT_ENUM_HARDWARE_URL_Attribute).ok())
+                .is_some()
+        };
+
+        configure_encoder(&transform, width, height, config.framerate, bitrate)?;
+        force_keyframe(&transform);
+
+        info!(
+            "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={})",
+            width,
+            height,
+            config.framerate,
+            bitrate / 1000,
+            hardware
+        );
+
+        Ok(Self {
+            transform,
+            width,
+            height,
+            nv12: vec![0u8; (width * height * 3 / 2) as usize],
+            frame_index: 0,
+            hardware,
+        })
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.hardware
+    }
+
+    pub fn force_keyframe(&mut self) {
+        force_keyframe(&self.transform);
+    }
+
+    pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
+        bgra_to_nv12(bgra, self.width, self.height, &mut self.nv12);
+        let sample = create_nv12_sample(&self.nv12, self.frame_index)?;
+        self.frame_index += 1;
+
+        unsafe {
+            self.transform.ProcessInput(0, &sample, 0)?;
+        }
+
+        let mut out = Vec::new();
+        for packet in drain_output(&self.transform)? {
+            out.extend_from_slice(&packet);
+        }
+        if out.is_empty() {
+            anyhow::bail!("MF encoder produced no output");
+        }
+        Ok(out)
+    }
+}
+
+pub struct MfH264Decoder {
+    transform: IMFTransform,
+    width: u32,
+    height: u32,
+    configured: bool,
+}
+
+impl MfH264Decoder {
+    pub fn try_new() -> Result<Self> {
+        ensure_media_foundation()?;
+        let transform = find_transform(
+            MFT_CATEGORY_VIDEO_DECODER,
+            MFVideoFormat_H264,
+            MFVideoFormat_NV12,
+            true,
+        )?;
+
+        let input_type = unsafe { MFCreateMediaType()? };
+        unsafe {
+            input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            input_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            transform.SetInputType(0, &input_type, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+        }
+
+        info!("MF H.264 decoder ready");
+        Ok(Self {
+            transform,
+            width: 0,
+            height: 0,
+            configured: false,
+        })
+    }
+
+    fn ensure_output_type(&mut self) -> Result<()> {
+        if self.configured {
+            return Ok(());
+        }
+        let output_type = unsafe { self.transform.GetOutputAvailableType(0, 0)? };
+        let frame_size = unsafe { output_type.GetUINT64(&MF_MT_FRAME_SIZE)? };
+        let width = (frame_size >> 32) as u32;
+        let height = frame_size as u32;
+        unsafe {
+            self.transform.SetOutputType(0, &output_type, 0)?;
+        }
+        self.width = width;
+        self.height = height;
+        self.configured = true;
+        info!("MF decoder output negotiated: {width}x{height}");
+        Ok(())
+    }
+
+    pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+        let sample = create_h264_sample(data)?;
+        unsafe {
+            self.transform.ProcessInput(0, &sample, 0)?;
+        }
+        if !self.configured {
+            self.ensure_output_type()?;
+        }
+
+        let packets = drain_output(&self.transform)?;
+        let nv12 = packets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("MF decoder produced no output"))?;
+
+        let w = self.width;
+        let h = self.height;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        nv12_to_rgba(&nv12, w, h, &mut rgba);
+        Ok((rgba, w, h))
+    }
+}
+
+use windows::Win32::System::Com::CoTaskMemFree;
