@@ -8,7 +8,7 @@ use openh264::formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 use tracing::info;
 
-use crate::video::{default_bitrate, VideoConfig, VideoResolution};
+use crate::video::{VideoConfig, VideoResolution};
 
 fn h264_level(resolution: VideoResolution, framerate: u32) -> Level {
     match resolution {
@@ -30,7 +30,7 @@ impl VideoEncoder {
     pub fn new(config: &VideoConfig) -> Result<Self> {
         let width = config.resolution.width();
         let height = config.resolution.height();
-        let bitrate_bps = default_bitrate(config.resolution, config.framerate);
+        let bitrate_bps = config.effective_bitrate();
         let enc_config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)

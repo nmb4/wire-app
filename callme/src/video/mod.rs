@@ -53,11 +53,84 @@ pub fn default_bitrate(resolution: VideoResolution, framerate: u32) -> u32 {
     (base as f64 * (framerate as f64 / 30.0)) as u32
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitratePreset {
+    Auto,
+    Mbps4,
+    Mbps6,
+    Mbps8,
+    Mbps12,
+    Mbps16,
+    Mbps24,
+    Mbps32,
+}
+
+impl BitratePreset {
+    pub fn all() -> &'static [BitratePreset] {
+        &[
+            BitratePreset::Auto,
+            BitratePreset::Mbps4,
+            BitratePreset::Mbps6,
+            BitratePreset::Mbps8,
+            BitratePreset::Mbps12,
+            BitratePreset::Mbps16,
+            BitratePreset::Mbps24,
+            BitratePreset::Mbps32,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BitratePreset::Auto => "Auto (match resolution)",
+            BitratePreset::Mbps4 => "4 Mbps (fastest encode)",
+            BitratePreset::Mbps6 => "6 Mbps",
+            BitratePreset::Mbps8 => "8 Mbps",
+            BitratePreset::Mbps12 => "12 Mbps",
+            BitratePreset::Mbps16 => "16 Mbps",
+            BitratePreset::Mbps24 => "24 Mbps",
+            BitratePreset::Mbps32 => "32 Mbps (max quality)",
+        }
+    }
+
+    pub fn bps(self) -> Option<u32> {
+        match self {
+            BitratePreset::Auto => None,
+            BitratePreset::Mbps4 => Some(4_000_000),
+            BitratePreset::Mbps6 => Some(6_000_000),
+            BitratePreset::Mbps8 => Some(8_000_000),
+            BitratePreset::Mbps12 => Some(12_000_000),
+            BitratePreset::Mbps16 => Some(16_000_000),
+            BitratePreset::Mbps24 => Some(24_000_000),
+            BitratePreset::Mbps32 => Some(32_000_000),
+        }
+    }
+
+    pub fn from_config(config: &VideoConfig) -> Self {
+        let Some(bps) = config.bitrate_bps else {
+            return BitratePreset::Auto;
+        };
+        Self::all()
+            .iter()
+            .copied()
+            .find(|preset| preset.bps() == Some(bps))
+            .unwrap_or(BitratePreset::Auto)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoConfig {
     pub resolution: VideoResolution,
     pub framerate: u32,
+    /// When `None`, `default_bitrate()` is used for the current resolution and fps.
+    pub bitrate_bps: Option<u32>,
     pub sharing_enabled: bool,
+}
+
+impl VideoConfig {
+    pub fn effective_bitrate(&self) -> u32 {
+        self.bitrate_bps
+            .unwrap_or_else(|| default_bitrate(self.resolution, self.framerate))
+    }
 }
 
 impl Default for VideoConfig {
@@ -65,6 +138,7 @@ impl Default for VideoConfig {
         Self {
             resolution: VideoResolution::P1080,
             framerate: 30,
+            bitrate_bps: None,
             sharing_enabled: false,
         }
     }

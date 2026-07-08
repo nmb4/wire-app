@@ -13,7 +13,7 @@ use async_channel::{Receiver, Sender};
 use callme::{
     audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
-    video::{transport, StreamPreset, VideoConfig},
+    video::{transport, BitratePreset, StreamPreset, VideoConfig},
 };
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
@@ -837,6 +837,28 @@ impl AppState {
                     .weak(),
                 );
 
+                let bitrate_label = BitratePreset::from_config(&self.video_config).label();
+                egui::ComboBox::from_label("Bitrate")
+                    .selected_text(bitrate_label)
+                    .show_ui(ui, |ui| {
+                        for preset in BitratePreset::all() {
+                            let selected =
+                                BitratePreset::from_config(&self.video_config) == *preset;
+                            if ui.selectable_label(selected, preset.label()).clicked() {
+                                self.video_config.bitrate_bps = preset.bps();
+                            }
+                        }
+                    });
+
+                ui.label(
+                    RichText::new(format!(
+                        "Effective bitrate: {} Mbps",
+                        self.video_config.effective_bitrate() / 1_000_000
+                    ))
+                    .small()
+                    .weak(),
+                );
+
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -1456,10 +1478,11 @@ impl Worker {
         self.capture_thread = Some(thread);
         self.capture_stop_flag = Some(stop_flag);
         info!(
-            "screen capture started ({}x{} @ {}fps, {} active call(s))",
+            "screen capture started ({}x{} @ {}fps, {} kbps, {} active call(s))",
             target_w,
             target_h,
             config.framerate,
+            config.effective_bitrate() / 1000,
             self.video_peers.len()
         );
         let event_tx = self.event_tx.clone();
@@ -1469,7 +1492,7 @@ impl Worker {
         Ok(())
     }
 
-    fn stop_capture(&mut self) {
+    fn stop_capture_thread(&mut self) {
         if let Some(flag) = &self.capture_stop_flag {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1477,6 +1500,10 @@ impl Worker {
             let _ = handle.join();
         }
         self.capture_stop_flag = None;
+    }
+
+    fn stop_capture(&mut self) {
+        self.stop_capture_thread();
         self.sharing_active = false;
         self.stop_all_video_send();
         let event_tx = self.event_tx.clone();
@@ -1495,7 +1522,14 @@ impl Worker {
                 self.audio_context = Some(audio_context);
             }
             Command::SetVideoConfig { video_config } => {
+                let restart_capture = self.sharing_active;
+                if restart_capture {
+                    self.stop_capture_thread();
+                }
                 self.video_config = video_config;
+                if restart_capture {
+                    self.start_capture()?;
+                }
             }
             Command::ToggleSharing { enabled } => {
                 if enabled && !self.sharing_active {

@@ -3,8 +3,8 @@
 use std::sync::Once;
 
 use anyhow::{anyhow, Context, Result};
-use callme::video::{default_bitrate, VideoConfig};
-use tracing::info;
+use callme::video::VideoConfig;
+use tracing::{info, warn};
 use windows::core::Interface;
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::*;
@@ -174,14 +174,20 @@ fn configure_encoder(
     if async_mode {
         unlock_async_transform(transform)?;
     }
-    unsafe {
-        transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-    }
     enable_low_latency(transform);
+    send_transform_message(transform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
+    send_transform_message(transform, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
     if async_mode {
         wait_for_transform_event(transform, METransformNeedInput)?;
+    }
+    Ok(())
+}
+
+fn send_transform_message(transform: &IMFTransform, message: MFT_MESSAGE_TYPE) -> Result<()> {
+    unsafe {
+        transform
+            .ProcessMessage(message, 0)
+            .map_err(|e| anyhow!("MFT message {:?} failed: {e}", message.0))?;
     }
     Ok(())
 }
@@ -372,12 +378,20 @@ impl MfH264Encoder {
         ensure_media_foundation()?;
         let width = config.resolution.width();
         let height = config.resolution.height();
-        let bitrate = default_bitrate(config.resolution, config.framerate);
+        let bitrate = config.effective_bitrate();
+        let mut last_err = None;
 
-        if let Ok(enc) = Self::try_open(config, width, height, bitrate, true) {
-            return Ok(enc);
+        for (prefer_hardware, label) in [(true, "hardware"), (false, "software")] {
+            match Self::try_open(config, width, height, bitrate, prefer_hardware) {
+                Ok(enc) => return Ok(enc),
+                Err(e) => {
+                    warn!("MF {label} H.264 encoder failed: {e:?}");
+                    last_err = Some(e);
+                }
+            }
         }
-        Self::try_open(config, width, height, bitrate, false)
+
+        Err(last_err.unwrap_or_else(|| anyhow!("no Media Foundation encoder found")))
     }
 
     fn try_open(
