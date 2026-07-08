@@ -45,9 +45,9 @@ impl VideoResolution {
 /// Suggested bitrate in bits per second for screen content at the given resolution.
 pub fn default_bitrate(resolution: VideoResolution, framerate: u32) -> u32 {
     let base = match resolution {
-        VideoResolution::P720 => 4_000_000,
-        VideoResolution::P1080 => 8_000_000,
-        VideoResolution::P1440 => 12_000_000,
+        VideoResolution::P720 => 5_000_000,
+        VideoResolution::P1080 => 12_000_000,
+        VideoResolution::P1440 => 20_000_000,
     };
     (base as f64 * (framerate as f64 / 30.0)) as u32
 }

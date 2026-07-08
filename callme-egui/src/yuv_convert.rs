@@ -49,7 +49,7 @@ fn avg_rgb(row0: &[u8], i0: usize, row1: &[u8], i1: usize) -> (i32, i32, i32) {
     (r, g, b)
 }
 
-/// NV12 -> RGBA8 for display.
+/// NV12 -> RGBA8 for display. Processes 2x2 blocks to reduce UV fetches.
 pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let w = width as usize;
     let h = height as usize;
@@ -59,22 +59,36 @@ pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
 
     let (y_plane, uv_plane) = nv12.split_at(y_size);
 
-    for y in 0..h {
-        for x in 0..w {
-            let y_val = y_plane[y * w + x] as i32;
-            let uv_i = (y / 2) * w + (x & !1);
-            let u = uv_plane[uv_i] as i32 - 128;
-            let v = uv_plane[uv_i + 1] as i32 - 128;
+    for y in (0..h).step_by(2) {
+        let uv_row = &uv_plane[(y / 2) * w..];
+        for x in (0..w).step_by(2) {
+            let u = uv_row[x] as i32 - 128;
+            let v = uv_row[x + 1] as i32 - 128;
+            let rv = (1436 * v) >> 10;
+            let gu = (352 * u) >> 10;
+            let gv = (731 * v) >> 10;
+            let bu = (1814 * u) >> 10;
 
-            let r = (y_val + ((1436 * v) >> 10)).clamp(0, 255) as u8;
-            let g = (y_val - ((352 * u + 731 * v) >> 10)).clamp(0, 255) as u8;
-            let b = (y_val + ((1814 * u) >> 10)).clamp(0, 255) as u8;
-
-            let i = (y * w + x) * 4;
-            out[i] = r;
-            out[i + 1] = g;
-            out[i + 2] = b;
-            out[i + 3] = 255;
+            for dy in 0..2 {
+                let py = y + dy;
+                if py >= h {
+                    continue;
+                }
+                let y_row = &y_plane[py * w..(py + 1) * w];
+                let out_row = &mut out[py * w * 4..(py + 1) * w * 4];
+                for dx in 0..2 {
+                    let px = x + dx;
+                    if px >= w {
+                        continue;
+                    }
+                    let y_val = y_row[px] as i32;
+                    let i = px * 4;
+                    out_row[i] = (y_val + rv).clamp(0, 255) as u8;
+                    out_row[i + 1] = (y_val - gu - gv).clamp(0, 255) as u8;
+                    out_row[i + 2] = (y_val + bu).clamp(0, 255) as u8;
+                    out_row[i + 3] = 255;
+                }
+            }
         }
     }
 }

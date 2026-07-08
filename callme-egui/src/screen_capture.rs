@@ -149,10 +149,22 @@ enum CaptureSource {
 fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<CaptureSource> {
     #[cfg(windows)]
     {
+        let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
+        let needs_downscale =
+            src_w as u32 > target_w + 64 || src_h as u32 > target_h + 64;
+
+        // zed-scap WGC on Windows always captures native resolution; downscaling every
+        // frame is expensive on 4K displays. GDI StretchBlt downscales in one pass.
+        if needs_downscale {
+            info!(
+                "capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi downscale)"
+            );
+            return Ok(CaptureSource::Gdi { x, y, src_w, src_h });
+        }
+
         if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate) {
             return Ok(CaptureSource::Scap(scap));
         }
-        let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
         info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
         Ok(CaptureSource::Gdi { x, y, src_w, src_h })
     }

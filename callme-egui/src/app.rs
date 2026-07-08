@@ -13,7 +13,7 @@ use async_channel::{Receiver, Sender};
 use callme::{
     audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
-    video::{codec::VideoDecoder, transport, StreamPreset, VideoConfig},
+    video::{transport, StreamPreset, VideoConfig},
 };
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
@@ -21,6 +21,8 @@ use iroh::{protocol::Router, Endpoint, KeyParsingError, NodeId};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
+
+use crate::video_decode::VideoDecodeWorker;
 
 const DEFAULT: &str = "<default>";
 
@@ -1564,20 +1566,30 @@ async fn run_video_send(
         let _ = keyframe_tx.send(());
         let mut sent = 0u64;
         loop {
-            match rx.recv().await {
-                Ok(frame) => {
-                    transport::send_frame(&mut send, &frame).await?;
-                    sent += 1;
-                    if sent == 1 {
-                        info!(
-                            "sent first video frame ({} bytes) to {}",
-                            frame.len(),
-                            node_id.fmt_short()
-                        );
-                    }
-                }
+            let frame = match rx.recv().await {
+                Ok(frame) => frame,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => return Err(anyhow::anyhow!("broadcast recv: {e}")),
+            };
+            let mut latest = frame;
+            loop {
+                match rx.try_recv() {
+                    Ok(frame) => latest = frame,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        return Err(anyhow::anyhow!("broadcast closed"));
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                }
+            }
+            transport::send_frame(&mut send, &latest).await?;
+            sent += 1;
+            if sent == 1 {
+                info!(
+                    "sent first video frame ({} bytes) to {}",
+                    latest.len(),
+                    node_id.fmt_short()
+                );
             }
         }
     }
@@ -1643,41 +1655,29 @@ async fn recv_video_on_stream(
     event_tx: &async_channel::Sender<Event>,
     callback: Option<&UpdateCallback>,
 ) -> Result<()> {
-    let mut decoder = VideoDecoder::new()?;
-    let mut decoded = 0u64;
+    let event_tx = event_tx.clone();
+    let callback = callback.cloned();
+    let worker = VideoDecodeWorker::spawn(move |frame| {
+        if event_tx
+            .try_send(Event::VideoFrame {
+                node_id,
+                data: frame.data,
+                width: frame.width,
+                height: frame.height,
+            })
+            .is_ok()
+        {
+            if let Some(cb) = &callback {
+                cb();
+            }
+        }
+    })?;
+
     loop {
         let Some(data) = transport::recv_frame(recv).await? else {
             break;
         };
-        match decoder.decode(&data) {
-            Ok((rgba, w, h)) => {
-                decoded += 1;
-                if decoded == 1 {
-                    info!(
-                        "decoded first video frame from {} ({}x{})",
-                        node_id.fmt_short(),
-                        w,
-                        h
-                    );
-                }
-                if event_tx
-                    .try_send(Event::VideoFrame {
-                        node_id,
-                        data: Arc::new(rgba),
-                        width: w,
-                        height: h,
-                    })
-                    .is_ok()
-                {
-                    if let Some(cb) = callback {
-                        cb();
-                    }
-                }
-            }
-            Err(e) => {
-                info!("video decode error for {}: {e:?}", node_id.fmt_short());
-            }
-        }
+        worker.submit(data);
     }
     Ok(())
 }

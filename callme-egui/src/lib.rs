@@ -3,6 +3,7 @@ use egui_winit::winit;
 
 pub mod app;
 mod screen_capture;
+mod video_decode;
 #[cfg(windows)]
 mod scap_capture;
 #[cfg(windows)]

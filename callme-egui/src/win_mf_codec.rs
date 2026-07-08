@@ -294,6 +294,7 @@ pub struct MfH264Decoder {
     width: u32,
     height: u32,
     configured: bool,
+    rgba: Vec<u8>,
 }
 
 impl MfH264Decoder {
@@ -322,6 +323,7 @@ impl MfH264Decoder {
             width: 0,
             height: 0,
             configured: false,
+            rgba: Vec::new(),
         })
     }
 
@@ -360,9 +362,15 @@ impl MfH264Decoder {
 
         let w = self.width;
         let h = self.height;
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
-        nv12_to_rgba(&nv12, w, h, &mut rgba);
-        Ok((rgba, w, h))
+        let len = (w * h * 4) as usize;
+        if self.rgba.len() != len {
+            self.rgba.resize(len, 0);
+        }
+        nv12_to_rgba(&nv12, w, h, &mut self.rgba);
+        let mut out = Vec::with_capacity(len);
+        std::mem::swap(&mut self.rgba, &mut out);
+        self.rgba.resize(len, 0);
+        Ok((out, w, h))
     }
 }
 

@@ -13,6 +13,9 @@ pub struct ScapCapturer {
     capturer: Capturer,
     target_w: u32,
     target_h: u32,
+    needs_resize: bool,
+    resizer: Resizer,
+    dst: Image<'static>,
 }
 
 impl ScapCapturer {
@@ -40,14 +43,18 @@ impl ScapCapturer {
         capturer.start_capture();
 
         let [out_w, out_h] = capturer.get_output_frame_size();
+        let needs_resize = out_w != target_w || out_h != target_h;
         info!(
-            "WGC capture started via zed-scap (native ~{out_w}x{out_h} -> {target_w}x{target_h})"
+            "WGC capture started via zed-scap (native ~{out_w}x{out_h} -> {target_w}x{target_h}, resize={needs_resize})"
         );
 
         Ok(Self {
             capturer,
             target_w,
             target_h,
+            needs_resize,
+            resizer: Resizer::new(),
+            dst: Image::new(target_w, target_h, PixelType::U8x4),
         })
     }
 
@@ -60,18 +67,16 @@ impl ScapCapturer {
             other => return Err(anyhow!("unexpected scap frame type: {other:?}")),
         };
 
-        if src_w == self.target_w && src_h == self.target_h {
+        if !self.needs_resize && src_w == self.target_w && src_h == self.target_h {
             return Ok(data);
         }
 
         let src_img = Image::from_vec_u8(src_w, src_h, data, PixelType::U8x4)
             .map_err(|e| anyhow!("invalid scap frame buffer: {e}"))?;
-        let mut dst = Image::new(self.target_w, self.target_h, PixelType::U8x4);
-        let mut resizer = Resizer::new();
-        resizer
-            .resize(&src_img, &mut dst, None)
+        self.resizer
+            .resize(&src_img, &mut self.dst, None)
             .map_err(|e| anyhow!("resize failed: {e}"))?;
-        Ok(dst.buffer().to_vec())
+        Ok(self.dst.buffer().to_vec())
     }
 }
 
