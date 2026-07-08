@@ -10,9 +10,8 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,callme=info,callme_egui=info")
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,callme=info,callme_egui=info"));
 
     let log_path = std::env::var("LOCALAPPDATA").ok().map(|root| {
         PathBuf::from(root)

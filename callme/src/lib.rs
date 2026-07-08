@@ -49,7 +49,8 @@ mod tests {
 
         let conn2 = conn2.unwrap();
 
-        let (mut node1, track1) = MediaTrackOpusEncoder::new(4, ENGINE_FORMAT, AudioQuality::Ultra)?;
+        let (mut node1, track1) =
+            MediaTrackOpusEncoder::new(4, ENGINE_FORMAT, AudioQuality::Ultra)?;
         conn1.send_track(track1.clone()).await?;
 
         let sample_count = ENGINE_FORMAT.sample_count(Duration::from_millis(20));

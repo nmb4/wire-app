@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 #[cfg(not(windows))]
 use anyhow::Context;
+use anyhow::Result;
 use async_channel::Sender;
 use callme::video::{codec::VideoEncoder, VideoConfig};
+use spin_sleep::SpinSleeper;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -22,9 +23,9 @@ use fr::{PixelType, Resizer};
 use image::DynamicImage;
 
 #[cfg(windows)]
-use crate::win_mf_codec::MfH264Encoder;
-#[cfg(windows)]
 use crate::scap_capture::ScapCapturer;
+#[cfg(windows)]
+use crate::win_mf_codec::MfH264Encoder;
 
 const FRAME_CHANNEL_DEPTH: usize = 3;
 const PREVIEW_EVERY_N_FRAMES: u64 = 4;
@@ -180,9 +181,7 @@ fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<C
             return Ok(CaptureSource::Scap(scap));
         }
         let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
-        info!(
-            "capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)"
-        );
+        info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
         Ok(CaptureSource::Gdi { x, y, src_w, src_h })
     }
     #[cfg(not(windows))]
@@ -208,10 +207,16 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
         CaptureSource::Scap(scap) => scap.capture_bgra(),
         #[cfg(windows)]
         CaptureSource::Gdi { x, y, src_w, src_h } => {
-            crate::win_gdi_capture::capture_monitor_scaled(*x, *y, *src_w, *src_h, target_w, target_h)
+            crate::win_gdi_capture::capture_monitor_scaled(
+                *x, *y, *src_w, *src_h, target_w, target_h,
+            )
         }
         #[cfg(not(windows))]
-        CaptureSource::Xcap { monitor, resizer, dst } => {
+        CaptureSource::Xcap {
+            monitor,
+            resizer,
+            dst,
+        } => {
             let img = monitor
                 .capture_image()
                 .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
@@ -233,20 +238,49 @@ fn run_capture_loop(
     frame_tx: &mpsc::SyncSender<Vec<u8>>,
 ) -> Result<()> {
     let mut source = init_capture_source(target_w, target_h, framerate)?;
+    let sleeper = SpinSleeper::default();
+    let mut window_captured = 0u64;
+    let mut window_dropped = 0u64;
+    let mut dropped_count = 0u64;
+    let mut last_stats_log = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
 
         let bgra = capture_frame(&mut source, target_w, target_h)?;
         match frame_tx.try_send(bgra) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {}
+            Ok(()) => {
+                window_captured += 1;
+            }
+            Err(TrySendError::Full(_)) => {
+                dropped_count += 1;
+                window_dropped += 1;
+            }
             Err(TrySendError::Disconnected(_)) => break,
         }
 
         let elapsed = frame_start.elapsed();
+        if last_stats_log.elapsed() >= Duration::from_secs(5) {
+            let window_elapsed = last_stats_log.elapsed().as_secs_f64();
+            let capture_fps = if window_elapsed > 0.0 {
+                window_captured as f64 / window_elapsed
+            } else {
+                0.0
+            };
+            info!(
+                "capture pipeline: {:.1} fps, {:.1} ms/capture, {} dropped this window, {} dropped total (target {} fps)",
+                capture_fps,
+                elapsed.as_secs_f64() * 1000.0,
+                window_dropped,
+                dropped_count,
+                framerate
+            );
+            last_stats_log = Instant::now();
+            window_captured = 0;
+            window_dropped = 0;
+        }
         if elapsed < target_interval {
-            thread::sleep(target_interval - elapsed);
+            sleeper.sleep(target_interval - elapsed);
         }
     }
     Ok(())
@@ -326,9 +360,7 @@ fn run_encode_loop(
                 }
                 #[cfg(windows)]
                 if encoder.is_media_foundation() && encode_errors >= 5 {
-                    warn!(
-                        "switching to OpenH264 after repeated MF encode errors (last: {e:?})"
-                    );
+                    warn!("switching to OpenH264 after repeated MF encode errors (last: {e:?})");
                     encoder = FrameEncoder::try_new(&config)?;
                     encode_errors = 0;
                 }

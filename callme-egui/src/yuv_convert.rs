@@ -24,7 +24,7 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                     let b = row[i] as i32;
                     let g = row[i + 1] as i32;
                     let r = row[i + 2] as i32;
-                    *y_out = ((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 255) as u8;
+                    *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
                 }
             });
 
@@ -43,8 +43,8 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                     let i0 = x * 4;
                     let i1 = i0 + 4;
                     let (r, g, b) = avg_rgb(row0, i0, row1, i1);
-                    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8).clamp(0, 255) as u8;
-                    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8).clamp(0, 255) as u8;
+                    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
                     uv_row[x] = u;
                     uv_row[x + 1] = v;
                 }
@@ -61,7 +61,7 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                 let b = row[i] as i32;
                 let g = row[i + 1] as i32;
                 let r = row[i + 2] as i32;
-                *y_out = ((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 255) as u8;
+                *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
             }
         }
 
@@ -77,8 +77,8 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                 let i0 = x * 4;
                 let i1 = i0 + 4;
                 let (r, g, b) = avg_rgb(row0, i0, row1, i1);
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8).clamp(0, 255) as u8;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8).clamp(0, 255) as u8;
+                let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
                 uv_row[x] = u;
                 uv_row[x + 1] = v;
             }
@@ -87,8 +87,10 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
 }
 
 fn avg_rgb(row0: &[u8], i0: usize, row1: &[u8], i1: usize) -> (i32, i32, i32) {
-    let r = (row0[i0 + 2] as i32 + row0[i1 + 2] as i32 + row1[i0 + 2] as i32 + row1[i1 + 2] as i32) / 4;
-    let g = (row0[i0 + 1] as i32 + row0[i1 + 1] as i32 + row1[i0 + 1] as i32 + row1[i1 + 1] as i32) / 4;
+    let r =
+        (row0[i0 + 2] as i32 + row0[i1 + 2] as i32 + row1[i0 + 2] as i32 + row1[i1 + 2] as i32) / 4;
+    let g =
+        (row0[i0 + 1] as i32 + row0[i1 + 1] as i32 + row1[i0 + 1] as i32 + row1[i1 + 1] as i32) / 4;
     let b = (row0[i0] as i32 + row0[i1] as i32 + row1[i0] as i32 + row1[i1] as i32) / 4;
     (r, g, b)
 }

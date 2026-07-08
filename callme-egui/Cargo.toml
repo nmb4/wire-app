@@ -27,6 +27,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "std"] }
 strum = { version = "0.27.1", features = ["derive"] }
 zed-scap = { version = "0.0.8-zed", default-features = false }
+spin_sleep = "1.3.0"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_clipboard = "0.1.0"
@@ -62,6 +63,7 @@ arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
 windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

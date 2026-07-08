@@ -2,16 +2,16 @@
 use egui_winit::winit;
 
 pub mod app;
+#[cfg(windows)]
+mod scap_capture;
 mod screen_capture;
 mod video_decode;
 #[cfg(windows)]
-mod scap_capture;
-#[cfg(windows)]
 mod win_gdi_capture;
 #[cfg(windows)]
-mod win_mf_d3d;
+pub mod win_mf_codec;
 #[cfg(windows)]
-mod win_mf_codec;
+mod win_mf_d3d;
 #[cfg(windows)]
 mod yuv_convert;
 

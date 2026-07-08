@@ -114,7 +114,9 @@ impl std::str::FromStr for AudioQuality {
             "medium" => Ok(AudioQuality::Medium),
             "high" => Ok(AudioQuality::High),
             "ultra" => Ok(AudioQuality::Ultra),
-            _ => Err(format!("unknown quality '{s}', expected low, medium, high, or ultra")),
+            _ => Err(format!(
+                "unknown quality '{s}', expected low, medium, high, or ultra"
+            )),
         }
     }
 }
@@ -261,7 +263,11 @@ pub struct MediaTrackOpusEncoder {
 }
 
 impl MediaTrackOpusEncoder {
-    pub fn new(track_channel_cap: usize, _audio_format: AudioFormat, quality: AudioQuality) -> Result<(Self, MediaTrack)> {
+    pub fn new(
+        track_channel_cap: usize,
+        _audio_format: AudioFormat,
+        quality: AudioQuality,
+    ) -> Result<(Self, MediaTrack)> {
         let (sender, receiver) = broadcast::channel(track_channel_cap);
         let channels = quality.channels();
         let track = MediaTrack::new(receiver, Codec::Opus { channels }, TrackKind::Audio);
@@ -311,7 +317,9 @@ impl OpusEncoder {
         let format = AudioFormat::new2(sample_rate, channels as u16);
         let mut encoder =
             opus::Encoder::new(sample_rate, channels.into(), opus::Application::Voip).unwrap();
-        encoder.set_bitrate(opus::Bitrate::Bits(quality.bitrate())).ok();
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(quality.bitrate()))
+            .ok();
         debug!(
             "initialized opus encoder: channels {} bitrate {:?} bandwidth {:?}",
             channels as u16,

@@ -105,7 +105,11 @@ impl AudioPlayback {
         self.add_source(decoder).await
     }
 
-    pub async fn add_track_with_volume(&self, track: MediaTrack, volume: VolumeHandle) -> Result<()> {
+    pub async fn add_track_with_volume(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+    ) -> Result<()> {
         let decoder = MediaTrackOpusDecoder::new(track)?;
         self.add_source(GainSource {
             inner: Box::new(decoder),

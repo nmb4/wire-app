@@ -88,7 +88,10 @@ impl AudioCapture {
             drop(stream);
         });
         init_rx.await??;
-        let handle = AudioCapture { sink_sender, quality };
+        let handle = AudioCapture {
+            sink_sender,
+            quality,
+        };
         Ok(handle)
     }
 

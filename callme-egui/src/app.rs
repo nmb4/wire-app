@@ -17,7 +17,7 @@ use callme::{
 };
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
-use iroh::{protocol::Router, Endpoint, KeyParsingError, NodeId};
+use iroh::{endpoint::VarInt, protocol::Router, Endpoint, KeyParsingError, NodeId};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
@@ -25,6 +25,8 @@ use tracing::{info, warn};
 use crate::video_decode::VideoDecodeWorker;
 
 const DEFAULT: &str = "<default>";
+const VIDEO_SEND_LATENCY_BUDGET: Duration = Duration::from_millis(150);
+const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
 
 pub struct App {
     is_first_update: bool,
@@ -218,7 +220,8 @@ impl AppState {
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
                         if self.selected_video_participant == Some(node_id) {
-                            self.selected_video_participant = self.video_frames.keys().next().copied();
+                            self.selected_video_participant =
+                                self.video_frames.keys().next().copied();
                         }
                     } else {
                         self.calls.insert(node_id, call_state);
@@ -236,17 +239,17 @@ impl AppState {
                     width,
                     height,
                 } => {
-                    let state = self
-                        .video_frames
-                        .entry(node_id)
-                        .or_insert_with(|| VideoFrameState {
-                            width: 0,
-                            height: 0,
-                            generation: 0,
-                            data: Arc::new(Vec::new()),
-                            texture: None,
-                            uploaded_generation: 0,
-                        });
+                    let state =
+                        self.video_frames
+                            .entry(node_id)
+                            .or_insert_with(|| VideoFrameState {
+                                width: 0,
+                                height: 0,
+                                generation: 0,
+                                data: Arc::new(Vec::new()),
+                                texture: None,
+                                uploaded_generation: 0,
+                            });
                     state.width = width;
                     state.height = height;
                     state.data = data;
@@ -449,7 +452,10 @@ impl AppState {
                     .fill(ui.visuals().widgets.noninteractive.bg_fill)
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(10.0)
-                    .stroke(Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                    .stroke(Stroke::new(
+                        1.0,
+                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                    ))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
@@ -460,29 +466,27 @@ impl AppState {
                         });
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            match state {
-                                CallState::Incoming => {
-                                    if ui.button("Accept").clicked() {
-                                        self.cmd(Command::HandleIncoming {
-                                            node_id,
-                                            accept: true,
-                                        });
-                                    }
-                                    if ui.button("Decline").clicked() {
-                                        self.cmd(Command::HandleIncoming {
-                                            node_id,
-                                            accept: false,
-                                        });
-                                    }
+                        ui.horizontal(|ui| match state {
+                            CallState::Incoming => {
+                                if ui.button("Accept").clicked() {
+                                    self.cmd(Command::HandleIncoming {
+                                        node_id,
+                                        accept: true,
+                                    });
                                 }
-                                CallState::Calling | CallState::Active => {
-                                    if ui.small_button("End").clicked() {
-                                        self.cmd(Command::Abort { node_id });
-                                    }
+                                if ui.button("Decline").clicked() {
+                                    self.cmd(Command::HandleIncoming {
+                                        node_id,
+                                        accept: false,
+                                    });
                                 }
-                                CallState::Aborted => {}
                             }
+                            CallState::Calling | CallState::Active => {
+                                if ui.small_button("End").clicked() {
+                                    self.cmd(Command::Abort { node_id });
+                                }
+                            }
+                            CallState::Aborted => {}
                         });
 
                         if matches!(state, CallState::Active) {
@@ -515,10 +519,7 @@ impl AppState {
                     if ui.button("Stop sharing").clicked() {
                         self.cmd(Command::ToggleSharing { enabled: false });
                     }
-                    ui.label(
-                        RichText::new("Live")
-                            .color(Color32::from_rgb(100, 200, 120)),
-                    );
+                    ui.label(RichText::new("Live").color(Color32::from_rgb(100, 200, 120)));
                 } else if ui.button("Start sharing").clicked() {
                     self.cmd(Command::ToggleSharing { enabled: true });
                 }
@@ -582,7 +583,8 @@ impl AppState {
         if !has_stream {
             let available = ui.available_size();
             let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-            ui.painter().rect_filled(rect, 8.0, ui.visuals().extreme_bg_color);
+            ui.painter()
+                .rect_filled(rect, 8.0, ui.visuals().extreme_bg_color);
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -697,7 +699,10 @@ impl AppState {
 
             let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
             if ui
-                .selectable_label(fs_selected, if compact { "Fullscreen" } else { "Fullscreen" })
+                .selectable_label(
+                    fs_selected,
+                    if compact { "Fullscreen" } else { "Fullscreen" },
+                )
                 .on_hover_text("Enter native fullscreen (Esc to exit)")
                 .clicked()
             {
@@ -941,10 +946,8 @@ fn sync_rgba_texture(
     if *uploaded_generation == generation || width == 0 || height == 0 || data.is_empty() {
         return;
     }
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [width as usize, height as usize],
-        data,
-    );
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], data);
     let options = egui::TextureOptions::LINEAR;
     if let Some(tex) = texture {
         tex.set(color_image, options);
@@ -957,9 +960,7 @@ fn sync_rgba_texture(
 fn copy_to_clipboard(text: &str) {
     #[cfg(not(target_os = "android"))]
     {
-        if let Err(err) = arboard::Clipboard::new()
-            .and_then(|mut c| c.set_text(text.to_string()))
-        {
+        if let Err(err) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
             warn!("failed to copy to clipboard: {err}");
         }
     }
@@ -1280,7 +1281,8 @@ impl Worker {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
-        self.emit(Event::VolumeHandle(node_id, volume.clone())).await?;
+        self.emit(Event::VolumeHandle(node_id, volume.clone()))
+            .await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -1315,7 +1317,8 @@ impl Worker {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
-        self.emit(Event::VolumeHandle(node_id, volume.clone())).await?;
+        self.emit(Event::VolumeHandle(node_id, volume.clone()))
+            .await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -1343,7 +1346,9 @@ impl Worker {
                     );
                     match remote_track.kind() {
                         TrackKind::Audio => {
-                            audio_context.play_track_with_volume(remote_track, volume.clone()).await?;
+                            audio_context
+                                .play_track_with_volume(remote_track, volume.clone())
+                                .await?;
                         }
                         TrackKind::Video => unimplemented!(),
                     }
@@ -1358,19 +1363,12 @@ impl Worker {
     }
 
     async fn ensure_video_streams(&mut self, node_id: NodeId, conn: RtcConnection) {
-        let entry = self
-            .video_peers
-            .entry(node_id)
-            .or_insert(VideoPeerTasks {
-                send: None,
-                recv: None,
-            });
+        let entry = self.video_peers.entry(node_id).or_insert(VideoPeerTasks {
+            send: None,
+            recv: None,
+        });
 
-        let recv_dead = entry
-            .recv
-            .as_ref()
-            .map(|h| h.is_finished())
-            .unwrap_or(true);
+        let recv_dead = entry.recv.as_ref().map(|h| h.is_finished()).unwrap_or(true);
         if recv_dead {
             let recv_conn = conn.clone();
             let event_tx = self.event_tx.clone();
@@ -1383,11 +1381,7 @@ impl Worker {
         }
 
         if self.sharing_active {
-            let send_dead = entry
-                .send
-                .as_ref()
-                .map(|h| h.is_finished())
-                .unwrap_or(true);
+            let send_dead = entry.send.as_ref().map(|h| h.is_finished()).unwrap_or(true);
             if send_dead {
                 let send_conn = conn.clone();
                 let frame_tx = self.video_frame_tx.clone();
@@ -1549,9 +1543,8 @@ impl Worker {
                     .await?;
 
                 let handler = self.handler.clone();
-                self.connect_tasks.spawn(async move {
-                    (node_id, handler.connect(node_id).await)
-                });
+                self.connect_tasks
+                    .spawn(async move { (node_id, handler.connect(node_id).await) });
             }
             Command::HandleIncoming { node_id, accept } => {
                 let Some(CallInfo::Incoming(conn)) = self.active_calls.remove(&node_id) else {
@@ -1599,10 +1592,12 @@ async fn run_video_send(
     let result: Result<()> = async {
         info!("opening video stream to {}", node_id.fmt_short());
         let (mut send, recv) = conn.transport().open_bi().await?;
+        let _ = send.set_priority(10);
         tokio::spawn(drain_quic_recv(recv));
         let mut rx = frame_tx.subscribe();
         let _ = keyframe_tx.send(());
         let mut sent = 0u64;
+        let mut resets = 0u64;
         loop {
             let frame = match rx.recv().await {
                 Ok(frame) => frame,
@@ -1620,13 +1615,45 @@ async fn run_video_send(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 }
             }
-            transport::send_frame(&mut send, &latest).await?;
+            let send_start = std::time::Instant::now();
+            match time::timeout(
+                VIDEO_SEND_LATENCY_BUDGET,
+                transport::send_frame(&mut send, &latest),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    resets += 1;
+                    warn!(
+                        "video send to {} exceeded {}ms while sending {} bytes; resetting stale stream (#{resets})",
+                        node_id.fmt_short(),
+                        VIDEO_SEND_LATENCY_BUDGET.as_millis(),
+                        latest.len()
+                    );
+                    let _ = send.reset(VIDEO_STREAM_RESET_CODE);
+                    let (new_send, recv) = conn.transport().open_bi().await?;
+                    send = new_send;
+                    let _ = send.set_priority(10);
+                    tokio::spawn(drain_quic_recv(recv));
+                    let _ = keyframe_tx.send(());
+                    continue;
+                }
+            }
             sent += 1;
             if sent == 1 {
                 info!(
                     "sent first video frame ({} bytes) to {}",
                     latest.len(),
                     node_id.fmt_short()
+                );
+            } else if send_start.elapsed() > Duration::from_millis(75) {
+                info!(
+                    "video send to {} took {:.0}ms for {} bytes",
+                    node_id.fmt_short(),
+                    send_start.elapsed().as_secs_f64() * 1000.0,
+                    latest.len()
                 );
             }
         }
@@ -1710,11 +1737,53 @@ async fn recv_video_on_stream(
             }
         }
     })?;
+    let mut received = 0u64;
+    let mut received_bytes = 0u64;
+    let mut received_age_ms = 0.0;
+    let mut max_age_ms = 0.0;
+    let mut last_stats_log = std::time::Instant::now();
 
     loop {
-        let Some(data) = transport::recv_frame(recv).await? else {
+        let Some((data, sent_at_micros)) = transport::recv_frame(recv).await? else {
             break;
         };
+        received += 1;
+        received_bytes += data.len() as u64;
+        if let Some(age_ms) = transport::frame_age_ms(sent_at_micros) {
+            received_age_ms += age_ms;
+            max_age_ms = f64::max(max_age_ms, age_ms);
+        }
+        if last_stats_log.elapsed() >= Duration::from_secs(5) {
+            let elapsed = last_stats_log.elapsed().as_secs_f64();
+            let recv_fps = if elapsed > 0.0 {
+                received as f64 / elapsed
+            } else {
+                0.0
+            };
+            let avg_packet_kb = if received > 0 {
+                received_bytes as f64 / received as f64 / 1024.0
+            } else {
+                0.0
+            };
+            let avg_age_ms = if received > 0 {
+                received_age_ms / received as f64
+            } else {
+                0.0
+            };
+            info!(
+                "video receive pipeline from {}: {:.1} fps, {:.1} KiB/frame, {:.0}ms avg age, {:.0}ms max age",
+                node_id.fmt_short(),
+                recv_fps,
+                avg_packet_kb,
+                avg_age_ms,
+                max_age_ms
+            );
+            last_stats_log = std::time::Instant::now();
+            received = 0;
+            received_bytes = 0;
+            received_age_ms = 0.0;
+            max_age_ms = 0.0;
+        }
         worker.submit(data);
     }
     Ok(())

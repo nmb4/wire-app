@@ -49,9 +49,8 @@ impl VideoEncoder {
             config.framerate,
             bitrate_bps / 1000
         );
-        let encoder =
-            Encoder::with_api_config(OpenH264API::from_source(), enc_config)
-                .context("failed to create H.264 encoder")?;
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), enc_config)
+            .context("failed to create H.264 encoder")?;
         let mut this = Self {
             encoder,
             width,
@@ -66,8 +65,7 @@ impl VideoEncoder {
     }
 
     pub fn encode(&mut self, rgba_data: &[u8]) -> Result<Vec<u8>> {
-        let rgb_slice =
-            RgbaSliceU8::new(rgba_data, (self.width as usize, self.height as usize));
+        let rgb_slice = RgbaSliceU8::new(rgba_data, (self.width as usize, self.height as usize));
         let yuv = YUVBuffer::from_rgb_source(rgb_slice);
         let bitstream = self.encoder.encode(&yuv)?;
         Ok(bitstream.to_vec())

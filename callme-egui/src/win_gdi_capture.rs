@@ -6,9 +6,9 @@ use scopeguard::guard;
 use windows::Win32::{
     Foundation::GetLastError,
     Graphics::Gdi::{
-        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
-        GetWindowDC, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
-        BITMAPINFOHEADER, COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetWindowDC,
+        ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
+        COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
     },
     UI::WindowsAndMessaging::GetDesktopWindow,
 };

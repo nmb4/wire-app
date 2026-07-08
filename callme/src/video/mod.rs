@@ -39,7 +39,11 @@ impl VideoResolution {
     }
 
     pub fn all() -> &'static [VideoResolution] {
-        &[VideoResolution::P720, VideoResolution::P1080, VideoResolution::P1440]
+        &[
+            VideoResolution::P720,
+            VideoResolution::P1080,
+            VideoResolution::P1440,
+        ]
     }
 }
 
@@ -50,7 +54,10 @@ pub fn default_bitrate(resolution: VideoResolution, framerate: u32) -> u32 {
         VideoResolution::P1080 => 12_000_000,
         VideoResolution::P1440 => 20_000_000,
     };
-    (base as f64 * (framerate as f64 / 30.0)) as u32
+    // Keep Auto latency-oriented. Linear fps scaling made 1080p60 default to 24 Mbps,
+    // which easily builds reliable-stream backlog during high-motion screen sharing.
+    let scale = (framerate as f64 / 30.0).sqrt().min(1.5);
+    (base as f64 * scale) as u32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

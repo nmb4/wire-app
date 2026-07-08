@@ -59,8 +59,13 @@ impl AudioContext {
         #[cfg(not(feature = "audio-processing"))]
         let processor = WebrtcAudioProcessor;
 
-        let capture =
-            AudioCapture::build(&host, config.input_device.as_deref(), processor.clone(), config.quality).await?;
+        let capture = AudioCapture::build(
+            &host,
+            config.input_device.as_deref(),
+            processor.clone(),
+            config.quality,
+        )
+        .await?;
         let playback =
             AudioPlayback::build(&host, config.output_device.as_deref(), processor.clone()).await?;
         Ok(Self { playback, capture })
@@ -75,7 +80,11 @@ impl AudioContext {
         Ok(())
     }
 
-    pub async fn play_track_with_volume(&self, track: MediaTrack, volume: VolumeHandle) -> Result<()> {
+    pub async fn play_track_with_volume(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+    ) -> Result<()> {
         self.playback.add_track_with_volume(track, volume).await?;
         Ok(())
     }
