@@ -42,11 +42,13 @@ fn create_video_media_type(
     height: u32,
     framerate: u32,
     bitrate: Option<u32>,
+    compressed: bool,
 ) -> Result<IMFMediaType> {
     let media_type = unsafe { MFCreateMediaType()? };
     unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
+        media_type.SetUINT32(&MF_MT_COMPRESSED, compressed as u32)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_size(width, height))?;
         media_type.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(framerate, 1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
@@ -58,12 +60,12 @@ fn create_video_media_type(
     Ok(media_type)
 }
 
-fn find_transform(
+fn enumerate_transforms(
     category: windows::core::GUID,
     input: windows::core::GUID,
     output: windows::core::GUID,
     flags: MFT_ENUM_FLAG,
-) -> Result<IMFTransform> {
+) -> Result<Vec<IMFTransform>> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: input,
@@ -90,31 +92,43 @@ fn find_transform(
         return Err(anyhow!("no Media Foundation transform found"));
     }
 
-    let transform = unsafe {
-        let activate = (*activates.add(0))
-            .as_ref()
-            .ok_or_else(|| anyhow!("null MFT activate"))?;
-        let transform: IMFTransform = activate.ActivateObject()?;
+    let mut transforms = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let transform = unsafe {
+            let activate = (*activates.add(i as usize))
+                .as_ref()
+                .ok_or_else(|| anyhow!("null MFT activate"))?;
+            info!("found MFT candidate #{}", i + 1);
+            activate.ActivateObject::<IMFTransform>()
+        }?;
+        transforms.push(transform);
+    }
+    unsafe {
         CoTaskMemFree(Some(activates as *const _ as *mut _));
-        transform
-    };
-
-    Ok(transform)
+    }
+    Ok(transforms)
 }
 
-fn find_video_encoder(prefer_hardware: bool) -> Result<IMFTransform> {
+fn find_transform(
+    category: windows::core::GUID,
+    input: windows::core::GUID,
+    output: windows::core::GUID,
+    flags: MFT_ENUM_FLAG,
+) -> Result<IMFTransform> {
+    enumerate_transforms(category, input, output, flags)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no Media Foundation transform found"))
+}
+
+fn enumerate_video_encoders(prefer_hardware: bool) -> Result<Vec<IMFTransform>> {
     let base = MFT_ENUM_FLAG_SORTANDFILTER;
-    if prefer_hardware {
-        let flags = MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_ASYNCMFT.0);
-        return find_transform(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFVideoFormat_NV12,
-            MFVideoFormat_H264,
-            flags,
-        );
-    }
-    let flags = MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_SYNCMFT.0);
-    find_transform(
+    let flags = if prefer_hardware {
+        MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_HARDWARE.0)
+    } else {
+        MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_SYNCMFT.0)
+    };
+    enumerate_transforms(
         MFT_CATEGORY_VIDEO_ENCODER,
         MFVideoFormat_NV12,
         MFVideoFormat_H264,
@@ -163,16 +177,32 @@ fn configure_encoder(
     bitrate: u32,
     async_mode: bool,
 ) -> Result<()> {
-    let output_type = create_video_media_type(MFVideoFormat_H264, width, height, framerate, Some(bitrate))?;
-    let input_type = create_video_media_type(MFVideoFormat_NV12, width, height, framerate, None)?;
+    // Async hardware encoders must be unlocked before SetInputType (and related calls).
+    if async_mode {
+        unlock_async_transform(transform)?;
+    }
+
+    let output_type = create_video_media_type(
+        MFVideoFormat_H264,
+        width,
+        height,
+        framerate,
+        Some(bitrate),
+        true,
+    )?;
+    let input_type = create_video_media_type(
+        MFVideoFormat_NV12,
+        width,
+        height,
+        framerate,
+        None,
+        false,
+    )?;
 
     unsafe {
         output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_BASELINE)?;
         transform.SetOutputType(0, &output_type, 0)?;
         transform.SetInputType(0, &input_type, 0)?;
-    }
-    if async_mode {
-        unlock_async_transform(transform)?;
     }
     enable_low_latency(transform);
     send_transform_message(transform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
@@ -203,6 +233,10 @@ fn enable_low_latency(transform: &IMFTransform) {
             let _ = VariantClear(&mut variant);
         }
     }
+}
+
+fn nv12_buffer_size(width: u32, height: u32) -> u32 {
+    width * (height + height / 2)
 }
 
 fn create_media_sample(data: &[u8], timestamp: i64, duration: i64) -> Result<IMFSample> {
@@ -288,8 +322,8 @@ fn configure_processor(
     width: u32,
     height: u32,
 ) -> Result<()> {
-    let output_type = create_video_media_type(output, width, height, 30, None)?;
-    let input_type = create_video_media_type(input, width, height, 30, None)?;
+    let output_type = create_video_media_type(output, width, height, 30, None, false)?;
+    let input_type = create_video_media_type(input, width, height, 30, None, false)?;
     unsafe {
         transform.SetOutputType(0, &output_type, 0)?;
         transform.SetInputType(0, &input_type, 0)?;
@@ -371,6 +405,7 @@ pub struct MfH264Encoder {
     frame_duration: i64,
     hardware: bool,
     async_mode: bool,
+    pending_input: u32,
 }
 
 impl MfH264Encoder {
@@ -382,11 +417,28 @@ impl MfH264Encoder {
         let mut last_err = None;
 
         for (prefer_hardware, label) in [(true, "hardware"), (false, "software")] {
-            match Self::try_open(config, width, height, bitrate, prefer_hardware) {
-                Ok(enc) => return Ok(enc),
+            let candidates = match enumerate_video_encoders(prefer_hardware) {
+                Ok(c) => c,
                 Err(e) => {
-                    warn!("MF {label} H.264 encoder failed: {e:?}");
+                    warn!("MF {label} H.264 encoder enumeration failed: {e:?}");
                     last_err = Some(e);
+                    continue;
+                }
+            };
+            for transform in candidates {
+                match Self::build(
+                    transform,
+                    config,
+                    width,
+                    height,
+                    bitrate,
+                    prefer_hardware,
+                ) {
+                    Ok(enc) => return Ok(enc),
+                    Err(e) => {
+                        warn!("MF {label} H.264 encoder candidate failed: {e:?}");
+                        last_err = Some(e);
+                    }
                 }
             }
         }
@@ -394,14 +446,14 @@ impl MfH264Encoder {
         Err(last_err.unwrap_or_else(|| anyhow!("no Media Foundation encoder found")))
     }
 
-    fn try_open(
+    fn build(
+        transform: IMFTransform,
         config: &VideoConfig,
         width: u32,
         height: u32,
         bitrate: u32,
         prefer_hardware: bool,
     ) -> Result<Self> {
-        let transform = find_video_encoder(prefer_hardware)?;
         let async_mode = is_async_transform(&transform)?;
         let hardware = prefer_hardware
             && unsafe {
@@ -449,17 +501,19 @@ impl MfH264Encoder {
         );
 
         let frame_duration = 10_000_000i64 / config.framerate.max(1) as i64;
+        let nv12_len = nv12_buffer_size(width, height) as usize;
 
         Ok(Self {
             transform,
             width,
             height,
-            nv12: vec![0u8; (width * height * 3 / 2) as usize],
+            nv12: vec![0u8; nv12_len],
             bgra_to_nv12,
             frame_index: 0,
             frame_duration,
             hardware,
             async_mode,
+            pending_input: if async_mode { 1 } else { 0 },
         })
     }
 
@@ -469,6 +523,27 @@ impl MfH264Encoder {
 
     pub fn force_keyframe(&mut self) {
         force_keyframe(&self.transform);
+    }
+
+    fn pump_async_events(&mut self) -> Result<()> {
+        if !self.async_mode {
+            return Ok(());
+        }
+        let events: IMFMediaEventGenerator = self.transform.cast()?;
+        loop {
+            let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => event,
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => break,
+                Err(e) => return Err(e.into()),
+            };
+            let event_type = unsafe { event.GetType()? };
+            if event_type == METransformNeedInput.0 as u32 {
+                self.pending_input += 1;
+            } else if event_type == METransformHaveOutput.0 as u32 {
+                // handled by the caller via ProcessOutput
+            }
+        }
+        Ok(())
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
@@ -485,11 +560,23 @@ impl MfH264Encoder {
             bgra_to_nv12(bgra, self.width, self.height, &mut self.nv12);
             &self.nv12
         };
-        let sample = create_media_sample(nv12, timestamp, self.frame_duration)?;
+        let expected_len = nv12_buffer_size(self.width, self.height) as usize;
+        if nv12.len() < expected_len {
+            return Err(anyhow!(
+                "NV12 buffer too small: got {} bytes, expected {expected_len}",
+                nv12.len()
+            ));
+        }
+        let sample = create_media_sample(&nv12[..expected_len], timestamp, self.frame_duration)?;
         self.frame_index += 1;
 
         if self.async_mode {
-            wait_for_transform_event(&self.transform, METransformNeedInput)?;
+            self.pump_async_events()?;
+            if self.pending_input == 0 {
+                wait_for_transform_event(&self.transform, METransformNeedInput)?;
+                self.pending_input = 1;
+            }
+            self.pending_input -= 1;
             unsafe {
                 self.transform.ProcessInput(0, &sample, 0)?;
             }

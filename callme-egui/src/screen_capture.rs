@@ -326,7 +326,9 @@ fn run_encode_loop(
                 }
                 #[cfg(windows)]
                 if encoder.is_media_foundation() && encode_errors >= 5 {
-                    warn!("switching to OpenH264 after repeated MF encode errors");
+                    warn!(
+                        "switching to OpenH264 after repeated MF encode errors (last: {e:?})"
+                    );
                     encoder = FrameEncoder::try_new(&config)?;
                     encode_errors = 0;
                 }
