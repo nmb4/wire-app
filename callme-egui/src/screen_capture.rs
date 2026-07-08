@@ -56,11 +56,16 @@ impl FrameEncoder {
     fn try_new_with_mf(config: &VideoConfig) -> Result<Self> {
         match MfH264Encoder::try_new(config) {
             Ok(enc) => {
-                info!("using MF hardware encoder");
+                let kind = if enc.is_hardware() {
+                    "MF hardware"
+                } else {
+                    "MF software"
+                };
+                info!("using {kind} encoder");
                 Ok(Self::MediaFoundation(enc))
             }
             Err(e) => {
-                info!("MF hardware encoder unavailable, using OpenH264: {e:?}");
+                info!("MF encoder unavailable, using OpenH264: {e:?}");
                 Self::try_new(config)
             }
         }
@@ -267,6 +272,7 @@ fn run_encode_loop(
     let mut encode_errors = 0u64;
     let mut mf_empty_streak = 0u32;
     let mut no_subscriber_logged = false;
+    let mut last_stats_log = Instant::now();
     let loop_start = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -335,6 +341,16 @@ fn run_encode_loop(
         } else {
             0.0
         };
+
+        if last_stats_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                "encode pipeline: {:.1} fps, {:.1} ms/frame (target {} fps)",
+                actual_fps,
+                encode_time.as_secs_f64() * 1000.0,
+                config.framerate
+            );
+            last_stats_log = Instant::now();
+        }
 
         if frame_count % PREVIEW_EVERY_N_FRAMES == 0 {
             let (preview_data, preview_w, preview_h) = make_preview(&bgra, target_w, target_h);

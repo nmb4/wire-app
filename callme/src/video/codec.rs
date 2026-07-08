@@ -35,7 +35,7 @@ impl VideoEncoder {
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(bitrate_bps))
-            .complexity(Complexity::Medium)
+            .complexity(Complexity::Low)
             .skip_frames(false)
             .num_threads(0)
             .max_frame_rate(FrameRate::from_hz(config.framerate as f32))

@@ -531,6 +531,8 @@ impl AppState {
                     ui.label(format!("{:.0}×{:.0}", preview.width, preview.height));
                     ui.separator();
                     ui.label(format!("{:.0} fps", preview.actual_fps));
+                    ui.separator();
+                    ui.label(format!("{:.0} ms encode", preview.encode_time_ms));
                 });
                 sync_rgba_texture(
                     ui,

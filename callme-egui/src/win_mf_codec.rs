@@ -62,7 +62,7 @@ fn find_transform(
     category: windows::core::GUID,
     input: windows::core::GUID,
     output: windows::core::GUID,
-    prefer_hardware: bool,
+    flags: MFT_ENUM_FLAG,
 ) -> Result<IMFTransform> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -72,11 +72,6 @@ fn find_transform(
         guidMajorType: MFMediaType_Video,
         guidSubtype: output,
     };
-
-    let mut flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0);
-    if prefer_hardware {
-        flags = MFT_ENUM_FLAG(flags.0 | MFT_ENUM_FLAG_HARDWARE.0);
-    }
 
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
@@ -92,9 +87,6 @@ fn find_transform(
     }
 
     if count == 0 {
-        if prefer_hardware {
-            return find_transform(category, input, output, false);
-        }
         return Err(anyhow!("no Media Foundation transform found"));
     }
 
@@ -110,6 +102,57 @@ fn find_transform(
     Ok(transform)
 }
 
+fn find_video_encoder(prefer_hardware: bool) -> Result<IMFTransform> {
+    let base = MFT_ENUM_FLAG_SORTANDFILTER;
+    if prefer_hardware {
+        let flags = MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_ASYNCMFT.0);
+        return find_transform(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFVideoFormat_NV12,
+            MFVideoFormat_H264,
+            flags,
+        );
+    }
+    let flags = MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_SYNCMFT.0);
+    find_transform(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        MFVideoFormat_NV12,
+        MFVideoFormat_H264,
+        flags,
+    )
+}
+
+fn is_async_transform(transform: &IMFTransform) -> Result<bool> {
+    let attrs = unsafe { transform.GetAttributes()? };
+    let async_flag = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0);
+    Ok(async_flag != 0)
+}
+
+fn unlock_async_transform(transform: &IMFTransform) -> Result<()> {
+    let attrs = unsafe { transform.GetAttributes()? };
+    unsafe {
+        attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+    }
+    Ok(())
+}
+
+fn wait_for_transform_event(
+    transform: &IMFTransform,
+    expected: MF_EVENT_TYPE,
+) -> Result<()> {
+    let events: IMFMediaEventGenerator = transform.cast()?;
+    loop {
+        let event = unsafe { events.GetEvent(MF_EVENT_FLAG_NONE)? };
+        let event_type = unsafe { event.GetType()? };
+        if event_type == expected.0 as u32 {
+            return Ok(());
+        }
+        if event_type == METransformHaveOutput.0 as u32 {
+            let _ = drain_output(transform)?;
+        }
+    }
+}
+
 const H264_PROFILE_BASELINE: u32 = 66;
 
 fn configure_encoder(
@@ -118,6 +161,7 @@ fn configure_encoder(
     height: u32,
     framerate: u32,
     bitrate: u32,
+    async_mode: bool,
 ) -> Result<()> {
     let output_type = create_video_media_type(MFVideoFormat_H264, width, height, framerate, Some(bitrate))?;
     let input_type = create_video_media_type(MFVideoFormat_NV12, width, height, framerate, None)?;
@@ -126,11 +170,19 @@ fn configure_encoder(
         output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_BASELINE)?;
         transform.SetOutputType(0, &output_type, 0)?;
         transform.SetInputType(0, &input_type, 0)?;
+    }
+    if async_mode {
+        unlock_async_transform(transform)?;
+    }
+    unsafe {
         transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
     }
     enable_low_latency(transform);
+    if async_mode {
+        wait_for_transform_event(transform, METransformNeedInput)?;
+    }
     Ok(())
 }
 
@@ -267,11 +319,12 @@ impl MfColorConverter {
         width: u32,
         height: u32,
     ) -> Result<Self> {
+        let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0);
         let transform = find_transform(
             MFT_CATEGORY_VIDEO_PROCESSOR,
             input,
             output,
-            false,
+            flags,
         )?;
         configure_processor(&transform, input, output, width, height)?;
         let scratch_len = if output == MFVideoFormat_NV12 {
@@ -311,6 +364,7 @@ pub struct MfH264Encoder {
     frame_index: i64,
     frame_duration: i64,
     hardware: bool,
+    async_mode: bool,
 }
 
 impl MfH264Encoder {
@@ -320,22 +374,38 @@ impl MfH264Encoder {
         let height = config.resolution.height();
         let bitrate = default_bitrate(config.resolution, config.framerate);
 
-        let transform = find_transform(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFVideoFormat_NV12,
-            MFVideoFormat_H264,
-            true,
+        if let Ok(enc) = Self::try_open(config, width, height, bitrate, true) {
+            return Ok(enc);
+        }
+        Self::try_open(config, width, height, bitrate, false)
+    }
+
+    fn try_open(
+        config: &VideoConfig,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        prefer_hardware: bool,
+    ) -> Result<Self> {
+        let transform = find_video_encoder(prefer_hardware)?;
+        let async_mode = is_async_transform(&transform)?;
+        let hardware = prefer_hardware
+            && unsafe {
+                transform
+                    .GetAttributes()
+                    .ok()
+                    .and_then(|attrs| attrs.GetUINT32(&MFT_ENUM_HARDWARE_URL_Attribute).ok())
+                    .is_some()
+            };
+
+        configure_encoder(
+            &transform,
+            width,
+            height,
+            config.framerate,
+            bitrate,
+            async_mode,
         )?;
-
-        let hardware = unsafe {
-            transform
-                .GetAttributes()
-                .ok()
-                .and_then(|attrs| attrs.GetUINT32(&MFT_ENUM_HARDWARE_URL_Attribute).ok())
-                .is_some()
-        };
-
-        configure_encoder(&transform, width, height, config.framerate, bitrate)?;
         force_keyframe(&transform);
 
         let bgra_to_nv12 = match MfColorConverter::try_new(
@@ -355,12 +425,13 @@ impl MfH264Encoder {
         };
 
         info!(
-            "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={})",
+            "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={}, async={})",
             width,
             height,
             config.framerate,
             bitrate / 1000,
-            hardware
+            hardware,
+            async_mode
         );
 
         let frame_duration = 10_000_000i64 / config.framerate.max(1) as i64;
@@ -374,6 +445,7 @@ impl MfH264Encoder {
             frame_index: 0,
             frame_duration,
             hardware,
+            async_mode,
         })
     }
 
@@ -402,8 +474,16 @@ impl MfH264Encoder {
         let sample = create_media_sample(nv12, timestamp, self.frame_duration)?;
         self.frame_index += 1;
 
-        unsafe {
-            self.transform.ProcessInput(0, &sample, 0)?;
+        if self.async_mode {
+            wait_for_transform_event(&self.transform, METransformNeedInput)?;
+            unsafe {
+                self.transform.ProcessInput(0, &sample, 0)?;
+            }
+            wait_for_transform_event(&self.transform, METransformHaveOutput)?;
+        } else {
+            unsafe {
+                self.transform.ProcessInput(0, &sample, 0)?;
+            }
         }
 
         let mut out = Vec::new();
@@ -426,12 +506,26 @@ pub struct MfH264Decoder {
 impl MfH264Decoder {
     pub fn try_new() -> Result<Self> {
         ensure_media_foundation()?;
+        let flags = MFT_ENUM_FLAG(
+            MFT_ENUM_FLAG_SORTANDFILTER.0
+                | MFT_ENUM_FLAG_HARDWARE.0
+                | MFT_ENUM_FLAG_ASYNCMFT.0,
+        );
         let transform = find_transform(
             MFT_CATEGORY_VIDEO_DECODER,
             MFVideoFormat_H264,
             MFVideoFormat_NV12,
-            true,
-        )?;
+            flags,
+        )
+        .or_else(|_| {
+            let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0);
+            find_transform(
+                MFT_CATEGORY_VIDEO_DECODER,
+                MFVideoFormat_H264,
+                MFVideoFormat_NV12,
+                flags,
+            )
+        })?;
 
         let input_type = unsafe { MFCreateMediaType()? };
         unsafe {
