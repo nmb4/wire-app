@@ -48,6 +48,18 @@ struct AppState {
     video_frames: BTreeMap<NodeId, VideoFrameState>,
     selected_video_participant: Option<NodeId>,
     sharing_active: bool,
+    preview: Option<PreviewState>,
+}
+
+struct PreviewState {
+    width: u32,
+    height: u32,
+    actual_fps: f64,
+    encode_time_ms: f64,
+    generation: u64,
+    data: Arc<Vec<u8>>,
+    texture: Option<egui::TextureHandle>,
+    uploaded_generation: u64,
 }
 
 struct VideoFrameState {
@@ -56,6 +68,7 @@ struct VideoFrameState {
     generation: u64,
     data: Arc<Vec<u8>>,
     texture: Option<egui::TextureHandle>,
+    uploaded_generation: u64,
 }
 
 struct UiAudioConfig {
@@ -103,7 +116,7 @@ impl eframe::App for App {
             self.is_first_update = false;
             ctx.set_zoom_factor(1.5);
             let ctx = ctx.clone();
-            let callback = Box::new(move || ctx.request_repaint());
+            let callback = Arc::new(move || ctx.request_repaint());
             self.state.cmd(Command::SetUpdateCallback { callback });
         }
         // on android, add some space at the top.
@@ -135,6 +148,7 @@ impl App {
             video_frames: Default::default(),
             selected_video_participant: None,
             sharing_active: false,
+            preview: None,
         };
 
         let app = App {
@@ -156,6 +170,7 @@ impl AppState {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
                         self.rtts.remove(&node_id);
+                        self.video_frames.remove(&node_id);
                     } else {
                         self.calls.insert(node_id, call_state);
                     }
@@ -181,14 +196,42 @@ impl AppState {
                             generation: 0,
                             data: Arc::new(Vec::new()),
                             texture: None,
+                            uploaded_generation: 0,
                         });
                     state.width = width;
                     state.height = height;
                     state.data = data;
                     state.generation += 1;
+                    if self.selected_video_participant.is_none() {
+                        self.selected_video_participant = Some(node_id);
+                    }
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
+                }
+                Event::PreviewFrame {
+                    width,
+                    height,
+                    data,
+                    actual_fps,
+                    encode_time_ms,
+                } => {
+                    let preview = self.preview.get_or_insert_with(|| PreviewState {
+                        width: 0,
+                        height: 0,
+                        actual_fps: 0.0,
+                        encode_time_ms: 0.0,
+                        generation: 0,
+                        data: Arc::new(Vec::new()),
+                        texture: None,
+                        uploaded_generation: 0,
+                    });
+                    preview.width = width;
+                    preview.height = height;
+                    preview.actual_fps = actual_fps;
+                    preview.encode_time_ms = encode_time_ms;
+                    preview.data = data;
+                    preview.generation += 1;
                 }
             }
         }
@@ -284,6 +327,42 @@ impl AppState {
             }
         });
 
+        if let Some(preview) = &mut self.preview {
+            ui.label("Preview:");
+            ui.horizontal(|ui| {
+                ui.label(format!("{:.0}x{:.0}", preview.width, preview.height));
+                ui.separator();
+                ui.label(format!("{:.1} FPS", preview.actual_fps));
+                ui.separator();
+                ui.label(format!("encode {:.1}ms", preview.encode_time_ms));
+            });
+            if preview.uploaded_generation != preview.generation {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [preview.width as usize, preview.height as usize],
+                    &preview.data,
+                );
+                if let Some(tex) = &mut preview.texture {
+                    tex.set(color_image, egui::TextureOptions::default());
+                } else {
+                    preview.texture = Some(ui.ctx().load_texture(
+                        "preview",
+                        color_image,
+                        egui::TextureOptions::default(),
+                    ));
+                }
+                preview.uploaded_generation = preview.generation;
+            }
+            if let Some(tex) = &preview.texture {
+                let aspect = preview.width as f32 / preview.height as f32;
+                let max_w = ui.available_width().min(400.0);
+                ui.add(
+                    egui::Image::new(tex)
+                        .max_width(max_w)
+                        .max_height(max_w / aspect),
+                );
+            }
+        }
+
         let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
         if !share_targets.is_empty() {
             ui.horizontal(|ui| {
@@ -307,44 +386,36 @@ impl AppState {
                     });
             });
 
-            if let Some(participant) = self.selected_video_participant {
-                let needs_upload = self
-                    .video_frames
-                    .get(&participant)
-                    .map(|f| !f.data.is_empty() && f.width > 0 && f.height > 0)
-                    .unwrap_or(false);
-                if needs_upload {
-                    let (w, h, data) = {
-                        let f = self.video_frames.get(&participant).unwrap();
-                        (f.width, f.height, f.data.clone())
-                    };
-                    let tex = if let Some(mut t) = self.video_frames.get(&participant).unwrap().texture.clone() {
+            let participant = self
+                .selected_video_participant
+                .unwrap_or(share_targets[0]);
+            if let Some(frame) = self.video_frames.get_mut(&participant) {
+                if !frame.data.is_empty() && frame.width > 0 && frame.height > 0 {
+                    if frame.uploaded_generation != frame.generation {
                         let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            &data,
+                            [frame.width as usize, frame.height as usize],
+                            &frame.data,
                         );
-                        t.set(color_image, egui::TextureOptions::default());
-                        t
-                    } else {
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            &data,
+                        if let Some(tex) = &mut frame.texture {
+                            tex.set(color_image, egui::TextureOptions::default());
+                        } else {
+                            frame.texture = Some(ui.ctx().load_texture(
+                                format!("video-{}", participant),
+                                color_image,
+                                egui::TextureOptions::default(),
+                            ));
+                        }
+                        frame.uploaded_generation = frame.generation;
+                    }
+                    if let Some(tex) = &frame.texture {
+                        let aspect = frame.width as f32 / frame.height as f32;
+                        let max_w = ui.available_width().min(400.0);
+                        ui.add(
+                            egui::Image::new(tex)
+                                .max_width(max_w)
+                                .max_height(max_w / aspect),
                         );
-                        let t = ui.ctx().load_texture(
-                            "video",
-                            color_image,
-                            egui::TextureOptions::default(),
-                        );
-                        self.video_frames.get_mut(&participant).unwrap().texture = Some(t.clone());
-                        t
-                    };
-                    let aspect = w as f32 / h as f32;
-                    let max_w = ui.available_width().min(400.0);
-                    ui.add(
-                        egui::Image::new(&tex)
-                            .max_width(max_w)
-                            .max_height(max_w / aspect),
-                    );
+                    }
                 }
             }
         } else {
@@ -549,6 +620,13 @@ enum Event {
         data: Arc<Vec<u8>>,
     },
     SharingToggled(bool),
+    PreviewFrame {
+        width: u32,
+        height: u32,
+        data: Arc<Vec<u8>>,
+        actual_fps: f64,
+        encode_time_ms: f64,
+    },
 }
 
 #[derive(strum::Display)]
@@ -561,11 +639,34 @@ enum CallState {
 
 enum CallInfo {
     Calling,
+    Connecting(RtcConnection),
     Incoming(RtcConnection),
     Active(RtcConnection),
 }
 
-type UpdateCallback = Box<dyn Fn() + Send + 'static>;
+struct VideoPeerTasks {
+    send: Option<tokio::task::JoinHandle<()>>,
+    recv: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl VideoPeerTasks {
+    fn abort_all(&mut self) {
+        if let Some(h) = self.send.take() {
+            h.abort();
+        }
+        if let Some(h) = self.recv.take() {
+            h.abort();
+        }
+    }
+
+    fn abort_send(&mut self) {
+        if let Some(h) = self.send.take() {
+            h.abort();
+        }
+    }
+}
+
+type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
 
 enum Command {
     SetUpdateCallback { callback: UpdateCallback },
@@ -586,13 +687,17 @@ struct Worker {
     endpoint: Endpoint,
     handler: RtcProtocol,
     call_tasks: JoinSet<(NodeId, Result<()>)>,
-    connect_tasks: JoinSet<(NodeId, Result<(RtcConnection, MediaTrack)>)>,
+    connect_tasks: JoinSet<(NodeId, Result<RtcConnection>)>,
+    track_tasks: JoinSet<(NodeId, Result<MediaTrack>)>,
     _router: Router,
     audio_context: Option<AudioContext>,
     rtt_interval: time::Interval,
     video_config: VideoConfig,
     video_frame_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
-    capture_task: Option<tokio::task::JoinHandle<()>>,
+    keyframe_tx: tokio::sync::broadcast::Sender<()>,
+    video_peers: BTreeMap<NodeId, VideoPeerTasks>,
+    capture_thread: Option<std::thread::JoinHandle<()>>,
+    capture_stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     sharing_active: bool,
 }
 
@@ -604,7 +709,7 @@ struct WorkerHandle {
 impl Worker {
     pub fn spawn() -> WorkerHandle {
         let (command_tx, command_rx) = async_channel::bounded(16);
-        let (event_tx, event_rx) = async_channel::bounded(16);
+        let (event_tx, event_rx) = async_channel::bounded(64);
         let handle = WorkerHandle {
             event_rx,
             command_tx,
@@ -644,7 +749,8 @@ impl Worker {
             .accept(RtcProtocol::ALPN, handler.clone())
             .spawn()
             .await?;
-        let (video_frame_tx, _) = tokio::sync::broadcast::channel(4);
+        let (video_frame_tx, _) = tokio::sync::broadcast::channel(32);
+        let (keyframe_tx, _) = tokio::sync::broadcast::channel(16);
         Ok(Self {
             command_rx,
             event_tx,
@@ -652,6 +758,7 @@ impl Worker {
             volumes: Default::default(),
             call_tasks: JoinSet::new(),
             connect_tasks: JoinSet::new(),
+            track_tasks: JoinSet::new(),
             endpoint,
             handler,
             _router,
@@ -660,7 +767,10 @@ impl Worker {
             rtt_interval: time::interval(Duration::from_secs(1)),
             video_config: VideoConfig::default(),
             video_frame_tx,
-            capture_task: None,
+            keyframe_tx,
+            video_peers: Default::default(),
+            capture_thread: None,
+            capture_stop_flag: None,
             sharing_active: false,
         })
     }
@@ -691,12 +801,17 @@ impl Worker {
                     }
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
+                    self.remove_video_peer(node_id);
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
                 Some(res) = self.connect_tasks.join_next(), if !self.connect_tasks.is_empty() => {
                     let (node_id, res) = res.expect("connect task panicked");
-                    self.handle_connected(node_id, res).await?;
+                    self.handle_quic_connected(node_id, res).await?;
+                }
+                Some(res) = self.track_tasks.join_next(), if !self.track_tasks.is_empty() => {
+                    let (node_id, res) = res.expect("track task panicked");
+                    self.handle_track_received(node_id, res).await?;
                 }
                 _ = self.rtt_interval.tick() => {
                     self.query_rtts().await?;
@@ -715,19 +830,55 @@ impl Worker {
         Ok(())
     }
 
-    async fn handle_connected(
+    async fn handle_quic_connected(
         &mut self,
         node_id: NodeId,
-        conn: Result<(RtcConnection, MediaTrack)>,
+        conn: Result<RtcConnection>,
     ) -> Result<()> {
         match conn {
-            Ok((conn, track)) => {
-                self.accept_from_connect(conn, track).await?;
+            Ok(conn) => {
+                info!("quic connected to {}", node_id.fmt_short());
+                self.ensure_video_streams(node_id, conn.clone()).await;
+                self.active_calls
+                    .insert(node_id, CallInfo::Connecting(conn.clone()));
+                self.track_tasks.spawn(async move {
+                    let res: Result<MediaTrack> = async {
+                        conn.recv_track()
+                            .await?
+                            .ok_or_else(|| anyhow!("connection closed without receiving a track"))
+                    }
+                    .await;
+                    (node_id, res)
+                });
             }
             Err(err) => {
-                warn!("connection to {} failed: {err:?}", node_id);
+                warn!("connection to {} failed: {err:?}", node_id.fmt_short());
                 self.active_calls.remove(&node_id);
                 self.volumes.remove(&node_id);
+                self.emit(Event::SetCallState(node_id, CallState::Aborted))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_track_received(
+        &mut self,
+        node_id: NodeId,
+        track: Result<MediaTrack>,
+    ) -> Result<()> {
+        let Some(CallInfo::Connecting(conn)) = self.active_calls.remove(&node_id) else {
+            return Ok(());
+        };
+        match track {
+            Ok(track) => self.accept_from_connect(conn, track).await?,
+            Err(err) => {
+                warn!(
+                    "failed to receive audio track from {}: {err:?}",
+                    node_id.fmt_short()
+                );
+                self.remove_video_peer(node_id);
+                conn.transport().close(0u32.into(), b"bye");
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -749,70 +900,11 @@ impl Worker {
             .clone()
             .context("missing audio context")?;
 
-        let video_frame_tx = self.video_frame_tx.clone();
-        let sharing_active = self.sharing_active;
-        let event_tx = self.event_tx.clone();
+        self.ensure_video_streams(node_id, conn.clone()).await;
 
         let audio_conn = conn.clone();
-        let recv_conn = conn.clone();
-        let send_conn = conn.clone();
-
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
-
-            if sharing_active {
-                let tx = video_frame_tx.clone();
-                let nid = node_id;
-                tokio::spawn(async move {
-                    let result: Result<()> = async {
-                        let (mut send, _) = send_conn.transport().open_bi().await?;
-                        let mut rx = tx.subscribe();
-                        loop {
-                            let frame = rx.recv().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                            transport::send_frame(&mut send, &frame).await?;
-                        }
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        info!("video send for {} stopped: {e:?}", nid.fmt_short());
-                    }
-                });
-            }
-
-            let recv_event_tx = event_tx.clone();
-            let nid = node_id;
-            tokio::spawn(async move {
-                let result: Result<()> = async {
-                    let (_, mut recv) = recv_conn.transport().accept_bi().await?;
-                    let mut decoder = VideoDecoder::new()?;
-                    loop {
-                        let Some(data) = transport::recv_frame(&mut recv).await? else {
-                            break;
-                        };
-                        match decoder.decode(&data) {
-                            Ok((rgba, w, h)) => {
-                                recv_event_tx
-                                    .send(Event::VideoFrame {
-                                        node_id: nid,
-                                        data: Arc::new(rgba),
-                                        width: w,
-                                        height: h,
-                                    })
-                                    .await
-                                    .ok();
-                            }
-                            Err(e) => {
-                                info!("video decode error for {}: {e:?}", nid.fmt_short());
-                            }
-                        }
-                    }
-                    anyhow::Ok(())
-                }
-                .await;
-                if let Err(e) = result {
-                    info!("video recv for {} stopped: {e:?}", nid.fmt_short());
-                }
-            });
 
             let fut = async {
                 audio_context.play_track_with_volume(track, volume).await?;
@@ -843,70 +935,11 @@ impl Worker {
             .clone()
             .context("missing audio context")?;
 
-        let video_frame_tx = self.video_frame_tx.clone();
-        let sharing_active = self.sharing_active;
-        let event_tx = self.event_tx.clone();
+        self.ensure_video_streams(node_id, conn.clone()).await;
 
         let audio_conn = conn.clone();
-        let recv_conn = conn.clone();
-        let send_conn = conn.clone();
-
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
-
-            if sharing_active {
-                let tx = video_frame_tx.clone();
-                let nid = node_id;
-                tokio::spawn(async move {
-                    let result: Result<()> = async {
-                        let (mut send, _) = send_conn.transport().open_bi().await?;
-                        let mut rx = tx.subscribe();
-                        loop {
-                            let frame = rx.recv().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                            transport::send_frame(&mut send, &frame).await?;
-                        }
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        info!("video send for {} stopped: {e:?}", nid.fmt_short());
-                    }
-                });
-            }
-
-            let recv_event_tx = event_tx.clone();
-            let nid = node_id;
-            tokio::spawn(async move {
-                let result: Result<()> = async {
-                    let (_, mut recv) = recv_conn.transport().accept_bi().await?;
-                    let mut decoder = VideoDecoder::new()?;
-                    loop {
-                        let Some(data) = transport::recv_frame(&mut recv).await? else {
-                            break;
-                        };
-                        match decoder.decode(&data) {
-                            Ok((rgba, w, h)) => {
-                                recv_event_tx
-                                    .send(Event::VideoFrame {
-                                        node_id: nid,
-                                        data: Arc::new(rgba),
-                                        width: w,
-                                        height: h,
-                                    })
-                                    .await
-                                    .ok();
-                            }
-                            Err(e) => {
-                                info!("video decode error for {}: {e:?}", nid.fmt_short());
-                            }
-                        }
-                    }
-                    anyhow::Ok(())
-                }
-                .await;
-                if let Err(e) = result {
-                    info!("video recv for {} stopped: {e:?}", nid.fmt_short());
-                }
-            });
 
             let fut = async {
                 let capture_track = audio_context.capture_track().await?;
@@ -934,6 +967,76 @@ impl Worker {
         Ok(())
     }
 
+    async fn ensure_video_streams(&mut self, node_id: NodeId, conn: RtcConnection) {
+        let entry = self
+            .video_peers
+            .entry(node_id)
+            .or_insert(VideoPeerTasks {
+                send: None,
+                recv: None,
+            });
+
+        let recv_dead = entry
+            .recv
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true);
+        if recv_dead {
+            let recv_conn = conn.clone();
+            let event_tx = self.event_tx.clone();
+            let callback = self.update_callback.clone();
+            let nid = node_id;
+            let handle = tokio::spawn(async move {
+                run_video_recv(recv_conn, nid, event_tx, callback).await;
+            });
+            entry.recv = Some(handle);
+        }
+
+        if self.sharing_active {
+            let send_dead = entry
+                .send
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(true);
+            if send_dead {
+                let send_conn = conn.clone();
+                let frame_tx = self.video_frame_tx.clone();
+                let keyframe_tx = self.keyframe_tx.clone();
+                let nid = node_id;
+                let handle = tokio::spawn(async move {
+                    run_video_send(send_conn, frame_tx, keyframe_tx, nid).await;
+                });
+                entry.send = Some(handle);
+            }
+        }
+    }
+
+    async fn attach_video_to_active_calls(&mut self) {
+        let active: Vec<_> = self
+            .active_calls
+            .iter()
+            .filter_map(|(id, info)| match info {
+                CallInfo::Active(conn) | CallInfo::Connecting(conn) => Some((*id, conn.clone())),
+                _ => None,
+            })
+            .collect();
+        for (node_id, conn) in active {
+            self.ensure_video_streams(node_id, conn).await;
+        }
+    }
+
+    fn remove_video_peer(&mut self, node_id: NodeId) {
+        if let Some(mut tasks) = self.video_peers.remove(&node_id) {
+            tasks.abort_all();
+        }
+    }
+
+    fn stop_all_video_send(&mut self) {
+        for tasks in self.video_peers.values_mut() {
+            tasks.abort_send();
+        }
+    }
+
     async fn query_rtts(&mut self) -> Result<()> {
         for (node_id, info) in &self.active_calls {
             if let Some(rtt) = match info {
@@ -948,46 +1051,43 @@ impl Worker {
 
     fn start_capture(&mut self) -> Result<()> {
         let config = self.video_config;
-        use callme::video::codec::VideoEncoder;
+        let target_w = config.resolution.width();
+        let target_h = config.resolution.height();
 
-        let tx = self.video_frame_tx.clone();
-
-        let handle = tokio::task::spawn_blocking(move || {
-            let capture_result: Result<()> = (|| {
-                let monitors = xcap::Monitor::all()
-                    .map_err(|e| anyhow::anyhow!("failed to enumerate monitors: {e}"))?;
-                let primary = monitors
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("no monitors found"))?;
-
-                let mut encoder = VideoEncoder::new(&config)?;
-                let interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
-
-                loop {
-                    let img = primary
-                        .capture_image()
-                        .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
-                    let rgba = img.into_raw();
-                    match encoder.encode(&rgba) {
-                        Ok(encoded) => {
-                            let _ = tx.send(Arc::new(encoded));
-                        }
-                        Err(e) => {
-                            info!("video encode error: {e:?}");
-                        }
-                    }
-                    std::thread::sleep(interval);
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (preview_tx, preview_rx) =
+            async_channel::bounded::<crate::screen_capture::PreviewUpdate>(4);
+        let event_tx = self.event_tx.clone();
+        let callback = self.update_callback.clone();
+        tokio::task::spawn(async move {
+            while let Ok(update) = preview_rx.recv().await {
+                let _ = event_tx
+                    .send(Event::PreviewFrame {
+                        width: update.width,
+                        height: update.height,
+                        data: update.data,
+                        actual_fps: update.actual_fps,
+                        encode_time_ms: update.encode_time_ms,
+                    })
+                    .await;
+                if let Some(cb) = &callback {
+                    cb();
                 }
-            })();
-            if let Err(e) = capture_result {
-                info!("screen capture stopped: {e:?}");
             }
         });
 
-        self.capture_task = Some(tokio::task::spawn(async move {
-            handle.await.ok();
-        }));
+        let thread = crate::screen_capture::start(
+            config,
+            stop_flag.clone(),
+            self.video_frame_tx.clone(),
+            preview_tx,
+            self.keyframe_tx.clone(),
+        );
+
+        self.capture_thread = Some(thread);
+        self.capture_stop_flag = Some(stop_flag);
         self.sharing_active = true;
+        info!("screen sharing started ({}x{} @ {}fps)", target_w, target_h, config.framerate);
         let event_tx = self.event_tx.clone();
         tokio::task::spawn(async move {
             let _ = event_tx.send(Event::SharingToggled(true)).await;
@@ -996,10 +1096,15 @@ impl Worker {
     }
 
     fn stop_capture(&mut self) {
-        if let Some(handle) = self.capture_task.take() {
-            handle.abort();
+        if let Some(flag) = &self.capture_stop_flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(handle) = self.capture_thread.take() {
+            let _ = handle.join();
+        }
+        self.capture_stop_flag = None;
         self.sharing_active = false;
+        self.stop_all_video_send();
         let event_tx = self.event_tx.clone();
         tokio::task::spawn(async move {
             let _ = event_tx.send(Event::SharingToggled(false)).await;
@@ -1021,6 +1126,7 @@ impl Worker {
             Command::ToggleSharing { enabled } => {
                 if enabled && !self.sharing_active {
                     self.start_capture()?;
+                    self.attach_video_to_active_calls().await;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture();
                 }
@@ -1035,14 +1141,7 @@ impl Worker {
 
                 let handler = self.handler.clone();
                 self.connect_tasks.spawn(async move {
-                    let fut = async {
-                        let conn = handler.connect(node_id).await?;
-                        let track = conn.recv_track().await?.ok_or_else(|| {
-                            anyhow!("connection closed without receiving a single track")
-                        })?;
-                        anyhow::Ok((conn, track))
-                    };
-                    (node_id, fut.await)
+                    (node_id, handler.connect(node_id).await)
                 });
             }
             Command::HandleIncoming { node_id, accept } => {
@@ -1060,8 +1159,12 @@ impl Worker {
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     self.volumes.remove(&node_id);
+                    self.remove_video_peer(node_id);
                     match state {
                         CallInfo::Calling => {}
+                        CallInfo::Connecting(conn) => {
+                            conn.transport().close(0u32.into(), b"bye");
+                        }
                         CallInfo::Active(conn) => {
                             conn.transport().close(0u32.into(), b"bye");
                         }
@@ -1076,4 +1179,136 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+async fn run_video_send(
+    conn: RtcConnection,
+    frame_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    keyframe_tx: tokio::sync::broadcast::Sender<()>,
+    node_id: NodeId,
+) {
+    let result: Result<()> = async {
+        info!("opening video stream to {}", node_id.fmt_short());
+        let (mut send, recv) = conn.transport().open_bi().await?;
+        tokio::spawn(drain_quic_recv(recv));
+        let mut rx = frame_tx.subscribe();
+        let _ = keyframe_tx.send(());
+        let mut sent = 0u64;
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    transport::send_frame(&mut send, &frame).await?;
+                    sent += 1;
+                    if sent == 1 {
+                        info!(
+                            "sent first video frame ({} bytes) to {}",
+                            frame.len(),
+                            node_id.fmt_short()
+                        );
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => return Err(anyhow::anyhow!("broadcast recv: {e}")),
+            }
+        }
+    }
+    .await;
+    if let Err(e) = result {
+        info!("video send to {} stopped: {e:?}", node_id.fmt_short());
+    }
+}
+
+async fn drain_quic_recv(mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static) {
+    let mut buf = [0u8; 256];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut recv, &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn run_video_recv(
+    conn: RtcConnection,
+    node_id: NodeId,
+    event_tx: async_channel::Sender<Event>,
+    callback: Option<UpdateCallback>,
+) {
+    loop {
+        let accept = conn.transport().accept_bi();
+        tokio::select! {
+            closed = conn.transport().closed() => {
+                match closed {
+                    iroh::endpoint::ConnectionError::LocallyClosed => {}
+                    err => info!(
+                        "connection closed while waiting for video from {}: {err:?}",
+                        node_id.fmt_short()
+                    ),
+                }
+                break;
+            }
+            stream = accept => {
+                match stream {
+                    Ok((_send, mut recv)) => {
+                        info!("receiving video from {}", node_id.fmt_short());
+                        if let Err(e) =
+                            recv_video_on_stream(&mut recv, node_id, &event_tx, callback.as_ref())
+                                .await
+                        {
+                            info!("video stream from {} ended: {e:?}", node_id.fmt_short());
+                        }
+                    }
+                    Err(e) => {
+                        info!("video accept_bi from {} failed: {e:?}", node_id.fmt_short());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn recv_video_on_stream(
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    node_id: NodeId,
+    event_tx: &async_channel::Sender<Event>,
+    callback: Option<&UpdateCallback>,
+) -> Result<()> {
+    let mut decoder = VideoDecoder::new()?;
+    let mut decoded = 0u64;
+    loop {
+        let Some(data) = transport::recv_frame(recv).await? else {
+            break;
+        };
+        match decoder.decode(&data) {
+            Ok((rgba, w, h)) => {
+                decoded += 1;
+                if decoded == 1 {
+                    info!(
+                        "decoded first video frame from {} ({}x{})",
+                        node_id.fmt_short(),
+                        w,
+                        h
+                    );
+                }
+                if event_tx
+                    .try_send(Event::VideoFrame {
+                        node_id,
+                        data: Arc::new(rgba),
+                        width: w,
+                        height: h,
+                    })
+                    .is_ok()
+                {
+                    if let Some(cb) = callback {
+                        cb();
+                    }
+                }
+            }
+            Err(e) => {
+                info!("video decode error for {}: {e:?}", node_id.fmt_short());
+            }
+        }
+    }
+    Ok(())
 }

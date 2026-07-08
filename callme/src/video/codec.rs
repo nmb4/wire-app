@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use openh264::decoder::Decoder;
-use openh264::encoder::Encoder;
+use openh264::encoder::{Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType};
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
+use openh264::OpenH264API;
 
 use crate::video::VideoConfig;
 
@@ -15,12 +16,27 @@ impl VideoEncoder {
     pub fn new(config: &VideoConfig) -> Result<Self> {
         let width = config.resolution.width();
         let height = config.resolution.height();
-        let encoder = Encoder::new().context("failed to create H.264 encoder")?;
-        Ok(Self {
+        let enc_config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .complexity(Complexity::Low)
+            .num_threads(0)
+            .max_frame_rate(FrameRate::from_hz(config.framerate as f32))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(config.framerate * 2))
+            .background_detection(false);
+        let encoder =
+            Encoder::with_api_config(OpenH264API::from_source(), enc_config)
+                .context("failed to create H.264 encoder")?;
+        let mut this = Self {
             encoder,
             width,
             height,
-        })
+        };
+        this.force_keyframe();
+        Ok(this)
+    }
+
+    pub fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
     }
 
     pub fn encode(&mut self, rgba_data: &[u8]) -> Result<Vec<u8>> {

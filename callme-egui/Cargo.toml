@@ -22,6 +22,7 @@ n0-future = "0.1.2"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "io-util"] }
 xcap = "0.4"
 image = "0.25"
+fast_image_resize = { version = "5.1", features = ["image"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "std"] }
 strum = { version = "0.27.1", features = ["derive"] }
@@ -55,6 +56,14 @@ eframe = { version = "0.31", default-features = false, features = [
     "glow",
 ] }
 arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+scopeguard = "1.2"
 
 [features]
 default = ["audio-processing"]
