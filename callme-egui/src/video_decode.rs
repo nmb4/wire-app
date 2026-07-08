@@ -197,6 +197,18 @@ where
                 if decode_errors <= 5 || decode_errors % 60 == 0 {
                     warn!("video decode error (#{decode_errors}): {e:?}");
                 }
+                // If the active decoder never produced a frame, fall back to the
+                // software decoder so the receiver still shows something.
+                if decoded == 0 && decode_errors >= 10 {
+                    warn!("decode backend produced no frames; falling back to OpenH264 software decoder");
+                    match OpenH264Decoder::try_new() {
+                        Ok(sw) => {
+                            decoder = Box::new(sw);
+                            decode_errors = 0;
+                        }
+                        Err(e2) => warn!("OpenH264 fallback also failed: {e2:?}"),
+                    }
+                }
             }
         }
 

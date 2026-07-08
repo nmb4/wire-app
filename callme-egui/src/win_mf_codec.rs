@@ -1133,6 +1133,7 @@ pub struct MfH264Decoder {
     width: u32,
     height: u32,
     configured: bool,
+    async_mode: bool,
     nv12_to_rgb: Option<MfColorConverter>,
     rgba: Vec<u8>,
 }
@@ -1159,6 +1160,18 @@ impl MfH264Decoder {
             )
         })?;
 
+        // Async hardware MFTs must be unlocked before any other call, and we run in
+        // low-latency mode so output is produced per input frame (no B-frame reordering).
+        let async_mode = is_async_transform(&transform).unwrap_or(false);
+        if async_mode {
+            unlock_async_transform(&transform)?;
+        }
+        if let Ok(attrs) = unsafe { transform.GetAttributes() } {
+            unsafe {
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
+        }
+
         let input_type = unsafe { MFCreateMediaType()? };
         unsafe {
             input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -1169,12 +1182,13 @@ impl MfH264Decoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
 
-        info!("MF H.264 decoder ready");
+        info!("MF H.264 decoder ready (async={async_mode})");
         Ok(Self {
             transform,
             width: 0,
             height: 0,
             configured: false,
+            async_mode,
             nv12_to_rgb: None,
             rgba: Vec::new(),
         })
@@ -1218,6 +1232,35 @@ impl MfH264Decoder {
         }
         if !self.configured {
             self.ensure_output_type()?;
+        }
+
+        if self.async_mode {
+            // Async MFTs surface output via an event rather than immediately. Wait for
+            // the "have output" signal (without draining it here; drain_output does that
+            // next). Doing this before reading output is what makes hardware decode work.
+            // Bounded so a reordering MFT can never hang this thread: the frame is still
+            // queued inside the decoder and will be emitted on the next call.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut got_output = false;
+            loop {
+                match read_transform_event(&self.transform, MF_EVENT_FLAG_NO_WAIT)? {
+                    Some(TransformEvent::HaveOutput) => {
+                        got_output = true;
+                        break;
+                    }
+                    Some(TransformEvent::NeedInput) => break,
+                    Some(TransformEvent::Other(_)) => continue,
+                    None => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            if !got_output {
+                warn!("MF decoder did not signal output within budget; continuing");
+            }
         }
 
         let packets = drain_output(&self.transform, 0)?;
