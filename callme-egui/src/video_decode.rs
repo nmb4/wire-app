@@ -1,13 +1,23 @@
-//! Dedicated decode thread. Uses OpenH264 to match the software encoder bitstream.
+//! Dedicated decode thread.
+//!
+//! On Windows we prefer the Media Foundation hardware (GPU) H.264 decoder and
+//! fall back to the OpenH264 software decoder otherwise.
+//!
+//! Frames are always decoded in the exact order they arrive. Dropping
+//! intermediate H.264 pictures (as the old "newest-wins" loop did) breaks the
+//! decoder's reference picture chain: a P-frame whose reference was skipped
+//! makes OpenH264 report "no decodable frame found", and while it is erroring
+//! the UI just holds the last good frame — that is the freeze. So we never skip
+//! frames here; when the decoder cannot keep up we backpressure the sender via
+//! QUIC flow control instead of discarding pictures.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use callme::video::codec::VideoDecoder;
 use tracing::{info, warn};
 
 pub struct DecodedFrame {
@@ -16,23 +26,68 @@ pub struct DecodedFrame {
     pub height: u32,
 }
 
-struct FrameDecoder(VideoDecoder);
+/// Common interface for the two decoder backends.
+///
+/// Not `Send`-bound: the decoder is created on the decode thread (just like the
+/// MF encoder), so it never crosses thread boundaries even though the underlying
+/// COM `IMFTransform` is `!Send`.
+trait FrameDecoder {
+    fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+}
 
-impl FrameDecoder {
+struct OpenH264Decoder(callme::video::codec::VideoDecoder);
+
+impl OpenH264Decoder {
     fn try_new() -> Result<Self> {
         info!("using OpenH264 software video decoder");
-        Ok(Self(VideoDecoder::new()?))
+        Ok(Self(callme::video::codec::VideoDecoder::new()?))
     }
+}
 
+impl FrameDecoder for OpenH264Decoder {
     fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
         self.0.decode(data)
     }
 }
 
-const PACKET_QUEUE_DEPTH: usize = 2;
+#[cfg(windows)]
+struct MfDecoder(crate::win_mf_codec::MfH264Decoder);
+
+#[cfg(windows)]
+impl MfDecoder {
+    fn try_new() -> Result<Self> {
+        info!("using MF hardware (GPU) H.264 decoder");
+        Ok(Self(crate::win_mf_codec::MfH264Decoder::try_new()?))
+    }
+}
+
+#[cfg(windows)]
+impl FrameDecoder for MfDecoder {
+    fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+        self.0.decode(data)
+    }
+}
+
+fn make_decoder() -> Result<Box<dyn FrameDecoder>> {
+    #[cfg(windows)]
+    {
+        match MfDecoder::try_new() {
+            Ok(decoder) => return Ok(Box::new(decoder)),
+            Err(e) => {
+                warn!("MF hardware H.264 decoder unavailable, falling back to OpenH264: {e:?}")
+            }
+        }
+    }
+    Ok(Box::new(OpenH264Decoder::try_new()?))
+}
+
+/// Bounded hand-off between the QUIC receive task and the decode thread. Small on
+/// purpose: under normal load the decoder keeps up, and if it ever falls behind we
+/// apply backpressure rather than drop pictures.
+const PACKET_QUEUE_DEPTH: usize = 3;
 
 pub struct VideoDecodeWorker {
-    packet_tx: mpsc::SyncSender<Vec<u8>>,
+    packet_tx: SyncSender<Vec<u8>>,
     submitted: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
@@ -66,15 +121,20 @@ impl VideoDecodeWorker {
         })
     }
 
+    /// Hand a frame to the decode thread.
+    ///
+    /// Uses a blocking send so the decode thread always receives a contiguous
+    /// sequence of H.264 pictures. If the decoder is slower than the network,
+    /// this blocks the caller (the QUIC receive task), which backpressures the
+    /// sender through QUIC flow control instead of dropping frames.
     pub fn submit(&self, data: Vec<u8>) {
-        match self.packet_tx.try_send(data) {
+        match self.packet_tx.send(data) {
             Ok(()) => {
                 self.submitted.fetch_add(1, Ordering::Relaxed);
             }
-            Err(TrySendError::Full(_)) => {
+            Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
-            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -96,7 +156,7 @@ fn run_decode_loop<F>(
 where
     F: Fn(DecodedFrame),
 {
-    let mut decoder = FrameDecoder::try_new()?;
+    let mut decoder = make_decoder()?;
     let mut decoded = 0u64;
     let mut decode_errors = 0u64;
     let mut window_decoded = 0u64;
@@ -107,16 +167,11 @@ where
     let mut last_dropped = 0u64;
 
     loop {
-        let mut data = match packet_rx.recv_timeout(Duration::from_millis(200)) {
+        let data = match packet_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(packet) => packet,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-
-        while let Ok(newer) = packet_rx.try_recv() {
-            dropped.fetch_add(1, Ordering::Relaxed);
-            data = newer;
-        }
 
         let packet_len = data.len() as u64;
         let decode_start = Instant::now();
