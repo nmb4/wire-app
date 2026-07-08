@@ -11,6 +11,9 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VariantClear, VT_BOOL, VARIANT};
 
+use std::sync::Arc;
+
+use crate::win_mf_d3d::{GpuNv12Frames, MfD3d};
 use crate::yuv_convert::{bgra_to_nv12, bgra_to_rgba, nv12_to_rgba};
 
 static MF_INIT: Once = Once::new();
@@ -176,10 +179,14 @@ fn configure_encoder(
     framerate: u32,
     bitrate: u32,
     async_mode: bool,
+    d3d: Option<&MfD3d>,
 ) -> Result<()> {
     // Async hardware encoders must be unlocked before SetInputType (and related calls).
     if async_mode {
         unlock_async_transform(transform)?;
+    }
+    if let Some(d3d) = d3d {
+        d3d.attach_to_transform(transform)?;
     }
 
     let output_type = create_video_media_type(
@@ -406,6 +413,8 @@ pub struct MfH264Encoder {
     hardware: bool,
     async_mode: bool,
     pending_input: u32,
+    d3d: Option<Arc<MfD3d>>,
+    gpu_nv12: Option<GpuNv12Frames>,
 }
 
 impl MfH264Encoder {
@@ -455,14 +464,12 @@ impl MfH264Encoder {
         prefer_hardware: bool,
     ) -> Result<Self> {
         let async_mode = is_async_transform(&transform)?;
-        let hardware = prefer_hardware
-            && unsafe {
-                transform
-                    .GetAttributes()
-                    .ok()
-                    .and_then(|attrs| attrs.GetUINT32(&MFT_ENUM_HARDWARE_URL_Attribute).ok())
-                    .is_some()
-            };
+        let hardware = prefer_hardware;
+        let d3d = if hardware {
+            Some(Arc::new(MfD3d::try_new()?))
+        } else {
+            None
+        };
 
         configure_encoder(
             &transform,
@@ -471,39 +478,41 @@ impl MfH264Encoder {
             config.framerate,
             bitrate,
             async_mode,
+            d3d.as_deref(),
         )?;
         force_keyframe(&transform);
 
-        let bgra_to_nv12 = match MfColorConverter::try_new(
-            MFVideoFormat_RGB32,
-            MFVideoFormat_NV12,
-            width,
-            height,
-        ) {
-            Ok(conv) => {
-                info!("MF color converter ready (BGRA -> NV12)");
-                Some(conv)
-            }
-            Err(e) => {
-                info!("MF color converter unavailable, using CPU YUV: {e:?}");
-                None
+        let bgra_to_nv12 = if hardware {
+            None
+        } else {
+            match MfColorConverter::try_new(
+                MFVideoFormat_RGB32,
+                MFVideoFormat_NV12,
+                width,
+                height,
+            ) {
+                Ok(conv) => {
+                    info!("MF color converter ready (BGRA -> NV12)");
+                    Some(conv)
+                }
+                Err(e) => {
+                    info!("MF color converter unavailable, using CPU YUV: {e:?}");
+                    None
+                }
             }
         };
 
-        info!(
-            "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={}, async={})",
-            width,
-            height,
-            config.framerate,
-            bitrate / 1000,
-            hardware,
-            async_mode
-        );
+        let gpu_nv12 = if hardware {
+            let d3d = d3d.as_ref().context("hardware encoder missing D3D context")?;
+            Some(GpuNv12Frames::new(d3d, width, height)?)
+        } else {
+            None
+        };
 
         let frame_duration = 10_000_000i64 / config.framerate.max(1) as i64;
         let nv12_len = nv12_buffer_size(width, height) as usize;
 
-        Ok(Self {
+        let mut encoder = Self {
             transform,
             width,
             height,
@@ -514,7 +523,29 @@ impl MfH264Encoder {
             hardware,
             async_mode,
             pending_input: if async_mode { 1 } else { 0 },
-        })
+            d3d,
+            gpu_nv12,
+        };
+
+        let probe = vec![0u8; (width * height * 4) as usize];
+        match encoder.encode_bgra(&probe) {
+            Ok(data) if !data.is_empty() => {
+                info!(
+                    "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={}, async={}, probe={} bytes)",
+                    width,
+                    height,
+                    config.framerate,
+                    bitrate / 1000,
+                    hardware,
+                    async_mode,
+                    data.len()
+                );
+                encoder.force_keyframe();
+                Ok(encoder)
+            }
+            Ok(_) => Err(anyhow!("MF encoder probe produced empty bitstream")),
+            Err(e) => Err(e.context("MF encoder probe encode failed")),
+        }
     }
 
     pub fn is_hardware(&self) -> bool {
@@ -567,7 +598,12 @@ impl MfH264Encoder {
                 nv12.len()
             ));
         }
-        let sample = create_media_sample(&nv12[..expected_len], timestamp, self.frame_duration)?;
+        let sample = if let (Some(d3d), Some(gpu)) = (&self.d3d, &self.gpu_nv12) {
+            gpu.upload(d3d, &nv12[..expected_len])?;
+            gpu.create_sample(timestamp, self.frame_duration)?
+        } else {
+            create_media_sample(&nv12[..expected_len], timestamp, self.frame_duration)?
+        };
         self.frame_index += 1;
 
         if self.async_mode {

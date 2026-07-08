@@ -57,7 +57,7 @@ impl FrameEncoder {
         match MfH264Encoder::try_new(config) {
             Ok(enc) => {
                 let kind = if enc.is_hardware() {
-                    "MF hardware"
+                    "MF hardware (GPU)"
                 } else {
                     "MF software"
                 };

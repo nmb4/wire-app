@@ -9,6 +9,8 @@ mod scap_capture;
 #[cfg(windows)]
 mod win_gdi_capture;
 #[cfg(windows)]
+mod win_mf_d3d;
+#[cfg(windows)]
 mod win_mf_codec;
 #[cfg(windows)]
 mod yuv_convert;
