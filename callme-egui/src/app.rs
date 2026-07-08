@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     str::FromStr,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -33,6 +34,39 @@ pub struct App {
     state: AppState,
 }
 
+/// A locally stored contact, identified by their stable callme node id.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Friend {
+    name: String,
+    node_id: String,
+}
+
+fn friends_path() -> Option<PathBuf> {
+    callme::net::config_dir().map(|dir| dir.join("friends.json"))
+}
+
+fn load_friends() -> Vec<Friend> {
+    if let Some(path) = friends_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(friends) = serde_json::from_str::<Vec<Friend>>(&contents) {
+                return friends;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn save_friends(friends: &[Friend]) {
+    if let Some(path) = friends_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(contents) = serde_json::to_string_pretty(friends) {
+            let _ = std::fs::write(&path, contents);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamViewMode {
     Normal,
@@ -64,6 +98,9 @@ struct AppState {
     selected_video_participant: Option<NodeId>,
     sharing_active: bool,
     preview: Option<PreviewState>,
+    friends: Vec<Friend>,
+    new_friend_name: String,
+    new_friend_id: String,
 }
 
 struct PreviewState {
@@ -166,6 +203,9 @@ impl App {
             selected_video_participant: None,
             sharing_active: false,
             preview: None,
+            friends: load_friends(),
+            new_friend_name: String::new(),
+            new_friend_id: String::new(),
         };
 
         let app = App {
@@ -366,6 +406,8 @@ impl AppState {
         ui.add_space(12.0);
         self.ui_dial_card(ui);
         ui.add_space(12.0);
+        self.ui_friends_card(ui);
+        ui.add_space(12.0);
         self.ui_calls_card(ui);
         ui.add_space(12.0);
         self.ui_sharing_card(ui);
@@ -381,7 +423,7 @@ impl AppState {
                     }
                 });
                 ui.label(
-                    RichText::new("Share this ID so others can call you.")
+                    RichText::new("This is your stable ID (saved locally). Share it so friends can add and call you.")
                         .small()
                         .weak(),
                 );
@@ -436,6 +478,97 @@ impl AppState {
                 }
             });
         });
+    }
+
+    fn ui_friends_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Friends", |ui| {
+            let mut call: Option<NodeId> = None;
+            let mut remove_idx: Option<usize> = None;
+
+            if self.friends.is_empty() {
+                ui.label(RichText::new("No friends yet. Add one below.").weak());
+            }
+            for (idx, friend) in self.friends.iter().enumerate() {
+                let parsed = NodeId::from_str(&friend.node_id);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(friend.name.clone());
+                        match &parsed {
+                            Ok(id) => {
+                                ui.label(fmt_node_id(&id.fmt_short()));
+                            }
+                            Err(_) => {
+                                ui.label(RichText::new("invalid id").small().weak());
+                            }
+                        };
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove_idx = Some(idx);
+                        }
+                        if ui.button("Call").clicked() {
+                            if let Ok(id) = parsed {
+                                call = Some(id);
+                            }
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+            }
+
+            if let Some(id) = call {
+                self.cmd(Command::Call { node_id: id });
+            }
+            if let Some(idx) = remove_idx {
+                self.friends.remove(idx);
+                save_friends(&self.friends);
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Add a friend").strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_friend_name)
+                    .hint_text("Name (optional)"),
+            );
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_friend_id)
+                        .hint_text("Their node ID"),
+                );
+                if response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    self.add_friend();
+                }
+            });
+            if ui.button("Add friend").clicked() {
+                self.add_friend();
+            }
+        });
+    }
+
+    fn add_friend(&mut self) {
+        let node_id = self.new_friend_id.trim().to_string();
+        if node_id.is_empty() {
+            return;
+        }
+        if NodeId::from_str(&node_id).is_err() {
+            return;
+        }
+        let name = if self.new_friend_name.trim().is_empty() {
+            node_id.clone()
+        } else {
+            self.new_friend_name.trim().to_string()
+        };
+        if !self.friends.iter().any(|f| f.node_id == node_id) {
+            self.friends.push(Friend {
+                name,
+                node_id: node_id.clone(),
+            });
+            save_friends(&self.friends);
+        }
+        self.new_friend_name.clear();
+        self.new_friend_id.clear();
     }
 
     fn ui_calls_card(&mut self, ui: &mut Ui) {

@@ -1052,6 +1052,8 @@ dependencies = [
  "n0-future",
  "rayon",
  "scopeguard",
+ "serde",
+ "serde_json",
  "spin_sleep",
  "strum 0.27.1",
  "tokio",
