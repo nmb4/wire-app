@@ -6,10 +6,12 @@ use anyhow::{anyhow, Context, Result};
 use callme::video::{default_bitrate, VideoConfig};
 use tracing::info;
 use windows::core::Interface;
+use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::Variant::{VariantClear, VT_BOOL, VARIANT};
 
-use crate::yuv_convert::{bgra_to_nv12, nv12_to_rgba};
+use crate::yuv_convert::{bgra_to_nv12, bgra_to_rgba, nv12_to_rgba};
 
 static MF_INIT: Once = Once::new();
 
@@ -128,7 +130,7 @@ fn configure_encoder(
     Ok(())
 }
 
-fn create_nv12_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
+fn create_media_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
     let buffer = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
     unsafe {
         let mut ptr = std::ptr::null_mut();
@@ -204,8 +206,84 @@ fn read_sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     }
 }
 
+fn configure_processor(
+    transform: &IMFTransform,
+    input: windows::core::GUID,
+    output: windows::core::GUID,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let output_type = create_video_media_type(output, width, height, 30, None)?;
+    let input_type = create_video_media_type(input, width, height, 30, None)?;
+    unsafe {
+        transform.SetOutputType(0, &output_type, 0)?;
+        transform.SetInputType(0, &input_type, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+    }
+    Ok(())
+}
+
 fn force_keyframe(transform: &IMFTransform) {
-    let _ = unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) };
+    unsafe {
+        if let Ok(api) = transform.cast::<ICodecAPI>() {
+            let mut variant = VARIANT::default();
+            let inner = &mut *variant.Anonymous.Anonymous;
+            inner.vt = VT_BOOL;
+            inner.Anonymous.boolVal = VARIANT_TRUE;
+            let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant);
+            let _ = VariantClear(&mut variant);
+        }
+    }
+}
+
+struct MfColorConverter {
+    transform: IMFTransform,
+    scratch: Vec<u8>,
+}
+
+impl MfColorConverter {
+    fn try_new(
+        input: windows::core::GUID,
+        output: windows::core::GUID,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let transform = find_transform(
+            MFT_CATEGORY_VIDEO_PROCESSOR,
+            input,
+            output,
+            false,
+        )?;
+        configure_processor(&transform, input, output, width, height)?;
+        let scratch_len = if output == MFVideoFormat_NV12 {
+            (width * height * 3 / 2) as usize
+        } else {
+            (width * height * 4) as usize
+        };
+        Ok(Self {
+            transform,
+            scratch: vec![0u8; scratch_len],
+        })
+    }
+
+    fn convert(&mut self, input: &[u8], timestamp: i64) -> Result<&[u8]> {
+        let sample = create_media_sample(input, timestamp)?;
+        unsafe {
+            self.transform.ProcessInput(0, &sample, 0)?;
+        }
+        let packets = drain_output(&self.transform)?;
+        let packet = packets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("MF color converter produced no output"))?;
+        if packet.len() > self.scratch.len() {
+            self.scratch.resize(packet.len(), 0);
+        }
+        self.scratch[..packet.len()].copy_from_slice(&packet);
+        Ok(&self.scratch[..packet.len()])
+    }
 }
 
 pub struct MfH264Encoder {
@@ -213,6 +291,7 @@ pub struct MfH264Encoder {
     width: u32,
     height: u32,
     nv12: Vec<u8>,
+    bgra_to_nv12: Option<MfColorConverter>,
     frame_index: i64,
     hardware: bool,
 }
@@ -242,6 +321,22 @@ impl MfH264Encoder {
         configure_encoder(&transform, width, height, config.framerate, bitrate)?;
         force_keyframe(&transform);
 
+        let bgra_to_nv12 = match MfColorConverter::try_new(
+            MFVideoFormat_RGB32,
+            MFVideoFormat_NV12,
+            width,
+            height,
+        ) {
+            Ok(conv) => {
+                info!("MF color converter ready (BGRA -> NV12)");
+                Some(conv)
+            }
+            Err(e) => {
+                info!("MF color converter unavailable, using CPU YUV: {e:?}");
+                None
+            }
+        };
+
         info!(
             "MF H.264 encoder ready ({}x{} @ {}fps, {} kbps, hw={})",
             width,
@@ -256,6 +351,7 @@ impl MfH264Encoder {
             width,
             height,
             nv12: vec![0u8; (width * height * 3 / 2) as usize],
+            bgra_to_nv12,
             frame_index: 0,
             hardware,
         })
@@ -270,8 +366,13 @@ impl MfH264Encoder {
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
-        bgra_to_nv12(bgra, self.width, self.height, &mut self.nv12);
-        let sample = create_nv12_sample(&self.nv12, self.frame_index)?;
+        let nv12 = if let Some(conv) = &mut self.bgra_to_nv12 {
+            conv.convert(bgra, self.frame_index)?
+        } else {
+            bgra_to_nv12(bgra, self.width, self.height, &mut self.nv12);
+            &self.nv12
+        };
+        let sample = create_media_sample(nv12, self.frame_index)?;
         self.frame_index += 1;
 
         unsafe {
@@ -294,6 +395,7 @@ pub struct MfH264Decoder {
     width: u32,
     height: u32,
     configured: bool,
+    nv12_to_rgb: Option<MfColorConverter>,
     rgba: Vec<u8>,
 }
 
@@ -323,6 +425,7 @@ impl MfH264Decoder {
             width: 0,
             height: 0,
             configured: false,
+            nv12_to_rgb: None,
             rgba: Vec::new(),
         })
     }
@@ -341,6 +444,21 @@ impl MfH264Decoder {
         self.width = width;
         self.height = height;
         self.configured = true;
+        self.nv12_to_rgb = match MfColorConverter::try_new(
+            MFVideoFormat_NV12,
+            MFVideoFormat_RGB32,
+            width,
+            height,
+        ) {
+            Ok(conv) => {
+                info!("MF color converter ready (NV12 -> RGBA)");
+                Some(conv)
+            }
+            Err(e) => {
+                info!("MF NV12->RGB converter unavailable, using CPU YUV: {e:?}");
+                None
+            }
+        };
         info!("MF decoder output negotiated: {width}x{height}");
         Ok(())
     }
@@ -366,7 +484,12 @@ impl MfH264Decoder {
         if self.rgba.len() != len {
             self.rgba.resize(len, 0);
         }
-        nv12_to_rgba(&nv12, w, h, &mut self.rgba);
+        if let Some(conv) = &mut self.nv12_to_rgb {
+            let bgra = conv.convert(&nv12, 0)?;
+            bgra_to_rgba(bgra, &mut self.rgba);
+        } else {
+            nv12_to_rgba(&nv12, w, h, &mut self.rgba);
+        }
         let mut out = Vec::with_capacity(len);
         std::mem::swap(&mut self.rgba, &mut out);
         self.rgba.resize(len, 0);

@@ -65,8 +65,11 @@ windows = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ] }
 scopeguard = "1.2"
+rayon = "1.12"
 
 [features]
 default = ["audio-processing"]

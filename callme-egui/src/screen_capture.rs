@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -221,8 +221,10 @@ fn run_capture_loop(
         let frame_start = Instant::now();
 
         let bgra = capture_frame(&mut source, target_w, target_h)?;
-        if frame_tx.send(bgra).is_err() {
-            break;
+        match frame_tx.try_send(bgra) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => break,
         }
 
         let elapsed = frame_start.elapsed();

@@ -1,3 +1,6 @@
+#[cfg(windows)]
+use rayon::prelude::*;
+
 /// Fast BGRA8 -> NV12 conversion for hardware encoders.
 pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let w = width as usize;
@@ -9,35 +12,76 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
 
     let (y_plane, uv_plane) = out.split_at_mut(y_size);
 
-    for y in 0..h {
-        let row = &bgra[y * w * 4..(y + 1) * w * 4];
-        let y_row = &mut y_plane[y * w..(y + 1) * w];
-        for (x, y_out) in y_row.iter_mut().enumerate() {
-            let i = x * 4;
-            let b = row[i] as i32;
-            let g = row[i + 1] as i32;
-            let r = row[i + 2] as i32;
-            *y_out = ((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 255) as u8;
-        }
+    #[cfg(windows)]
+    {
+        y_plane
+            .par_chunks_mut(w)
+            .enumerate()
+            .for_each(|(y, y_row)| {
+                let row = &bgra[y * w * 4..(y + 1) * w * 4];
+                for (x, y_out) in y_row.iter_mut().enumerate() {
+                    let i = x * 4;
+                    let b = row[i] as i32;
+                    let g = row[i + 1] as i32;
+                    let r = row[i + 2] as i32;
+                    *y_out = ((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 255) as u8;
+                }
+            });
+
+        uv_plane
+            .par_chunks_mut(w)
+            .enumerate()
+            .for_each(|(y_half, uv_row)| {
+                let y = y_half * 2;
+                let row0 = &bgra[y * w * 4..(y + 1) * w * 4];
+                let row1 = if y + 1 < h {
+                    &bgra[(y + 1) * w * 4..(y + 2) * w * 4]
+                } else {
+                    row0
+                };
+                for x in (0..w).step_by(2) {
+                    let i0 = x * 4;
+                    let i1 = i0 + 4;
+                    let (r, g, b) = avg_rgb(row0, i0, row1, i1);
+                    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8).clamp(0, 255) as u8;
+                    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8).clamp(0, 255) as u8;
+                    uv_row[x] = u;
+                    uv_row[x + 1] = v;
+                }
+            });
     }
 
-    for y in (0..h).step_by(2) {
-        let row0 = &bgra[y * w * 4..(y + 1) * w * 4];
-        let row1 = if y + 1 < h {
-            &bgra[(y + 1) * w * 4..(y + 2) * w * 4]
-        } else {
-            row0
-        };
-        let uv_row = &mut uv_plane[(y / 2) * w..(y / 2 + 1) * w];
-        for x in (0..w).step_by(2) {
-            let i0 = x * 4;
-            let i1 = i0 + 4;
-            let (r, g, b) = avg_rgb(row0, i0, row1, i1);
-            let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8).clamp(0, 255) as u8;
-            let v = ((112 * r - 94 * g - 18 * b + 128) >> 8).clamp(0, 255) as u8;
-            let uv_i = x;
-            uv_row[uv_i] = u;
-            uv_row[uv_i + 1] = v;
+    #[cfg(not(windows))]
+    {
+        for y in 0..h {
+            let row = &bgra[y * w * 4..(y + 1) * w * 4];
+            let y_row = &mut y_plane[y * w..(y + 1) * w];
+            for (x, y_out) in y_row.iter_mut().enumerate() {
+                let i = x * 4;
+                let b = row[i] as i32;
+                let g = row[i + 1] as i32;
+                let r = row[i + 2] as i32;
+                *y_out = ((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 255) as u8;
+            }
+        }
+
+        for y in (0..h).step_by(2) {
+            let row0 = &bgra[y * w * 4..(y + 1) * w * 4];
+            let row1 = if y + 1 < h {
+                &bgra[(y + 1) * w * 4..(y + 2) * w * 4]
+            } else {
+                row0
+            };
+            let uv_row = &mut uv_plane[(y / 2) * w..(y / 2 + 1) * w];
+            for x in (0..w).step_by(2) {
+                let i0 = x * 4;
+                let i1 = i0 + 4;
+                let (r, g, b) = avg_rgb(row0, i0, row1, i1);
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8).clamp(0, 255) as u8;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8).clamp(0, 255) as u8;
+                uv_row[x] = u;
+                uv_row[x + 1] = v;
+            }
         }
     }
 }
@@ -47,6 +91,31 @@ fn avg_rgb(row0: &[u8], i0: usize, row1: &[u8], i1: usize) -> (i32, i32, i32) {
     let g = (row0[i0 + 1] as i32 + row0[i1 + 1] as i32 + row1[i0 + 1] as i32 + row1[i1 + 1] as i32) / 4;
     let b = (row0[i0] as i32 + row0[i1] as i32 + row1[i0] as i32 + row1[i1] as i32) / 4;
     (r, g, b)
+}
+
+/// BGRA8 -> RGBA8 for display (MF RGB32 output).
+pub fn bgra_to_rgba(bgra: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(bgra.len(), out.len());
+    #[cfg(windows)]
+    {
+        bgra.par_chunks_exact(4)
+            .zip(out.par_chunks_exact_mut(4))
+            .for_each(|(src, dst)| {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = 255;
+            });
+    }
+    #[cfg(not(windows))]
+    {
+        for (src, dst) in bgra.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 255;
+        }
+    }
 }
 
 /// NV12 -> RGBA8 for display. Processes 2x2 blocks to reduce UV fetches.
