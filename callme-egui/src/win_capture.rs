@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _, Result};
 use fast_image_resize as fr;
 use fr::images::Image;
-use fr::{PixelType, Resizer};
+use fr::{PixelType, ResizeAlg, ResizeOptions, Resizer};
 use tracing::{info, warn};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -35,6 +35,7 @@ pub struct WindowsCapturer {
     src_h: u32,
     needs_resize: bool,
     resizer: Resizer,
+    resize_options: ResizeOptions,
     dst: Image<'static>,
 }
 
@@ -76,6 +77,9 @@ impl WindowsCapturer {
             pending: Some(first),
             needs_resize,
             resizer: Resizer::new(),
+            resize_options: ResizeOptions::new()
+                .resize_alg(ResizeAlg::Nearest)
+                .use_alpha(false),
             dst: Image::new(target_w, target_h, PixelType::U8x4),
         })
     }
@@ -108,7 +112,7 @@ impl WindowsCapturer {
         let src_img = Image::from_vec_u8(frame.width, frame.height, frame.data, PixelType::U8x4)
             .map_err(|e| anyhow!("invalid direct WGC frame buffer: {e}"))?;
         self.resizer
-            .resize(&src_img, &mut self.dst, None)
+            .resize(&src_img, &mut self.dst, Some(&self.resize_options))
             .map_err(|e| anyhow!("direct WGC resize failed: {e}"))?;
         Ok(self.dst.buffer().to_vec())
     }
