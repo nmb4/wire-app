@@ -1,4 +1,4 @@
-//! Dedicated decode thread with hardware acceleration on Windows.
+//! Dedicated decode thread. Uses OpenH264 to match the software encoder bitstream.
 
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
@@ -7,10 +7,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use callme::video::codec::VideoDecoder;
-use tracing::info;
-
-#[cfg(windows)]
-use crate::win_mf_codec::MfH264Decoder;
+use tracing::{info, warn};
 
 pub struct DecodedFrame {
     pub data: Arc<Vec<u8>>,
@@ -18,33 +15,16 @@ pub struct DecodedFrame {
     pub height: u32,
 }
 
-enum FrameDecoder {
-    #[cfg(windows)]
-    MediaFoundation(MfH264Decoder),
-    OpenH264(VideoDecoder),
-}
+struct FrameDecoder(VideoDecoder);
 
 impl FrameDecoder {
     fn try_new() -> Result<Self> {
-        #[cfg(windows)]
-        {
-            match MfH264Decoder::try_new() {
-                Ok(dec) => {
-                    info!("using MF hardware video decoder");
-                    return Ok(Self::MediaFoundation(dec));
-                }
-                Err(e) => info!("MF decoder unavailable, using OpenH264: {e:?}"),
-            }
-        }
-        Ok(Self::OpenH264(VideoDecoder::new()?))
+        info!("using OpenH264 software video decoder");
+        Ok(Self(VideoDecoder::new()?))
     }
 
     fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-        match self {
-            #[cfg(windows)]
-            Self::MediaFoundation(dec) => dec.decode(data),
-            Self::OpenH264(dec) => dec.decode(data),
-        }
+        self.0.decode(data)
     }
 }
 
@@ -95,6 +75,7 @@ where
 {
     let mut decoder = FrameDecoder::try_new()?;
     let mut decoded = 0u64;
+    let mut decode_errors = 0u64;
 
     loop {
         let mut data = match packet_rx.recv_timeout(Duration::from_millis(200)) {
@@ -110,6 +91,7 @@ where
         match decoder.decode(&data) {
             Ok((rgba, w, h)) => {
                 decoded += 1;
+                decode_errors = 0;
                 if decoded == 1 {
                     info!("decoded first video frame ({w}x{h})");
                 }
@@ -120,7 +102,10 @@ where
                 });
             }
             Err(e) => {
-                info!("video decode error: {e:?}");
+                decode_errors += 1;
+                if decode_errors <= 5 || decode_errors % 60 == 0 {
+                    warn!("video decode error (#{decode_errors}): {e:?}");
+                }
             }
         }
     }

@@ -14,9 +14,11 @@ fn init_logging() {
         EnvFilter::new("info,callme=info,callme_egui=info")
     });
 
-    let log_path = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|root| PathBuf::from(root).join("callme").join("callme.log"));
+    let log_path = std::env::var("LOCALAPPDATA").ok().map(|root| {
+        PathBuf::from(root)
+            .join("callme")
+            .join(format!("callme-{}.log", std::process::id()))
+    });
 
     if let Some(path) = log_path {
         if let Some(parent) = path.parent() {
