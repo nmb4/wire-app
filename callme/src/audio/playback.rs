@@ -58,6 +58,7 @@ impl AudioSource for GainSource {
 #[derive(derive_more::Debug, Clone)]
 pub struct AudioPlayback {
     source_sender: mpsc::Sender<Box<dyn AudioSource>>,
+    deafened: Arc<AtomicBool>,
 }
 
 impl AudioPlayback {
@@ -73,6 +74,8 @@ impl AudioPlayback {
         let (producer, consumer) = ringbuf::HeapRb::<f32>::new(buffer_size).split();
 
         let (source_sender, source_receiver) = mpsc::channel(16);
+        let deafened = Arc::new(AtomicBool::new(false));
+        let deafened_for_thread = deafened.clone();
         let (init_tx, init_rx) = oneshot::channel();
 
         std::thread::spawn(move || {
@@ -92,12 +95,15 @@ impl AudioPlayback {
                     return;
                 }
             };
-            playback_loop(producer, source_receiver);
+            playback_loop(producer, source_receiver, deafened_for_thread);
             drop(stream);
         });
 
         init_rx.await??;
-        Ok(Self { source_sender })
+        Ok(Self {
+            source_sender,
+            deafened,
+        })
     }
 
     pub async fn add_track(&self, track: MediaTrack) -> Result<()> {
@@ -125,11 +131,16 @@ impl AudioPlayback {
             .map_err(|_| anyhow!("failed to add audio source: playback loop dead"))?;
         Ok(())
     }
+
+    pub fn set_deafened(&self, deafened: bool) {
+        self.deafened.store(deafened, Ordering::Relaxed);
+    }
 }
 
 fn playback_loop(
     mut producer: Producer<f32>,
     mut source_receiver: mpsc::Receiver<Box<dyn AudioSource>>,
+    deafened: Arc<AtomicBool>,
 ) {
     let span = tracing::span!(Level::TRACE, "playback-loop");
     let _guard = span.enter();
@@ -190,6 +201,10 @@ fn playback_loop(
                 false
             }
         });
+
+        if deafened.load(Ordering::Relaxed) {
+            out_buf.fill(0.0);
+        }
 
         let len = producer.push_slice(&out_buf[..]);
         if len < out_buf.len() {

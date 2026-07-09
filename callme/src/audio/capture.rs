@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     ops::ControlFlow,
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         Arc,
     },
     time::{Duration, Instant},
@@ -41,6 +41,7 @@ pub trait AudioSink: Send + 'static {
 pub struct AudioCapture {
     sink_sender: mpsc::Sender<Box<dyn AudioSink>>,
     quality: AudioQuality,
+    muted: Arc<AtomicBool>,
 }
 
 impl AudioCapture {
@@ -63,6 +64,8 @@ impl AudioCapture {
 
         // a channel to pass new sinks to the the audio thread.
         let (sink_sender, sink_receiver) = mpsc::channel(16);
+        let muted = Arc::new(AtomicBool::new(false));
+        let muted_for_thread = muted.clone();
 
         let (init_tx, init_rx) = oneshot::channel();
         std::thread::spawn(move || {
@@ -84,13 +87,14 @@ impl AudioCapture {
                     return;
                 }
             };
-            capture_loop(consumer, sink_receiver);
+            capture_loop(consumer, sink_receiver, muted_for_thread);
             drop(stream);
         });
         init_rx.await??;
         let handle = AudioCapture {
             sink_sender,
             quality,
+            muted,
         };
         Ok(handle)
     }
@@ -109,6 +113,10 @@ impl AudioCapture {
         let (encoder, track) = MediaTrackOpusEncoder::new(16, audio_format, self.quality)?;
         self.add_sink(encoder).await?;
         Ok(track)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, AtomicOrdering::Relaxed);
     }
 }
 
@@ -279,6 +287,7 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
+    muted: Arc<AtomicBool>,
 ) {
     let span = tracing::span!(Level::TRACE, "capture-loop");
     let _guard = span.enter();
@@ -308,6 +317,9 @@ fn capture_loop(
             }
         }
         let count = consumer.pop_slice(&mut buf);
+        if muted.load(AtomicOrdering::Relaxed) {
+            buf[..count].fill(0.0);
+        }
 
         sinks.retain_mut(|sink| match sink.tick(&buf[..count]) {
             Ok(ControlFlow::Continue(())) => true,

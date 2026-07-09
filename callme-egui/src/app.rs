@@ -18,12 +18,13 @@ use callme::{
 };
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
+use egui_phosphor::regular as ph;
 use iroh::{endpoint::VarInt, protocol::Router, Endpoint, KeyParsingError, NodeId};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::video_decode::VideoDecodeWorker;
+use crate::{theme::*, video_decode::VideoDecodeWorker};
 
 const DEFAULT: &str = "<default>";
 const VIDEO_SEND_LATENCY_BUDGET: Duration = Duration::from_millis(150);
@@ -101,6 +102,9 @@ struct AppState {
     friends: Vec<Friend>,
     new_friend_name: String,
     new_friend_id: String,
+    theme: Theme,
+    muted: bool,
+    deafened: bool,
 }
 
 struct PreviewState {
@@ -206,17 +210,33 @@ impl App {
             friends: load_friends(),
             new_friend_name: String::new(),
             new_friend_id: String::new(),
+            theme: Theme::Amber,
+            muted: false,
+            deafened: false,
         };
 
         let app = App {
             state,
             is_first_update: true,
         };
-        eframe::run_native("callme", options, Box::new(|_cc| Ok(Box::new(app))))
+        eframe::run_native(
+            "callme",
+            options,
+            Box::new(|cc| {
+                setup_fonts(&cc.egui_ctx);
+                Ok(Box::new(app))
+            }),
+        )
     }
 }
 impl AppState {
     fn update(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+            self.theme = self.theme.next();
+        }
+        let pal = Palette::for_theme(self.theme);
+        ctx.set_visuals(visuals_for(&pal));
+
         self.process_events();
         self.handle_view_mode_input(ctx);
 
@@ -226,21 +246,19 @@ impl AppState {
             self.ui_top_bar(ctx);
         }
 
-        if !immersive {
-            egui::SidePanel::left("sidebar")
-                .resizable(true)
-                .default_width(300.0)
-                .frame(Frame::side_top_panel(&ctx.style()).inner_margin(12.0))
-                .show(ctx, |ui| self.ui_sidebar(ui));
-        }
-
         egui::CentralPanel::default()
             .frame(if immersive {
                 Frame::NONE
             } else {
-                Frame::central_panel(&ctx.style()).inner_margin(12.0)
+                Frame::central_panel(&ctx.style())
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(20, 14))
             })
-            .show(ctx, |ui| self.ui_stream_panel(ui, ctx));
+            .show(ctx, |ui| self.ui_stage(ui, ctx, &pal));
+
+        if !self.stream_view_mode.is_fullscreen() {
+            self.ui_dock(ctx, &pal);
+        }
 
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
@@ -358,12 +376,24 @@ impl AppState {
     }
 
     fn ui_top_bar(&mut self, ctx: &egui::Context) {
+        let pal = Palette::for_theme(self.theme);
         egui::TopBottomPanel::top("top_bar")
-            .frame(Frame::new().inner_margin(egui::Margin::symmetric(16, 10)))
+            .frame(
+                Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Callme").strong().size(18.0));
-                    ui.separator();
+                    ui.label(
+                        RichText::new("CALLME")
+                            .family(kh_family())
+                            .color(pal.text)
+                            .size(16.0),
+                    );
+                    ui.add_space(10.0);
+                    v_sep(ui, pal.line);
+                    ui.add_space(10.0);
                     if let Some(node_id) = &self.our_node_id {
                         ui.label("Node");
                         ui.label(fmt_node_id(&node_id.fmt_short()));
@@ -372,8 +402,7 @@ impl AppState {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .button("Settings")
+                        if action_button(ui, &pal, "Settings", ButtonTone::Secondary)
                             .on_hover_text("Audio and screen sharing options")
                             .clicked()
                         {
@@ -396,7 +425,319 @@ impl AppState {
                                     .color(Color32::from_rgb(120, 170, 255)),
                             );
                         }
+                        ui.add_space(8.0);
+                        if theme_badge(ui, &pal, self.theme.name()).clicked() {
+                            self.theme = self.theme.next();
+                        }
                     });
+                });
+            });
+    }
+
+    fn ui_dock(&mut self, ctx: &egui::Context, pal: &Palette) {
+        egui::TopBottomPanel::bottom("call_dock")
+            .exact_height(86.0)
+            .frame(
+                Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(20, 8)),
+            )
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter()
+                    .hline(rect.x_range(), rect.top() - 8.0, Stroke::new(1.0, pal.line));
+                let active_calls = self
+                    .calls
+                    .values()
+                    .filter(|state| matches!(state, CallState::Active))
+                    .count();
+
+                let control_width = 58.0;
+                let controls_width =
+                    control_width * 4.0 + if active_calls > 0 { 100.0 } else { 0.0 };
+                let controls_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - controls_width, rect.top()),
+                    Vec2::new(controls_width, rect.height()),
+                );
+                let status_rect = egui::Rect::from_min_max(
+                    rect.left_top(),
+                    egui::pos2(
+                        (controls_rect.left() - 12.0).max(rect.left()),
+                        rect.bottom(),
+                    ),
+                );
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(if active_calls == 1 {
+                                "1 peer in session".to_owned()
+                            } else {
+                                format!("{active_calls} peers in session")
+                            })
+                            .color(pal.text2)
+                            .size(13.0),
+                        );
+                        ui.horizontal(|ui| {
+                            dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
+                            ui.label(
+                                RichText::new(if active_calls > 0 {
+                                    "direct connection"
+                                } else {
+                                    "ready to connect"
+                                })
+                                .color(pal.dim)
+                                .size(12.0),
+                            );
+                            if self.sharing_active {
+                                ui.add_space(8.0);
+                                dot(ui, pal.accent, 5.0);
+                                ui.label(RichText::new("sharing").color(pal.dim).size(12.0));
+                            }
+                        });
+                    });
+                });
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if active_calls > 0 {
+                            ui.add_space(4.0);
+                        }
+                        if dock_control(
+                            ui,
+                            pal,
+                            if self.muted {
+                                ph::MICROPHONE_SLASH
+                            } else {
+                                ph::MICROPHONE
+                            },
+                            if self.muted { "Muted" } else { "Mute" },
+                            self.muted,
+                        )
+                        .on_hover_text("Mute or unmute your microphone")
+                        .clicked()
+                        {
+                            self.muted = !self.muted;
+                            self.cmd(Command::SetMuted { muted: self.muted });
+                        }
+                        ui.add_space(2.0);
+                        if dock_control(
+                            ui,
+                            pal,
+                            ph::HEADPHONES,
+                            if self.deafened { "Deafened" } else { "Deafen" },
+                            self.deafened,
+                        )
+                        .on_hover_text("Silence or restore all incoming call audio")
+                        .clicked()
+                        {
+                            self.deafened = !self.deafened;
+                            self.cmd(Command::SetDeafened {
+                                deafened: self.deafened,
+                            });
+                        }
+                        ui.add_space(2.0);
+                        if dock_control(
+                            ui,
+                            pal,
+                            ph::MONITOR,
+                            if self.sharing_active {
+                                "Stop share"
+                            } else {
+                                "Share"
+                            },
+                            self.sharing_active,
+                        )
+                        .on_hover_text(if self.sharing_active {
+                            "Stop sharing"
+                        } else {
+                            "Share your screen"
+                        })
+                        .clicked()
+                        {
+                            self.cmd(Command::ToggleSharing {
+                                enabled: !self.sharing_active,
+                            });
+                        }
+                        ui.add_space(2.0);
+                        if dock_control(ui, pal, ph::GEAR_SIX, "Settings", false)
+                            .on_hover_text("Audio and screen sharing settings")
+                            .clicked()
+                        {
+                            self.show_settings = true;
+                        }
+                        if active_calls > 0 {
+                            ui.add_space(8.0);
+                            v_sep(ui, pal.line);
+                            ui.add_space(8.0);
+                            if leave_button(ui, pal).clicked() {
+                                let peers: Vec<_> = self.calls.keys().copied().collect();
+                                for node_id in peers {
+                                    self.cmd(Command::Abort { node_id });
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_stage(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
+        if self.stream_view_mode != StreamViewMode::Normal {
+            self.ui_stream_panel(ui, ctx);
+            return;
+        }
+
+        let has_live_visual = self.sharing_active
+            || self
+                .video_frames
+                .values()
+                .any(|frame| frame.width > 0 && frame.height > 0 && !frame.data.is_empty());
+        let stage_height = if has_live_visual {
+            (ui.available_height() * 0.45).clamp(160.0, 380.0)
+        } else {
+            (ui.available_height() * 0.25).clamp(120.0, 150.0)
+        };
+        let stage_width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(stage_width, stage_height),
+            Layout::top_down(Align::Min),
+            |ui| self.ui_stream_panel(ui, ctx),
+        );
+        ui.add_space(14.0);
+
+        self.ui_participant_strip(ui, pal);
+        ui.add_space(14.0);
+
+        ui.columns(2, |columns| {
+            self.ui_identity_card(&mut columns[0]);
+            columns[0].add_space(10.0);
+            self.ui_dial_card(&mut columns[0]);
+            self.ui_friends_card(&mut columns[1]);
+        });
+    }
+
+    fn ui_participant_strip(&mut self, ui: &mut Ui, pal: &Palette) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("PEERS")
+                    .family(kh_family())
+                    .color(pal.dim)
+                    .size(12.0),
+            );
+            ui.label(RichText::new("live call status").color(pal.dim2).size(12.0));
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if self.calls.is_empty() {
+                self.ui_empty_peer_tile(ui, pal);
+            } else {
+                let calls: Vec<_> = self
+                    .calls
+                    .iter()
+                    .map(|(node_id, state)| (*node_id, *state))
+                    .collect();
+                for (node_id, state) in calls {
+                    self.ui_peer_tile(ui, pal, node_id, state);
+                    ui.add_space(10.0);
+                }
+            }
+        });
+    }
+
+    fn ui_empty_peer_tile(&self, ui: &mut Ui, pal: &Palette) {
+        Frame::new()
+            .fill(pal.panel)
+            .stroke(Stroke::new(1.0, pal.line))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(220.0);
+                ui.label(
+                    RichText::new("NO ACTIVE PEERS")
+                        .family(kh_family())
+                        .color(pal.text2)
+                        .size(12.0),
+                );
+                ui.label(
+                    RichText::new("Call a saved contact or paste a node ID below.")
+                        .color(pal.dim)
+                        .size(12.0),
+                );
+            });
+    }
+
+    fn ui_peer_tile(&mut self, ui: &mut Ui, pal: &Palette, node_id: NodeId, state: CallState) {
+        Frame::new()
+            .fill(pal.panel)
+            .stroke(Stroke::new(
+                1.0,
+                if matches!(state, CallState::Active) {
+                    pal.line_br
+                } else {
+                    pal.line
+                },
+            ))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(208.0);
+                ui.horizontal(|ui| {
+                    circle_avatar(ui, pal, "P", 28.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            fmt_node_id(&node_id.fmt_short())
+                                .color(pal.text)
+                                .monospace()
+                                .size(12.0),
+                        );
+                        let (label, color) = match state {
+                            CallState::Incoming => ("incoming", pal.accent),
+                            CallState::Calling => ("connecting", pal.accent),
+                            CallState::Active => ("connected", pal.ok),
+                            CallState::Aborted => ("ended", pal.err),
+                        };
+                        ui.label(RichText::new(label).color(color).size(12.0));
+                    });
+                });
+                ui.add_space(7.0);
+                ui.horizontal(|ui| match state {
+                    CallState::Incoming => {
+                        if action_button(ui, pal, "Accept", ButtonTone::Primary).clicked() {
+                            self.cmd(Command::HandleIncoming {
+                                node_id,
+                                accept: true,
+                            });
+                        }
+                        if action_button(ui, pal, "Decline", ButtonTone::Danger).clicked() {
+                            self.cmd(Command::HandleIncoming {
+                                node_id,
+                                accept: false,
+                            });
+                        }
+                    }
+                    CallState::Calling | CallState::Active => {
+                        if let Some(rtt) = self.rtts.get(&node_id) {
+                            ui.label(rtt_label(*rtt).color(pal.dim).monospace().size(11.0));
+                        }
+                        if let Some(volume) = self.volumes.get(&node_id) {
+                            let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
+                            ui.add_sized(
+                                [56.0, 18.0],
+                                egui::Slider::new(&mut value, 0.0..=2.0)
+                                    .show_value(false)
+                                    .max_decimals(1),
+                            );
+                            volume.store(value.to_bits(), Ordering::Relaxed);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if action_button(ui, pal, "End", ButtonTone::Danger).clicked() {
+                                self.cmd(Command::Abort { node_id });
+                            }
+                        });
+                    }
+                    CallState::Aborted => {}
                 });
             });
     }
@@ -414,11 +755,12 @@ impl AppState {
     }
 
     fn ui_identity_card(&mut self, ui: &mut Ui) {
-        section_card(ui, "Your identity", |ui| {
+        let pal = Palette::for_theme(self.theme);
+        section_card(ui, &pal, "Your identity", |ui| {
             if let Some(node_id) = &self.our_node_id {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(fmt_node_id(&node_id.fmt_short()));
-                    if ui.small_button("Copy").clicked() {
+                    if action_button(ui, &pal, "Copy", ButtonTone::Secondary).clicked() {
                         copy_to_clipboard(&node_id.to_string());
                     }
                 });
@@ -434,7 +776,8 @@ impl AppState {
     }
 
     fn ui_dial_card(&mut self, ui: &mut Ui) {
-        section_card(ui, "Place a call", |ui| {
+        let pal = Palette::for_theme(self.theme);
+        section_card(ui, &pal, "Place a call", |ui| {
             ui.horizontal(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.remote_node_input)
@@ -448,7 +791,7 @@ impl AppState {
                         Some(NodeId::from_str(self.remote_node_input.trim()))
                     };
                 }
-                if ui.button("Paste").clicked() {
+                if action_button(ui, &pal, "Paste", ButtonTone::Secondary).clicked() {
                     if let Some(text) = read_clipboard() {
                         self.remote_node_input = text;
                         self.remote_node_id = Some(NodeId::from_str(self.remote_node_input.trim()));
@@ -459,7 +802,7 @@ impl AppState {
             ui.horizontal(|ui| {
                 let can_call = matches!(self.remote_node_id, Some(Ok(_)));
                 ui.add_enabled_ui(can_call, |ui| {
-                    if ui.button("Call").clicked() {
+                    if action_button(ui, &pal, "Call", ButtonTone::Primary).clicked() {
                         if let Some(Ok(node_id)) = self.remote_node_id {
                             self.cmd(Command::Call { node_id });
                         }
@@ -481,7 +824,8 @@ impl AppState {
     }
 
     fn ui_friends_card(&mut self, ui: &mut Ui) {
-        section_card(ui, "Friends", |ui| {
+        let pal = Palette::for_theme(self.theme);
+        section_card(ui, &pal, "Friends", |ui| {
             let mut call: Option<NodeId> = None;
             let mut remove_idx: Option<usize> = None;
 
@@ -503,10 +847,10 @@ impl AppState {
                         };
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Remove").clicked() {
+                        if action_button(ui, &pal, "Remove", ButtonTone::Danger).clicked() {
                             remove_idx = Some(idx);
                         }
-                        if ui.button("Call").clicked() {
+                        if action_button(ui, &pal, "Call", ButtonTone::Primary).clicked() {
                             if let Ok(id) = parsed {
                                 call = Some(id);
                             }
@@ -527,21 +871,17 @@ impl AppState {
             ui.separator();
             ui.label(RichText::new("Add a friend").strong());
             ui.add(
-                egui::TextEdit::singleline(&mut self.new_friend_name)
-                    .hint_text("Name (optional)"),
+                egui::TextEdit::singleline(&mut self.new_friend_name).hint_text("Name (optional)"),
             );
             ui.horizontal(|ui| {
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.new_friend_id)
-                        .hint_text("Their node ID"),
+                    egui::TextEdit::singleline(&mut self.new_friend_id).hint_text("Their node ID"),
                 );
-                if response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                {
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.add_friend();
                 }
             });
-            if ui.button("Add friend").clicked() {
+            if action_button_full(ui, &pal, "Add friend", ButtonTone::Primary).clicked() {
                 self.add_friend();
             }
         });
@@ -572,7 +912,8 @@ impl AppState {
     }
 
     fn ui_calls_card(&mut self, ui: &mut Ui) {
-        section_card(ui, "Calls", |ui| {
+        let pal = Palette::for_theme(self.theme);
+        section_card(ui, &pal, "Calls", |ui| {
             if self.calls.is_empty() {
                 ui.label(RichText::new("No active calls").weak());
                 return;
@@ -601,13 +942,15 @@ impl AppState {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| match state {
                             CallState::Incoming => {
-                                if ui.button("Accept").clicked() {
+                                if action_button(ui, &pal, "Accept", ButtonTone::Primary).clicked()
+                                {
                                     self.cmd(Command::HandleIncoming {
                                         node_id,
                                         accept: true,
                                     });
                                 }
-                                if ui.button("Decline").clicked() {
+                                if action_button(ui, &pal, "Decline", ButtonTone::Danger).clicked()
+                                {
                                     self.cmd(Command::HandleIncoming {
                                         node_id,
                                         accept: false,
@@ -615,7 +958,7 @@ impl AppState {
                                 }
                             }
                             CallState::Calling | CallState::Active => {
-                                if ui.small_button("End").clicked() {
+                                if action_button(ui, &pal, "End", ButtonTone::Danger).clicked() {
                                     self.cmd(Command::Abort { node_id });
                                 }
                             }
@@ -646,14 +989,15 @@ impl AppState {
     }
 
     fn ui_sharing_card(&mut self, ui: &mut Ui) {
-        section_card(ui, "Screen sharing", |ui| {
+        let pal = Palette::for_theme(self.theme);
+        section_card(ui, &pal, "Screen sharing", |ui| {
             ui.horizontal(|ui| {
                 if self.sharing_active {
-                    if ui.button("Stop sharing").clicked() {
+                    if action_button(ui, &pal, "Stop sharing", ButtonTone::Danger).clicked() {
                         self.cmd(Command::ToggleSharing { enabled: false });
                     }
                     ui.label(RichText::new("Live").color(Color32::from_rgb(100, 200, 120)));
-                } else if ui.button("Start sharing").clicked() {
+                } else if action_button(ui, &pal, "Start sharing", ButtonTone::Primary).clicked() {
                     self.cmd(Command::ToggleSharing { enabled: true });
                 }
             });
@@ -692,6 +1036,7 @@ impl AppState {
     }
 
     fn ui_stream_panel(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let pal = Palette::for_theme(self.theme);
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
         let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
         let has_stream = share_targets.iter().any(|id| {
@@ -705,7 +1050,23 @@ impl AppState {
             ui.add_space(4.0);
         } else {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Remote screen").strong().size(16.0));
+                ui.label(
+                    RichText::new("STAGE")
+                        .family(kh_family())
+                        .color(pal.text)
+                        .size(16.0),
+                );
+                ui.label(
+                    RichText::new(if has_stream {
+                        "remote screen"
+                    } else if self.sharing_active {
+                        "your screen"
+                    } else {
+                        "secure screen sharing"
+                    })
+                    .color(pal.dim)
+                    .size(13.0),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.ui_stream_toolbar(ui, ctx, &share_targets, has_stream, false);
                 });
@@ -717,7 +1078,48 @@ impl AppState {
             let available = ui.available_size();
             let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, 8.0, ui.visuals().extreme_bg_color);
+                .rect_filled(rect, CornerRadius::same(10), pal.panel);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(10),
+                Stroke::new(1.0, pal.line),
+                egui::StrokeKind::Inside,
+            );
+            if self.sharing_active {
+                if let Some(preview) = &mut self.preview {
+                    sync_rgba_texture(
+                        ui,
+                        "preview-stage",
+                        preview.width,
+                        preview.height,
+                        &preview.data,
+                        preview.generation,
+                        &mut preview.uploaded_generation,
+                        &mut preview.texture,
+                    );
+                    if let Some(texture) = &preview.texture {
+                        let aspect = preview.width as f32 / preview.height as f32;
+                        let image_rect = egui::Rect::from_center_size(
+                            rect.center(),
+                            video_display_size(rect.shrink(12.0).size(), aspect, false),
+                        );
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        ui.painter().text(
+                            rect.left_top() + egui::vec2(14.0, 14.0),
+                            Align2::LEFT_TOP,
+                            "YOUR SCREEN · SHARING",
+                            sans(11.0),
+                            pal.text,
+                        );
+                        return;
+                    }
+                }
+            }
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -757,6 +1159,15 @@ impl AppState {
                 if immersive {
                     ui.painter()
                         .rect_filled(area, 0.0, Color32::from_rgb(12, 12, 14));
+                } else {
+                    ui.painter()
+                        .rect_filled(area, CornerRadius::same(10), pal.panel);
+                    ui.painter().rect_stroke(
+                        area,
+                        CornerRadius::same(10),
+                        Stroke::new(1.0, pal.line),
+                        egui::StrokeKind::Inside,
+                    );
                 }
 
                 let size = video_display_size(area.size(), aspect, immersive);
@@ -1015,18 +1426,25 @@ impl AppState {
     }
 }
 
-fn section_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+fn section_card<R>(
+    ui: &mut Ui,
+    pal: &Palette,
+    title: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
     Frame::new()
-        .fill(ui.visuals().widgets.noninteractive.weak_bg_fill)
-        .corner_radius(CornerRadius::same(8))
+        .fill(pal.panel)
+        .corner_radius(CornerRadius::same(10))
         .inner_margin(12.0)
-        .stroke(Stroke::new(
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-        ))
+        .stroke(Stroke::new(1.0, pal.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong());
+            ui.label(
+                RichText::new(title.to_uppercase())
+                    .family(kh_family())
+                    .color(pal.dim)
+                    .size(11.0),
+            );
             ui.add_space(8.0);
             add_contents(ui)
         })
@@ -1152,7 +1570,7 @@ enum Event {
     },
 }
 
-#[derive(strum::Display)]
+#[derive(strum::Display, Clone, Copy)]
 enum CallState {
     Incoming,
     Calling,
@@ -1199,6 +1617,8 @@ enum Command {
     HandleIncoming { node_id: NodeId, accept: bool },
     Abort { node_id: NodeId },
     ToggleSharing { enabled: bool },
+    SetMuted { muted: bool },
+    SetDeafened { deafened: bool },
 }
 
 struct Worker {
@@ -1222,6 +1642,8 @@ struct Worker {
     capture_thread: Option<std::thread::JoinHandle<()>>,
     capture_stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     sharing_active: bool,
+    muted: bool,
+    deafened: bool,
 }
 
 struct WorkerHandle {
@@ -1295,6 +1717,8 @@ impl Worker {
             capture_thread: None,
             capture_stop_flag: None,
             sharing_active: false,
+            muted: false,
+            deafened: false,
         })
     }
 
@@ -1646,6 +2070,8 @@ impl Worker {
             }
             Command::SetAudioConfig { audio_config } => {
                 let audio_context = AudioContext::new(audio_config).await?;
+                audio_context.set_muted(self.muted);
+                audio_context.set_deafened(self.deafened);
                 self.audio_context = Some(audio_context);
             }
             Command::SetVideoConfig { video_config } => {
@@ -1665,6 +2091,18 @@ impl Worker {
                     self.start_capture()?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture();
+                }
+            }
+            Command::SetMuted { muted } => {
+                self.muted = muted;
+                if let Some(audio_context) = &self.audio_context {
+                    audio_context.set_muted(muted);
+                }
+            }
+            Command::SetDeafened { deafened } => {
+                self.deafened = deafened;
+                if let Some(audio_context) = &self.audio_context {
+                    audio_context.set_deafened(deafened);
                 }
             }
             Command::Call { node_id } => {

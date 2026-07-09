@@ -53,7 +53,8 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
         if key_path.exists() {
             let contents =
                 std::fs::read_to_string(&key_path).context("failed to read stored secret key")?;
-            return SecretKey::from_str(contents.trim()).context("failed to parse stored secret key");
+            return SecretKey::from_str(contents.trim())
+                .context("failed to parse stored secret key");
         }
     }
 

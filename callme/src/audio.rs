@@ -89,6 +89,16 @@ impl AudioContext {
         Ok(())
     }
 
+    /// Stop or resume sending microphone samples to active call tracks.
+    pub fn set_muted(&self, muted: bool) {
+        self.capture.set_muted(muted);
+    }
+
+    /// Stop or resume the mixed remote-call audio output.
+    pub fn set_deafened(&self, deafened: bool) {
+        self.playback.set_deafened(deafened);
+    }
+
     pub async fn feedback_encoded(&self) -> Result<()> {
         let track = self.capture_track().await?;
         self.play_track(track).await?;
