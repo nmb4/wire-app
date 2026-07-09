@@ -6,6 +6,7 @@ pub mod app;
 mod scap_capture;
 mod screen_capture;
 pub mod theme;
+mod update;
 mod video_decode;
 #[cfg(windows)]
 mod win_capture;

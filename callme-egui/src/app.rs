@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     time::Duration,
 };
@@ -24,7 +24,11 @@ use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::{theme::*, video_decode::VideoDecodeWorker};
+use crate::{
+    theme::*,
+    update::{self, ReleaseInfo},
+    video_decode::VideoDecodeWorker,
+};
 
 const DEFAULT: &str = "<default>";
 const VIDEO_SEND_LATENCY_BUDGET: Duration = Duration::from_millis(150);
@@ -134,6 +138,24 @@ struct AppState {
     theme: Theme,
     muted: bool,
     deafened: bool,
+    update_tx: mpsc::Sender<UpdateMessage>,
+    update_rx: mpsc::Receiver<UpdateMessage>,
+    update_status: UpdateStatus,
+    show_update_prompt: bool,
+}
+
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseInfo),
+    Downloading(ReleaseInfo),
+    Error(String),
+}
+
+enum UpdateMessage {
+    CheckFinished(anyhow::Result<Option<ReleaseInfo>>),
+    DownloadFinished(anyhow::Result<PathBuf>),
 }
 
 struct PreviewState {
@@ -220,9 +242,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_first_update {
             self.is_first_update = false;
-            let ctx = ctx.clone();
-            let callback = Arc::new(move || ctx.request_repaint());
+            let repaint_ctx = ctx.clone();
+            let callback = Arc::new(move || repaint_ctx.request_repaint());
             self.state.cmd(Command::SetUpdateCallback { callback });
+            #[cfg(windows)]
+            self.state.start_update_check(ctx);
         }
         // on android, add some space at the top.
         #[cfg(target_os = "android")]
@@ -245,6 +269,7 @@ impl App {
             .map(|settings| settings.configured)
             .unwrap_or(false);
         let settings = saved_settings.unwrap_or_default();
+        let (update_tx, update_rx) = mpsc::channel();
         let state = AppState {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
@@ -269,6 +294,10 @@ impl App {
             theme: settings.theme,
             muted: false,
             deafened: false,
+            update_tx,
+            update_rx,
+            update_status: UpdateStatus::Idle,
+            show_update_prompt: false,
         };
 
         if has_saved_settings {
@@ -296,6 +325,7 @@ impl App {
 }
 impl AppState {
     fn update(&mut self, ctx: &egui::Context) {
+        self.process_update_events(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::T)) {
             self.theme = self.theme.next();
             self.persist_theme();
@@ -328,6 +358,69 @@ impl AppState {
 
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
+        }
+        if self.show_update_prompt {
+            self.ui_update_prompt(ctx);
+        }
+    }
+
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if matches!(self.update_status, UpdateStatus::Checking) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        let tx = self.update_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::check_for_update();
+            let _ = tx.send(UpdateMessage::CheckFinished(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update_download(&mut self, ctx: &egui::Context, release: ReleaseInfo) {
+        if matches!(self.update_status, UpdateStatus::Downloading(_)) {
+            return;
+        }
+        self.update_status = UpdateStatus::Downloading(release.clone());
+        self.show_update_prompt = false;
+        let tx = self.update_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::download_update(&release);
+            let _ = tx.send(UpdateMessage::DownloadFinished(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn process_update_events(&mut self, ctx: &egui::Context) {
+        while let Ok(message) = self.update_rx.try_recv() {
+            match message {
+                UpdateMessage::CheckFinished(Ok(Some(release))) => {
+                    self.show_update_prompt = true;
+                    self.update_status = UpdateStatus::Available(release);
+                }
+                UpdateMessage::CheckFinished(Ok(None)) => {
+                    self.update_status = UpdateStatus::UpToDate;
+                }
+                UpdateMessage::CheckFinished(Err(error)) => {
+                    self.update_status = UpdateStatus::Error(error.to_string());
+                }
+                UpdateMessage::DownloadFinished(Ok(path)) => {
+                    match std::process::Command::new(&path).spawn() {
+                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(error) => {
+                            self.update_status = UpdateStatus::Error(format!(
+                                "Downloaded to {}, but could not launch it: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                UpdateMessage::DownloadFinished(Err(error)) => {
+                    self.update_status = UpdateStatus::Error(error.to_string());
+                }
+            }
         }
     }
 
@@ -531,12 +624,29 @@ impl AppState {
                         ui.label(RichText::new("Connecting…").weak());
                     }
 
+                    let available_update = match &self.update_status {
+                        UpdateStatus::Available(release) => Some(release.clone()),
+                        _ => None,
+                    };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if action_button(ui, &pal, "Settings", ButtonTone::Secondary)
                             .on_hover_text("Audio and screen sharing options")
                             .clicked()
                         {
                             self.show_settings = true;
+                        }
+                        if let Some(release) = available_update {
+                            if action_button(
+                                ui,
+                                &pal,
+                                &format!("Update v{}", release.version),
+                                ButtonTone::Primary,
+                            )
+                            .on_hover_text("Download the update to Desktop and relaunch")
+                            .clicked()
+                            {
+                                self.start_update_download(ctx, release);
+                            }
                         }
                         let active_calls = self
                             .calls
@@ -1617,6 +1727,61 @@ impl AppState {
                     .weak(),
                 );
 
+                #[cfg(windows)]
+                {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Updates").strong());
+                    ui.label(
+                        RichText::new(format!("Installed version: v{}", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .weak(),
+                    );
+
+                    let mut check_clicked = false;
+                    let mut download = None;
+                    match &self.update_status {
+                        UpdateStatus::Idle => {
+                            check_clicked = ui.button("Check for updates").clicked();
+                        }
+                        UpdateStatus::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking for updates...");
+                            });
+                        }
+                        UpdateStatus::UpToDate => {
+                            ui.horizontal(|ui| {
+                                ui.label("You are up to date.");
+                                check_clicked = ui.button("Check again").clicked();
+                            });
+                        }
+                        UpdateStatus::Available(release) => {
+                            ui.label(format!("Version v{} is available.", release.version));
+                            if ui.button("Download to Desktop and relaunch").clicked() {
+                                download = Some(release.clone());
+                            }
+                        }
+                        UpdateStatus::Downloading(release) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Downloading v{}...", release.version));
+                            });
+                        }
+                        UpdateStatus::Error(error) => {
+                            ui.colored_label(Color32::from_rgb(220, 100, 90), error);
+                            check_clicked = ui.button("Try again").clicked();
+                        }
+                    }
+                    if check_clicked {
+                        self.start_update_check(ctx);
+                    }
+                    if let Some(release) = download {
+                        self.start_update_download(ctx, release);
+                    }
+                }
+
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -1633,6 +1798,48 @@ impl AppState {
                     }
                 });
             });
+    }
+
+    fn ui_update_prompt(&mut self, ctx: &egui::Context) {
+        let release = match &self.update_status {
+            UpdateStatus::Available(release) => release.clone(),
+            _ => {
+                self.show_update_prompt = false;
+                return;
+            }
+        };
+        let mut open = self.show_update_prompt;
+        let mut download = false;
+        let mut later = false;
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Callme v{} is available. You are running v{}.",
+                    release.version,
+                    env!("CARGO_PKG_VERSION")
+                ));
+                ui.label("The new executable will be verified and placed on your Desktop.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Download and relaunch").clicked() {
+                        download = true;
+                    }
+                    if ui.button("Later").clicked() {
+                        later = true;
+                    }
+                });
+            });
+        if later {
+            open = false;
+        }
+        self.show_update_prompt = open;
+        if download {
+            self.start_update_download(ctx, release);
+        }
     }
 }
 
