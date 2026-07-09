@@ -2,7 +2,7 @@ pub mod bitstream;
 pub mod codec;
 pub mod transport;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VideoResolution {
     P720,
     P1080,
@@ -60,7 +60,7 @@ pub fn default_bitrate(resolution: VideoResolution, framerate: u32) -> u32 {
     (base as f64 * scale) as u32
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BitratePreset {
     Auto,
     Mbps4,
@@ -124,7 +124,7 @@ impl BitratePreset {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoConfig {
     pub resolution: VideoResolution,
     pub framerate: u32,

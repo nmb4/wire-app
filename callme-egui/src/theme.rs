@@ -23,12 +23,18 @@ pub fn mono(size: f32) -> FontId {
 }
 
 // -- palette --
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
     Amber,
     Terminal,
     DiscordOled,
     Slate,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::Amber
+    }
 }
 
 impl Theme {

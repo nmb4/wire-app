@@ -8,7 +8,7 @@ pub use iroh_roq::ALPN;
 use crate::rtc::RtcConnection;
 
 /// Returns the per-user config directory used to persist callme state
-/// (secret key and friends list).
+/// (secret key, friends list, and application settings).
 ///
 /// Can be overridden with the `CALLME_CONFIG_DIR` environment variable.
 pub fn config_dir() -> Option<PathBuf> {

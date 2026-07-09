@@ -68,6 +68,27 @@ fn save_friends(friends: &[Friend]) {
     }
 }
 
+fn settings_path() -> Option<PathBuf> {
+    callme::net::config_dir().map(|dir| dir.join("settings.json"))
+}
+
+fn load_settings() -> Option<Settings> {
+    let path = settings_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn save_settings(settings: &Settings) {
+    if let Some(path) = settings_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(contents) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(path, contents);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamViewMode {
     Normal,
@@ -135,11 +156,32 @@ struct VideoFrameState {
     uploaded_generation: u64,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct UiAudioConfig {
     selected_input: String,
     selected_output: String,
     processing_enabled: bool,
     quality: AudioQuality,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    audio: UiAudioConfig,
+    video: VideoConfig,
+    theme: Theme,
+    configured: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            audio: UiAudioConfig::default(),
+            video: VideoConfig::default(),
+            theme: Theme::default(),
+            configured: false,
+        }
+    }
 }
 
 impl From<&UiAudioConfig> for AudioConfig {
@@ -197,17 +239,23 @@ impl App {
         let handle = Worker::spawn();
         let devices =
             callme::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
+        let saved_settings = load_settings();
+        let has_saved_settings = saved_settings
+            .as_ref()
+            .map(|settings| settings.configured)
+            .unwrap_or(false);
+        let settings = saved_settings.unwrap_or_default();
         let state = AppState {
-            configured: false,
-            show_settings: true,
+            configured: has_saved_settings,
+            show_settings: !has_saved_settings,
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
             remote_node_input: String::new(),
             worker: handle,
             our_node_id: None,
             devices,
-            audio_config: Default::default(),
-            video_config: Default::default(),
+            audio_config: settings.audio,
+            video_config: settings.video,
             calls: Default::default(),
             volumes: Default::default(),
             rtts: Default::default(),
@@ -218,10 +266,19 @@ impl App {
             friends: load_friends(),
             new_friend_name: String::new(),
             new_friend_id: String::new(),
-            theme: Theme::Amber,
+            theme: settings.theme,
             muted: false,
             deafened: false,
         };
+
+        if has_saved_settings {
+            state.cmd(Command::SetAudioConfig {
+                audio_config: state.audio_config(),
+            });
+            state.cmd(Command::SetVideoConfig {
+                video_config: state.video_config,
+            });
+        }
 
         let app = App {
             state,
@@ -241,6 +298,7 @@ impl AppState {
     fn update(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::T)) {
             self.theme = self.theme.next();
+            self.persist_theme();
         }
         let pal = Palette::for_theme(self.theme);
         ctx.set_visuals(visuals_for(&pal));
@@ -322,6 +380,12 @@ impl AppState {
                     state.height = height;
                     state.data = data;
                     state.generation += 1;
+                }
+                Event::VideoStreamEnded(node_id) => {
+                    self.video_frames.remove(&node_id);
+                    if self.focused_stream == Some(StreamSource::Remote(node_id)) {
+                        self.focused_stream = None;
+                    }
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
@@ -419,6 +483,21 @@ impl AppState {
         (&self.audio_config).into()
     }
 
+    fn persist_settings(&self) {
+        save_settings(&Settings {
+            audio: self.audio_config.clone(),
+            video: self.video_config,
+            theme: self.theme,
+            configured: true,
+        });
+    }
+
+    fn persist_theme(&self) {
+        let mut settings = load_settings().unwrap_or_default();
+        settings.theme = self.theme;
+        save_settings(&settings);
+    }
+
     fn cmd(&self, command: Command) {
         self.worker
             .command_tx
@@ -479,6 +558,7 @@ impl AppState {
                         ui.add_space(8.0);
                         if theme_badge(ui, &pal, self.theme.name()).clicked() {
                             self.theme = self.theme.next();
+                            self.persist_theme();
                         }
                     });
                 });
@@ -1544,6 +1624,7 @@ impl AppState {
                         let video_config = self.video_config;
                         self.cmd(Command::SetAudioConfig { audio_config });
                         self.cmd(Command::SetVideoConfig { video_config });
+                        self.persist_settings();
                         self.configured = true;
                         self.show_settings = false;
                     }
@@ -1705,6 +1786,7 @@ enum Event {
         height: u32,
         data: Arc<Vec<u8>>,
     },
+    VideoStreamEnded(NodeId),
     SharingToggled(bool),
     PreviewFrame {
         width: u32,
@@ -1894,7 +1976,7 @@ impl Worker {
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id);
-                    self.cleanup_after_call_end();
+                    self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
@@ -1947,7 +2029,7 @@ impl Worker {
                 warn!("connection to {} failed: {err:?}", node_id.fmt_short());
                 self.active_calls.remove(&node_id);
                 self.volumes.remove(&node_id);
-                self.cleanup_after_call_end();
+                self.cleanup_after_call_end().await;
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -1971,7 +2053,7 @@ impl Worker {
                     node_id.fmt_short()
                 );
                 self.remove_video_peer(node_id);
-                self.cleanup_after_call_end();
+                self.cleanup_after_call_end().await;
                 conn.transport().close(0u32.into(), b"bye");
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
@@ -2091,17 +2173,27 @@ impl Worker {
         }
 
         if self.sharing_active {
-            let send_dead = entry.send.as_ref().map(|h| h.is_finished()).unwrap_or(true);
-            if send_dead {
-                let send_conn = conn.clone();
-                let frame_tx = self.video_frame_tx.clone();
-                let keyframe_tx = self.keyframe_tx.clone();
-                let nid = node_id;
-                info!("starting video send task for {}", node_id.fmt_short());
-                let handle = tokio::spawn(async move {
-                    run_video_send(send_conn, frame_tx, keyframe_tx, nid).await;
-                });
-                entry.send = Some(handle);
+            if let Some(h) = entry.send.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            let send_conn = conn.clone();
+            let frame_tx = self.video_frame_tx.clone();
+            let keyframe_tx = self.keyframe_tx.clone();
+            let nid = node_id;
+            info!("starting video send task for {}", node_id.fmt_short());
+            let handle = tokio::spawn(async move {
+                run_video_send(send_conn, frame_tx, keyframe_tx, nid).await;
+            });
+            entry.send = Some(handle);
+        }
+    }
+
+    async fn finish_all_video_send(&mut self) {
+        for tasks in self.video_peers.values_mut() {
+            if let Some(h) = tasks.send.take() {
+                h.abort();
+                let _ = h.await;
             }
         }
     }
@@ -2126,15 +2218,9 @@ impl Worker {
         }
     }
 
-    fn cleanup_after_call_end(&mut self) {
+    async fn cleanup_after_call_end(&mut self) {
         if self.active_calls.is_empty() && self.sharing_active {
-            self.stop_capture();
-        }
-    }
-
-    fn stop_all_video_send(&mut self) {
-        for tasks in self.video_peers.values_mut() {
-            tasks.abort_send();
+            self.stop_capture().await;
         }
     }
 
@@ -2212,14 +2298,12 @@ impl Worker {
         self.capture_stop_flag = None;
     }
 
-    fn stop_capture(&mut self) {
+    async fn stop_capture(&mut self) {
         self.stop_capture_thread();
         self.sharing_active = false;
-        self.stop_all_video_send();
+        self.finish_all_video_send().await;
         let event_tx = self.event_tx.clone();
-        tokio::task::spawn(async move {
-            let _ = event_tx.send(Event::SharingToggled(false)).await;
-        });
+        let _ = event_tx.send(Event::SharingToggled(false)).await;
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<()> {
@@ -2246,10 +2330,11 @@ impl Worker {
             Command::ToggleSharing { enabled } => {
                 if enabled && !self.sharing_active {
                     self.sharing_active = true;
+                    let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
                     self.start_capture()?;
                 } else if !enabled && self.sharing_active {
-                    self.stop_capture();
+                    self.stop_capture().await;
                 }
             }
             Command::SetMuted { muted } => {
@@ -2285,7 +2370,7 @@ impl Worker {
                 } else {
                     self.remove_video_peer(node_id);
                     conn.transport().close(0u32.into(), b"bye");
-                    self.cleanup_after_call_end();
+                    self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
@@ -2294,7 +2379,7 @@ impl Worker {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id);
-                    self.cleanup_after_call_end();
+                    self.cleanup_after_call_end().await;
                     match state {
                         CallInfo::Calling => {}
                         CallInfo::Connecting(conn) => {
@@ -2335,22 +2420,28 @@ async fn run_video_send(
             let frame = match rx.recv().await {
                 Ok(frame) => frame,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(e) => return Err(anyhow::anyhow!("broadcast recv: {e}")),
+                Err(_) => break,
             };
             let mut latest = frame;
+            let mut source_closed = false;
             loop {
                 match rx.try_recv() {
                     Ok(frame) => latest = frame,
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        return Err(anyhow::anyhow!("broadcast closed"));
+                        source_closed = true;
+                        break;
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 }
             }
+            if source_closed {
+                break;
+            }
             let send_start = std::time::Instant::now();
             if let Err(e) = transport::send_frame(&mut send, &latest).await {
-                return Err(e);
+                info!("video send to {} failed: {e:?}", node_id.fmt_short());
+                break;
             }
             let send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
             if send_ms > 1000.0 {
@@ -2380,10 +2471,14 @@ async fn run_video_send(
                 );
             }
         }
+        let _ = send.reset(VIDEO_STREAM_RESET_CODE);
+        Ok(())
     }
     .await;
     if let Err(e) = result {
         info!("video send to {} stopped: {e:?}", node_id.fmt_short());
+    } else {
+        info!("video send to {} ended", node_id.fmt_short());
     }
 }
 
@@ -2443,10 +2538,12 @@ async fn recv_video_on_stream(
     event_tx: &async_channel::Sender<Event>,
     callback: Option<&UpdateCallback>,
 ) -> Result<()> {
-    let event_tx = event_tx.clone();
-    let callback = callback.cloned();
+    let frame_event_tx = event_tx.clone();
+    let ended_event_tx = event_tx.clone();
+    let frame_callback = callback.cloned();
+    let ended_callback = callback.cloned();
     let worker = VideoDecodeWorker::spawn(move |frame| {
-        if event_tx
+        if frame_event_tx
             .try_send(Event::VideoFrame {
                 node_id,
                 data: frame.data,
@@ -2455,7 +2552,7 @@ async fn recv_video_on_stream(
             })
             .is_ok()
         {
-            if let Some(cb) = &callback {
+            if let Some(cb) = &frame_callback {
                 cb();
             }
         }
@@ -2467,47 +2564,62 @@ async fn recv_video_on_stream(
     let mut last_stats_log = std::time::Instant::now();
 
     loop {
-        let Some((data, sent_at_micros)) = transport::recv_frame(recv).await? else {
-            break;
-        };
-        received += 1;
-        received_bytes += data.len() as u64;
-        if let Some(age_ms) = transport::frame_age_ms(sent_at_micros) {
-            received_age_ms += age_ms;
-            max_age_ms = f64::max(max_age_ms, age_ms);
+        match transport::recv_frame(recv).await {
+            Ok(Some((data, sent_at_micros))) => {
+                received += 1;
+                received_bytes += data.len() as u64;
+                if let Some(age_ms) = transport::frame_age_ms(sent_at_micros) {
+                    received_age_ms += age_ms;
+                    max_age_ms = f64::max(max_age_ms, age_ms);
+                }
+                if last_stats_log.elapsed() >= Duration::from_secs(5) {
+                    let elapsed = last_stats_log.elapsed().as_secs_f64();
+                    let recv_fps = if elapsed > 0.0 {
+                        received as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let avg_packet_kb = if received > 0 {
+                        received_bytes as f64 / received as f64 / 1024.0
+                    } else {
+                        0.0
+                    };
+                    let avg_age_ms = if received > 0 {
+                        received_age_ms / received as f64
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        "video receive pipeline from {}: {:.1} fps, {:.1} KiB/frame, {:.0}ms avg age, {:.0}ms max age",
+                        node_id.fmt_short(),
+                        recv_fps,
+                        avg_packet_kb,
+                        avg_age_ms,
+                        max_age_ms
+                    );
+                    last_stats_log = std::time::Instant::now();
+                    received = 0;
+                    received_bytes = 0;
+                    received_age_ms = 0.0;
+                    max_age_ms = 0.0;
+                }
+                worker.submit(data);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                info!(
+                    "video stream from {} ended with error: {e:?}",
+                    node_id.fmt_short()
+                );
+                break;
+            }
         }
-        if last_stats_log.elapsed() >= Duration::from_secs(5) {
-            let elapsed = last_stats_log.elapsed().as_secs_f64();
-            let recv_fps = if elapsed > 0.0 {
-                received as f64 / elapsed
-            } else {
-                0.0
-            };
-            let avg_packet_kb = if received > 0 {
-                received_bytes as f64 / received as f64 / 1024.0
-            } else {
-                0.0
-            };
-            let avg_age_ms = if received > 0 {
-                received_age_ms / received as f64
-            } else {
-                0.0
-            };
-            info!(
-                "video receive pipeline from {}: {:.1} fps, {:.1} KiB/frame, {:.0}ms avg age, {:.0}ms max age",
-                node_id.fmt_short(),
-                recv_fps,
-                avg_packet_kb,
-                avg_age_ms,
-                max_age_ms
-            );
-            last_stats_log = std::time::Instant::now();
-            received = 0;
-            received_bytes = 0;
-            received_age_ms = 0.0;
-            max_age_ms = 0.0;
-        }
-        worker.submit(data);
+    }
+
+    drop(worker);
+    let _ = ended_event_tx.try_send(Event::VideoStreamEnded(node_id));
+    if let Some(cb) = ended_callback {
+        cb();
     }
     Ok(())
 }
