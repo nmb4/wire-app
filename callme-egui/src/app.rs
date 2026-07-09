@@ -81,6 +81,14 @@ impl StreamViewMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum StreamSource {
+    Local,
+    Remote(NodeId),
+}
+
+const STREAM_GRID_GAP: f32 = 6.0;
+
 struct AppState {
     configured: bool,
     show_settings: bool,
@@ -96,7 +104,7 @@ struct AppState {
     volumes: BTreeMap<NodeId, VolumeHandle>,
     rtts: BTreeMap<NodeId, Duration>,
     video_frames: BTreeMap<NodeId, VideoFrameState>,
-    selected_video_participant: Option<NodeId>,
+    focused_stream: Option<StreamSource>,
     sharing_active: bool,
     preview: Option<PreviewState>,
     friends: Vec<Friend>,
@@ -204,7 +212,7 @@ impl App {
             volumes: Default::default(),
             rtts: Default::default(),
             video_frames: Default::default(),
-            selected_video_participant: None,
+            focused_stream: None,
             sharing_active: false,
             preview: None,
             friends: load_friends(),
@@ -277,9 +285,8 @@ impl AppState {
                         self.volumes.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
-                        if self.selected_video_participant == Some(node_id) {
-                            self.selected_video_participant =
-                                self.video_frames.keys().next().copied();
+                        if self.focused_stream == Some(StreamSource::Remote(node_id)) {
+                            self.focused_stream = None;
                         }
                     } else {
                         self.calls.insert(node_id, call_state);
@@ -315,14 +322,14 @@ impl AppState {
                     state.height = height;
                     state.data = data;
                     state.generation += 1;
-                    if self.selected_video_participant.is_none() {
-                        self.selected_video_participant = Some(node_id);
-                    }
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
                     if !active {
                         self.preview = None;
+                        if self.focused_stream == Some(StreamSource::Local) {
+                            self.focused_stream = None;
+                        }
                     }
                 }
                 Event::PreviewFrame {
@@ -358,7 +365,42 @@ impl AppState {
 
     fn handle_view_mode_input(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+            if self.focused_stream.is_some() {
+                self.focused_stream = None;
+            } else {
+                self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+            }
+        }
+    }
+
+    fn local_stream_ready(&self) -> bool {
+        self.sharing_active
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|p| p.width > 0 && p.height > 0 && !p.data.is_empty())
+    }
+
+    fn active_stream_sources(&self) -> Vec<StreamSource> {
+        let mut sources = Vec::new();
+        if self.local_stream_ready() {
+            sources.push(StreamSource::Local);
+        }
+        for node_id in self.video_frames.keys() {
+            if self.video_frames[node_id].width > 0
+                && self.video_frames[node_id].height > 0
+                && !self.video_frames[node_id].data.is_empty()
+            {
+                sources.push(StreamSource::Remote(*node_id));
+            }
+        }
+        sources
+    }
+
+    fn stream_label(&self, source: StreamSource) -> String {
+        match source {
+            StreamSource::Local => "You".to_string(),
+            StreamSource::Remote(node_id) => node_id.fmt_short().to_string(),
         }
     }
 
@@ -598,11 +640,7 @@ impl AppState {
             return;
         }
 
-        let has_live_visual = self.sharing_active
-            || self
-                .video_frames
-                .values()
-                .any(|frame| frame.width > 0 && frame.height > 0 && !frame.data.is_empty());
+        let has_live_visual = !self.active_stream_sources().is_empty() || self.sharing_active;
         let stage_height = if has_live_visual {
             (ui.available_height() * 0.45).clamp(160.0, 380.0)
         } else {
@@ -1047,15 +1085,11 @@ impl AppState {
     fn ui_stream_panel(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
-        let share_targets: Vec<NodeId> = self.video_frames.keys().copied().collect();
-        let has_stream = share_targets.iter().any(|id| {
-            self.video_frames
-                .get(id)
-                .is_some_and(|f| f.width > 0 && f.height > 0 && !f.data.is_empty())
-        });
+        let streams = self.active_stream_sources();
+        let has_stream = !streams.is_empty();
 
         if immersive {
-            self.ui_stream_toolbar(ui, ctx, &share_targets, has_stream, true);
+            self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, true);
             ui.add_space(4.0);
         } else {
             ui.horizontal(|ui| {
@@ -1066,76 +1100,52 @@ impl AppState {
                         .size(16.0),
                 );
                 ui.label(
-                    RichText::new(if has_stream {
-                        "remote screen"
-                    } else if self.sharing_active {
-                        "your screen"
-                    } else {
-                        "secure screen sharing"
+                    RichText::new({
+                        if has_stream {
+                            if self.focused_stream.is_some() {
+                                "focused stream".to_string()
+                            } else if streams.len() == 1 {
+                                "1 stream".to_string()
+                            } else {
+                                format!("{} streams", streams.len())
+                            }
+                        } else if self.sharing_active {
+                            "starting share…".to_string()
+                        } else {
+                            "secure screen sharing".to_string()
+                        }
                     })
                     .color(pal.dim)
                     .size(13.0),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    self.ui_stream_toolbar(ui, ctx, &share_targets, has_stream, false);
+                    self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, false);
                 });
             });
             ui.add_space(8.0);
         }
 
+        let available = ui.available_size();
+        let (area, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+
         if !has_stream {
-            let available = ui.available_size();
-            let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(10), pal.panel);
-            ui.painter().rect_stroke(
-                rect,
-                CornerRadius::same(10),
-                Stroke::new(1.0, pal.line),
-                egui::StrokeKind::Inside,
-            );
-            if self.sharing_active {
-                if let Some(preview) = &mut self.preview {
-                    sync_rgba_texture(
-                        ui,
-                        "preview-stage",
-                        preview.width,
-                        preview.height,
-                        &preview.data,
-                        preview.generation,
-                        &mut preview.uploaded_generation,
-                        &mut preview.texture,
-                    );
-                    if let Some(texture) = &preview.texture {
-                        let aspect = preview.width as f32 / preview.height as f32;
-                        let image_rect = egui::Rect::from_center_size(
-                            rect.center(),
-                            video_display_size(rect.shrink(12.0).size(), aspect, false),
-                        );
-                        ui.painter().image(
-                            texture.id(),
-                            image_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                        ui.painter().text(
-                            rect.left_top() + egui::vec2(14.0, 14.0),
-                            Align2::LEFT_TOP,
-                            "YOUR SCREEN · SHARING",
-                            sans(11.0),
-                            pal.text,
-                        );
-                        return;
-                    }
-                }
+            if !immersive {
+                ui.painter()
+                    .rect_filled(area, CornerRadius::same(10), pal.panel);
+                ui.painter().rect_stroke(
+                    area,
+                    CornerRadius::same(10),
+                    Stroke::new(1.0, pal.line),
+                    egui::StrokeKind::Inside,
+                );
             }
             ui.painter().text(
-                rect.center(),
+                area.center(),
                 Align2::CENTER_CENTER,
-                if share_targets.is_empty() {
-                    "Waiting for a remote screen share"
+                if self.sharing_active {
+                    "Starting screen share…"
                 } else {
-                    "Receiving video…"
+                    "No active streams"
                 },
                 egui::FontId::proportional(16.0),
                 ui.visuals().weak_text_color(),
@@ -1143,63 +1153,185 @@ impl AppState {
             return;
         }
 
-        let participant = self
-            .selected_video_participant
-            .filter(|id| share_targets.contains(id))
-            .unwrap_or(share_targets[0]);
+        if let Some(focused) = self
+            .focused_stream
+            .filter(|source| streams.contains(source))
+        {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area), |ui| {
+                self.ui_stream_tile(ui, &pal, focused, true, immersive);
+            });
+            return;
+        }
 
-        if let Some(frame) = self.video_frames.get_mut(&participant) {
-            sync_rgba_texture(
-                ui,
-                &format!("video-{participant}"),
-                frame.width,
-                frame.height,
-                &frame.data,
-                frame.generation,
-                &mut frame.uploaded_generation,
-                &mut frame.texture,
+        let count = streams.len();
+        let (cols, rows) = stream_grid_dims(count);
+        let gap = STREAM_GRID_GAP;
+        let total_gap_x = gap * (cols.saturating_sub(1)) as f32;
+        let total_gap_y = gap * (rows.saturating_sub(1)) as f32;
+        let cell_w = (area.width() - total_gap_x) / cols as f32;
+        let cell_h = (area.height() - total_gap_y) / rows as f32;
+
+        for (index, source) in streams.iter().enumerate() {
+            let col = index % cols;
+            let row = index / cols;
+            let cell_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    area.min.x + col as f32 * (cell_w + gap),
+                    area.min.y + row as f32 * (cell_h + gap),
+                ),
+                Vec2::new(cell_w, cell_h),
             );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_rect), |ui| {
+                self.ui_stream_tile(ui, &pal, *source, false, immersive);
+            });
+        }
+    }
 
-            if let Some(tex) = &frame.texture {
-                let available = ui.available_size();
-                let aspect = frame.width as f32 / frame.height as f32;
-                let (area, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+    fn ui_stream_tile(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        source: StreamSource,
+        expanded: bool,
+        immersive: bool,
+    ) {
+        let available = ui.available_size();
+        let (tile_rect, _tile_response) = ui.allocate_exact_size(available, egui::Sense::hover());
+        let corner = if immersive { 0.0 } else { 10.0 };
+        let corner_radius = CornerRadius::same(corner as u8);
+        let btn_size = 30.0;
+        let btn_rect = egui::Rect::from_min_size(
+            tile_rect.right_top() + egui::vec2(-btn_size - 8.0, 8.0),
+            Vec2::splat(btn_size),
+        );
+        let pointer_over = ui.ctx().pointer_hover_pos().is_some_and(|pos| {
+            tile_rect.contains(pos) || btn_rect.contains(pos)
+        });
+        let show_controls = expanded || pointer_over;
 
-                if immersive {
-                    ui.painter()
-                        .rect_filled(area, 0.0, Color32::from_rgb(12, 12, 14));
-                } else {
-                    ui.painter()
-                        .rect_filled(area, CornerRadius::same(10), pal.panel);
-                    ui.painter().rect_stroke(
-                        area,
-                        CornerRadius::same(10),
-                        Stroke::new(1.0, pal.line),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+        ui.painter()
+            .rect_filled(tile_rect, corner_radius, Color32::from_rgb(12, 12, 14));
+        if !immersive {
+            ui.painter().rect_stroke(
+                tile_rect,
+                corner_radius,
+                Stroke::new(1.0, pal.line),
+                egui::StrokeKind::Inside,
+            );
+        }
 
-                let size = video_display_size(area.size(), aspect, immersive);
-                let image_rect = egui::Rect::from_center_size(area.center(), size);
-                ui.painter().image(
-                    tex.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
+        let label = self.stream_label(source);
+        let (width, height, texture_id) = match source {
+            StreamSource::Local => {
+                let Some(preview) = &mut self.preview else {
+                    return;
+                };
+                let width = preview.width;
+                let height = preview.height;
+                sync_rgba_texture(
+                    ui,
+                    "preview-stage",
+                    width,
+                    height,
+                    &preview.data,
+                    preview.generation,
+                    &mut preview.uploaded_generation,
+                    &mut preview.texture,
                 );
+                let texture_id = preview.texture.as_ref().map(|tex| tex.id());
+                (width, height, texture_id)
+            }
+            StreamSource::Remote(node_id) => {
+                let Some(frame) = self.video_frames.get_mut(&node_id) else {
+                    return;
+                };
+                let width = frame.width;
+                let height = frame.height;
+                sync_rgba_texture(
+                    ui,
+                    &format!("video-{node_id}"),
+                    width,
+                    height,
+                    &frame.data,
+                    frame.generation,
+                    &mut frame.uploaded_generation,
+                    &mut frame.texture,
+                );
+                let texture_id = frame.texture.as_ref().map(|tex| tex.id());
+                (width, height, texture_id)
+            }
+        };
 
-                if !immersive {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} — {}×{}",
-                            participant.fmt_short(),
-                            frame.width,
-                            frame.height
-                        ))
-                        .small()
-                        .weak(),
-                    );
+        let Some(texture_id) = texture_id else {
+            ui.painter().text(
+                tile_rect.center(),
+                Align2::CENTER_CENTER,
+                "Waiting for video…",
+                sans(13.0),
+                pal.dim,
+            );
+            return;
+        };
+
+        let aspect = width as f32 / height.max(1) as f32;
+        let image_rect = egui::Rect::from_center_size(
+            tile_rect.center(),
+            video_display_size(tile_rect.shrink(4.0).size(), aspect, expanded),
+        );
+        ui.painter().image(
+            texture_id,
+            image_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+
+        let name_bg = egui::Rect::from_min_size(
+            tile_rect.left_bottom() + egui::vec2(8.0, -30.0),
+            egui::vec2(120.0, 22.0),
+        );
+        ui.painter()
+            .rect_filled(name_bg, CornerRadius::same(4), Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+        ui.painter().text(
+            name_bg.left_center() + egui::vec2(8.0, 0.0),
+            Align2::LEFT_CENTER,
+            &label,
+            sans(11.0),
+            pal.text,
+        );
+
+        if show_controls && !expanded {
+            ui.painter().rect_filled(
+                tile_rect,
+                corner_radius,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 50),
+            );
+        }
+
+        let icon = if expanded {
+            ph::SQUARES_FOUR
+        } else {
+            ph::ARROWS_OUT_SIMPLE
+        };
+        let tooltip = if expanded {
+            "Show all streams"
+        } else {
+            "Focus this stream"
+        };
+        if show_controls {
+            if ui
+                .put(
+                    btn_rect,
+                    egui::Button::new(RichText::new(icon).size(15.0))
+                        .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 190))
+                        .stroke(Stroke::new(1.0, pal.line_br)),
+                )
+                .on_hover_text(tooltip)
+                .clicked()
+            {
+                if expanded {
+                    self.focused_stream = None;
+                } else {
+                    self.focused_stream = Some(source);
                 }
             }
         }
@@ -1209,28 +1341,16 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
-        share_targets: &[NodeId],
+        stream_count: usize,
         has_stream: bool,
         compact: bool,
     ) {
-        if !share_targets.is_empty() {
-            let selected = self
-                .selected_video_participant
-                .filter(|id| share_targets.contains(id))
-                .unwrap_or(share_targets[0]);
-            egui::ComboBox::from_id_salt("video_source")
-                .selected_text(selected.fmt_short())
-                .width(if compact { 140.0 } else { 180.0 })
-                .show_ui(ui, |ui| {
-                    for node_id in share_targets {
-                        if ui
-                            .selectable_label(selected == *node_id, node_id.fmt_short())
-                            .clicked()
-                        {
-                            self.selected_video_participant = Some(*node_id);
-                        }
-                    }
-                });
+        if stream_count > 1 {
+            ui.label(
+                RichText::new(format!("{stream_count} streams"))
+                    .color(Color32::from_rgb(0x91, 0x8e, 0x8a))
+                    .size(12.0),
+            );
         }
 
         if has_stream {
@@ -1480,6 +1600,22 @@ fn rtt_label(rtt: Duration) -> RichText {
         Color32::LIGHT_RED
     };
     RichText::new(text).color(color).small()
+}
+
+fn stream_grid_dims(count: usize) -> (usize, usize) {
+    match count {
+        0 => (1, 1),
+        1 => (1, 1),
+        2 => (2, 1),
+        3 | 4 => (2, 2),
+        5 | 6 => (3, 2),
+        7 | 8 | 9 => (3, 3),
+        _ => {
+            let cols = (count as f32).sqrt().ceil() as usize;
+            let rows = count.div_ceil(cols);
+            (cols, rows)
+        }
+    }
 }
 
 fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 {
