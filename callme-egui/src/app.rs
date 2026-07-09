@@ -297,6 +297,9 @@ impl AppState {
                     width,
                     height,
                 } => {
+                    if !matches!(self.calls.get(&node_id), Some(CallState::Active)) {
+                        continue;
+                    }
                     let state =
                         self.video_frames
                             .entry(node_id)
@@ -318,6 +321,9 @@ impl AppState {
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
+                    if !active {
+                        self.preview = None;
+                    }
                 }
                 Event::PreviewFrame {
                     width,
@@ -326,6 +332,9 @@ impl AppState {
                     actual_fps,
                     encode_time_ms,
                 } => {
+                    if !self.sharing_active {
+                        continue;
+                    }
                     let preview = self.preview.get_or_insert_with(|| PreviewState {
                         width: 0,
                         height: 0,
@@ -1749,6 +1758,7 @@ impl Worker {
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id);
+                    self.cleanup_after_call_end();
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
@@ -1771,7 +1781,6 @@ impl Worker {
     async fn handle_incoming(&mut self, conn: RtcConnection) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         info!("incoming connection from {}", node_id.fmt_short());
-        self.ensure_video_streams(node_id, conn.clone()).await;
         self.active_calls.insert(node_id, CallInfo::Incoming(conn));
         self.emit(Event::SetCallState(node_id, CallState::Incoming))
             .await?;
@@ -1786,7 +1795,6 @@ impl Worker {
         match conn {
             Ok(conn) => {
                 info!("quic connected to {}", node_id.fmt_short());
-                self.ensure_video_streams(node_id, conn.clone()).await;
                 self.active_calls
                     .insert(node_id, CallInfo::Connecting(conn.clone()));
                 self.track_tasks.spawn(async move {
@@ -1803,6 +1811,7 @@ impl Worker {
                 warn!("connection to {} failed: {err:?}", node_id.fmt_short());
                 self.active_calls.remove(&node_id);
                 self.volumes.remove(&node_id);
+                self.cleanup_after_call_end();
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -1826,6 +1835,7 @@ impl Worker {
                     node_id.fmt_short()
                 );
                 self.remove_video_peer(node_id);
+                self.cleanup_after_call_end();
                 conn.transport().close(0u32.into(), b"bye");
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
@@ -1920,6 +1930,13 @@ impl Worker {
     }
 
     async fn ensure_video_streams(&mut self, node_id: NodeId, conn: RtcConnection) {
+        if !matches!(
+            self.active_calls.get(&node_id),
+            Some(CallInfo::Active(_))
+        ) {
+            return;
+        }
+
         let entry = self.video_peers.entry(node_id).or_insert(VideoPeerTasks {
             send: None,
             recv: None,
@@ -1958,7 +1975,7 @@ impl Worker {
             .active_calls
             .iter()
             .filter_map(|(id, info)| match info {
-                CallInfo::Active(conn) | CallInfo::Connecting(conn) => Some((*id, conn.clone())),
+                CallInfo::Active(conn) => Some((*id, conn.clone())),
                 _ => None,
             })
             .collect();
@@ -1970,6 +1987,12 @@ impl Worker {
     fn remove_video_peer(&mut self, node_id: NodeId) {
         if let Some(mut tasks) = self.video_peers.remove(&node_id) {
             tasks.abort_all();
+        }
+    }
+
+    fn cleanup_after_call_end(&mut self) {
+        if self.active_calls.is_empty() && self.sharing_active {
+            self.stop_capture();
         }
     }
 
@@ -2124,7 +2147,9 @@ impl Worker {
                 if accept {
                     self.accept_from_accept(conn).await?;
                 } else {
+                    self.remove_video_peer(node_id);
                     conn.transport().close(0u32.into(), b"bye");
+                    self.cleanup_after_call_end();
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
@@ -2133,6 +2158,7 @@ impl Worker {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id);
+                    self.cleanup_after_call_end();
                     match state {
                         CallInfo::Calling => {}
                         CallInfo::Connecting(conn) => {
