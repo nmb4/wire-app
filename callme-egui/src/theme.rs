@@ -5,7 +5,9 @@
 // intentionally NOT ported -- they don't map onto this real callme app.
 
 use eframe::egui;
-use egui::{Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, Vec2};
+use egui::{
+    Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
+};
 // uppercase display font family used for headers / big text
 pub fn kh_family() -> FontFamily {
     FontFamily::Name("KhInterference".into())
@@ -13,6 +15,10 @@ pub fn kh_family() -> FontFamily {
 
 // Fraktion fonts render a touch small at a given point size, so nudge them up.
 pub const FONT_BOOST: f32 = 2.0;
+
+pub const fn ui_font_size(size: f32) -> f32 {
+    size + FONT_BOOST
+}
 
 pub fn sans(size: f32) -> FontId {
     FontId::proportional(size + FONT_BOOST)
@@ -208,7 +214,14 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(8.0, 4.0);
+    style.text_styles.insert(TextStyle::Heading, sans(18.0));
+    style.text_styles.insert(TextStyle::Body, sans(13.0));
+    style.text_styles.insert(TextStyle::Button, sans(13.0));
+    style.text_styles.insert(TextStyle::Small, sans(11.0));
+    style.text_styles.insert(TextStyle::Monospace, mono(12.0));
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(14.0, 7.0);
+    style.spacing.interact_size.y = 34.0;
     style.visuals.window_corner_radius = CornerRadius::same(10);
     ctx.set_style(style);
 }
@@ -225,22 +238,27 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
     visuals.code_bg_color = pal.panel2;
 
     visuals.widgets.noninteractive.bg_fill = pal.panel;
+    visuals.widgets.noninteractive.weak_bg_fill = pal.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.line);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text2);
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
+    visuals.widgets.inactive.weak_bg_fill = pal.panel2;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.line);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text);
 
     visuals.widgets.hovered.bg_fill = pal.panel2;
+    visuals.widgets.hovered.weak_bg_fill = pal.panel2;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.line_br);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text);
 
     visuals.widgets.active.bg_fill = pal.panel2;
+    visuals.widgets.active.weak_bg_fill = pal.panel2;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, pal.line_br);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, pal.accent);
 
     visuals.widgets.open.bg_fill = pal.panel2;
+    visuals.widgets.open.weak_bg_fill = pal.panel2;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, pal.line_br);
 
     visuals.selection.bg_fill = pal.accent_dim;
@@ -297,7 +315,11 @@ pub fn badge(ui: &mut egui::Ui, pal: &Palette, text: &str) {
         .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(pal.text2).size(12.5));
+            ui.label(
+                RichText::new(text)
+                    .color(pal.text2)
+                    .size(ui_font_size(12.5)),
+            );
         });
 }
 
@@ -309,8 +331,16 @@ pub fn theme_badge(ui: &mut egui::Ui, pal: &Palette, name: &str) -> egui::Respon
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 dot(ui, pal.accent, 6.0);
-                ui.label(RichText::new(name).color(pal.text2).size(12.5));
-                ui.label(RichText::new("(T)").color(pal.dim2).size(11.0));
+                ui.label(
+                    RichText::new(name)
+                        .color(pal.text2)
+                        .size(ui_font_size(12.5)),
+                );
+                ui.label(
+                    RichText::new("(T)")
+                        .color(pal.dim2)
+                        .size(ui_font_size(11.0)),
+                );
             });
         })
         .response
@@ -329,11 +359,11 @@ pub fn action_button(
         ButtonTone::Danger => (pal.panel2, Stroke::new(1.0, pal.err), pal.err),
     };
     ui.add(
-        egui::Button::new(RichText::new(label).color(text).size(13.0))
+        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
             .fill(fill)
             .stroke(stroke)
             .corner_radius(CornerRadius::same(6))
-            .min_size(Vec2::new(0.0, 30.0)),
+            .min_size(Vec2::new(0.0, 34.0)),
     )
 }
 
@@ -349,11 +379,34 @@ pub fn action_button_full(
         ButtonTone::Danger => (pal.panel2, Stroke::new(1.0, pal.err), pal.err),
     };
     ui.add_sized(
-        Vec2::new(ui.available_width(), 30.0),
-        egui::Button::new(RichText::new(label).color(text).size(13.0))
+        Vec2::new(ui.available_width(), 34.0),
+        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
             .fill(fill)
             .stroke(stroke)
             .corner_radius(CornerRadius::same(6)),
+    )
+}
+
+pub fn toolbar_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let fill = if selected { pal.accent_dim } else { pal.panel2 };
+    let stroke = if selected {
+        Stroke::new(1.0, pal.accent)
+    } else {
+        Stroke::new(1.0, pal.line_br)
+    };
+    let text = if selected { pal.accent } else { pal.text2 };
+
+    ui.add(
+        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(12.0)))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(CornerRadius::same(7))
+            .min_size(Vec2::new(0.0, 32.0)),
     )
 }
 pub fn dock_icon_btn(
@@ -389,12 +442,16 @@ pub fn dock_control(
     active: bool,
 ) -> egui::Response {
     ui.allocate_ui_with_layout(
-        Vec2::new(54.0, 62.0),
+        Vec2::new(58.0, 66.0),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             let response = dock_icon_btn(ui, pal, glyph, active);
-            ui.add_space(1.0);
-            ui.label(RichText::new(label).color(pal.text2).size(12.0));
+            ui.label(
+                RichText::new(label)
+                    .color(pal.text2)
+                    .size(ui_font_size(12.0)),
+            );
             response
         },
     )

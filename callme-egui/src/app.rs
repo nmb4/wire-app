@@ -142,6 +142,7 @@ struct AppState {
     update_rx: mpsc::Receiver<UpdateMessage>,
     update_status: UpdateStatus,
     show_update_prompt: bool,
+    reset_home_scroll: bool,
 }
 
 enum UpdateStatus {
@@ -298,6 +299,7 @@ impl App {
             update_rx,
             update_status: UpdateStatus::Idle,
             show_update_prompt: false,
+            reset_home_scroll: false,
         };
 
         if has_saved_settings {
@@ -340,6 +342,7 @@ impl AppState {
 
         if !self.stream_view_mode.is_fullscreen() {
             self.ui_top_bar(ctx);
+            self.ui_dock(ctx, &pal);
         }
 
         egui::CentralPanel::default()
@@ -351,10 +354,6 @@ impl AppState {
                     .inner_margin(egui::Margin::symmetric(20, 14))
             })
             .show(ctx, |ui| self.ui_stage(ui, ctx, &pal));
-
-        if !self.stream_view_mode.is_fullscreen() {
-            self.ui_dock(ctx, &pal);
-        }
 
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
@@ -457,6 +456,9 @@ impl AppState {
                     if !matches!(self.calls.get(&node_id), Some(CallState::Active)) {
                         continue;
                     }
+                    if !self.video_frames.contains_key(&node_id) {
+                        self.reset_home_scroll = true;
+                    }
                     let state =
                         self.video_frames
                             .entry(node_id)
@@ -481,6 +483,7 @@ impl AppState {
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
+                    self.reset_home_scroll = true;
                     if !active {
                         self.preview = None;
                         if self.focused_stream == Some(StreamSource::Local) {
@@ -556,8 +559,32 @@ impl AppState {
     fn stream_label(&self, source: StreamSource) -> String {
         match source {
             StreamSource::Local => "You".to_string(),
-            StreamSource::Remote(node_id) => node_id.fmt_short().to_string(),
+            StreamSource::Remote(node_id) => self.peer_display_name(node_id),
         }
+    }
+
+    fn friend_name(&self, node_id: NodeId) -> Option<&str> {
+        let node_id = node_id.to_string();
+        self.friends
+            .iter()
+            .find(|friend| friend.node_id.trim() == node_id.as_str())
+            .and_then(|friend| {
+                let name = friend.name.trim();
+                (!name.is_empty() && name != friend.node_id.trim()).then_some(name)
+            })
+    }
+
+    fn peer_display_name(&self, node_id: NodeId) -> String {
+        self.friend_name(node_id)
+            .unwrap_or("Unknown peer")
+            .to_owned()
+    }
+
+    fn peer_initial(&self, node_id: NodeId) -> String {
+        self.friend_name(node_id)
+            .and_then(|name| name.chars().find(|c| c.is_alphanumeric()))
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_owned())
     }
 
     fn set_stream_view_mode(&mut self, ctx: &egui::Context, mode: StreamViewMode) {
@@ -600,13 +627,15 @@ impl AppState {
     fn ui_top_bar(&mut self, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
         egui::TopBottomPanel::top("top_bar")
+            .exact_height(54.0)
             .frame(
                 Frame::new()
                     .fill(pal.bg)
-                    .inner_margin(egui::Margin::symmetric(20, 10)),
+                    .inner_margin(egui::Margin::symmetric(20, 0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                let show_context_status = ui.max_rect().width() >= 760.0;
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(
                         RichText::new("CALLME")
                             .family(kh_family())
@@ -616,9 +645,13 @@ impl AppState {
                     ui.add_space(10.0);
                     v_sep(ui, pal.line);
                     ui.add_space(10.0);
-                    if let Some(node_id) = &self.our_node_id {
-                        ui.label("Node");
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                    if self.our_node_id.is_some() {
+                        dot(ui, pal.ok, 6.0);
+                        ui.label(
+                            RichText::new("Ready")
+                                .color(pal.text2)
+                                .size(ui_font_size(12.0)),
+                        );
                     } else {
                         ui.label(RichText::new("Connecting…").weak());
                     }
@@ -652,16 +685,22 @@ impl AppState {
                             .values()
                             .filter(|s| matches!(s, CallState::Active))
                             .count();
-                        if active_calls > 0 {
+                        if show_context_status && active_calls > 0 {
                             ui.label(
-                                RichText::new(format!("{active_calls} active call(s)"))
-                                    .color(Color32::from_rgb(100, 200, 120)),
+                                RichText::new(if active_calls == 1 {
+                                    "1 active call".to_owned()
+                                } else {
+                                    format!("{active_calls} active calls")
+                                })
+                                .color(pal.ok)
+                                .size(ui_font_size(12.0)),
                             );
                         }
-                        if self.sharing_active {
+                        if show_context_status && self.sharing_active {
                             ui.label(
                                 RichText::new("Sharing screen")
-                                    .color(Color32::from_rgb(120, 170, 255)),
+                                    .color(pal.accent)
+                                    .size(ui_font_size(12.0)),
                             );
                         }
                         ui.add_space(8.0);
@@ -692,11 +731,15 @@ impl AppState {
                     .filter(|state| matches!(state, CallState::Active))
                     .count();
 
-                let control_width = 58.0;
-                let controls_width =
-                    control_width * 4.0 + if active_calls > 0 { 100.0 } else { 0.0 };
+                let controls_width = if active_calls > 0 { 350.0 } else { 250.0 };
+                let show_status = rect.width() >= controls_width + 180.0;
+                let controls_left = if show_status {
+                    rect.right() - controls_width
+                } else {
+                    rect.center().x - controls_width / 2.0
+                };
                 let controls_rect = egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - controls_width, rect.top()),
+                    egui::pos2(controls_left.max(rect.left()), rect.top()),
                     Vec2::new(controls_width, rect.height()),
                 );
                 let status_rect = egui::Rect::from_min_max(
@@ -707,37 +750,43 @@ impl AppState {
                     ),
                 );
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(if active_calls == 1 {
-                                "1 peer in session".to_owned()
-                            } else {
-                                format!("{active_calls} peers in session")
-                            })
-                            .color(pal.text2)
-                            .size(13.0),
-                        );
-                        ui.horizontal(|ui| {
-                            dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
+                if show_status {
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
                             ui.label(
-                                RichText::new(if active_calls > 0 {
-                                    "direct connection"
+                                RichText::new(if active_calls == 1 {
+                                    "1 peer in session".to_owned()
                                 } else {
-                                    "ready to connect"
+                                    format!("{active_calls} peers in session")
                                 })
-                                .color(pal.dim)
-                                .size(12.0),
+                                .color(pal.text2)
+                                .size(ui_font_size(13.0)),
                             );
-                            if self.sharing_active {
-                                ui.add_space(8.0);
-                                dot(ui, pal.accent, 5.0);
-                                ui.label(RichText::new("sharing").color(pal.dim).size(12.0));
-                            }
+                            ui.horizontal(|ui| {
+                                dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
+                                ui.label(
+                                    RichText::new(if active_calls > 0 {
+                                        "direct connection"
+                                    } else {
+                                        "ready to connect"
+                                    })
+                                    .color(pal.dim)
+                                    .size(ui_font_size(12.0)),
+                                );
+                                if self.sharing_active {
+                                    ui.add_space(8.0);
+                                    dot(ui, pal.accent, 5.0);
+                                    ui.label(
+                                        RichText::new("sharing")
+                                            .color(pal.dim)
+                                            .size(ui_font_size(12.0)),
+                                    );
+                                }
+                            });
                         });
                     });
-                });
+                }
 
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -782,11 +831,7 @@ impl AppState {
                             ui,
                             pal,
                             ph::MONITOR,
-                            if self.sharing_active {
-                                "Stop share"
-                            } else {
-                                "Share"
-                            },
+                            if self.sharing_active { "Stop" } else { "Share" },
                             self.sharing_active,
                         )
                         .on_hover_text(if self.sharing_active {
@@ -830,10 +875,15 @@ impl AppState {
         }
 
         let has_live_visual = !self.active_stream_sources().is_empty() || self.sharing_active;
+        let available_height = ui.available_height();
         let stage_height = if has_live_visual {
-            (ui.available_height() * 0.45).clamp(160.0, 380.0)
+            (available_height * 0.62)
+                .clamp(220.0, 720.0)
+                .min(available_height.max(120.0))
         } else {
-            (ui.available_height() * 0.25).clamp(120.0, 150.0)
+            (available_height * 0.32)
+                .clamp(150.0, 220.0)
+                .min(available_height.max(110.0))
         };
         let stage_width = ui.available_width();
         ui.allocate_ui_with_layout(
@@ -841,16 +891,33 @@ impl AppState {
             Layout::top_down(Align::Min),
             |ui| self.ui_stream_panel(ui, ctx),
         );
-        ui.add_space(14.0);
+        ui.add_space(8.0);
 
         self.ui_participant_strip(ui, pal);
-        ui.add_space(14.0);
+        ui.add_space(8.0);
 
-        ui.columns(2, |columns| {
-            self.ui_identity_card(&mut columns[0]);
-            columns[0].add_space(10.0);
-            self.ui_dial_card(&mut columns[0]);
-            self.ui_friends_card(&mut columns[1]);
+        let mut scroll_area = egui::ScrollArea::vertical()
+            .id_salt("home-cards-scroll")
+            .auto_shrink([false, false]);
+        if self.reset_home_scroll {
+            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+            self.reset_home_scroll = false;
+        }
+        scroll_area.show(ui, |ui| {
+            if ui.available_width() >= 760.0 {
+                ui.columns(2, |columns| {
+                    self.ui_identity_card(&mut columns[0]);
+                    columns[0].add_space(10.0);
+                    self.ui_dial_card(&mut columns[0]);
+                    self.ui_friends_card(&mut columns[1]);
+                });
+            } else {
+                self.ui_identity_card(ui);
+                ui.add_space(10.0);
+                self.ui_dial_card(ui);
+                ui.add_space(10.0);
+                self.ui_friends_card(ui);
+            }
         });
     }
 
@@ -862,13 +929,17 @@ impl AppState {
                     .color(pal.dim)
                     .size(12.0),
             );
-            ui.label(RichText::new("live call status").color(pal.dim2).size(12.0));
+            ui.label(
+                RichText::new("live call status")
+                    .color(pal.dim2)
+                    .size(ui_font_size(12.0)),
+            );
         });
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            if self.calls.is_empty() {
-                self.ui_empty_peer_tile(ui, pal);
-            } else {
+        ui.add_space(2.0);
+        if self.calls.is_empty() {
+            self.ui_empty_peer_tile(ui, pal);
+        } else {
+            ui.horizontal_wrapped(|ui| {
                 let calls: Vec<_> = self
                     .calls
                     .iter()
@@ -878,8 +949,8 @@ impl AppState {
                     self.ui_peer_tile(ui, pal, node_id, state);
                     ui.add_space(10.0);
                 }
-            }
-        });
+            });
+        }
     }
 
     fn ui_empty_peer_tile(&self, ui: &mut Ui, pal: &Palette) {
@@ -887,20 +958,42 @@ impl AppState {
             .fill(pal.panel)
             .stroke(Stroke::new(1.0, pal.line))
             .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(14, 12))
+            .inner_margin(egui::Margin::symmetric(16, 10))
             .show(ui, |ui| {
-                ui.set_min_width(220.0);
-                ui.label(
-                    RichText::new("NO ACTIVE PEERS")
-                        .family(kh_family())
-                        .color(pal.text2)
-                        .size(12.0),
-                );
-                ui.label(
-                    RichText::new("Call a saved contact or paste a node ID below.")
-                        .color(pal.dim)
-                        .size(12.0),
-                );
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(icon_rect.center(), 17.0, pal.panel2);
+                    ui.painter().circle_stroke(
+                        icon_rect.center(),
+                        17.0,
+                        Stroke::new(1.0, pal.line_br),
+                    );
+                    ui.painter().text(
+                        icon_rect.center(),
+                        Align2::CENTER_CENTER,
+                        ph::USER_PLUS,
+                        sans(15.0),
+                        pal.dim,
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("No one else is here")
+                                .color(pal.text2)
+                                .size(ui_font_size(13.0)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Start a call from a saved contact or enter a node ID below.",
+                            )
+                            .color(pal.dim)
+                            .size(ui_font_size(11.5)),
+                        );
+                    });
+                });
             });
     }
 
@@ -919,22 +1012,24 @@ impl AppState {
             .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 ui.set_min_width(208.0);
+                let peer_name = self.peer_display_name(node_id);
+                let peer_initial = self.peer_initial(node_id);
                 ui.horizontal(|ui| {
-                    circle_avatar(ui, pal, "P", 28.0);
+                    circle_avatar(ui, pal, &peer_initial, 28.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            fmt_node_id(&node_id.fmt_short())
+                            RichText::new(peer_name)
                                 .color(pal.text)
-                                .monospace()
-                                .size(12.0),
-                        );
+                                .size(ui_font_size(13.0)),
+                        )
+                        .on_hover_text(format!("Node {}…", node_id.fmt_short()));
                         let (label, color) = match state {
                             CallState::Incoming => ("incoming", pal.accent),
                             CallState::Calling => ("connecting", pal.accent),
                             CallState::Active => ("connected", pal.ok),
                             CallState::Aborted => ("ended", pal.err),
                         };
-                        ui.label(RichText::new(label).color(color).size(12.0));
+                        ui.label(RichText::new(label).color(color).size(ui_font_size(11.5)));
                     });
                 });
                 ui.add_space(7.0);
@@ -955,7 +1050,12 @@ impl AppState {
                     }
                     CallState::Calling | CallState::Active => {
                         if let Some(rtt) = self.rtts.get(&node_id) {
-                            ui.label(rtt_label(*rtt).color(pal.dim).monospace().size(11.0));
+                            ui.label(
+                                rtt_label(*rtt)
+                                    .color(pal.dim)
+                                    .monospace()
+                                    .size(ui_font_size(11.0)),
+                            );
                         }
                         if let Some(volume) = self.volumes.get(&node_id) {
                             let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
@@ -1046,7 +1146,11 @@ impl AppState {
                 });
                 match &self.remote_node_id {
                     Some(Ok(node_id)) => {
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                        let status = self
+                            .friend_name(*node_id)
+                            .map(|name| format!("Ready to call {name}"))
+                            .unwrap_or_else(|| "Valid node ID".to_owned());
+                        ui.label(RichText::new(status).color(pal.ok));
                     }
                     Some(Err(err)) => {
                         ui.label(fmt_error(&format!("Invalid ID: {err}")));
@@ -1070,12 +1174,27 @@ impl AppState {
             }
             for (idx, friend) in self.friends.iter().enumerate() {
                 let parsed = NodeId::from_str(&friend.node_id);
+                let display_name = if friend.name.trim().is_empty()
+                    || friend.name.trim() == friend.node_id.trim()
+                {
+                    "Unnamed contact"
+                } else {
+                    friend.name.trim()
+                };
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(friend.name.clone());
+                        ui.label(
+                            RichText::new(display_name)
+                                .color(pal.text)
+                                .size(ui_font_size(13.0)),
+                        );
                         match &parsed {
-                            Ok(id) => {
-                                ui.label(fmt_node_id(&id.fmt_short()));
+                            Ok(_) => {
+                                ui.label(
+                                    RichText::new("Saved contact")
+                                        .color(pal.dim)
+                                        .size(ui_font_size(11.0)),
+                                );
                             }
                             Err(_) => {
                                 ui.label(RichText::new("invalid id").small().weak());
@@ -1106,17 +1225,21 @@ impl AppState {
 
             ui.separator();
             ui.label(RichText::new("Add a friend").strong());
+            let name_width = ui.available_width();
             ui.add(
-                egui::TextEdit::singleline(&mut self.new_friend_name).hint_text("Name (optional)"),
+                egui::TextEdit::singleline(&mut self.new_friend_name)
+                    .hint_text("Name (optional)")
+                    .desired_width(name_width),
             );
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.new_friend_id).hint_text("Their node ID"),
-                );
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.add_friend();
-                }
-            });
+            let id_width = ui.available_width();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.new_friend_id)
+                    .hint_text("Their node ID")
+                    .desired_width(id_width),
+            );
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.add_friend();
+            }
             if action_button_full(ui, &pal, "Add friend", ButtonTone::Primary).clicked() {
                 self.add_friend();
             }
@@ -1132,7 +1255,7 @@ impl AppState {
             return;
         }
         let name = if self.new_friend_name.trim().is_empty() {
-            node_id.clone()
+            "Unnamed contact".to_owned()
         } else {
             self.new_friend_name.trim().to_string()
         };
@@ -1158,6 +1281,7 @@ impl AppState {
             let calls: Vec<_> = self.calls.iter().collect();
             for (node_id, state) in calls {
                 let node_id = *node_id;
+                let peer_name = self.peer_display_name(node_id);
                 Frame::new()
                     .fill(ui.visuals().widgets.noninteractive.bg_fill)
                     .corner_radius(CornerRadius::same(6))
@@ -1169,7 +1293,12 @@ impl AppState {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.label(fmt_node_id(&node_id.fmt_short()));
+                            ui.label(
+                                RichText::new(peer_name)
+                                    .color(pal.text)
+                                    .size(ui_font_size(13.0)),
+                            )
+                            .on_hover_text(format!("Node {}…", node_id.fmt_short()));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 call_state_badge(ui, state);
                             });
@@ -1305,40 +1434,20 @@ impl AppState {
                         }
                     })
                     .color(pal.dim)
-                    .size(13.0),
+                    .size(ui_font_size(13.0)),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, false);
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(4.0);
         }
 
         let available = ui.available_size();
         let (area, _) = ui.allocate_exact_size(available, egui::Sense::hover());
 
         if !has_stream {
-            if !immersive {
-                ui.painter()
-                    .rect_filled(area, CornerRadius::same(10), pal.panel);
-                ui.painter().rect_stroke(
-                    area,
-                    CornerRadius::same(10),
-                    Stroke::new(1.0, pal.line),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            ui.painter().text(
-                area.center(),
-                Align2::CENTER_CENTER,
-                if self.sharing_active {
-                    "Starting screen share…"
-                } else {
-                    "No active streams"
-                },
-                egui::FontId::proportional(16.0),
-                ui.visuals().weak_text_color(),
-            );
+            self.ui_empty_stream_state(ui, &pal, area, immersive);
             return;
         }
 
@@ -1353,7 +1462,7 @@ impl AppState {
         }
 
         let count = streams.len();
-        let (cols, rows) = stream_grid_dims(count);
+        let (cols, rows) = stream_grid_dims(count, area.size());
         let gap = STREAM_GRID_GAP;
         let total_gap_x = gap * (cols.saturating_sub(1)) as f32;
         let total_gap_y = gap * (rows.saturating_sub(1)) as f32;
@@ -1376,6 +1485,93 @@ impl AppState {
         }
     }
 
+    fn ui_empty_stream_state(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        area: egui::Rect,
+        immersive: bool,
+    ) {
+        let corner_radius = if immersive {
+            CornerRadius::ZERO
+        } else {
+            CornerRadius::same(10)
+        };
+        ui.painter().rect_filled(area, corner_radius, pal.panel);
+        if !immersive {
+            ui.painter().rect_stroke(
+                area,
+                corner_radius,
+                Stroke::new(1.0, pal.line),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        let roomy = area.height() >= 150.0;
+        let block_height = if roomy { 142.0 } else { 70.0 };
+        let block_size = Vec2::new((area.width() - 24.0).min(440.0), block_height);
+        let block_rect = egui::Rect::from_center_size(area.center(), block_size);
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(block_rect), |ui| {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(icon_rect.center(), 20.0, pal.panel2);
+                ui.painter()
+                    .circle_stroke(icon_rect.center(), 20.0, Stroke::new(1.0, pal.line_br));
+                ui.painter().text(
+                    icon_rect.center(),
+                    Align2::CENTER_CENTER,
+                    if self.sharing_active {
+                        ph::SPINNER_GAP
+                    } else {
+                        ph::MONITOR
+                    },
+                    sans(17.0),
+                    if self.sharing_active {
+                        pal.accent
+                    } else {
+                        pal.dim
+                    },
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if self.sharing_active {
+                        "Starting your screen share"
+                    } else {
+                        "Nothing is being shared"
+                    })
+                    .color(pal.text2)
+                    .size(ui_font_size(14.0)),
+                );
+
+                if roomy {
+                    ui.label(
+                        RichText::new(if self.sharing_active {
+                            "Preparing the first frame. This usually takes a moment."
+                        } else {
+                            "Shared screens and incoming video will appear here."
+                        })
+                        .color(pal.dim)
+                        .size(ui_font_size(11.5)),
+                    );
+                    ui.add_space(6.0);
+                    let (label, tone) = if self.sharing_active {
+                        ("Stop sharing", ButtonTone::Secondary)
+                    } else {
+                        ("Share your screen", ButtonTone::Primary)
+                    };
+                    if action_button(ui, pal, label, tone).clicked() {
+                        self.cmd(Command::ToggleSharing {
+                            enabled: !self.sharing_active,
+                        });
+                    }
+                }
+            });
+        });
+    }
+
     fn ui_stream_tile(
         &mut self,
         ui: &mut Ui,
@@ -1393,9 +1589,10 @@ impl AppState {
             tile_rect.right_top() + egui::vec2(-btn_size - 8.0, 8.0),
             Vec2::splat(btn_size),
         );
-        let pointer_over = ui.ctx().pointer_hover_pos().is_some_and(|pos| {
-            tile_rect.contains(pos) || btn_rect.contains(pos)
-        });
+        let pointer_over = ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|pos| tile_rect.contains(pos) || btn_rect.contains(pos));
         let show_controls = expanded || pointer_over;
 
         ui.painter()
@@ -1409,7 +1606,7 @@ impl AppState {
             );
         }
 
-        let label = self.stream_label(source);
+        let label = ellipsize(&self.stream_label(source), 30);
         let (width, height, texture_id) = match source {
             StreamSource::Local => {
                 let Some(preview) = &mut self.preview else {
@@ -1474,12 +1671,18 @@ impl AppState {
             Color32::WHITE,
         );
 
+        let label_galley = ui
+            .painter()
+            .layout_no_wrap(label.clone(), sans(11.0), pal.text);
         let name_bg = egui::Rect::from_min_size(
             tile_rect.left_bottom() + egui::vec2(8.0, -30.0),
-            egui::vec2(120.0, 22.0),
+            egui::vec2((label_galley.size().x + 16.0).clamp(64.0, 240.0), 22.0),
         );
-        ui.painter()
-            .rect_filled(name_bg, CornerRadius::same(4), Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+        ui.painter().rect_filled(
+            name_bg,
+            CornerRadius::same(4),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 170),
+        );
         ui.painter().text(
             name_bg.left_center() + egui::vec2(8.0, 0.0),
             Align2::LEFT_CENTER,
@@ -1510,7 +1713,7 @@ impl AppState {
             if ui
                 .put(
                     btn_rect,
-                    egui::Button::new(RichText::new(icon).size(15.0))
+                    egui::Button::new(RichText::new(icon).size(ui_font_size(15.0)))
                         .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 190))
                         .stroke(Stroke::new(1.0, pal.line_br)),
                 )
@@ -1534,20 +1737,25 @@ impl AppState {
         has_stream: bool,
         compact: bool,
     ) {
+        let pal = Palette::for_theme(self.theme);
         if stream_count > 1 {
             ui.label(
                 RichText::new(format!("{stream_count} streams"))
                     .color(Color32::from_rgb(0x91, 0x8e, 0x8a))
-                    .size(12.0),
+                    .size(ui_font_size(12.0)),
             );
         }
 
         if has_stream {
             let fill_selected = self.stream_view_mode == StreamViewMode::FillWindow;
-            if ui
-                .selectable_label(fill_selected, if compact { "Fill" } else { "Fill window" })
-                .on_hover_text("Expand stream to fill the client window")
-                .clicked()
+            if toolbar_button(
+                ui,
+                &pal,
+                if compact { "Fill" } else { "Fill window" },
+                fill_selected,
+            )
+            .on_hover_text("Expand stream to fill the client window")
+            .clicked()
             {
                 self.set_stream_view_mode(
                     ctx,
@@ -1560,11 +1768,7 @@ impl AppState {
             }
 
             let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
-            if ui
-                .selectable_label(
-                    fs_selected,
-                    if compact { "Fullscreen" } else { "Fullscreen" },
-                )
+            if toolbar_button(ui, &pal, "Fullscreen", fs_selected)
                 .on_hover_text("Enter native fullscreen (Esc to exit)")
                 .clicked()
             {
@@ -1580,8 +1784,7 @@ impl AppState {
         }
 
         if compact && self.stream_view_mode != StreamViewMode::Normal {
-            if ui
-                .button("Exit")
+            if toolbar_button(ui, &pal, "Exit", false)
                 .on_hover_text("Return to normal layout (Esc)")
                 .clicked()
             {
@@ -1592,210 +1795,380 @@ impl AppState {
 
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
         let can_close = self.configured;
-        egui::Window::new("Settings")
+        let pal = Palette::for_theme(self.theme);
+        let screen_rect = ctx.screen_rect();
+        let dialog_width = (screen_rect.width() - 40.0).clamp(420.0, 500.0);
+        let body_height = (screen_rect.height() - 210.0).clamp(280.0, 620.0);
+        egui::Window::new("settings-dialog")
+            .title_bar(false)
             .collapsible(false)
-            .resizable(true)
-            .default_width(420.0)
+            .resizable(false)
+            .default_width(dialog_width)
+            .min_width(dialog_width)
+            .max_width(dialog_width)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                Frame::new()
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0, pal.line_br))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(0.0),
+            )
             .show(ctx, |ui| {
-                ui.label(RichText::new("Audio").strong());
-                ui.add_space(4.0);
-
-                egui::ComboBox::from_label("Microphone")
-                    .selected_text(&self.audio_config.selected_input)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(self.audio_config.selected_input == DEFAULT, DEFAULT)
-                            .clicked()
-                        {
-                            self.audio_config.selected_input = DEFAULT.to_string();
-                        }
-                        for device in &self.devices.input {
-                            if ui
-                                .selectable_label(
-                                    &self.audio_config.selected_input == device,
-                                    device,
-                                )
-                                .clicked()
-                            {
-                                self.audio_config.selected_input = device.to_string();
-                            }
-                        }
+                ui.set_width(dialog_width);
+                Frame::new()
+                    .fill(pal.panel)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("SETTINGS")
+                                    .family(kh_family())
+                                    .color(pal.text)
+                                    .size(14.0),
+                            );
+                            ui.label(
+                                RichText::new("audio, video and updates")
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.5)),
+                            );
+                        });
                     });
+                Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings-scroll")
+                            .max_height(body_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
+                                    "Audio",
+                                    "Input, playback and call quality.",
+                                );
 
-                egui::ComboBox::from_label("Speakers")
-                    .selected_text(&self.audio_config.selected_output)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(self.audio_config.selected_output == DEFAULT, DEFAULT)
-                            .clicked()
-                        {
-                            self.audio_config.selected_output = DEFAULT.to_string();
-                        }
-                        for device in &self.devices.output {
-                            if ui
-                                .selectable_label(
-                                    &self.audio_config.selected_output == device,
-                                    device,
-                                )
-                                .clicked()
-                            {
-                                self.audio_config.selected_output = device.to_string();
-                            }
-                        }
-                    });
+                                settings_field_label(ui, &pal, "Microphone", None);
+                                let input_label = if self.audio_config.selected_input == DEFAULT {
+                                    "System default"
+                                } else {
+                                    &self.audio_config.selected_input
+                                };
+                                egui::ComboBox::from_id_salt("settings-microphone")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(input_label)
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.audio_config.selected_input == DEFAULT,
+                                                "System default",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.audio_config.selected_input = DEFAULT.to_string();
+                                        }
+                                        for device in &self.devices.input {
+                                            if ui
+                                                .selectable_label(
+                                                    &self.audio_config.selected_input == device,
+                                                    device,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.audio_config.selected_input =
+                                                    device.to_string();
+                                            }
+                                        }
+                                    });
+                                ui.add_space(8.0);
 
-                #[cfg(feature = "audio-processing")]
-                ui.checkbox(
-                    &mut self.audio_config.processing_enabled,
-                    "Echo cancellation",
-                );
+                                settings_field_label(ui, &pal, "Speakers", None);
+                                let output_label = if self.audio_config.selected_output == DEFAULT {
+                                    "System default"
+                                } else {
+                                    &self.audio_config.selected_output
+                                };
+                                egui::ComboBox::from_id_salt("settings-speakers")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(output_label)
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.audio_config.selected_output == DEFAULT,
+                                                "System default",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.audio_config.selected_output = DEFAULT.to_string();
+                                        }
+                                        for device in &self.devices.output {
+                                            if ui
+                                                .selectable_label(
+                                                    &self.audio_config.selected_output == device,
+                                                    device,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.audio_config.selected_output =
+                                                    device.to_string();
+                                            }
+                                        }
+                                    });
 
-                egui::ComboBox::from_label("Audio quality")
-                    .selected_text(self.audio_config.quality.label())
-                    .show_ui(ui, |ui| {
-                        for quality in &[
-                            AudioQuality::Low,
-                            AudioQuality::Medium,
-                            AudioQuality::High,
-                            AudioQuality::Ultra,
-                        ] {
-                            let label =
-                                format!("{} ({})", quality.label(), quality.bandwidth_human());
-                            if ui
-                                .selectable_label(self.audio_config.quality == *quality, &label)
-                                .clicked()
-                            {
-                                self.audio_config.quality = *quality;
-                            }
-                        }
-                    });
+                                #[cfg(feature = "audio-processing")]
+                                {
+                                    ui.add_space(8.0);
+                                    Frame::new()
+                                        .fill(pal.panel2)
+                                        .stroke(Stroke::new(1.0, pal.line))
+                                        .corner_radius(CornerRadius::same(7))
+                                        .inner_margin(egui::Margin::symmetric(10, 5))
+                                        .show(ui, |ui| {
+                                            ui.checkbox(
+                                                &mut self.audio_config.processing_enabled,
+                                                RichText::new("Echo cancellation")
+                                                    .color(pal.text2)
+                                                    .size(ui_font_size(12.0)),
+                                            );
+                                        });
+                                }
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("Screen sharing").strong());
-                ui.add_space(4.0);
+                                ui.add_space(8.0);
+                                settings_field_label(ui, &pal, "Audio quality", None);
+                                let selected_quality = format!(
+                                    "{} · {}",
+                                    self.audio_config.quality.label(),
+                                    self.audio_config.quality.bandwidth_human()
+                                );
+                                egui::ComboBox::from_id_salt("settings-audio-quality")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(selected_quality)
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for quality in &[
+                                            AudioQuality::Low,
+                                            AudioQuality::Medium,
+                                            AudioQuality::High,
+                                            AudioQuality::Ultra,
+                                        ] {
+                                            let label = format!(
+                                                "{} · {}",
+                                                quality.label(),
+                                                quality.bandwidth_human()
+                                            );
+                                            if ui
+                                                .selectable_label(
+                                                    self.audio_config.quality == *quality,
+                                                    &label,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.audio_config.quality = *quality;
+                                            }
+                                        }
+                                    });
 
-                let preset_label = StreamPreset::matches(&self.video_config)
-                    .map(|p| p.label)
-                    .unwrap_or("Custom");
-                egui::ComboBox::from_label("Stream quality")
-                    .selected_text(preset_label)
-                    .show_ui(ui, |ui| {
-                        for preset in StreamPreset::all() {
-                            let selected = self.video_config.resolution == preset.resolution
-                                && self.video_config.framerate == preset.framerate;
-                            if ui.selectable_label(selected, preset.label).clicked() {
-                                self.video_config.resolution = preset.resolution;
-                                self.video_config.framerate = preset.framerate;
-                            }
-                        }
-                    });
+                                settings_divider(ui);
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
+                                    "Screen sharing",
+                                    "Balance clarity, motion and bandwidth.",
+                                );
 
-                ui.label(
-                    RichText::new(format!(
-                        "{}×{} @ {} fps",
-                        self.video_config.resolution.width(),
-                        self.video_config.resolution.height(),
-                        self.video_config.framerate
-                    ))
-                    .small()
-                    .weak(),
-                );
+                                let preset_label = StreamPreset::matches(&self.video_config)
+                                    .map(|p| p.label)
+                                    .unwrap_or("Custom");
+                                let resolution_detail = format!(
+                                    "{}×{} @ {} fps",
+                                    self.video_config.resolution.width(),
+                                    self.video_config.resolution.height(),
+                                    self.video_config.framerate
+                                );
+                                settings_field_label(
+                                    ui,
+                                    &pal,
+                                    "Stream quality",
+                                    Some(&resolution_detail),
+                                );
+                                egui::ComboBox::from_id_salt("settings-stream-quality")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(preset_label)
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for preset in StreamPreset::all() {
+                                            let selected = self.video_config.resolution
+                                                == preset.resolution
+                                                && self.video_config.framerate == preset.framerate;
+                                            if ui.selectable_label(selected, preset.label).clicked()
+                                            {
+                                                self.video_config.resolution = preset.resolution;
+                                                self.video_config.framerate = preset.framerate;
+                                            }
+                                        }
+                                    });
 
-                let bitrate_label = BitratePreset::from_config(&self.video_config).label();
-                egui::ComboBox::from_label("Bitrate")
-                    .selected_text(bitrate_label)
-                    .show_ui(ui, |ui| {
-                        for preset in BitratePreset::all() {
-                            let selected =
-                                BitratePreset::from_config(&self.video_config) == *preset;
-                            if ui.selectable_label(selected, preset.label()).clicked() {
-                                self.video_config.bitrate_bps = preset.bps();
-                            }
-                        }
-                    });
+                                ui.add_space(8.0);
+                                let bitrate_label =
+                                    BitratePreset::from_config(&self.video_config).label();
+                                let bitrate_detail = format!(
+                                    "{} Mbps effective",
+                                    self.video_config.effective_bitrate() / 1_000_000
+                                );
+                                settings_field_label(ui, &pal, "Bitrate", Some(&bitrate_detail));
+                                egui::ComboBox::from_id_salt("settings-bitrate")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(bitrate_label)
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for preset in BitratePreset::all() {
+                                            let selected =
+                                                BitratePreset::from_config(&self.video_config)
+                                                    == *preset;
+                                            if ui
+                                                .selectable_label(selected, preset.label())
+                                                .clicked()
+                                            {
+                                                self.video_config.bitrate_bps = preset.bps();
+                                            }
+                                        }
+                                    });
 
-                ui.label(
-                    RichText::new(format!(
-                        "Effective bitrate: {} Mbps",
-                        self.video_config.effective_bitrate() / 1_000_000
-                    ))
-                    .small()
-                    .weak(),
-                );
+                                #[cfg(windows)]
+                                {
+                                    settings_divider(ui);
+                                    settings_section_heading(
+                                        ui,
+                                        &pal,
+                                        "Updates",
+                                        &format!(
+                                            "Installed version v{}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ),
+                                    );
 
-                #[cfg(windows)]
-                {
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Updates").strong());
-                    ui.label(
-                        RichText::new(format!("Installed version: v{}", env!("CARGO_PKG_VERSION")))
-                            .small()
-                            .weak(),
-                    );
+                                    let mut check_clicked = false;
+                                    let mut download = None;
+                                    match &self.update_status {
+                                        UpdateStatus::Idle => {
+                                            check_clicked = action_button(
+                                                ui,
+                                                &pal,
+                                                "Check for updates",
+                                                ButtonTone::Secondary,
+                                            )
+                                            .clicked();
+                                        }
+                                        UpdateStatus::Checking => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label("Checking for updates...");
+                                            });
+                                        }
+                                        UpdateStatus::UpToDate => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("You are up to date")
+                                                        .color(pal.ok),
+                                                );
+                                                check_clicked = action_button(
+                                                    ui,
+                                                    &pal,
+                                                    "Check again",
+                                                    ButtonTone::Secondary,
+                                                )
+                                                .clicked();
+                                            });
+                                        }
+                                        UpdateStatus::Available(release) => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Version v{} is available",
+                                                    release.version
+                                                ))
+                                                .color(pal.ok),
+                                            );
+                                            if action_button(
+                                                ui,
+                                                &pal,
+                                                "Download and relaunch",
+                                                ButtonTone::Primary,
+                                            )
+                                            .clicked()
+                                            {
+                                                download = Some(release.clone());
+                                            }
+                                        }
+                                        UpdateStatus::Downloading(release) => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(format!(
+                                                    "Downloading v{}...",
+                                                    release.version
+                                                ));
+                                            });
+                                        }
+                                        UpdateStatus::Error(error) => {
+                                            ui.label(RichText::new(error).color(pal.err));
+                                            check_clicked = action_button(
+                                                ui,
+                                                &pal,
+                                                "Try again",
+                                                ButtonTone::Secondary,
+                                            )
+                                            .clicked();
+                                        }
+                                    }
+                                    if check_clicked {
+                                        self.start_update_check(ctx);
+                                    }
+                                    if let Some(release) = download {
+                                        self.start_update_download(ctx, release);
+                                    }
+                                }
 
-                    let mut check_clicked = false;
-                    let mut download = None;
-                    match &self.update_status {
-                        UpdateStatus::Idle => {
-                            check_clicked = ui.button("Check for updates").clicked();
-                        }
-                        UpdateStatus::Checking => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Checking for updates...");
+                                settings_divider(ui);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if action_button(ui, &pal, "Save changes", ButtonTone::Primary)
+                                        .clicked()
+                                    {
+                                        let audio_config = self.audio_config();
+                                        let video_config = self.video_config;
+                                        self.cmd(Command::SetAudioConfig { audio_config });
+                                        self.cmd(Command::SetVideoConfig { video_config });
+                                        self.persist_settings();
+                                        self.configured = true;
+                                        self.show_settings = false;
+                                    }
+                                    if can_close
+                                        && action_button(ui, &pal, "Cancel", ButtonTone::Secondary)
+                                            .clicked()
+                                    {
+                                        self.show_settings = false;
+                                    }
+                                });
                             });
-                        }
-                        UpdateStatus::UpToDate => {
-                            ui.horizontal(|ui| {
-                                ui.label("You are up to date.");
-                                check_clicked = ui.button("Check again").clicked();
-                            });
-                        }
-                        UpdateStatus::Available(release) => {
-                            ui.label(format!("Version v{} is available.", release.version));
-                            if ui.button("Download to Desktop and relaunch").clicked() {
-                                download = Some(release.clone());
-                            }
-                        }
-                        UpdateStatus::Downloading(release) => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Downloading v{}...", release.version));
-                            });
-                        }
-                        UpdateStatus::Error(error) => {
-                            ui.colored_label(Color32::from_rgb(220, 100, 90), error);
-                            check_clicked = ui.button("Try again").clicked();
-                        }
-                    }
-                    if check_clicked {
-                        self.start_update_check(ctx);
-                    }
-                    if let Some(release) = download {
-                        self.start_update_download(ctx, release);
-                    }
-                }
-
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        let audio_config = self.audio_config();
-                        let video_config = self.video_config;
-                        self.cmd(Command::SetAudioConfig { audio_config });
-                        self.cmd(Command::SetVideoConfig { video_config });
-                        self.persist_settings();
-                        self.configured = true;
-                        self.show_settings = false;
-                    }
-                    if can_close && ui.button("Cancel").clicked() {
-                        self.show_settings = false;
-                    }
-                });
+                    });
             });
     }
 
@@ -1842,6 +2215,47 @@ impl AppState {
     }
 }
 
+fn settings_section_heading(ui: &mut Ui, pal: &Palette, title: &str, description: &str) {
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .family(kh_family())
+            .color(pal.text2)
+            .size(11.0),
+    );
+    ui.label(
+        RichText::new(description)
+            .color(pal.dim)
+            .size(ui_font_size(11.0)),
+    );
+    ui.add_space(8.0);
+}
+
+fn settings_field_label(ui: &mut Ui, pal: &Palette, label: &str, detail: Option<&str>) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .color(pal.text2)
+                .size(ui_font_size(12.0)),
+        );
+        if let Some(detail) = detail {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(detail)
+                        .color(pal.dim)
+                        .size(ui_font_size(10.5)),
+                );
+            });
+        }
+    });
+    ui.add_space(2.0);
+}
+
+fn settings_divider(ui: &mut Ui) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+}
+
 fn section_card<R>(
     ui: &mut Ui,
     pal: &Palette,
@@ -1861,7 +2275,7 @@ fn section_card<R>(
                     .color(pal.dim)
                     .size(11.0),
             );
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             add_contents(ui)
         })
         .inner
@@ -1889,20 +2303,31 @@ fn rtt_label(rtt: Duration) -> RichText {
     RichText::new(text).color(color).small()
 }
 
-fn stream_grid_dims(count: usize) -> (usize, usize) {
-    match count {
-        0 => (1, 1),
-        1 => (1, 1),
-        2 => (2, 1),
-        3 | 4 => (2, 2),
-        5 | 6 => (3, 2),
-        7 | 8 | 9 => (3, 3),
-        _ => {
-            let cols = (count as f32).sqrt().ceil() as usize;
-            let rows = count.div_ceil(cols);
-            (cols, rows)
+fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
+    if count <= 1 || available.x <= 0.0 || available.y <= 0.0 {
+        return (1, 1);
+    }
+
+    let mut best = (1, count);
+    let mut best_score = 0.0;
+    for cols in 1..=count {
+        let rows = count.div_ceil(cols);
+        let width = (available.x - STREAM_GRID_GAP * (cols.saturating_sub(1)) as f32) / cols as f32;
+        let height =
+            (available.y - STREAM_GRID_GAP * (rows.saturating_sub(1)) as f32) / rows as f32;
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+
+        let displayed = video_display_size(Vec2::new(width, height), 16.0 / 9.0, false);
+        let occupied_cells = count as f32 / (cols * rows) as f32;
+        let score = displayed.x * displayed.y * count as f32 * (0.9 + occupied_cells * 0.1);
+        if score > best_score {
+            best_score = score;
+            best = (cols, rows);
         }
     }
+    best
 }
 
 fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 {
@@ -1979,6 +2404,45 @@ fn fmt_error(text: &str) -> RichText {
 
 fn fmt_rtt(dur: &Duration) -> String {
     format!("{}ms", dur.as_millis())
+}
+
+fn ellipsize(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+
+    let mut shortened: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    shortened.push('…');
+    shortened
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn stream_grid_tracks_the_stage_shape() {
+        assert_eq!(stream_grid_dims(2, Vec2::new(1200.0, 400.0)), (2, 1));
+        assert_eq!(stream_grid_dims(2, Vec2::new(400.0, 1200.0)), (1, 2));
+        assert_eq!(stream_grid_dims(4, Vec2::new(800.0, 800.0)), (2, 2));
+    }
+
+    #[test]
+    fn video_fit_preserves_aspect_ratio() {
+        let wide = video_display_size(Vec2::new(1000.0, 400.0), 16.0 / 9.0, false);
+        assert!((wide.x - 711.1111).abs() < 0.01);
+        assert_eq!(wide.y, 400.0);
+
+        let narrow = video_display_size(Vec2::new(400.0, 1000.0), 16.0 / 9.0, false);
+        assert_eq!(narrow.x, 400.0);
+        assert!((narrow.y - 225.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn long_stream_names_are_clipped_cleanly() {
+        assert_eq!(ellipsize("Ada", 8), "Ada");
+        assert_eq!(ellipsize("Long display name", 8), "Long di…");
+    }
 }
 
 enum Event {
@@ -2354,10 +2818,7 @@ impl Worker {
     }
 
     async fn ensure_video_streams(&mut self, node_id: NodeId, conn: RtcConnection) {
-        if !matches!(
-            self.active_calls.get(&node_id),
-            Some(CallInfo::Active(_))
-        ) {
+        if !matches!(self.active_calls.get(&node_id), Some(CallInfo::Active(_))) {
             return;
         }
 
