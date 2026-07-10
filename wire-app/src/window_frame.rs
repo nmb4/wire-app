@@ -7,8 +7,8 @@
 //! expanded by [`egui::style::Visuals::clip_rect_margin`] for anti-aliasing.
 
 use eframe::egui::{
-    self, epaint, layers::ShapeIdx, Color32, CornerRadius, Frame, Margin, Rect, Sense, Shape,
-    Stroke, Ui, UiBuilder, ViewportCommand,
+    self, epaint, layers::ShapeIdx, Color32, CornerRadius, CursorIcon, Frame, Margin, Rect,
+    ResizeDirection, Sense, Shape, Stroke, Ui, UiBuilder, ViewportCommand,
 };
 use epaint::{RectShape, StrokeKind};
 use crate::theme::{Palette, WindowFrameStyle};
@@ -168,4 +168,34 @@ pub fn effective_rounded(ctx: &egui::Context, style: WindowFrameStyle) -> bool {
 
 pub fn sync_viewport_transparent(ctx: &egui::Context, transparent: bool) {
     ctx.send_viewport_cmd(ViewportCommand::Transparent(transparent));
+}
+
+/// Restore native-style resize hit targets for a borderless viewport.
+pub fn resize_edges(ui: &mut Ui, rect: Rect) {
+    if ui.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+
+    const EDGE: f32 = 6.0;
+    const CORNER: f32 = 12.0;
+    let edges = [
+        ("north", Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + EDGE)), ResizeDirection::North, CursorIcon::ResizeVertical),
+        ("south", Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - EDGE), rect.max), ResizeDirection::South, CursorIcon::ResizeVertical),
+        ("west", Rect::from_min_max(rect.min, egui::pos2(rect.min.x + EDGE, rect.max.y)), ResizeDirection::West, CursorIcon::ResizeHorizontal),
+        ("east", Rect::from_min_max(egui::pos2(rect.max.x - EDGE, rect.min.y), rect.max), ResizeDirection::East, CursorIcon::ResizeHorizontal),
+        ("north-west", Rect::from_min_size(rect.min, egui::vec2(CORNER, CORNER)), ResizeDirection::NorthWest, CursorIcon::ResizeNwSe),
+        ("north-east", Rect::from_min_size(egui::pos2(rect.max.x - CORNER, rect.min.y), egui::vec2(CORNER, CORNER)), ResizeDirection::NorthEast, CursorIcon::ResizeNeSw),
+        ("south-west", Rect::from_min_size(egui::pos2(rect.min.x, rect.max.y - CORNER), egui::vec2(CORNER, CORNER)), ResizeDirection::SouthWest, CursorIcon::ResizeNeSw),
+        ("south-east", Rect::from_min_size(rect.max - egui::vec2(CORNER, CORNER), egui::vec2(CORNER, CORNER)), ResizeDirection::SouthEast, CursorIcon::ResizeNwSe),
+    ];
+
+    for (name, hit_rect, direction, cursor) in edges {
+        let response = ui.interact(hit_rect, egui::Id::new(("window-resize", name)), Sense::drag());
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(ViewportCommand::BeginResize(direction));
+        }
+    }
 }

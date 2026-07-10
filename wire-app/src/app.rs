@@ -20,6 +20,7 @@ use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use egui_phosphor::regular as ph;
 use iroh::{endpoint::VarInt, protocol::Router, Endpoint, KeyParsingError, NodeId};
+use lucide_icons::Icon;
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
@@ -753,11 +754,12 @@ impl AppState {
                         rect.max.y = rect.min.y + title_bar::HEIGHT;
                         rect
                     };
-                    title_bar::ui(ui, title_bar_rect, pal, "Wire", always_on_top);
+                    title_bar::ui(ui, title_bar_rect, pal, "Wire", always_on_top, rounded);
 
                     let mut body_rect = app_rect;
                     body_rect.min.y = title_bar_rect.max.y;
                     self.ui_chrome_body(ui, ctx, pal, body_rect);
+                    window_frame::resize_edges(ui, ctx.screen_rect());
                 });
             });
     }
@@ -811,16 +813,14 @@ impl AppState {
     fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
         let show_context_status = ui.max_rect().width() >= 760.0;
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("Wire")
-                            .family(kh_family())
-                            .color(pal.text)
-                            .size(16.0),
-                    );
-                    ui.add_space(10.0);
-                    v_sep(ui, pal.line);
-                    ui.add_space(10.0);
-                    if self.our_node_id.is_some() {
+                    if self.sharing_active {
+                        dot(ui, pal.accent, 6.0);
+                        ui.label(
+                            RichText::new("Sharing screen")
+                                .color(pal.text2)
+                                .size(ui_font_size(12.0)),
+                        );
+                    } else if self.our_node_id.is_some() {
                         dot(ui, pal.ok, 6.0);
                         ui.label(
                             RichText::new("Ready")
@@ -836,7 +836,7 @@ impl AppState {
                         _ => None,
                     };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if action_button(ui, &pal, "Settings", ButtonTone::Secondary)
+                        if ghost_icon_button(ui, pal, ph::GEAR_SIX)
                             .on_hover_text("Audio and screen sharing options")
                             .clicked()
                         {
@@ -871,18 +871,6 @@ impl AppState {
                                 .size(ui_font_size(12.0)),
                             );
                         }
-                        if show_context_status && self.sharing_active {
-                            ui.label(
-                                RichText::new("Sharing screen")
-                                    .color(pal.accent)
-                                    .size(ui_font_size(12.0)),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        if theme_badge(ui, &pal, self.theme.name()).clicked() {
-                            self.theme = self.theme.next();
-                            self.persist_theme();
-                        }
                     });
                 });
     }
@@ -897,7 +885,7 @@ impl AppState {
                     .filter(|state| matches!(state, CallState::Active))
                     .count();
 
-                let controls_width = if active_calls > 0 { 350.0 } else { 250.0 };
+                let controls_width = if active_calls > 0 { 320.0 } else { 210.0 };
                 let show_status = rect.width() >= controls_width + 180.0;
                 let controls_left = if show_status {
                     rect.right() - controls_width
@@ -940,15 +928,6 @@ impl AppState {
                                     .color(pal.dim)
                                     .size(ui_font_size(12.0)),
                                 );
-                                if self.sharing_active {
-                                    ui.add_space(8.0);
-                                    dot(ui, pal.accent, 5.0);
-                                    ui.label(
-                                        RichText::new("sharing")
-                                            .color(pal.dim)
-                                            .size(ui_font_size(12.0)),
-                                    );
-                                }
                             });
                         });
                     });
@@ -1012,13 +991,6 @@ impl AppState {
                             let enabled = !self.sharing_active;
                             self.play_control_sound(enabled);
                             self.cmd(Command::ToggleSharing { enabled });
-                        }
-                        ui.add_space(2.0);
-                        if dock_control(ui, pal, ph::GEAR_SIX, "Settings", false)
-                            .on_hover_text("Audio and screen sharing settings")
-                            .clicked()
-                        {
-                            self.show_settings = true;
                         }
                         if active_calls > 0 {
                             ui.add_space(8.0);
@@ -1361,18 +1333,9 @@ impl AppState {
                                 .color(pal.text)
                                 .size(ui_font_size(13.0)),
                         );
-                        match &parsed {
-                            Ok(_) => {
-                                ui.label(
-                                    RichText::new("Saved contact")
-                                        .color(pal.dim)
-                                        .size(ui_font_size(11.0)),
-                                );
-                            }
-                            Err(_) => {
-                                ui.label(RichText::new("invalid id").small().weak());
-                            }
-                        };
+                        if parsed.is_err() {
+                            ui.label(RichText::new("invalid id").small().weak());
+                        }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if action_button(ui, &pal, "Remove", ButtonTone::Danger).clicked() {
@@ -1584,7 +1547,9 @@ impl AppState {
         let has_stream = !streams.is_empty();
 
         if immersive {
-            self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, true);
+            ui.horizontal(|ui| {
+                self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, true);
+            });
             ui.add_space(4.0);
         } else {
             ui.horizontal(|ui| {
@@ -1594,25 +1559,26 @@ impl AppState {
                         .color(pal.text)
                         .size(16.0),
                 );
-                ui.label(
-                    RichText::new({
-                        if has_stream {
-                            if self.focused_stream.is_some() {
-                                "focused stream".to_string()
-                            } else if streams.len() == 1 {
-                                "1 stream".to_string()
-                            } else {
-                                format!("{} streams", streams.len())
-                            }
-                        } else if self.sharing_active {
-                            "starting share…".to_string()
-                        } else {
-                            "secure screen sharing".to_string()
-                        }
+                let stage_detail = if has_stream {
+                    Some(if self.focused_stream.is_some() {
+                        "focused stream".to_string()
+                    } else if streams.len() == 1 {
+                        "1 stream".to_string()
+                    } else {
+                        format!("{} streams", streams.len())
                     })
-                    .color(pal.dim)
-                    .size(ui_font_size(13.0)),
-                );
+                } else if self.sharing_active {
+                    Some("starting share…".to_string())
+                } else {
+                    None
+                };
+                if let Some(detail) = stage_detail {
+                    ui.label(
+                        RichText::new(detail)
+                            .color(pal.dim)
+                            .size(ui_font_size(13.0)),
+                    );
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, false);
                 });
@@ -1928,6 +1894,7 @@ impl AppState {
             if toolbar_button(
                 ui,
                 &pal,
+                Icon::Expand,
                 if compact { "Fill" } else { "Fill window" },
                 fill_selected,
             )
@@ -1945,7 +1912,7 @@ impl AppState {
             }
 
             let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
-            if toolbar_button(ui, &pal, "Fullscreen", fs_selected)
+            if toolbar_button(ui, &pal, Icon::Fullscreen, "Fullscreen", fs_selected)
                 .on_hover_text("Enter native fullscreen (Esc to exit)")
                 .clicked()
             {
@@ -1961,7 +1928,7 @@ impl AppState {
         }
 
         if compact && self.stream_view_mode != StreamViewMode::Normal {
-            if toolbar_button(ui, &pal, "Exit", false)
+            if toolbar_button(ui, &pal, Icon::Minimize2, "Exit", false)
                 .on_hover_text("Return to normal layout (Esc)")
                 .clicked()
             {
@@ -1975,7 +1942,7 @@ impl AppState {
         let pal = Palette::for_theme(self.theme);
         let screen_rect = ctx.screen_rect();
         let dialog_width = (screen_rect.width() - 40.0).clamp(420.0, 500.0);
-        let body_height = (screen_rect.height() - 210.0).clamp(280.0, 620.0);
+        let body_height = (screen_rect.height() - 130.0).clamp(360.0, 840.0);
         egui::Window::new("settings-dialog")
             .title_bar(false)
             .collapsible(false)
@@ -2003,10 +1970,10 @@ impl AppState {
                                 RichText::new("SETTINGS")
                                     .family(kh_family())
                                     .color(pal.text)
-                                    .size(14.0),
+                                    .size(16.0),
                             );
                             ui.label(
-                                RichText::new("audio, video and updates")
+                                RichText::new("appearance, audio, video and updates")
                                     .color(pal.dim)
                                     .size(ui_font_size(11.5)),
                             );
@@ -2027,6 +1994,26 @@ impl AppState {
                                     "Appearance",
                                     "Window frame and corners.",
                                 );
+
+                                settings_field_label(ui, &pal, "Theme", None);
+                                egui::ComboBox::from_id_salt("settings-theme")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(self.theme.label())
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for theme in Theme::ALL {
+                                            if ui
+                                                .selectable_label(self.theme == theme, theme.label())
+                                                .clicked()
+                                            {
+                                                self.theme = theme;
+                                            }
+                                        }
+                                    });
+                                ui.add_space(8.0);
 
                                 settings_field_label(ui, &pal, "Window corners", None);
                                 let frame_detail = match self.window_frame_style {
@@ -2448,7 +2435,7 @@ fn settings_section_heading(ui: &mut Ui, pal: &Palette, title: &str, description
         RichText::new(title.to_uppercase())
             .family(kh_family())
             .color(pal.text2)
-            .size(11.0),
+            .size(13.0),
     );
     ui.label(
         RichText::new(description)

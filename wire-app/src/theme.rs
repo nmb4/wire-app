@@ -6,9 +6,10 @@
 
 use eframe::egui;
 use egui::{
-    Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
+    text::{LayoutJob, TextFormat}, Color32, CornerRadius, FontData, FontFamily, FontId, FontTweak,
+    Margin, RichText, Stroke, TextStyle, Vec2,
 };
-use lucide_icons::LUCIDE_FONT_BYTES;
+use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 // uppercase display font family used for headers / big text
 pub fn kh_family() -> FontFamily {
     FontFamily::Name("KhInterference".into())
@@ -83,6 +84,8 @@ impl WindowFrameStyle {
 }
 
 impl Theme {
+    pub const ALL: [Self; 4] = [Self::Amber, Self::Terminal, Self::DiscordOled, Self::Slate];
+
     pub fn next(self) -> Self {
         match self {
             Theme::Amber => Theme::Terminal,
@@ -98,6 +101,15 @@ impl Theme {
             Theme::Terminal => "terminal",
             Theme::DiscordOled => "oled",
             Theme::Slate => "slate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Amber => "Amber",
+            Theme::Terminal => "Terminal",
+            Theme::DiscordOled => "OLED",
+            Theme::Slate => "Slate",
         }
     }
 }
@@ -222,6 +234,10 @@ pub fn setup_fonts(ctx: &egui::Context) {
             ))
             .to_vec(),
         )
+        .tweak(FontTweak {
+            y_offset: 1.0,
+            ..Default::default()
+        })
         .into(),
     );
     fonts.font_data.insert(
@@ -233,6 +249,10 @@ pub fn setup_fonts(ctx: &egui::Context) {
             ))
             .to_vec(),
         )
+        .tweak(FontTweak {
+            y_offset: 1.0,
+            ..Default::default()
+        })
         .into(),
     );
     fonts.font_data.insert(
@@ -442,6 +462,7 @@ pub fn action_button_full(
 pub fn toolbar_button(
     ui: &mut egui::Ui,
     pal: &Palette,
+    icon: Icon,
     label: &str,
     selected: bool,
 ) -> egui::Response {
@@ -453,13 +474,60 @@ pub fn toolbar_button(
     };
     let text = if selected { pal.accent } else { pal.text2 };
 
+    let mut content = LayoutJob::default();
+    content.append(
+        &char::from(icon).to_string(),
+        0.0,
+        TextFormat {
+            font_id: lucide(14.0),
+            color: text,
+            ..Default::default()
+        },
+    );
+    content.append(
+        "  ",
+        0.0,
+        TextFormat {
+            font_id: sans(12.0),
+            color: text,
+            ..Default::default()
+        },
+    );
+    content.append(
+        label,
+        0.0,
+        TextFormat {
+            font_id: sans(12.0),
+            color: text,
+            ..Default::default()
+        },
+    );
+
     ui.add(
-        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(12.0)))
+        egui::Button::new(content)
             .fill(fill)
             .stroke(stroke)
             .corner_radius(CornerRadius::same(7))
             .min_size(Vec2::new(0.0, 32.0)),
     )
+}
+pub fn ghost_icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), pal.panel2);
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        sans(18.0),
+        if response.hovered() { pal.text } else { pal.text2 },
+    );
+    response
 }
 pub fn dock_icon_btn(
     ui: &mut egui::Ui,
@@ -494,7 +562,7 @@ pub fn dock_control(
     active: bool,
 ) -> egui::Response {
     ui.allocate_ui_with_layout(
-        Vec2::new(58.0, 66.0),
+        Vec2::new(66.0, 66.0),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
