@@ -110,21 +110,14 @@ pub fn download_update(release: &ReleaseInfo) -> Result<PathBuf> {
 
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid update ZIP")?;
     let legacy_executable_name = format!("callme-egui-v{}.exe", release.version);
-    let executable_name = if zip
-        .file_names()
-        .any(|name| name == EXECUTABLE_NAME)
-    {
+    let executable_name = if zip.file_names().any(|name| name == EXECUTABLE_NAME) {
         EXECUTABLE_NAME.to_owned()
     } else {
         legacy_executable_name.clone()
     };
-    let mut entry = zip
-        .by_name(&executable_name)
-        .with_context(|| {
-            format!(
-                "update ZIP does not contain {EXECUTABLE_NAME} or {legacy_executable_name}"
-            )
-        })?;
+    let mut entry = zip.by_name(&executable_name).with_context(|| {
+        format!("update ZIP does not contain {EXECUTABLE_NAME} or {legacy_executable_name}")
+    })?;
     let mut executable = Vec::with_capacity(entry.size() as usize);
     entry
         .read_to_end(&mut executable)
