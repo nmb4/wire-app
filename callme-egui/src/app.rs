@@ -407,12 +407,11 @@ impl AppState {
                     self.update_status = UpdateStatus::Error(error.to_string());
                 }
                 UpdateMessage::DownloadFinished(Ok(path)) => {
-                    match std::process::Command::new(&path).spawn() {
+                    match update::relaunch_after_download(&path) {
                         Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(error) => {
                             self.update_status = UpdateStatus::Error(format!(
-                                "Downloaded to {}, but could not launch it: {error}",
-                                path.display()
+                                "Downloaded the update, but could not relaunch it: {error}",
                             ));
                         }
                     }

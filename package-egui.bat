@@ -7,7 +7,7 @@ if not defined VERSION (
     exit /b 1
 )
 
-set "EXE_NAME=callme-egui-v%VERSION%.exe"
+set "EXE_NAME=callme-egui.exe"
 set "ZIP_NAME=callme-egui-v%VERSION%.zip"
 set "ARTIFACT_DIR=dist"
 set "EXE_PATH=%ARTIFACT_DIR%\%EXE_NAME%"

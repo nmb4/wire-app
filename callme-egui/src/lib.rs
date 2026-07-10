@@ -2,6 +2,9 @@
 use egui_winit::winit;
 
 pub mod app;
+/// The application version embedded at compile time from this package's Cargo manifest.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(windows)]
 mod scap_capture;
 mod screen_capture;

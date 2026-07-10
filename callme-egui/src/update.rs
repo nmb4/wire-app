@@ -1,7 +1,8 @@
 use std::{
     fs,
     io::{Cursor, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -12,6 +13,7 @@ use sha2::{Digest, Sha256};
 const FILES_API: &str = "https://api.stardive.space/v1/files";
 const RELEASE_PREFIX: &str = "callme-egui-v";
 const RELEASE_SUFFIX: &str = ".zip";
+const EXECUTABLE_NAME: &str = "callme-egui.exe";
 
 #[derive(Clone, Debug)]
 pub struct ReleaseInfo {
@@ -81,7 +83,7 @@ pub fn check_for_update() -> Result<Option<ReleaseInfo>> {
         .json::<FileList>()
         .context("update server returned invalid metadata")?;
 
-    let current = parse_version(env!("CARGO_PKG_VERSION"))
+    let current = parse_version(crate::APP_VERSION)
         .context("the current application version is not major.minor.patch")?;
     Ok(latest_newer_release(files.files, current))
 }
@@ -106,25 +108,59 @@ pub fn download_update(release: &ReleaseInfo) -> Result<PathBuf> {
         bail!("download checksum did not match the API metadata");
     }
 
-    let exe_name = format!("callme-egui-v{}.exe", release.version);
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid update ZIP")?;
+    let legacy_executable_name = format!("callme-egui-v{}.exe", release.version);
+    let executable_name = if zip
+        .file_names()
+        .any(|name| name == EXECUTABLE_NAME)
+    {
+        EXECUTABLE_NAME.to_owned()
+    } else {
+        legacy_executable_name.clone()
+    };
     let mut entry = zip
-        .by_name(&exe_name)
-        .with_context(|| format!("update ZIP does not contain {exe_name}"))?;
+        .by_name(&executable_name)
+        .with_context(|| {
+            format!(
+                "update ZIP does not contain {EXECUTABLE_NAME} or {legacy_executable_name}"
+            )
+        })?;
     let mut executable = Vec::with_capacity(entry.size() as usize);
     entry
         .read_to_end(&mut executable)
         .context("failed to extract update executable")?;
 
     let desktop = dirs::desktop_dir().context("could not locate the Desktop folder")?;
-    let destination = desktop.join(&exe_name);
-    let temporary = desktop.join(format!(".{exe_name}.download"));
+    let temporary = desktop.join(format!(".{EXECUTABLE_NAME}.download"));
     fs::write(&temporary, executable).context("failed to write update to Desktop")?;
-    if destination.exists() {
-        fs::remove_file(&destination).context("failed to replace existing Desktop update")?;
-    }
-    fs::rename(&temporary, &destination).context("failed to finalize Desktop update")?;
-    Ok(destination)
+    Ok(temporary)
+}
+
+pub fn relaunch_after_download(temporary: &Path) -> Result<()> {
+    let desktop = dirs::desktop_dir().context("could not locate the Desktop folder")?;
+    let destination = desktop.join(EXECUTABLE_NAME);
+    let source = powershell_quote(temporary);
+    let destination = powershell_quote(&destination);
+    let script = format!(
+        "$source = {source}; $destination = {destination}; for ($attempt = 0; $attempt -lt 120; $attempt++) {{ try {{ Move-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop; Start-Process -FilePath $destination; exit 0 }} catch {{ Start-Sleep -Milliseconds 250 }} }}; exit 1"
+    );
+
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .spawn()
+        .context("failed to start the update helper")?;
+    Ok(())
+}
+
+fn powershell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 #[cfg(test)]
