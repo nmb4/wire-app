@@ -3606,6 +3606,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucide-icons"
+version = "1.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc788cd197371c8775ecd589009350ea71dbc3a5709b2495c032670dcfed320d"
+
+[[package]]
 name = "mach"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8489,7 +8495,7 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -8501,6 +8507,7 @@ dependencies = [
  "fast_image_resize",
  "image 0.25.5",
  "iroh",
+ "lucide-icons",
  "n0-future",
  "rayon",
  "reqwest",

@@ -27,8 +27,10 @@ use tracing::{info, warn};
 use crate::{
     sounds::{Sound, Sounds},
     theme::*,
+    title_bar,
     update::{self, ReleaseInfo},
     video_decode::VideoDecodeWorker,
+    window_frame,
 };
 
 const DEFAULT: &str = "<default>";
@@ -37,6 +39,8 @@ const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
 
 pub struct App {
     is_first_update: bool,
+    always_on_top: bool,
+    viewport_transparent: Option<bool>,
     state: AppState,
 }
 
@@ -153,6 +157,7 @@ struct AppState {
     new_friend_name: String,
     new_friend_id: String,
     theme: Theme,
+    window_frame_style: WindowFrameStyle,
     muted: bool,
     deafened: bool,
     sounds: Option<Sounds>,
@@ -212,6 +217,8 @@ struct Settings {
     audio: UiAudioConfig,
     video: VideoConfig,
     theme: Theme,
+    #[serde(default)]
+    window_frame_style: WindowFrameStyle,
     configured: bool,
 }
 
@@ -221,6 +228,7 @@ impl Default for Settings {
             audio: UiAudioConfig::default(),
             video: VideoConfig::default(),
             theme: Theme::default(),
+            window_frame_style: WindowFrameStyle::default(),
             configured: false,
         }
     }
@@ -259,6 +267,15 @@ impl Default for UiAudioConfig {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.viewport_transparent == Some(true) {
+            egui::Rgba::TRANSPARENT.to_array()
+        } else {
+            let pal = Palette::for_theme(self.state.theme);
+            egui::Rgba::from(pal.bg).to_array()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_first_update {
             self.is_first_update = false;
@@ -274,11 +291,18 @@ impl eframe::App for App {
             .min_height(40.)
             .show(ctx, |_ui| {});
 
-        self.state.update(ctx);
+        self.state
+            .update(ctx, &mut self.always_on_top, &mut self.viewport_transparent);
     }
 }
 
 impl App {
+    pub fn initial_window_frame_style() -> WindowFrameStyle {
+        load_settings()
+            .map(|settings| settings.window_frame_style)
+            .unwrap_or_default()
+    }
+
     pub fn run(options: NativeOptions) -> Result<(), eframe::Error> {
         let handle = Worker::spawn();
         let devices =
@@ -316,6 +340,7 @@ impl App {
             new_friend_name: String::new(),
             new_friend_id: String::new(),
             theme: settings.theme,
+            window_frame_style: settings.window_frame_style,
             muted: false,
             deafened: false,
             sounds,
@@ -336,9 +361,12 @@ impl App {
             });
         }
 
+        let rounded = window_frame::style_wants_rounded(state.window_frame_style);
         let app = App {
             state,
             is_first_update: true,
+            always_on_top: false,
+            viewport_transparent: Some(rounded),
         };
         eframe::run_native(
             "wire",
@@ -351,7 +379,12 @@ impl App {
     }
 }
 impl AppState {
-    fn update(&mut self, ctx: &egui::Context) {
+    fn update(
+        &mut self,
+        ctx: &egui::Context,
+        always_on_top: &mut bool,
+        viewport_transparent: &mut Option<bool>,
+    ) {
         self.process_update_events(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::T)) {
             self.theme = self.theme.next();
@@ -363,22 +396,19 @@ impl AppState {
         self.process_events();
         self.handle_view_mode_input(ctx);
 
-        let immersive = self.stream_view_mode != StreamViewMode::Normal;
-
         if !self.stream_view_mode.is_fullscreen() {
-            self.ui_top_bar(ctx);
-            self.ui_dock(ctx, &pal);
+            let rounded = window_frame::effective_rounded(ctx, self.window_frame_style);
+            self.ui_with_chrome(ctx, &pal, rounded, always_on_top, viewport_transparent);
+        } else {
+            if *viewport_transparent != Some(false) {
+                window_frame::sync_viewport_transparent(ctx, false);
+                *viewport_transparent = Some(false);
+                ctx.request_repaint();
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::NONE)
+                .show(ctx, |ui| self.ui_stage(ui, ctx, &pal));
         }
-
-        egui::CentralPanel::default()
-            .frame(if immersive {
-                Frame::NONE
-            } else {
-                Frame::central_panel(&ctx.style())
-                    .fill(pal.bg)
-                    .inner_margin(egui::Margin::symmetric(20, 14))
-            })
-            .show(ctx, |ui| self.ui_stage(ui, ctx, &pal));
 
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
@@ -658,6 +688,7 @@ impl AppState {
             audio: self.audio_config.clone(),
             video: self.video_config,
             theme: self.theme,
+            window_frame_style: self.window_frame_style,
             configured: true,
         });
     }
@@ -695,18 +726,91 @@ impl AppState {
         self.cmd(Command::Abort { node_id });
     }
 
-    fn ui_top_bar(&mut self, ctx: &egui::Context) {
-        let pal = Palette::for_theme(self.theme);
-        egui::TopBottomPanel::top("top_bar")
-            .exact_height(54.0)
-            .frame(
-                Frame::new()
-                    .fill(pal.bg)
-                    .inner_margin(egui::Margin::symmetric(20, 0)),
-            )
+    fn ui_with_chrome(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &Palette,
+        rounded: bool,
+        always_on_top: &mut bool,
+        viewport_transparent: &mut Option<bool>,
+    ) {
+        let transparent = rounded;
+        if *viewport_transparent != Some(transparent) {
+            window_frame::sync_viewport_transparent(ctx, transparent);
+            *viewport_transparent = Some(transparent);
+            ctx.request_repaint();
+        }
+
+        egui::CentralPanel::default()
+            .frame(Frame::NONE)
             .show(ctx, |ui| {
-                let show_context_status = ui.max_rect().width() >= 760.0;
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.set_clip_rect(window_frame::clip_rect(ctx));
+
+                window_frame::show_panel(ui, pal, rounded, |ui, content_rect| {
+                    let app_rect = window_frame::body_rect(content_rect, rounded);
+                    let title_bar_rect = {
+                        let mut rect = app_rect;
+                        rect.max.y = rect.min.y + title_bar::HEIGHT;
+                        rect
+                    };
+                    title_bar::ui(ui, title_bar_rect, pal, "Wire", always_on_top);
+
+                    let mut body_rect = app_rect;
+                    body_rect.min.y = title_bar_rect.max.y;
+                    self.ui_chrome_body(ui, ctx, pal, body_rect);
+                });
+            });
+    }
+
+    fn ui_chrome_body(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        pal: &Palette,
+        body: egui::Rect,
+    ) {
+        const TOP_BAR_HEIGHT: f32 = 54.0;
+        const DOCK_HEIGHT: f32 = 86.0;
+        let immersive = self.stream_view_mode != StreamViewMode::Normal;
+
+        let top_rect = egui::Rect::from_min_max(
+            body.min,
+            egui::pos2(body.max.x, body.min.y + TOP_BAR_HEIGHT),
+        );
+        let dock_rect = egui::Rect::from_min_max(
+            egui::pos2(body.min.x, body.max.y - DOCK_HEIGHT),
+            body.max,
+        );
+        let stage_rect = egui::Rect::from_min_max(
+            egui::pos2(body.min.x, top_rect.max.y),
+            egui::pos2(body.max.x, dock_rect.min.y),
+        );
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+            Frame::new()
+                .inner_margin(egui::Margin::symmetric(20, 0))
+                .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
+        });
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+            Frame::new()
+                .inner_margin(egui::Margin::symmetric(20, 8))
+                .show(ui, |ui| self.ui_dock_content(ui, pal));
+        });
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(stage_rect), |ui| {
+            let frame = if immersive {
+                Frame::NONE
+            } else {
+                Frame::new().inner_margin(egui::Margin::symmetric(20, 14))
+            };
+            frame.show(ui, |ui| self.ui_stage(ui, ctx, pal));
+        });
+    }
+
+    fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
+        let show_context_status = ui.max_rect().width() >= 760.0;
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(
                         RichText::new("Wire")
                             .family(kh_family())
@@ -781,21 +885,12 @@ impl AppState {
                         }
                     });
                 });
-            });
     }
 
-    fn ui_dock(&mut self, ctx: &egui::Context, pal: &Palette) {
-        egui::TopBottomPanel::bottom("call_dock")
-            .exact_height(86.0)
-            .frame(
-                Frame::new()
-                    .fill(pal.bg)
-                    .inner_margin(egui::Margin::symmetric(20, 8)),
-            )
-            .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.painter()
-                    .hline(rect.x_range(), rect.top() - 8.0, Stroke::new(1.0, pal.line));
+    fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette) {
+        let rect = ui.max_rect();
+        ui.painter()
+            .hline(rect.x_range(), rect.top() - 8.0, Stroke::new(1.0, pal.line));
                 let active_calls = self
                     .calls
                     .values()
@@ -943,7 +1038,6 @@ impl AppState {
                         }
                     });
                 });
-            });
     }
 
     fn ui_stage(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
@@ -1927,6 +2021,59 @@ impl AppState {
                             .max_height(body_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
+                                    "Appearance",
+                                    "Window frame and corners.",
+                                );
+
+                                settings_field_label(ui, &pal, "Window corners", None);
+                                let frame_detail = match self.window_frame_style {
+                                    WindowFrameStyle::Auto => {
+                                        #[cfg(windows)]
+                                        {
+                                            if window_frame::is_windows_11_or_newer() {
+                                                "Rounded on this PC (Windows 11+)"
+                                            } else {
+                                                "Square on this PC (before Windows 11)"
+                                            }
+                                        }
+                                        #[cfg(not(windows))]
+                                        {
+                                            "Square on this platform"
+                                        }
+                                    }
+                                    WindowFrameStyle::Rounded => "Always rounded",
+                                    WindowFrameStyle::Square => "Always square",
+                                };
+                                ui.label(
+                                    RichText::new(frame_detail)
+                                        .color(pal.dim)
+                                        .size(ui_font_size(11.0)),
+                                );
+                                egui::ComboBox::from_id_salt("settings-window-corners")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(self.window_frame_style.label())
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for style in WindowFrameStyle::ALL {
+                                            if ui
+                                                .selectable_label(
+                                                    self.window_frame_style == style,
+                                                    style.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.window_frame_style = style;
+                                            }
+                                        }
+                                    });
+
+                                settings_divider(ui);
                                 settings_section_heading(
                                     ui,
                                     &pal,

@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 use wire_app::app::App;
+use wire_app::window_frame;
 use eframe::NativeOptions;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -76,10 +77,14 @@ fn init_logging() {
 fn main() -> Result<(), eframe::Error> {
     init_logging();
     wire::net::prepare_config_dir();
+    let frame_style = App::initial_window_frame_style();
+    let rounded = window_frame::style_wants_rounded(frame_style);
     let mut options = NativeOptions::default();
     options.viewport = options
         .viewport
         .with_title("Wire")
+        .with_decorations(false)
+        .with_transparent(rounded)
         .with_resizable(true)
         .with_min_inner_size([460., 500.])
         .with_inner_size([1100., 720.]);

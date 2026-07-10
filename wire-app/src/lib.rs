@@ -1,5 +1,7 @@
 pub mod app;
 mod sounds;
+mod title_bar;
+pub mod window_frame;
 /// The application version embedded at compile time from this package's Cargo manifest.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

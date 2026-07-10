@@ -8,6 +8,7 @@ use eframe::egui;
 use egui::{
     Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
 };
+use lucide_icons::LUCIDE_FONT_BYTES;
 // uppercase display font family used for headers / big text
 pub fn kh_family() -> FontFamily {
     FontFamily::Name("KhInterference".into())
@@ -28,6 +29,14 @@ pub fn mono(size: f32) -> FontId {
     FontId::monospace(size + FONT_BOOST)
 }
 
+pub fn lucide_family() -> FontFamily {
+    FontFamily::Name("lucide".into())
+}
+
+pub fn lucide(size: f32) -> FontId {
+    FontId::new(size, lucide_family())
+}
+
 // -- palette --
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
@@ -40,6 +49,36 @@ pub enum Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::Amber
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum WindowFrameStyle {
+    /// Rounded corners on Windows 11+, square elsewhere.
+    #[default]
+    Auto,
+    Rounded,
+    Square,
+}
+
+impl WindowFrameStyle {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Rounded, Self::Square];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                #[cfg(windows)]
+                {
+                    "Auto (Windows 11+)"
+                }
+                #[cfg(not(windows))]
+                {
+                    "Auto"
+                }
+            }
+            Self::Rounded => "Rounded",
+            Self::Square => "Square",
+        }
     }
 }
 
@@ -69,6 +108,8 @@ pub struct Palette {
     pub panel2: Color32,
     pub line: Color32,
     pub line_br: Color32,
+    /// Subtle outer window border, drawn around the custom frame.
+    pub frame_border: Color32,
     pub text: Color32,
     pub text2: Color32,
     pub dim: Color32,
@@ -96,6 +137,7 @@ impl Palette {
                 panel2: Color32::from_rgb(0x1a, 0x1a, 0x1d),
                 line: Color32::from_rgb(0x23, 0x23, 0x26),
                 line_br: Color32::from_rgb(0x2e, 0x2e, 0x32),
+                frame_border: Color32::from_rgba_unmultiplied(0x3a, 0x3a, 0x3e, 90),
                 text: Color32::from_rgb(0xe8, 0xe6, 0xe3),
                 text2: Color32::from_rgb(0xbc, 0xba, 0xb6),
                 dim: Color32::from_rgb(0x91, 0x8e, 0x8a),
@@ -112,6 +154,7 @@ impl Palette {
                 panel2: Color32::from_rgb(0x14, 0x17, 0x15),
                 line: Color32::from_rgb(0x1c, 0x1f, 0x1d),
                 line_br: Color32::from_rgb(0x2a, 0x2e, 0x2b),
+                frame_border: Color32::from_rgba_unmultiplied(0x32, 0x3a, 0x34, 80),
                 text: Color32::from_rgb(0xd4, 0xd8, 0xd4),
                 text2: Color32::from_rgb(0xb3, 0xbd, 0xb3),
                 dim: Color32::from_rgb(0x7b, 0x86, 0x7e),
@@ -128,6 +171,7 @@ impl Palette {
                 panel2: Color32::from_rgb(0x13, 0x13, 0x14),
                 line: Color32::from_rgb(0x1e, 0x1e, 0x1f),
                 line_br: Color32::from_rgb(0x2b, 0x2b, 0x2d),
+                frame_border: Color32::from_rgba_unmultiplied(0x38, 0x38, 0x3c, 70),
                 text: Color32::from_rgb(0xf2, 0xf3, 0xf5),
                 text2: Color32::from_rgb(0xc8, 0xcb, 0xd1),
                 dim: Color32::from_rgb(0x98, 0x9d, 0xa7),
@@ -144,6 +188,7 @@ impl Palette {
                 panel2: Color32::from_rgb(0x15, 0x15, 0x13),
                 line: Color32::from_rgb(0x1e, 0x1e, 0x1c),
                 line_br: Color32::from_rgb(0x2c, 0x2c, 0x28),
+                frame_border: Color32::from_rgba_unmultiplied(0x34, 0x34, 0x30, 85),
                 text: Color32::from_rgb(0xdd, 0xdd, 0xd5),
                 text2: Color32::from_rgb(0xbd, 0xbd, 0xb5),
                 dim: Color32::from_rgb(0x90, 0x90, 0x88),
@@ -160,6 +205,13 @@ impl Palette {
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    fonts.font_data.insert(
+        "lucide".into(),
+        FontData::from_static(LUCIDE_FONT_BYTES).into(),
+    );
+    fonts
+        .families
+        .insert(lucide_family(), vec!["lucide".into()]);
 
     fonts.font_data.insert(
         "FraktionSans".into(),
