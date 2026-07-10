@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$manifestPath = Join-Path $PSScriptRoot "callme-egui\Cargo.toml"
+$manifestPath = Join-Path $PSScriptRoot "wire-app\Cargo.toml"
 $lockPath = Join-Path $PSScriptRoot "Cargo.lock"
 $content = [IO.File]::ReadAllText($manifestPath)
 $lockContent = [IO.File]::ReadAllText($lockPath)
@@ -31,10 +31,10 @@ if ($Part -eq "minor") {
 $newVersion = "$major.$minor.$patch"
 $replacement = $match.Groups[1].Value + $newVersion + $match.Groups[5].Value
 $updated = $content.Substring(0, $match.Index) + $replacement + $content.Substring($match.Index + $match.Length)
-$lockPattern = '(?ms)(^\[\[package\]\]\s*^name\s*=\s*"callme-egui"\s*^version\s*=\s*")([^\"]+)(")'
+$lockPattern = '(?ms)(^\[\[package\]\]\s*^name\s*=\s*"wire-app"\s*^version\s*=\s*")([^\"]+)(")'
 $lockMatch = [regex]::Match($lockContent, $lockPattern)
 if (-not $lockMatch.Success -or $lockMatch.Groups[2].Value -ne $oldVersion) {
-    throw "Cargo.lock does not contain callme-egui version $oldVersion"
+    throw "Cargo.lock does not contain wire-app version $oldVersion"
 }
 $lockReplacement = $lockMatch.Groups[1].Value + $newVersion + $lockMatch.Groups[3].Value
 $updatedLock = $lockContent.Substring(0, $lockMatch.Index) + $lockReplacement + $lockContent.Substring($lockMatch.Index + $lockMatch.Length)
@@ -49,4 +49,4 @@ try {
     throw
 }
 
-Write-Host "Bumped callme-egui from $oldVersion to $newVersion ($Part)."
+Write-Host "Bumped wire-app from $oldVersion to $newVersion ($Part)."

@@ -1,16 +1,16 @@
-# callme
+# Wire
 
-Audio calls with Iroh!
+Voice and video calls over Iroh.
 
-`callme` is an experimental library and tool that uses [iroh-roq](https://github.com/dignifiedquire/iroh-roq) to transfer Opus-encoded audio between devices. It uses [cpal](https://github.com/RustAudio/cpal) for cross-platform access to the device's audio interfaces. It includes optional audio processing with echo cancellation, and should run on most platforms.
+`wire` is a library and toolset that uses [iroh-roq](https://github.com/dignifiedquire/iroh-roq) to transfer Opus-encoded audio between devices. It uses [cpal](https://github.com/RustAudio/cpal) for cross-platform access to the device's audio interfaces. It includes optional audio processing with echo cancellation, and runs on desktop platforms.
 
 ## Crates
 
 See the READMEs of the individual crates for usage instructions.
 
-* **[callme](callme)** is the main Rust library used by all other crates in the workspace.
-* **[callme-cli](callme-cli)** is a basic command-line tool to make audio calls.
-* **[callme-egui](callme-egui)** is a GUI for callme. It runs on desktop (Linux, macOS, WindowS) and Android. iOS support is currently untested, but should work. See the [README](callme-egui/README.md) for detailed instructions.
+* **[wire](wire)** is the main Rust library used by all other crates in the workspace.
+* **[wire-cli](wire-cli)** is a command-line tool to make audio calls.
+* **[wire-app](wire-app)** is the desktop GUI. See the [README](wire-app/README.md) for detailed instructions.
 
 ## License
 
@@ -28,4 +28,3 @@ at your option.
 ## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
-

@@ -6,7 +6,7 @@ On high-resolution displays (e.g. 3840×2160), we initially downscaled using **G
 
 ### Symptoms
 
-- Entire desktop felt choppy while sharing, not just the Callme window
+- Entire desktop felt choppy while sharing, not just the Wire window
 - Mouse cursor stuttered when dragging **any** window
 - Effect was visible at the OS/compositor level
 
@@ -29,7 +29,7 @@ On 4K → 1080p/1440p streams, WGC still captures at native resolution; we downs
 Runtime logs are written per process to:
 
 ```
-%LOCALAPPDATA%\callme\callme-<pid>.log
+%LOCALAPPDATA%\wire\wire-app-<pid>.log
 ```
 
 Two local instances append to separate files so send/receive paths can be correlated by timestamp and node id (`caf7327fd0`, etc.).

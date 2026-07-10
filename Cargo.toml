@@ -1,11 +1,11 @@
 
 [workspace]
 resolver = "2"
-members = ["callme", "callme-cli", "callme-egui"]
+members = ["wire", "wire-cli", "wire-app"]
 
 [workspace.package]
 authors = ["Frando <franz@n0.computer>", "n0 team"]
-repository = "https://github.com/n0-computer/callme.git"
+repository = "https://github.com/stardive/wire.git"
 license = "MIT OR Apache-2.0"
 
 [patch.crates-io]

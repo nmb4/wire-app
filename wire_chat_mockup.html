@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>wire :: general</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0a0b0a;
+    --panel:     #0f1110;
+    --line:      #1c1f1d;
+    --line-br:   #2a2e2b;
+    --text:      #d4d8d4;
+    --dim:       #5c6560;
+    --dim2:      #3a4038;
+    --amber:     #ffb454;
+    --green:     #7ee787;
+    --red:       #ff6b6b;
+    --cyan:      #6fd6d6;
+    --mono: 'JetBrains Mono', 'Berkeley Mono', ui-monospace, monospace;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    height: 100vh;
+    overflow: hidden;
+    letter-spacing: 0.01em;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── TOP STATUS BAR (tmux-style) ── */
+  .topbar {
+    height: 26px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    flex-shrink: 0;
+    font-size: 11px;
+    gap: 14px;
+  }
+  .tb-seg { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .tb-seg .val { color: var(--text); }
+  .tb-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .tb-dot.warn { background: var(--amber); }
+  .tb-sep { color: var(--line-br); }
+  .tb-spacer { flex: 1; }
+  .tb-peer { color: var(--dim); }
+  .tb-peer .id { color: var(--cyan); }
+
+  /* ── BODY: sidebar + main ── */
+  .body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  /* ── LEFT: flat channel list, no rail, no icons ── */
+  .sidenav {
+    width: 200px;
+    background: var(--bg);
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    padding: 10px 0 0;
+  }
+  .nav-root {
+    padding: 0 12px 10px;
+    font-size: 11px;
+    color: var(--dim);
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 6px;
+  }
+  .nav-root .name { color: var(--text); font-weight: 600; }
+  .nav-root .path { color: var(--dim2); }
+
+  .nav-list { flex: 1; overflow-y: auto; padding: 2px 6px; }
+  .nav-list::-webkit-scrollbar { width: 3px; }
+  .nav-list::-webkit-scrollbar-thumb { background: var(--line-br); }
+
+  .nav-item {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 6px;
+    cursor: pointer;
+    color: var(--dim);
+    border-radius: 2px;
+    line-height: 1.7;
+  }
+  .nav-item:hover { color: var(--text); background: var(--panel); }
+  .nav-item.active { color: var(--text); background: var(--panel); }
+  .nav-item.active .path-pfx { color: var(--amber); }
+  .path-pfx { color: var(--dim2); flex-shrink: 0; }
+  .nav-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-count { color: var(--amber); font-size: 10px; }
+
+  .nav-group-label {
+    font-size: 10px;
+    color: var(--dim2);
+    padding: 10px 8px 3px;
+    text-transform: lowercase;
+  }
+  .nav-group-label::before { content: '# '; }
+
+  .voice-strip {
+    padding-left: 20px;
+    padding-bottom: 2px;
+  }
+  .voice-user {
+    font-size: 10.5px; color: var(--dim2);
+    padding: 1px 4px;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .voice-user::before { content: '~'; color: var(--green); }
+
+  /* bottom self status (vim-modeline style) */
+  .self-line {
+    border-top: 1px solid var(--line);
+    padding: 7px 12px;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--dim);
+  }
+  .self-line .who { color: var(--text); font-weight: 500; }
+  .self-line .mode {
+    background: var(--green);
+    color: #061007;
+    font-weight: 700;
+    padding: 0 5px;
+    font-size: 9px;
+    border-radius: 2px;
+    letter-spacing: 0.06em;
+  }
+
+  /* ── MAIN ── */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--bg);
+  }
+
+  .chan-header {
+    height: 30px;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11.5px;
+    color: var(--dim);
+    flex-shrink: 0;
+    gap: 8px;
+  }
+  .chan-header .path { color: var(--text); }
+  .chan-header .path .pfx { color: var(--amber); }
+  .chan-header .topic { color: var(--dim2); }
+  .chan-header .hspacer { flex: 1; }
+  .kbd-hint {
+    font-size: 10px; color: var(--dim2);
+    border: 1px solid var(--line-br);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+
+  .feed {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 0 6px;
+  }
+  .feed::-webkit-scrollbar { width: 4px; }
+  .feed::-webkit-scrollbar-thumb { background: var(--line-br); }
+
+  .day-mark {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px 8px;
+    color: var(--dim2);
+    font-size: 10.5px;
+  }
+  .day-mark::before { content: '───'; letter-spacing: -2px; }
+  .day-mark::after  { content: '─────────────────────────'; letter-spacing: -2px; flex: 1; overflow: hidden; }
+
+  /* message row: git-log inspired, left rail with timestamp column */
+  .msg {
+    display: flex;
+    padding: 1px 14px 1px 0;
+    font-size: 12.5px;
+    line-height: 1.65;
+  }
+  .msg:hover { background: rgba(255,255,255,0.015); }
+  .msg .gutter {
+    width: 62px;
+    flex-shrink: 0;
+    text-align: right;
+    padding-right: 10px;
+    color: var(--dim2);
+    font-size: 10.5px;
+    padding-top: 2px;
+    user-select: none;
+  }
+  .msg .rail {
+    width: 2px;
+    background: var(--line);
+    flex-shrink: 0;
+    margin-right: 10px;
+    border-radius: 1px;
+  }
+  .msg.self .rail { background: var(--amber); opacity: 0.5; }
+  .msg.bot .rail { background: var(--cyan); opacity: 0.5; }
+
+  .msg .content { flex: 1; min-width: 0; }
+  .msg .author {
+    color: var(--green);
+    font-weight: 600;
+  }
+  .msg.self .author { color: var(--amber); }
+  .msg.bot .author { color: var(--cyan); }
+  .msg .author::after { content: ':'; color: var(--dim2); margin-right: 5px; font-weight: 400; }
+  .msg .text { color: var(--text); }
+  .msg .text .cmd {
+    color: var(--amber);
+    background: rgba(255,180,84,0.08);
+    padding: 0 4px;
+    border-radius: 2px;
+  }
+  .msg .text .mention {
+    color: var(--cyan);
+    background: rgba(111,214,214,0.1);
+    padding: 0 4px;
+    border-radius: 2px;
+  }
+  .msg .text .path-inline { color: var(--dim); }
+
+  .msg.grouped .gutter { color: transparent; }
+  .msg.grouped .gutter:hover { color: var(--dim2); }
+
+  /* file / diff style attachment */
+  .file-card {
+    margin: 4px 0 2px;
+    border: 1px solid var(--line-br);
+    border-radius: 2px;
+    background: var(--panel);
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 10px;
+    gap: 10px;
+    font-size: 11px;
+    max-width: 320px;
+  }
+  .file-card .fc-tag { color: var(--dim2); }
+  .file-card .fc-name { color: var(--text); }
+  .file-card .fc-meta { color: var(--dim2); font-size: 10px; }
+  .file-card .fc-arrow { margin-left: auto; color: var(--dim); }
+  .file-card:hover { border-color: var(--amber); }
+
+  /* reactions as terminal-style tally */
+  .tally { display: flex; gap: 8px; margin-top: 3px; font-size: 10.5px; }
+  .tally-item {
+    color: var(--dim);
+    cursor: pointer;
+    padding: 1px 5px;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+  }
+  .tally-item.self { color: var(--amber); border-color: rgba(255,180,84,0.4); }
+  .tally-item:hover { border-color: var(--dim); color: var(--text); }
+
+  /* system / bot output block, like a log line */
+  .sys-block {
+    margin: 2px 0 2px 72px;
+    padding: 5px 10px;
+    background: rgba(111,214,214,0.05);
+    border-left: 2px solid var(--cyan);
+    font-size: 11px;
+    color: var(--dim);
+    max-width: 420px;
+  }
+  .sys-block .metric { color: var(--cyan); }
+
+  /* ── TYPING / STATUS LINE ── */
+  .status-line {
+    height: 18px;
+    padding: 0 14px;
+    font-size: 10.5px;
+    color: var(--dim2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .status-line .blink { animation: blink 1s steps(2) infinite; color: var(--dim); }
+  @keyframes blink { to { opacity: 0; } }
+
+  /* ── INPUT: vim command-line style ── */
+  .input-line {
+    display: flex;
+    align-items: center;
+    border-top: 1px solid var(--line);
+    padding: 8px 14px;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .input-prompt { color: var(--amber); font-weight: 600; flex-shrink: 0; }
+  .input-field {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .input-field::placeholder { color: var(--dim2); }
+  .input-hints { display: flex; gap: 8px; flex-shrink: 0; }
+  .ih {
+    font-size: 10px; color: var(--dim2);
+    border: 1px solid var(--line-br);
+    padding: 1px 5px; border-radius: 2px;
+  }
+
+  /* ── COMMAND PALETTE OVERLAY (cmd+k) ── */
+  .palette-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 90px;
+  }
+  .palette {
+    width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--line-br);
+    border-radius: 3px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  .palette-input {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    color: var(--text);
+    font-size: 13px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .palette-input .car { color: var(--amber); }
+  .palette-results { padding: 6px; }
+  .palette-item {
+    padding: 6px 10px;
+    display: flex; justify-content: space-between; align-items: center;
+    border-radius: 2px;
+    font-size: 11.5px;
+    color: var(--dim);
+  }
+  .palette-item.sel { background: rgba(255,180,84,0.1); color: var(--text); }
+  .palette-item .kbd { font-size: 9px; color: var(--dim2); border: 1px solid var(--line-br); padding: 0 4px; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- TOP STATUS BAR -->
+<div class="topbar">
+  <div class="tb-seg"><span class="tb-dot"></span><span class="val">wire</span></div>
+  <span class="tb-sep">│</span>
+  <div class="tb-seg">peer <span class="val id" style="color:var(--cyan)">7f3a…e91c</span></div>
+  <span class="tb-sep">│</span>
+  <div class="tb-seg">rtt <span class="val">14ms</span></div>
+  <span class="tb-sep">│</span>
+  <div class="tb-seg"><span class="tb-dot warn"></span>3 syncing</div>
+  <div class="tb-spacer"></div>
+  <div class="tb-peer">4 peers connected · <span class="id">direct</span></div>
+</div>
+
+<div class="body">
+
+  <!-- SIDENAV -->
+  <div class="sidenav">
+    <div class="nav-root">
+      <div class="name">nexus-dev</div>
+      <div class="path">~/wire/nexus-dev</div>
+    </div>
+
+    <div class="nav-list">
+      <div class="nav-group-label">rooms</div>
+      <div class="nav-item active">
+        <span class="path-pfx">/</span>
+        <span class="nav-name">general</span>
+      </div>
+      <div class="nav-item">
+        <span class="path-pfx">/</span>
+        <span class="nav-name">dev-chat</span>
+        <span class="nav-count">3</span>
+      </div>
+      <div class="nav-item">
+        <span class="path-pfx">/</span>
+        <span class="nav-name">random</span>
+      </div>
+      <div class="nav-item">
+        <span class="path-pfx">*</span>
+        <span class="nav-name">staff-only</span>
+      </div>
+
+      <div class="nav-group-label">voice</div>
+      <div class="nav-item">
+        <span class="path-pfx">))</span>
+        <span class="nav-name">lounge</span>
+      </div>
+      <div class="voice-strip">
+        <div class="voice-user">noah</div>
+      </div>
+      <div class="nav-item">
+        <span class="path-pfx">))</span>
+        <span class="nav-name">work-room</span>
+      </div>
+
+      <div class="nav-group-label">direct</div>
+      <div class="nav-item">
+        <span class="path-pfx">@</span>
+        <span class="nav-name">dylan</span>
+      </div>
+      <div class="nav-item">
+        <span class="path-pfx">@</span>
+        <span class="nav-name">luna</span>
+      </div>
+    </div>
+
+    <div class="self-line">
+      <span class="who">noah</span>
+      <span class="mode">ON</span>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="chan-header">
+      <span class="path"><span class="pfx">/</span>general</span>
+      <span class="topic">— general chatter and updates</span>
+      <div class="hspacer"></div>
+      <span class="kbd-hint">⌘K</span>
+      <span class="kbd-hint">⌘/</span>
+    </div>
+
+    <div class="feed">
+      <div class="day-mark">today</div>
+
+      <div class="msg">
+        <div class="gutter">16:02</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="author">dylan</span>
+          <span class="text">yo the iroh p2p handshake works now, finally</span>
+        </div>
+      </div>
+      <div class="msg grouped">
+        <div class="gutter">16:02</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="text">latency is like <span class="cmd">18ms</span> on local network which is wild</span>
+          <div class="tally">
+            <span class="tally-item self">+2 fire</span>
+            <span class="tally-item">+1 rocket</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="msg self">
+        <div class="gutter">16:05</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="author">noah</span>
+          <span class="text">sick, now we need the video pipeline fixed — still only <span class="cmd">10-12fps</span> on encode</span>
+        </div>
+      </div>
+      <div class="msg self grouped">
+        <div class="gutter">16:05</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="text">bottleneck is the 4k→720p downscale before encode, <span class="path-inline">capture_frame()</span> blocks the thread</span>
+        </div>
+      </div>
+
+      <div class="msg">
+        <div class="gutter">16:11</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="author">luna</span>
+          <span class="text">profiling output from my machine <span class="mention">@noah</span></span>
+          <div class="file-card">
+            <span class="fc-tag">json</span>
+            <span class="fc-name">trace_video_enc.json</span>
+            <span class="fc-meta">142kb</span>
+            <span class="fc-arrow">↓</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="msg bot">
+        <div class="gutter">16:12</div>
+        <div class="rail"></div>
+        <div class="content">
+          <span class="author">nexus-bot</span>
+          <span class="text">build <span class="cmd">#47</span> finished</span>
+          <div class="sys-block">
+            0 errors · 2 warnings · avg latency <span class="metric">22ms</span> · peers <span class="metric">4</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="status-line">
+      <span class="blink">●</span> dylan is typing
+    </div>
+
+    <div class="input-line">
+      <span class="input-prompt">/general ></span>
+      <input class="input-field" placeholder="send a message, or type / for commands" />
+      <div class="input-hints">
+        <span class="ih">⏎ send</span>
+        <span class="ih">⇧⏎ newline</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
