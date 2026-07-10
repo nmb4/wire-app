@@ -2,6 +2,7 @@
 use egui_winit::winit;
 
 pub mod app;
+mod sounds;
 /// The application version embedded at compile time from this package's Cargo manifest.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

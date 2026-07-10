@@ -25,6 +25,7 @@ use tokio::time;
 use tracing::{info, warn};
 
 use crate::{
+    sounds::{Sound, Sounds},
     theme::*,
     update::{self, ReleaseInfo},
     video_decode::VideoDecodeWorker,
@@ -138,6 +139,8 @@ struct AppState {
     theme: Theme,
     muted: bool,
     deafened: bool,
+    sounds: Option<Sounds>,
+    voluntary_hangups: AtomicU32,
     update_tx: mpsc::Sender<UpdateMessage>,
     update_rx: mpsc::Receiver<UpdateMessage>,
     update_status: UpdateStatus,
@@ -271,6 +274,10 @@ impl App {
             .unwrap_or(false);
         let settings = saved_settings.unwrap_or_default();
         let (update_tx, update_rx) = mpsc::channel();
+        let sounds = Sounds::try_new();
+        if let Some(sounds) = &sounds {
+            sounds.play(Sound::Whoosh2);
+        }
         let state = AppState {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
@@ -295,6 +302,8 @@ impl App {
             theme: settings.theme,
             muted: false,
             deafened: false,
+            sounds,
+            voluntary_hangups: AtomicU32::new(0),
             update_tx,
             update_rx,
             update_status: UpdateStatus::Idle,
@@ -429,6 +438,24 @@ impl AppState {
                     self.our_node_id = Some(node_id);
                 }
                 Event::SetCallState(node_id, call_state) => {
+                    let previous = self.calls.get(&node_id).copied();
+                    match call_state {
+                        CallState::Active => {
+                            self.play_sound(Sound::Success);
+                        }
+                        CallState::Aborted => {
+                            if self.voluntary_hangups.load(Ordering::Relaxed) > 0 {
+                                self.voluntary_hangups.fetch_sub(1, Ordering::Relaxed);
+                            } else if matches!(
+                                previous,
+                                Some(CallState::Calling) | Some(CallState::Incoming)
+                            ) {
+                                self.play_sound(Sound::Fail);
+                            }
+                        }
+                        _ => {}
+                    }
+
                     if matches!(call_state, CallState::Aborted) {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
@@ -439,6 +466,14 @@ impl AppState {
                         }
                     } else {
                         self.calls.insert(node_id, call_state);
+                    }
+
+                    let has_incoming = self
+                        .calls
+                        .values()
+                        .any(|state| matches!(state, CallState::Incoming));
+                    if let Some(sounds) = &mut self.sounds {
+                        sounds.set_incoming_ring(has_incoming);
                     }
                 }
                 Event::VolumeHandle(node_id, volume) => {
@@ -622,6 +657,26 @@ impl AppState {
             .command_tx
             .send_blocking(command)
             .expect("worker thread is dead");
+    }
+
+    fn play_sound(&self, sound: Sound) {
+        if let Some(sounds) = &self.sounds {
+            sounds.play(sound);
+        }
+    }
+
+    fn play_control_sound(&self, enabled: bool) {
+        self.play_sound(if enabled {
+            Sound::Button1
+        } else {
+            Sound::Button2
+        });
+    }
+
+    fn hang_up_call(&self, node_id: NodeId) {
+        self.play_sound(Sound::Whoosh1);
+        self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
+        self.cmd(Command::Abort { node_id });
     }
 
     fn ui_top_bar(&mut self, ctx: &egui::Context) {
@@ -808,6 +863,7 @@ impl AppState {
                         .clicked()
                         {
                             self.muted = !self.muted;
+                            self.play_control_sound(self.muted);
                             self.cmd(Command::SetMuted { muted: self.muted });
                         }
                         ui.add_space(2.0);
@@ -822,6 +878,7 @@ impl AppState {
                         .clicked()
                         {
                             self.deafened = !self.deafened;
+                            self.play_control_sound(self.deafened);
                             self.cmd(Command::SetDeafened {
                                 deafened: self.deafened,
                             });
@@ -841,9 +898,9 @@ impl AppState {
                         })
                         .clicked()
                         {
-                            self.cmd(Command::ToggleSharing {
-                                enabled: !self.sharing_active,
-                            });
+                            let enabled = !self.sharing_active;
+                            self.play_control_sound(enabled);
+                            self.cmd(Command::ToggleSharing { enabled });
                         }
                         ui.add_space(2.0);
                         if dock_control(ui, pal, ph::GEAR_SIX, "Settings", false)
@@ -858,7 +915,12 @@ impl AppState {
                             ui.add_space(8.0);
                             if leave_button(ui, pal).clicked() {
                                 let peers: Vec<_> = self.calls.keys().copied().collect();
+                                if !peers.is_empty() {
+                                    self.play_sound(Sound::Whoosh1);
+                                }
                                 for node_id in peers {
+                                    self.voluntary_hangups
+                                        .fetch_add(1, Ordering::Relaxed);
                                     self.cmd(Command::Abort { node_id });
                                 }
                             }
@@ -1069,7 +1131,7 @@ impl AppState {
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if action_button(ui, pal, "End", ButtonTone::Danger).clicked() {
-                                self.cmd(Command::Abort { node_id });
+                                self.hang_up_call(node_id);
                             }
                         });
                     }
@@ -1140,6 +1202,7 @@ impl AppState {
                 ui.add_enabled_ui(can_call, |ui| {
                     if action_button(ui, &pal, "Call", ButtonTone::Primary).clicked() {
                         if let Some(Ok(node_id)) = self.remote_node_id {
+                            self.play_sound(Sound::Button2);
                             self.cmd(Command::Call { node_id });
                         }
                     }
@@ -1216,6 +1279,7 @@ impl AppState {
             }
 
             if let Some(id) = call {
+                self.play_sound(Sound::Button2);
                 self.cmd(Command::Call { node_id: id });
             }
             if let Some(idx) = remove_idx {
@@ -1259,6 +1323,7 @@ impl AppState {
         } else {
             self.new_friend_name.trim().to_string()
         };
+        self.play_sound(Sound::Button2);
         if !self.friends.iter().any(|f| f.node_id == node_id) {
             self.friends.push(Friend {
                 name,
@@ -1324,7 +1389,7 @@ impl AppState {
                             }
                             CallState::Calling | CallState::Active => {
                                 if action_button(ui, &pal, "End", ButtonTone::Danger).clicked() {
-                                    self.cmd(Command::Abort { node_id });
+                                    self.hang_up_call(node_id);
                                 }
                             }
                             CallState::Aborted => {}
@@ -1359,10 +1424,12 @@ impl AppState {
             ui.horizontal(|ui| {
                 if self.sharing_active {
                     if action_button(ui, &pal, "Stop sharing", ButtonTone::Danger).clicked() {
+                        self.play_control_sound(false);
                         self.cmd(Command::ToggleSharing { enabled: false });
                     }
                     ui.label(RichText::new("Live").color(Color32::from_rgb(100, 200, 120)));
                 } else if action_button(ui, &pal, "Start sharing", ButtonTone::Primary).clicked() {
+                    self.play_control_sound(true);
                     self.cmd(Command::ToggleSharing { enabled: true });
                 }
             });
@@ -1563,9 +1630,9 @@ impl AppState {
                         ("Share your screen", ButtonTone::Primary)
                     };
                     if action_button(ui, pal, label, tone).clicked() {
-                        self.cmd(Command::ToggleSharing {
-                            enabled: !self.sharing_active,
-                        });
+                        let enabled = !self.sharing_active;
+                        self.play_control_sound(enabled);
+                        self.cmd(Command::ToggleSharing { enabled });
                     }
                 }
             });
@@ -2061,10 +2128,7 @@ impl AppState {
                                         ui,
                                         &pal,
                                         "Updates",
-                                        &format!(
-                                            "Installed version v{}",
-                                            env!("CARGO_PKG_VERSION")
-                                        ),
+                                        &format!("Installed version v{}", crate::APP_VERSION),
                                     );
 
                                     let mut check_clicked = false;
@@ -2152,6 +2216,7 @@ impl AppState {
                                     if action_button(ui, &pal, "Save changes", ButtonTone::Primary)
                                         .clicked()
                                     {
+                                        self.play_sound(Sound::Button2);
                                         let audio_config = self.audio_config();
                                         let video_config = self.video_config;
                                         self.cmd(Command::SetAudioConfig { audio_config });
@@ -2192,7 +2257,7 @@ impl AppState {
                 ui.label(format!(
                     "Callme v{} is available. You are running v{}.",
                     release.version,
-                    env!("CARGO_PKG_VERSION")
+                    crate::APP_VERSION
                 ));
                 ui.label("The new executable will be verified and placed on your Desktop.");
                 ui.add_space(10.0);

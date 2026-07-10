@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "callme-egui"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "android_clipboard",
  "anyhow",
@@ -1057,6 +1057,7 @@ dependencies = [
  "n0-future",
  "rayon",
  "reqwest",
+ "rodio",
  "scopeguard",
  "serde",
  "serde_json",
@@ -6170,6 +6171,16 @@ checksum = "726bb493fe9cac765e8f96a144c3a8396bdf766dedad22e504b70b908dcbceb4"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",
+]
+
+[[package]]
+name = "rodio"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7ceb6607dd738c99bc8cb28eff249b7cd5c8ec88b9db96c0608c1480d140fb1"
+dependencies = [
+ "cpal",
+ "hound",
 ]
 
 [[package]]
