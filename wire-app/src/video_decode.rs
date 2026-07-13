@@ -99,7 +99,7 @@ fn make_decoder() -> Result<(Box<dyn FrameDecoder>, bool)> {
 const PACKET_QUEUE_DEPTH: usize = 3;
 
 pub struct VideoDecodeWorker {
-    packet_tx: SyncSender<EncodedPacket>,
+    packet_tx: Option<SyncSender<EncodedPacket>>,
     submitted: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
@@ -131,7 +131,7 @@ impl VideoDecodeWorker {
             }
         });
         Ok(Self {
-            packet_tx,
+            packet_tx: Some(packet_tx),
             submitted,
             dropped,
             join: Some(join),
@@ -145,7 +145,11 @@ impl VideoDecodeWorker {
     /// this blocks the caller (the QUIC receive task), which backpressures the
     /// sender through QUIC flow control instead of dropping frames.
     pub fn submit(&self, data: Vec<u8>, keyframe: bool) {
-        match self.packet_tx.send(EncodedPacket { data, keyframe }) {
+        let Some(packet_tx) = &self.packet_tx else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        match packet_tx.send(EncodedPacket { data, keyframe }) {
             Ok(()) => {
                 self.submitted.fetch_add(1, Ordering::Relaxed);
             }
@@ -158,9 +162,26 @@ impl VideoDecodeWorker {
 
 impl Drop for VideoDecodeWorker {
     fn drop(&mut self) {
+        // Close the packet channel before joining. Joining while this sender is
+        // alive leaves the decode thread blocked in recv_timeout forever, which
+        // used to deadlock video-stream replacement after a QUIC reset.
+        self.packet_tx.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_worker_shutdown_does_not_wait_for_another_packet() {
+        let worker = VideoDecodeWorker::spawn(|_| {}).unwrap();
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 

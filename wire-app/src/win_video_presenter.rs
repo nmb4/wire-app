@@ -10,15 +10,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 use windows::core::{w, Interface};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1,
     ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, D3D11_TEX2D_VPIV,
     D3D11_TEX2D_VPOV, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -201,8 +202,6 @@ impl NativeVideoPresenter {
     pub(crate) fn present(
         &mut self,
         frame: &D3d11VideoFrame,
-        source_width: u32,
-        source_height: u32,
         rect: PhysicalVideoRect,
         generation: u64,
     ) -> Result<()> {
@@ -250,9 +249,10 @@ impl NativeVideoPresenter {
             return Ok(());
         }
 
-        self.ensure_processor(source_width, source_height, rect.width, rect.height)?;
+        let (coded_width, coded_height) = frame.coded_size();
+        self.ensure_processor(coded_width, coded_height, rect.width, rect.height)?;
         let started = Instant::now();
-        self.blit(frame.texture())?;
+        self.blit(frame.texture(), frame.display_rect())?;
         let present = unsafe { self.swap_chain.Present(0, DXGI_PRESENT_DO_NOT_WAIT) };
         if present == DXGI_ERROR_WAS_STILL_DRAWING {
             // A flip-model queue that is momentarily full should drop the display
@@ -313,6 +313,16 @@ impl NativeVideoPresenter {
                     &processor,
                     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                 );
+                // Make orientation state explicit on every new processor. This
+                // prevents a driver from carrying rotation/mirror state across
+                // decoder and stream reinitialization.
+                context1.VideoProcessorSetStreamRotation(
+                    &processor,
+                    0,
+                    false,
+                    D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY,
+                );
+                context1.VideoProcessorSetStreamMirror(&processor, 0, false, false, false);
             }
         }
         self.processor = Some(VideoProcessorState {
@@ -326,7 +336,7 @@ impl NativeVideoPresenter {
         Ok(())
     }
 
-    fn blit(&self, texture: &ID3D11Texture2D) -> Result<()> {
+    fn blit(&self, texture: &ID3D11Texture2D, source_rect: RECT) -> Result<()> {
         let state = self.processor.as_ref().context("video processor missing")?;
         let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
@@ -347,6 +357,12 @@ impl NativeVideoPresenter {
         let back_buffer: ID3D11Texture2D = unsafe { self.swap_chain.GetBuffer(0)? };
         let mut input_view = None;
         let mut output_view = None;
+        let destination_rect = RECT {
+            left: 0,
+            top: 0,
+            right: state.output_width as i32,
+            bottom: state.output_height as i32,
+        };
         unsafe {
             self.video_device.CreateVideoProcessorInputView(
                 texture,
@@ -360,6 +376,23 @@ impl NativeVideoPresenter {
                 &output_desc,
                 Some(&mut output_view),
             )?;
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &state.processor,
+                0,
+                true,
+                Some(&source_rect),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &state.processor,
+                0,
+                true,
+                Some(&destination_rect),
+            );
+            self.video_context.VideoProcessorSetOutputTargetRect(
+                &state.processor,
+                true,
+                Some(&destination_rect),
+            );
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 pInputSurface: std::mem::ManuallyDrop::new(input_view),

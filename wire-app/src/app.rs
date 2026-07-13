@@ -2804,7 +2804,7 @@ fn present_native_video(
             .presenter
             .as_mut()
             .context("native presenter was not created")?
-            .present(gpu_frame, frame.width, frame.height, rect, frame.generation)
+            .present(gpu_frame, rect, frame.generation)
     })();
 
     match present_result {
@@ -2818,9 +2818,7 @@ fn present_native_video(
                 presenter.hide();
             }
             let rgba = match &frame.data {
-                DecodedFrameData::D3d11(gpu_frame) => {
-                    gpu_frame.to_rgba(frame.width, frame.height)?
-                }
+                DecodedFrameData::D3d11(gpu_frame) => gpu_frame.to_rgba()?,
                 DecodedFrameData::Rgba(_) => return Ok(false),
             };
             frame.data = DecodedFrameData::Rgba(Arc::new(rgba));
@@ -2966,6 +2964,19 @@ mod layout_tests {
     fn long_stream_names_are_clipped_cleanly() {
         assert_eq!(ellipsize("Ada", 8), "Ada");
         assert_eq!(ellipsize("Long display name", 8), "Long di…");
+    }
+
+    #[test]
+    fn recognizes_only_the_reserved_video_replacement_reset() {
+        assert!(is_video_stream_replacement_error(&anyhow::anyhow!(
+            "stream reset by peer: error 81"
+        )));
+        assert!(!is_video_stream_replacement_error(&anyhow::anyhow!(
+            "stream reset by peer: error 12"
+        )));
+        assert!(!is_video_stream_replacement_error(&anyhow::anyhow!(
+            "invalid video frame length: 81 bytes"
+        )));
     }
 }
 
@@ -3642,11 +3653,14 @@ async fn run_video_send(
                 resyncs += 1;
             }
             if replace_stream {
-                let _ = send.reset(VIDEO_STREAM_RESET_CODE);
+                // Open the replacement before resetting the old stream. If the
+                // connection cannot allocate a new stream, the peer keeps the
+                // old one instead of being stranded on a permanent last frame.
                 let (new_send, recv) = conn.transport().open_bi().await?;
-                send = new_send;
-                let _ = send.set_priority(10);
+                let _ = new_send.set_priority(10);
                 tokio::spawn(drain_quic_recv(recv));
+                let mut old_send = std::mem::replace(&mut send, new_send);
+                let _ = old_send.reset(VIDEO_STREAM_RESET_CODE);
                 replace_stream = false;
                 info!(
                     "replaced video stream to {} at IDR sequence {} ({} skipped, {} resyncs)",
@@ -3762,11 +3776,34 @@ async fn run_video_recv(
                 match stream {
                     Ok((_send, mut recv)) => {
                         info!("receiving video from {}", node_id.fmt_short());
-                        if let Err(e) =
-                            recv_video_on_stream(&mut recv, node_id, &event_tx, callback.as_ref())
-                                .await
+                        match recv_video_on_stream(
+                            &mut recv,
+                            node_id,
+                            &event_tx,
+                            callback.as_ref(),
+                        )
+                        .await
                         {
-                            info!("video stream from {} ended: {e:?}", node_id.fmt_short());
+                            Ok(()) => {
+                                info!(
+                                    "video stream from {} ended cleanly; waiting for another share",
+                                    node_id.fmt_short()
+                                );
+                                notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+                            }
+                            Err(error) if is_video_stream_replacement_error(&error) => {
+                                info!(
+                                    "video stream from {} was replaced at a frame boundary; waiting for the resync stream",
+                                    node_id.fmt_short()
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "video stream from {} failed: {error:?}; waiting for a replacement stream",
+                                    node_id.fmt_short()
+                                );
+                                notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+                            }
                         }
                     }
                     Err(e) => {
@@ -3777,6 +3814,24 @@ async fn run_video_recv(
             }
         }
     }
+    notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+}
+
+fn notify_video_stream_ended(
+    event_tx: &async_channel::Sender<Event>,
+    callback: Option<&UpdateCallback>,
+    node_id: NodeId,
+) {
+    let _ = event_tx.try_send(Event::VideoStreamEnded(node_id));
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("stream reset by peer")
+        && (message.contains("error 81") || message.contains("error 0x51"))
 }
 
 async fn recv_video_on_stream(
@@ -3786,9 +3841,7 @@ async fn recv_video_on_stream(
     callback: Option<&UpdateCallback>,
 ) -> Result<()> {
     let frame_event_tx = event_tx.clone();
-    let ended_event_tx = event_tx.clone();
     let frame_callback = callback.cloned();
-    let ended_callback = callback.cloned();
     let worker = VideoDecodeWorker::spawn(move |frame| {
         if frame_event_tx
             .try_send(Event::VideoFrame { node_id, frame })
@@ -3873,19 +3926,11 @@ async fn recv_video_on_stream(
             }
             Ok(None) => break,
             Err(e) => {
-                info!(
-                    "video stream from {} ended with error: {e:?}",
-                    node_id.fmt_short()
-                );
-                break;
+                return Err(e);
             }
         }
     }
 
     drop(worker);
-    let _ = ended_event_tx.try_send(Event::VideoStreamEnded(node_id));
-    if let Some(cb) = ended_callback {
-        cb();
-    }
     Ok(())
 }

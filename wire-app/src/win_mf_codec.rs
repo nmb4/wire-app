@@ -5,7 +5,7 @@ use std::sync::{mpsc, Once};
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 use windows::core::{Interface, GUID};
-use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, LUID, VARIANT_TRUE};
+use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, LUID, RECT, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BOOL, VT_I4, VT_UI4};
@@ -41,6 +41,9 @@ pub struct D3d11VideoFrame {
     device: ID3D11Device,
     return_tx: mpsc::Sender<ReturnedVideoTexture>,
     generation: u64,
+    coded_width: u32,
+    coded_height: u32,
+    display_rect: RECT,
 }
 
 impl D3d11VideoFrame {
@@ -54,9 +57,19 @@ impl D3d11VideoFrame {
         &self.device
     }
 
+    pub(crate) fn coded_size(&self) -> (u32, u32) {
+        (self.coded_width, self.coded_height)
+    }
+
+    pub(crate) fn display_rect(&self) -> RECT {
+        self.display_rect
+    }
+
     /// Expensive compatibility path used only if native D3D11 presentation
     /// cannot be initialized on this machine.
-    pub(crate) fn to_rgba(&self, width: u32, height: u32) -> Result<Vec<u8>> {
+    pub(crate) fn to_rgba(&self) -> Result<Vec<u8>> {
+        let width = self.coded_width;
+        let height = self.coded_height;
         let texture = self.texture();
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -113,7 +126,7 @@ impl D3d11VideoFrame {
         }
         let mut rgba = vec![0; width_usize * height_usize * 4];
         nv12_to_rgba(&nv12, width, height, &mut rgba);
-        Ok(rgba)
+        Ok(crop_rgba(&rgba, width, height, self.display_rect))
     }
 }
 
@@ -136,13 +149,14 @@ struct DecoderPresentationPool {
     allocated: usize,
     width: u32,
     height: u32,
+    display_rect: RECT,
     generation: u64,
     skipped: u64,
     last_skip_log: std::time::Instant,
 }
 
 impl DecoderPresentationPool {
-    fn new(d3d: Arc<MfD3d>, width: u32, height: u32, generation: u64) -> Self {
+    fn new(d3d: Arc<MfD3d>, width: u32, height: u32, display_rect: RECT, generation: u64) -> Self {
         let (return_tx, return_rx) = mpsc::channel();
         Self {
             d3d,
@@ -152,6 +166,7 @@ impl DecoderPresentationPool {
             allocated: 0,
             width,
             height,
+            display_rect,
             generation,
             skipped: 0,
             last_skip_log: std::time::Instant::now(),
@@ -246,8 +261,48 @@ impl DecoderPresentationPool {
             device: self.d3d.device.clone(),
             return_tx: self.return_tx.clone(),
             generation: self.generation,
+            coded_width: self.width,
+            coded_height: self.height,
+            display_rect: self.display_rect,
         }))
     }
+}
+
+fn rect_size(rect: RECT) -> (u32, u32) {
+    (
+        rect.right.saturating_sub(rect.left).max(0) as u32,
+        rect.bottom.saturating_sub(rect.top).max(0) as u32,
+    )
+}
+
+fn crop_rgba(src: &[u8], coded_width: u32, coded_height: u32, rect: RECT) -> Vec<u8> {
+    let (display_width, display_height) = rect_size(rect);
+    let valid = rect.left >= 0
+        && rect.top >= 0
+        && rect.right <= coded_width as i32
+        && rect.bottom <= coded_height as i32
+        && display_width > 0
+        && display_height > 0;
+    if !valid {
+        return src.to_vec();
+    }
+    if rect.left == 0
+        && rect.top == 0
+        && display_width == coded_width
+        && display_height == coded_height
+    {
+        return src.to_vec();
+    }
+    let source_stride = coded_width as usize * 4;
+    let row_bytes = display_width as usize * 4;
+    let mut out = vec![0; row_bytes * display_height as usize];
+    for row in 0..display_height as usize {
+        let source_offset = (rect.top as usize + row) * source_stride + rect.left as usize * 4;
+        let destination_offset = row * row_bytes;
+        out[destination_offset..destination_offset + row_bytes]
+            .copy_from_slice(&src[source_offset..source_offset + row_bytes]);
+    }
+    out
 }
 
 fn ensure_media_foundation() -> Result<()> {
@@ -1718,10 +1773,71 @@ fn decoder_nv12_output_type(transform: &IMFTransform) -> Result<IMFMediaType> {
     Err(anyhow!("MF H.264 decoder did not offer NV12 output"))
 }
 
+fn video_aperture(media_type: &IMFMediaType, key: &GUID) -> Option<RECT> {
+    let blob_size = unsafe { media_type.GetBlobSize(key) }.ok()? as usize;
+    if blob_size < std::mem::size_of::<MFVideoArea>() {
+        return None;
+    }
+    let mut blob = vec![0u8; blob_size];
+    unsafe { media_type.GetBlob(key, &mut blob, None) }.ok()?;
+    let area = unsafe { std::ptr::read_unaligned(blob.as_ptr().cast::<MFVideoArea>()) };
+    Some(RECT {
+        left: area.OffsetX.value as i32,
+        top: area.OffsetY.value as i32,
+        right: area.OffsetX.value as i32 + area.Area.cx,
+        bottom: area.OffsetY.value as i32 + area.Area.cy,
+    })
+}
+
+fn decoder_display_rect(media_type: &IMFMediaType, width: u32, height: u32) -> RECT {
+    for key in [
+        &MF_MT_MINIMUM_DISPLAY_APERTURE,
+        &MF_MT_GEOMETRIC_APERTURE,
+        &MF_MT_PAN_SCAN_APERTURE,
+    ] {
+        if let Some(rect) = video_aperture(media_type, key) {
+            let (display_width, display_height) = rect_size(rect);
+            if rect.left >= 0
+                && rect.top >= 0
+                && rect.right <= width as i32
+                && rect.bottom <= height as i32
+                && display_width > 0
+                && display_height > 0
+            {
+                return rect;
+            }
+        }
+    }
+
+    fallback_display_rect(width, height)
+}
+
+fn fallback_display_rect(width: u32, height: u32) -> RECT {
+    // Some H.264 decoders expose only the macroblock-aligned coded size. Wire's
+    // negotiated stream sizes are 16:9, so trim a sub-macroblock bottom pad such
+    // as 1920x1088 back to its 1920x1080 display area when no aperture is given.
+    let expected_height = width.saturating_mul(9) / 16;
+    let display_height = if width.saturating_mul(9) % 16 == 0
+        && height >= expected_height
+        && height - expected_height < 16
+    {
+        expected_height
+    } else {
+        height
+    };
+    RECT {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: display_height as i32,
+    }
+}
+
 pub struct MfH264Decoder {
     transform: IMFTransform,
     width: u32,
     height: u32,
+    display_rect: RECT,
     configured: bool,
     async_mode: bool,
     nv12: Vec<u8>,
@@ -1819,6 +1935,7 @@ impl MfH264Decoder {
             transform,
             width: 0,
             height: 0,
+            display_rect: RECT::default(),
             configured: false,
             async_mode,
             nv12: Vec::new(),
@@ -1838,12 +1955,15 @@ impl MfH264Decoder {
         let frame_size = unsafe { output_type.GetUINT64(&MF_MT_FRAME_SIZE)? };
         let width = (frame_size >> 32) as u32;
         let height = frame_size as u32;
+        let display_rect = decoder_display_rect(&output_type, width, height);
         unsafe {
             self.transform.SetOutputType(0, &output_type, 0)?;
         }
-        let dimensions_changed = self.width != width || self.height != height;
+        let dimensions_changed =
+            self.width != width || self.height != height || self.display_rect != display_rect;
         self.width = width;
         self.height = height;
+        self.display_rect = display_rect;
         self.configured = true;
         if dimensions_changed {
             self.nv12.resize((width * height * 3 / 2) as usize, 0);
@@ -1854,12 +1974,17 @@ impl MfH264Decoder {
                     d3d.clone(),
                     width,
                     height,
+                    display_rect,
                     self.presentation_generation,
                 )
             });
             self.native_output_failed = false;
         }
-        info!("MF decoder output negotiated: {width}x{height}");
+        let (display_width, display_height) = rect_size(display_rect);
+        info!(
+            "MF decoder output negotiated: {width}x{height} coded, {display_width}x{display_height} display at ({}, {})",
+            display_rect.left, display_rect.top
+        );
         Ok(())
     }
 
@@ -1869,6 +1994,8 @@ impl MfH264Decoder {
     ) -> Result<Option<crate::video_decode::DecodedFrame>> {
         let w = self.width;
         let h = self.height;
+        let display_rect = self.display_rect;
+        let (display_width, display_height) = rect_size(display_rect);
         if !self.native_output_failed {
             if let Some(pool) = &mut self.presentation_pool {
                 match pool.copy_sample(sample) {
@@ -1882,8 +2009,8 @@ impl MfH264Decoder {
                         }
                         return Ok(Some(crate::video_decode::DecodedFrame {
                             data: crate::video_decode::DecodedFrameData::D3d11(frame),
-                            width: w,
-                            height: h,
+                            width: display_width,
+                            height: display_height,
                         }));
                     }
                     Ok(None) => {
@@ -1908,13 +2035,11 @@ impl MfH264Decoder {
             self.rgba.resize(len, 0);
         }
         nv12_to_rgba(&self.nv12, w, h, &mut self.rgba);
-        let mut out = Vec::with_capacity(len);
-        std::mem::swap(&mut self.rgba, &mut out);
-        self.rgba.resize(len, 0);
+        let out = crop_rgba(&self.rgba, w, h, display_rect);
         Ok(Some(crate::video_decode::DecodedFrame {
             data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(out)),
-            width: w,
-            height: h,
+            width: display_width,
+            height: display_height,
         }))
     }
 
@@ -1987,3 +2112,31 @@ impl MfH264Decoder {
 }
 
 use windows::Win32::System::Com::CoTaskMemFree;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crops_macroblock_padding_from_rgba_frames() {
+        let width = 4u32;
+        let height = 4u32;
+        let src: Vec<u8> = (0..width * height * 4).map(|value| value as u8).collect();
+        let rect = RECT {
+            left: 0,
+            top: 1,
+            right: 4,
+            bottom: 3,
+        };
+        let cropped = crop_rgba(&src, width, height, rect);
+        assert_eq!(cropped.len(), 4 * 2 * 4);
+        assert_eq!(&cropped[..16], &src[16..32]);
+        assert_eq!(&cropped[16..], &src[32..48]);
+    }
+
+    #[test]
+    fn trims_h264_macroblock_padding_without_aperture_metadata() {
+        assert_eq!(rect_size(fallback_display_rect(1920, 1088)), (1920, 1080));
+        assert_eq!(rect_size(fallback_display_rect(1280, 720)), (1280, 720));
+    }
+}
