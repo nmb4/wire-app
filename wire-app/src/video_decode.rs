@@ -32,7 +32,7 @@ pub struct DecodedFrame {
 /// MF encoder), so it never crosses thread boundaries even though the underlying
 /// COM `IMFTransform` is `!Send`.
 trait FrameDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>>;
 }
 
 struct OpenH264Decoder(wire::video::codec::VideoDecoder);
@@ -45,8 +45,8 @@ impl OpenH264Decoder {
 }
 
 impl FrameDecoder for OpenH264Decoder {
-    fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-        self.0.decode(data)
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+        self.0.decode(data).map(|frame| vec![frame])
     }
 }
 
@@ -63,30 +63,20 @@ impl MfDecoder {
 
 #[cfg(windows)]
 impl FrameDecoder for MfDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
         self.0.decode(data)
     }
 }
 
-fn make_decoder() -> Result<Box<dyn FrameDecoder>> {
-    // Use the OpenH264 software decoder for receiving. It is reliable and
-    // orientation-correct. The MF hardware H.264 decoder (win_mf_codec) has an
-    // MFT state machine (MF_E_TRANSFORM_STREAM_CHANGE renegotiation and
-    // MF_E_NOTACCEPTING draining) that is not handled yet; using it stalls the
-    // receiver after a stream change. It is only a last resort if OpenH264 is
-    // unavailable.
-    match OpenH264Decoder::try_new() {
-        Ok(decoder) => return Ok(Box::new(decoder)),
-        Err(e) => warn!("OpenH264 decoder unavailable, trying MF hardware decoder: {e:?}"),
-    }
+fn make_decoder() -> Result<(Box<dyn FrameDecoder>, bool)> {
     #[cfg(windows)]
     {
-        Ok(Box::new(MfDecoder::try_new()?))
+        match MfDecoder::try_new() {
+            Ok(decoder) => return Ok((Box::new(decoder), true)),
+            Err(e) => warn!("MF hardware decoder unavailable, using OpenH264: {e:?}"),
+        }
     }
-    #[cfg(not(windows))]
-    {
-        Err(anyhow::anyhow!("no video decoder available"))
-    }
+    Ok((Box::new(OpenH264Decoder::try_new()?), false))
 }
 
 /// Bounded hand-off between the QUIC receive task and the decode thread. Small on
@@ -95,10 +85,15 @@ fn make_decoder() -> Result<Box<dyn FrameDecoder>> {
 const PACKET_QUEUE_DEPTH: usize = 3;
 
 pub struct VideoDecodeWorker {
-    packet_tx: SyncSender<Vec<u8>>,
+    packet_tx: SyncSender<EncodedPacket>,
     submitted: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
+}
+
+struct EncodedPacket {
+    data: Vec<u8>,
+    keyframe: bool,
 }
 
 impl VideoDecodeWorker {
@@ -135,8 +130,8 @@ impl VideoDecodeWorker {
     /// sequence of H.264 pictures. If the decoder is slower than the network,
     /// this blocks the caller (the QUIC receive task), which backpressures the
     /// sender through QUIC flow control instead of dropping frames.
-    pub fn submit(&self, data: Vec<u8>) {
-        match self.packet_tx.send(data) {
+    pub fn submit(&self, data: Vec<u8>, keyframe: bool) {
+        match self.packet_tx.send(EncodedPacket { data, keyframe }) {
             Ok(()) => {
                 self.submitted.fetch_add(1, Ordering::Relaxed);
             }
@@ -156,7 +151,7 @@ impl Drop for VideoDecodeWorker {
 }
 
 fn run_decode_loop<F>(
-    packet_rx: mpsc::Receiver<Vec<u8>>,
+    packet_rx: mpsc::Receiver<EncodedPacket>,
     submitted: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     on_frame: F,
@@ -164,7 +159,10 @@ fn run_decode_loop<F>(
 where
     F: Fn(DecodedFrame),
 {
-    let mut decoder = make_decoder()?;
+    let (mut decoder, mut hardware_decoder) = make_decoder()?;
+    let mut waiting_for_keyframe = false;
+    let mut seen_keyframe = false;
+    let mut empty_output_streak = 0u32;
     let mut decoded = 0u64;
     let mut decode_errors = 0u64;
     // A freshly joined stream starts mid-GOP, so the decoder cannot produce a
@@ -173,40 +171,77 @@ where
     let mut window_decoded = 0u64;
     let mut window_bytes = 0u64;
     let mut window_decode_ms = 0.0;
+    let mut decode_samples_ms = Vec::with_capacity(300);
     let mut last_stats_log = Instant::now();
     let mut last_submitted = 0u64;
     let mut last_dropped = 0u64;
 
     loop {
-        let data = match packet_rx.recv_timeout(Duration::from_millis(200)) {
+        let packet = match packet_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(packet) => packet,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        if waiting_for_keyframe && !packet.keyframe {
+            continue;
+        }
+        if packet.keyframe {
+            waiting_for_keyframe = false;
+            seen_keyframe = true;
+        }
 
-        let packet_len = data.len() as u64;
+        let packet_len = packet.data.len() as u64;
         let decode_start = Instant::now();
-        match decoder.decode(&data) {
-            Ok((rgba, w, h)) => {
+        match decoder.decode(&packet.data) {
+            Ok(frames) => {
                 let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-                decoded += 1;
-                window_decoded += 1;
-                window_bytes += packet_len;
                 window_decode_ms += decode_ms;
+                decode_samples_ms.push(decode_ms);
                 decode_errors = 0;
-                if decoded == 1 {
-                    info!("decoded first video frame ({w}x{h})");
+                if frames.is_empty() && hardware_decoder && seen_keyframe {
+                    empty_output_streak += 1;
+                } else if !frames.is_empty() {
+                    empty_output_streak = 0;
                 }
-                on_frame(DecodedFrame {
-                    data: Arc::new(rgba),
-                    width: w,
-                    height: h,
-                });
+                for (rgba, w, h) in frames {
+                    decoded += 1;
+                    window_decoded += 1;
+                    window_bytes += packet_len;
+                    if decoded == 1 {
+                        info!("decoded first video frame ({w}x{h})");
+                    }
+                    on_frame(DecodedFrame {
+                        data: Arc::new(rgba),
+                        width: w,
+                        height: h,
+                    });
+                }
+                #[cfg(windows)]
+                if hardware_decoder && empty_output_streak >= 30 {
+                    warn!(
+                        "MF decoder stopped producing output; falling back to OpenH264 at next IDR"
+                    );
+                    decoder = Box::new(OpenH264Decoder::try_new()?);
+                    hardware_decoder = false;
+                    waiting_for_keyframe = true;
+                    seen_keyframe = false;
+                    empty_output_streak = 0;
+                }
             }
             Err(e) => {
                 decode_errors += 1;
                 if decode_errors <= 5 || decode_errors % 60 == 0 {
                     warn!("video decode error (#{decode_errors}): {e:?}");
+                }
+                #[cfg(windows)]
+                if hardware_decoder && decode_errors >= 5 {
+                    warn!("MF decoder repeatedly failed; falling back to OpenH264 at next IDR");
+                    decoder = Box::new(OpenH264Decoder::try_new()?);
+                    hardware_decoder = false;
+                    waiting_for_keyframe = true;
+                    seen_keyframe = false;
+                    empty_output_streak = 0;
+                    decode_errors = 0;
                 }
             }
         }
@@ -227,15 +262,22 @@ where
             } else {
                 0.0
             };
+            decode_samples_ms.sort_by(f64::total_cmp);
+            let p95_decode_ms = if decode_samples_ms.is_empty() {
+                0.0
+            } else {
+                decode_samples_ms[((decode_samples_ms.len() - 1) as f64 * 0.95).round() as usize]
+            };
             let avg_packet_kb = if window_decoded > 0 {
                 window_bytes as f64 / window_decoded as f64 / 1024.0
             } else {
                 0.0
             };
             info!(
-                "video decode pipeline: {:.1} fps, {:.1} ms/frame, {:.1} KiB/frame, {} submitted, {} dropped this window, {} dropped total",
+                "video decode pipeline: {:.1} fps, {:.1} ms avg / {:.1} ms p95, {:.1} KiB/frame, {} submitted, {} dropped this window, {} dropped total",
                 decode_fps,
                 avg_decode_ms,
+                p95_decode_ms,
                 avg_packet_kb,
                 submitted_window,
                 dropped_window,
@@ -247,6 +289,7 @@ where
             window_decoded = 0;
             window_bytes = 0;
             window_decode_ms = 0.0;
+            decode_samples_ms.clear();
         }
     }
     Ok(())

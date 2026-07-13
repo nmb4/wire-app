@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -45,9 +45,10 @@ eframe = { version = "0.31", default-features = false, features = [
     "glow",
 ] }
 arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
+sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.60", features = [
+windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D10",
@@ -59,12 +60,14 @@ windows = { version = "0.60", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_SystemInformation",
     "Win32_System_Variant",
     "Wdk_System_SystemServices",
 ] }
 scopeguard = "1.2"
 rayon = "1.12"
+yuvutils-rs = { version = "0.8.3", features = ["rayon"] }
 windows-capture = "1.4.4"
 
 [features]

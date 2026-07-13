@@ -3,18 +3,23 @@
 use std::sync::Once;
 
 use anyhow::{anyhow, Context, Result};
-use wire::video::VideoConfig;
 use tracing::{info, warn};
 use windows::core::{Interface, GUID};
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, LUID, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BOOL, VT_I4, VT_UI4};
+use wire::video::VideoConfig;
 
 use std::sync::Arc;
 
-use crate::win_mf_d3d::{enumerate_adapters, GpuNv12Frames, MfD3d};
-use crate::yuv_convert::{bgra_to_nv12, bgra_to_rgba, nv12_to_rgba};
+use crate::win_mf_d3d::{enumerate_adapters, GpuNv12Frames, GpuVideoProcessor, MfD3d};
+use crate::yuv_convert::{bgra_to_nv12, nv12_to_rgba};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
 static MF_INIT: Once = Once::new();
 
@@ -101,7 +106,11 @@ fn enumerate_transforms(
             let activate = (*activates.add(i as usize))
                 .as_ref()
                 .ok_or_else(|| anyhow!("null MFT activate"))?;
-            info!("found MFT candidate #{}", i + 1);
+            info!(
+                "found MFT candidate #{}: {}",
+                i + 1,
+                read_mft_name(activate)
+            );
             activate.ActivateObject::<IMFTransform>()
         }?;
         transforms.push(transform);
@@ -603,7 +612,7 @@ fn create_media_sample(data: &[u8], timestamp: i64, duration: i64) -> Result<IMF
     Ok(sample)
 }
 
-fn create_h264_sample(data: &[u8]) -> Result<IMFSample> {
+fn create_h264_sample(data: &[u8], timestamp: i64, duration: i64) -> Result<IMFSample> {
     let buffer = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
     unsafe {
         let mut ptr = std::ptr::null_mut();
@@ -617,6 +626,8 @@ fn create_h264_sample(data: &[u8]) -> Result<IMFSample> {
     let sample = unsafe { MFCreateSample()? };
     unsafe {
         sample.AddBuffer(&buffer)?;
+        sample.SetSampleTime(timestamp)?;
+        sample.SetSampleDuration(duration)?;
     }
     Ok(sample)
 }
@@ -708,6 +719,37 @@ fn process_output_once_sample(
             Ok(Some(sample))
         }
         Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+enum DecoderOutput {
+    Sample(IMFSample),
+    NeedMoreInput,
+    StreamChange,
+}
+
+fn process_decoder_output_once(
+    transform: &IMFTransform,
+    output_stream_id: u32,
+) -> Result<DecoderOutput> {
+    let output_sample = create_output_sample(transform, output_stream_id)?;
+    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: output_stream_id,
+        pSample: std::mem::ManuallyDrop::new(output_sample),
+        dwStatus: 0,
+        pEvents: std::mem::ManuallyDrop::new(None),
+    };
+    let mut status = 0u32;
+    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) } {
+        Ok(()) => Ok(DecoderOutput::Sample(
+            buffer
+                .pSample
+                .take()
+                .ok_or_else(|| anyhow!("decoder output missing sample"))?,
+        )),
+        Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(DecoderOutput::NeedMoreInput),
+        Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => Ok(DecoderOutput::StreamChange),
         Err(e) => Err(e.into()),
     }
 }
@@ -853,11 +895,27 @@ impl MfColorConverter {
 
     fn convert(&mut self, input: &[u8], timestamp: i64, duration: i64) -> Result<Option<&[u8]>> {
         let sample = create_media_sample(input, timestamp, duration)?;
-        unsafe {
-            self.transform.ProcessInput(0, &sample, 0)?;
+        let mut queued_output = None;
+        match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+            Ok(()) => {}
+            Err(error) if error.code() == MF_E_NOTACCEPTING => {
+                // A synchronous converter may retain one frame. Drain that frame,
+                // then queue the current input instead of surfacing NOT_ACCEPTING
+                // as a decoder failure.
+                queued_output = process_output_once_sample(&self.transform, 0)?;
+                unsafe {
+                    self.transform.ProcessInput(0, &sample, 0)?;
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
-        let out_sample = process_output_once_sample(&self.transform, 0)?
-            .ok_or_else(|| anyhow!("MF color converter produced no output"))?;
+        let out_sample = match queued_output {
+            Some(sample) => Some(sample),
+            None => process_output_once_sample(&self.transform, 0)?,
+        };
+        let Some(out_sample) = out_sample else {
+            return Ok(None);
+        };
         // Normalize orientation: MF image buffers are often bottom-up, so read
         // the output top-down regardless of which direction we are converting.
         let out = read_sample_topdown(&out_sample, self.width, self.height, self.output_is_nv12)?;
@@ -885,9 +943,118 @@ pub struct MfH264Encoder {
     pending_input: u32,
     d3d: Option<Arc<MfD3d>>,
     gpu_nv12: Option<GpuNv12Frames>,
+    // The MF allocator's textures are encoder inputs and are not guaranteed to have
+    // D3D11_BIND_RENDER_TARGET. Render into our own NV12 target, then copy into the
+    // allocator surface at the frame boundary.
+    gpu_processor: Option<(u32, u32, GpuVideoProcessor, ID3D11Texture2D)>,
+}
+
+fn read_sample_topdown_into(
+    sample: &IMFSample,
+    width: u32,
+    height: u32,
+    is_nv12: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
+    let w = width as usize;
+    let h = height as usize;
+    let out_len = if is_nv12 { w * h * 3 / 2 } else { w * h * 4 };
+    out.resize(out_len, 0);
+
+    if let Ok(buf2d) = buffer.cast::<IMF2DBuffer>() {
+        let mut ptr = std::ptr::null_mut();
+        let mut stride: i32 = 0;
+        unsafe { buf2d.Lock2D(&mut ptr, &mut stride)? };
+        let bottom_up = stride < 0;
+        let stride = stride.unsigned_abs() as usize;
+        let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, (h + h / 2) * stride) };
+        if is_nv12 {
+            for y in 0..h {
+                let src_row = if bottom_up {
+                    (h - 1 - y) * stride
+                } else {
+                    y * stride
+                };
+                out[y * w..(y + 1) * w].copy_from_slice(&src[src_row..src_row + w]);
+            }
+            for y in 0..h / 2 {
+                let src_row = if bottom_up {
+                    (h + h / 2 - 1 - y) * stride
+                } else {
+                    (h + y) * stride
+                };
+                let dst = w * h + y * w;
+                out[dst..dst + w].copy_from_slice(&src[src_row..src_row + w]);
+            }
+        } else {
+            for y in 0..h {
+                let src_row = if bottom_up {
+                    (h - 1 - y) * stride
+                } else {
+                    y * stride
+                };
+                let dst = y * w * 4;
+                out[dst..dst + w * 4].copy_from_slice(&src[src_row..src_row + w * 4]);
+            }
+        }
+        unsafe { buf2d.Unlock2D()? };
+        Ok(())
+    } else {
+        let mut ptr = std::ptr::null_mut();
+        let mut max_len = 0u32;
+        let mut cur_len = 0u32;
+        unsafe {
+            buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
+            let len = (cur_len as usize).min(out.len());
+            out[..len].copy_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
+            buffer.Unlock()?;
+        }
+        Ok(())
+    }
 }
 
 impl MfH264Encoder {
+    pub fn try_new_on_device(config: &VideoConfig, device: &ID3D11Device) -> Result<Self> {
+        ensure_media_foundation()?;
+        let width = config.resolution.width();
+        let height = config.resolution.height();
+        let bitrate = config.effective_bitrate();
+        let d3d = Arc::new(MfD3d::from_device(device)?);
+        let mut last_err = None;
+        for candidate in enumerate_video_encoders(true)? {
+            if candidate.name.to_ascii_lowercase().contains("dx12") {
+                continue;
+            }
+            let transform = match activate_transform(&candidate.activate) {
+                Ok(transform) => transform,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match Self::build_with_d3d(
+                transform,
+                Some(d3d.clone()),
+                config,
+                width,
+                height,
+                bitrate,
+                true,
+            ) {
+                Ok(encoder) => {
+                    info!(
+                        "MF encoder '{}' is sharing the WGC D3D11 device",
+                        candidate.name
+                    );
+                    return Ok(encoder);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no encoder accepted the WGC D3D11 device")))
+    }
+
     pub fn try_new(config: &VideoConfig) -> Result<Self> {
         ensure_media_foundation()?;
         let width = config.resolution.width();
@@ -1069,6 +1236,7 @@ impl MfH264Encoder {
             pending_input: if async_mode { 1 } else { 0 },
             d3d,
             gpu_nv12,
+            gpu_processor: None,
         };
 
         let probe = vec![0u8; (width * height * 4) as usize];
@@ -1139,6 +1307,76 @@ impl MfH264Encoder {
         self.encode_bgra_inner(bgra)
     }
 
+    pub fn encode_texture_bgra(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        src_width: u32,
+        src_height: u32,
+    ) -> Result<Vec<u8>> {
+        let timestamp = self.frame_index * self.frame_duration;
+        let d3d = self
+            .d3d
+            .as_ref()
+            .context("GPU texture encode requires a D3D device")?;
+        let gpu = self
+            .gpu_nv12
+            .as_ref()
+            .context("GPU texture encode requires DXGI encoder samples")?;
+        let recreate = self
+            .gpu_processor
+            .as_ref()
+            .map(|(w, h, _, _)| *w != src_width || *h != src_height)
+            .unwrap_or(true);
+        if recreate {
+            let processor = GpuVideoProcessor::new(
+                d3d,
+                src_width,
+                src_height,
+                self.width,
+                self.height,
+                (10_000_000i64 / self.frame_duration.max(1)) as u32,
+            )?;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut target = None;
+            unsafe {
+                d3d.device
+                    .CreateTexture2D(&desc, None, Some(&mut target))
+                    .context("creating GPU-native NV12 render target")?;
+            }
+            self.gpu_processor = Some((
+                src_width,
+                src_height,
+                processor,
+                target.context("GPU-native NV12 render target was null")?,
+            ));
+        }
+        let sample = gpu.allocate_sample(timestamp, self.frame_duration)?;
+        let output_texture = GpuNv12Frames::sample_texture(&sample)?;
+        let (_, _, processor, render_target) = self.gpu_processor.as_ref().unwrap();
+        processor
+            .convert(texture, render_target)
+            .context("D3D11 BGRA-to-NV12 video processing")?;
+        unsafe {
+            d3d.context.CopyResource(&output_texture, render_target);
+        }
+        self.frame_index += 1;
+        self.process_sample(&sample)
+    }
+
     fn pack_nv12_for_encoder(
         width: u32,
         height: u32,
@@ -1202,7 +1440,10 @@ impl MfH264Encoder {
             create_media_sample(nv12, timestamp, frame_duration).context("cpu nv12 sample")?
         };
         self.frame_index += 1;
+        self.process_sample(&sample)
+    }
 
+    fn process_sample(&mut self, sample: &IMFSample) -> Result<Vec<u8>> {
         let mut out = Vec::new();
 
         if self.async_mode {
@@ -1215,7 +1456,7 @@ impl MfH264Encoder {
             self.pending_input -= 1;
             unsafe {
                 self.transform
-                    .ProcessInput(self.input_stream_id, &sample, 0)
+                    .ProcessInput(self.input_stream_id, sample, 0)
                     .context("async ProcessInput")?;
             }
             self.wait_for_async_event(&mut out)
@@ -1224,7 +1465,7 @@ impl MfH264Encoder {
         } else {
             unsafe {
                 self.transform
-                    .ProcessInput(self.input_stream_id, &sample, 0)
+                    .ProcessInput(self.input_stream_id, sample, 0)
                     .context("sync ProcessInput")?;
             }
             for packet in drain_output(&self.transform, self.output_stream_id)? {
@@ -1235,14 +1476,32 @@ impl MfH264Encoder {
     }
 }
 
+fn decoder_nv12_output_type(transform: &IMFTransform) -> Result<IMFMediaType> {
+    for index in 0..64 {
+        match unsafe { transform.GetOutputAvailableType(0, index) } {
+            Ok(media_type) => {
+                if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(MFVideoFormat_NV12) {
+                    return Ok(media_type);
+                }
+            }
+            Err(error) if error.code() == MF_E_NO_MORE_TYPES => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow!("MF H.264 decoder did not offer NV12 output"))
+}
+
 pub struct MfH264Decoder {
     transform: IMFTransform,
     width: u32,
     height: u32,
     configured: bool,
     async_mode: bool,
-    nv12_to_rgb: Option<MfColorConverter>,
+    nv12: Vec<u8>,
     rgba: Vec<u8>,
+    frame_index: i64,
+    frame_duration: i64,
+    _d3d: Option<Arc<MfD3d>>,
 }
 
 impl MfH264Decoder {
@@ -1273,10 +1532,33 @@ impl MfH264Decoder {
         if async_mode {
             unlock_async_transform(&transform)?;
         }
+        let d3d = match MfD3d::try_new(None) {
+            Ok(d3d) => {
+                let d3d = Arc::new(d3d);
+                match d3d.attach_to_transform(&transform) {
+                    Ok(()) => {
+                        info!("MF decoder attached to a D3D11 device manager");
+                        Some(d3d)
+                    }
+                    Err(error) => {
+                        warn!("MF decoder rejected D3D11 device manager: {error:#}");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                warn!("MF decoder D3D11 device creation failed: {error:#}");
+                None
+            }
+        };
         if let Ok(attrs) = unsafe { transform.GetAttributes() } {
             unsafe {
                 let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
             }
+        }
+        if let Ok(api) = transform.cast::<ICodecAPI>() {
+            set_codecapi_bool(&api, &CODECAPI_AVDecVideoAcceleration_H264, d3d.is_some());
+            set_codecapi_bool(&api, &CODECAPI_AVLowLatencyMode, true);
         }
 
         let input_type = unsafe { MFCreateMediaType()? };
@@ -1284,77 +1566,125 @@ impl MfH264Decoder {
             input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             input_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
             transform.SetInputType(0, &input_type, 0)?;
+            // With only the two required H.264 input attributes, Windows exposes
+            // a placeholder output type. It still must be selected before the
+            // first ProcessInput call; the decoder later reports STREAM_CHANGE
+            // once SPS/PPS reveal the actual dimensions.
+            let output_type = decoder_nv12_output_type(&transform)?;
+            transform.SetOutputType(0, &output_type, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
+        if async_mode {
+            wait_for_transform_event(&transform, 0, METransformNeedInput)?;
+        }
 
-        info!("MF H.264 decoder ready (async={async_mode})");
+        info!(
+            "MF H.264 decoder ready (async={async_mode}, d3d={})",
+            d3d.is_some()
+        );
         Ok(Self {
             transform,
             width: 0,
             height: 0,
             configured: false,
             async_mode,
-            nv12_to_rgb: None,
+            nv12: Vec::new(),
             rgba: Vec::new(),
+            frame_index: 0,
+            frame_duration: 10_000_000 / 60,
+            _d3d: d3d,
         })
     }
 
-    fn ensure_output_type(&mut self) -> Result<()> {
-        if self.configured {
-            return Ok(());
-        }
-        let output_type = unsafe { self.transform.GetOutputAvailableType(0, 0)? };
+    fn renegotiate_output_type(&mut self) -> Result<()> {
+        let output_type = decoder_nv12_output_type(&self.transform)?;
         let frame_size = unsafe { output_type.GetUINT64(&MF_MT_FRAME_SIZE)? };
         let width = (frame_size >> 32) as u32;
         let height = frame_size as u32;
         unsafe {
             self.transform.SetOutputType(0, &output_type, 0)?;
         }
+        let dimensions_changed = self.width != width || self.height != height;
         self.width = width;
         self.height = height;
         self.configured = true;
-        self.nv12_to_rgb =
-            match MfColorConverter::try_new(MFVideoFormat_NV12, MFVideoFormat_RGB32, width, height)
-            {
-                Ok(conv) => {
-                    info!("MF color converter ready (NV12 -> RGBA)");
-                    Some(conv)
-                }
-                Err(e) => {
-                    info!("MF NV12->RGB converter unavailable, using CPU YUV: {e:?}");
-                    None
-                }
-            };
+        if dimensions_changed {
+            self.nv12.resize((width * height * 3 / 2) as usize, 0);
+            self.rgba.resize((width * height * 4) as usize, 0);
+        }
         info!("MF decoder output negotiated: {width}x{height}");
         Ok(())
     }
 
-    pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-        let data = wire::video::bitstream::normalize_h264_for_decode(data);
-        let sample = create_h264_sample(&data)?;
-        unsafe {
-            self.transform.ProcessInput(0, &sample, 0)?;
+    fn sample_to_rgba(&mut self, sample: &IMFSample) -> Result<Option<(Vec<u8>, u32, u32)>> {
+        let w = self.width;
+        let h = self.height;
+        let len = (w * h * 4) as usize;
+        read_sample_topdown_into(sample, w, h, true, &mut self.nv12)?;
+        if self.rgba.len() != len {
+            self.rgba.resize(len, 0);
         }
-        if !self.configured {
-            self.ensure_output_type()?;
+        nv12_to_rgba(&self.nv12, w, h, &mut self.rgba);
+        let mut out = Vec::with_capacity(len);
+        std::mem::swap(&mut self.rgba, &mut out);
+        self.rgba.resize(len, 0);
+        Ok(Some((out, w, h)))
+    }
+
+    fn drain_available_output(&mut self) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+        let mut frames = Vec::new();
+        loop {
+            match process_decoder_output_once(&self.transform, 0)? {
+                DecoderOutput::Sample(sample) => {
+                    if !self.configured {
+                        self.renegotiate_output_type()?;
+                    }
+                    if let Some(frame) = self.sample_to_rgba(&sample)? {
+                        frames.push(frame);
+                    }
+                }
+                DecoderOutput::StreamChange => {
+                    self.configured = false;
+                    self.renegotiate_output_type()?;
+                }
+                DecoderOutput::NeedMoreInput => break,
+            }
+        }
+        Ok(frames)
+    }
+
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+        let data = wire::video::bitstream::normalize_h264_for_decode(data);
+        let timestamp = self.frame_index * self.frame_duration;
+        let sample = create_h264_sample(&data, timestamp, self.frame_duration)?;
+        self.frame_index += 1;
+        let mut frames = Vec::new();
+        let mut accepted = false;
+        for _ in 0..4 {
+            match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+                Ok(()) => {
+                    accepted = true;
+                    break;
+                }
+                Err(error) if error.code() == MF_E_NOTACCEPTING => {
+                    frames.extend(self.drain_available_output()?);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !accepted {
+            return Err(anyhow!(
+                "MF decoder remained NOT_ACCEPTING after draining output"
+            ));
         }
 
         if self.async_mode {
-            // Async MFTs surface output via an event rather than immediately. Wait for
-            // the "have output" signal (without draining it here; drain_output does that
-            // next). Doing this before reading output is what makes hardware decode work.
-            // Bounded so a reordering MFT can never hang this thread: the frame is still
-            // queued inside the decoder and will be emitted on the next call.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let mut got_output = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             loop {
                 match read_transform_event(&self.transform, MF_EVENT_FLAG_NO_WAIT)? {
-                    Some(TransformEvent::HaveOutput) => {
-                        got_output = true;
-                        break;
-                    }
+                    Some(TransformEvent::HaveOutput) => break,
                     Some(TransformEvent::NeedInput) => break,
                     Some(TransformEvent::Other(_)) => continue,
                     None => {
@@ -1365,33 +1695,9 @@ impl MfH264Decoder {
                     }
                 }
             }
-            if !got_output {
-                warn!("MF decoder did not signal output within budget; continuing");
-            }
         }
-
-        let sample = process_output_once_sample(&self.transform, 0)?
-            .ok_or_else(|| anyhow!("MF decoder produced no output"))?;
-        let nv12 = read_sample_topdown(&sample, self.width, self.height, true)?;
-
-        let w = self.width;
-        let h = self.height;
-        let len = (w * h * 4) as usize;
-        if self.rgba.len() != len {
-            self.rgba.resize(len, 0);
-        }
-        if let Some(conv) = &mut self.nv12_to_rgb {
-            let bgra = conv
-                .convert(&nv12, 0, 0)?
-                .ok_or_else(|| anyhow!("MF NV12->RGB converter produced no output"))?;
-            bgra_to_rgba(bgra, &mut self.rgba);
-        } else {
-            nv12_to_rgba(&nv12, w, h, &mut self.rgba);
-        }
-        let mut out = Vec::with_capacity(len);
-        std::mem::swap(&mut self.rgba, &mut out);
-        self.rgba.resize(len, 0);
-        Ok((out, w, h))
+        frames.extend(self.drain_available_output()?);
+        Ok(frames)
     }
 }
 

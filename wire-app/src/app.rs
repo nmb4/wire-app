@@ -11,11 +11,6 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use async_channel::{Receiver, Sender};
-use wire::{
-    audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
-    rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
-    video::{transport, BitratePreset, StreamPreset, VideoConfig},
-};
 use eframe::NativeOptions;
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use egui_phosphor::regular as ph;
@@ -24,8 +19,15 @@ use lucide_icons::Icon;
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
+use wire::{
+    audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
+    rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
+    video::{transport, BitratePreset, StreamPreset, VideoConfig},
+};
 
 use crate::{
+    dev_pair::DevPairState,
+    resource_monitor::ResourceMonitor,
     sounds::{Sound, Sounds},
     theme::*,
     title_bar,
@@ -35,7 +37,6 @@ use crate::{
 };
 
 const DEFAULT: &str = "<default>";
-const VIDEO_SEND_LATENCY_BUDGET: Duration = Duration::from_millis(150);
 const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
 
 pub struct App {
@@ -168,6 +169,9 @@ struct AppState {
     update_status: UpdateStatus,
     show_update_prompt: bool,
     reset_home_scroll: bool,
+    resource_monitor: ResourceMonitor,
+    dev_pair: Option<DevPairState>,
+    dev_auto_share: bool,
 }
 
 enum UpdateStatus {
@@ -193,6 +197,7 @@ struct PreviewState {
     data: Arc<Vec<u8>>,
     texture: Option<egui::TextureHandle>,
     uploaded_generation: u64,
+    upload_stats: TextureUploadStats,
 }
 
 struct VideoFrameState {
@@ -202,6 +207,23 @@ struct VideoFrameState {
     data: Arc<Vec<u8>>,
     texture: Option<egui::TextureHandle>,
     uploaded_generation: u64,
+    upload_stats: TextureUploadStats,
+}
+
+struct TextureUploadStats {
+    samples_ms: Vec<f64>,
+    frames: u64,
+    last_log: std::time::Instant,
+}
+
+impl Default for TextureUploadStats {
+    fn default() -> Self {
+        Self {
+            samples_ms: Vec::with_capacity(300),
+            frames: 0,
+            last_log: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -284,7 +306,9 @@ impl eframe::App for App {
             let callback = Arc::new(move || repaint_ctx.request_repaint());
             self.state.cmd(Command::SetUpdateCallback { callback });
             #[cfg(windows)]
-            self.state.start_update_check(ctx);
+            if self.state.dev_pair.is_none() {
+                self.state.start_update_check(ctx);
+            }
         }
         // on android, add some space at the top.
         #[cfg(target_os = "android")]
@@ -351,6 +375,9 @@ impl App {
             update_status: UpdateStatus::Idle,
             show_update_prompt: false,
             reset_home_scroll: false,
+            resource_monitor: ResourceMonitor::start(),
+            dev_pair: DevPairState::from_env(),
+            dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
         };
 
         if has_saved_settings {
@@ -386,6 +413,8 @@ impl AppState {
         always_on_top: &mut bool,
         viewport_transparent: &mut Option<bool>,
     ) {
+        // Keep the process resource readout current even while the rest of the UI is idle.
+        ctx.request_repaint_after(Duration::from_secs(1));
         self.process_update_events(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::T)) {
             self.theme = self.theme.next();
@@ -483,8 +512,27 @@ impl AppState {
             match event {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
+                    let dev_peer = match self.dev_pair.as_mut() {
+                        Some(dev_pair) => match dev_pair.register(node_id) {
+                            Ok(peer) => peer,
+                            Err(error) => {
+                                warn!("dev-pair rendezvous failed: {error:#}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    if let Some(peer) = dev_peer {
+                        info!("dev pair initiating automatic call to {}", peer.fmt_short());
+                        self.cmd(Command::Call { node_id: peer });
+                    }
                 }
                 Event::SetCallState(node_id, call_state) => {
+                    let auto_accept =
+                        self.dev_pair.is_some() && matches!(call_state, CallState::Incoming);
+                    let auto_share = self.dev_auto_share
+                        && !self.sharing_active
+                        && matches!(call_state, CallState::Active);
                     let previous = self.calls.get(&node_id).copied();
                     match call_state {
                         CallState::Active => {
@@ -515,12 +563,27 @@ impl AppState {
                         self.calls.insert(node_id, call_state);
                     }
 
-                    let has_incoming = self
-                        .calls
-                        .values()
-                        .any(|state| matches!(state, CallState::Incoming));
+                    let has_incoming = self.dev_pair.is_none()
+                        && self
+                            .calls
+                            .values()
+                            .any(|state| matches!(state, CallState::Incoming));
                     if let Some(sounds) = &mut self.sounds {
                         sounds.set_incoming_ring(has_incoming);
+                    }
+                    if auto_accept {
+                        info!(
+                            "dev pair automatically accepting call from {}",
+                            node_id.fmt_short()
+                        );
+                        self.cmd(Command::HandleIncoming {
+                            node_id,
+                            accept: true,
+                        });
+                    }
+                    if auto_share {
+                        info!("dev pair automatically starting the explicit test share");
+                        self.cmd(Command::ToggleSharing { enabled: true });
                     }
                 }
                 Event::VolumeHandle(node_id, volume) => {
@@ -551,6 +614,7 @@ impl AppState {
                                 data: Arc::new(Vec::new()),
                                 texture: None,
                                 uploaded_generation: 0,
+                                upload_stats: TextureUploadStats::default(),
                             });
                     state.width = width;
                     state.height = height;
@@ -592,6 +656,7 @@ impl AppState {
                         data: Arc::new(Vec::new()),
                         texture: None,
                         uploaded_generation: 0,
+                        upload_stats: TextureUploadStats::default(),
                     });
                     preview.width = width;
                     preview.height = height;
@@ -754,7 +819,20 @@ impl AppState {
                         rect.max.y = rect.min.y + title_bar::HEIGHT;
                         rect
                     };
-                    title_bar::ui(ui, title_bar_rect, pal, "Wire", always_on_top, rounded);
+                    let title = self
+                        .dev_pair
+                        .as_ref()
+                        .map(|dev_pair| format!("Wire · DEV {}", dev_pair.session()))
+                        .unwrap_or_else(|| "Wire".to_owned());
+                    title_bar::ui(
+                        ui,
+                        title_bar_rect,
+                        pal,
+                        &title,
+                        self.resource_monitor.snapshot(),
+                        always_on_top,
+                        rounded,
+                    );
 
                     let mut body_rect = app_rect;
                     body_rect.min.y = title_bar_rect.max.y;
@@ -779,10 +857,8 @@ impl AppState {
             body.min,
             egui::pos2(body.max.x, body.min.y + TOP_BAR_HEIGHT),
         );
-        let dock_rect = egui::Rect::from_min_max(
-            egui::pos2(body.min.x, body.max.y - DOCK_HEIGHT),
-            body.max,
-        );
+        let dock_rect =
+            egui::Rect::from_min_max(egui::pos2(body.min.x, body.max.y - DOCK_HEIGHT), body.max);
         let stage_rect = egui::Rect::from_min_max(
             egui::pos2(body.min.x, top_rect.max.y),
             egui::pos2(body.max.x, dock_rect.min.y),
@@ -813,203 +889,202 @@ impl AppState {
     fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
         let show_context_status = ui.max_rect().width() >= 760.0;
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    if self.sharing_active {
-                        dot(ui, pal.accent, 6.0);
-                        ui.label(
-                            RichText::new("Sharing screen")
-                                .color(pal.text2)
-                                .size(ui_font_size(12.0)),
-                        );
-                    } else if self.our_node_id.is_some() {
-                        dot(ui, pal.ok, 6.0);
-                        ui.label(
-                            RichText::new("Ready")
-                                .color(pal.text2)
-                                .size(ui_font_size(12.0)),
-                        );
-                    } else {
-                        ui.label(RichText::new("Connecting…").weak());
-                    }
+            if self.sharing_active {
+                dot(ui, pal.accent, 6.0);
+                ui.label(
+                    RichText::new("Sharing screen")
+                        .color(pal.text2)
+                        .size(ui_font_size(12.0)),
+                );
+            } else if self.our_node_id.is_some() {
+                dot(ui, pal.ok, 6.0);
+                ui.label(
+                    RichText::new("Ready")
+                        .color(pal.text2)
+                        .size(ui_font_size(12.0)),
+                );
+            } else {
+                ui.label(RichText::new("Connecting…").weak());
+            }
 
-                    let available_update = match &self.update_status {
-                        UpdateStatus::Available(release) => Some(release.clone()),
-                        _ => None,
-                    };
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ghost_icon_button(ui, pal, ph::GEAR_SIX)
-                            .on_hover_text("Audio and screen sharing options")
-                            .clicked()
-                        {
-                            self.show_settings = true;
-                        }
-                        if let Some(release) = available_update {
-                            if action_button(
-                                ui,
-                                &pal,
-                                &format!("Update v{}", release.version),
-                                ButtonTone::Primary,
-                            )
-                            .on_hover_text("Download the update to Desktop and relaunch")
-                            .clicked()
-                            {
-                                self.start_update_download(ctx, release);
-                            }
-                        }
-                        let active_calls = self
-                            .calls
-                            .values()
-                            .filter(|s| matches!(s, CallState::Active))
-                            .count();
-                        if show_context_status && active_calls > 0 {
-                            ui.label(
-                                RichText::new(if active_calls == 1 {
-                                    "1 active call".to_owned()
-                                } else {
-                                    format!("{active_calls} active calls")
-                                })
-                                .color(pal.ok)
-                                .size(ui_font_size(12.0)),
-                            );
-                        }
-                    });
-                });
+            let available_update = match &self.update_status {
+                UpdateStatus::Available(release) => Some(release.clone()),
+                _ => None,
+            };
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ghost_icon_button(ui, pal, ph::GEAR_SIX)
+                    .on_hover_text("Audio and screen sharing options")
+                    .clicked()
+                {
+                    self.show_settings = true;
+                }
+                if let Some(release) = available_update {
+                    if action_button(
+                        ui,
+                        &pal,
+                        &format!("Update v{}", release.version),
+                        ButtonTone::Primary,
+                    )
+                    .on_hover_text("Download the update to Desktop and relaunch")
+                    .clicked()
+                    {
+                        self.start_update_download(ctx, release);
+                    }
+                }
+                let active_calls = self
+                    .calls
+                    .values()
+                    .filter(|s| matches!(s, CallState::Active))
+                    .count();
+                if show_context_status && active_calls > 0 {
+                    ui.label(
+                        RichText::new(if active_calls == 1 {
+                            "1 active call".to_owned()
+                        } else {
+                            format!("{active_calls} active calls")
+                        })
+                        .color(pal.ok)
+                        .size(ui_font_size(12.0)),
+                    );
+                }
+            });
+        });
     }
 
     fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette) {
         let rect = ui.max_rect();
         ui.painter()
             .hline(rect.x_range(), rect.top() - 8.0, Stroke::new(1.0, pal.line));
-                let active_calls = self
-                    .calls
-                    .values()
-                    .filter(|state| matches!(state, CallState::Active))
-                    .count();
+        let active_calls = self
+            .calls
+            .values()
+            .filter(|state| matches!(state, CallState::Active))
+            .count();
 
-                let controls_width = if active_calls > 0 { 320.0 } else { 210.0 };
-                let show_status = rect.width() >= controls_width + 180.0;
-                let controls_left = if show_status {
-                    rect.right() - controls_width
-                } else {
-                    rect.center().x - controls_width / 2.0
-                };
-                let controls_rect = egui::Rect::from_min_size(
-                    egui::pos2(controls_left.max(rect.left()), rect.top()),
-                    Vec2::new(controls_width, rect.height()),
-                );
-                let status_rect = egui::Rect::from_min_max(
-                    rect.left_top(),
-                    egui::pos2(
-                        (controls_rect.left() - 12.0).max(rect.left()),
-                        rect.bottom(),
-                    ),
-                );
+        let controls_width = if active_calls > 0 { 320.0 } else { 210.0 };
+        let show_status = rect.width() >= controls_width + 180.0;
+        let controls_left = if show_status {
+            rect.right() - controls_width
+        } else {
+            rect.center().x - controls_width / 2.0
+        };
+        let controls_rect = egui::Rect::from_min_size(
+            egui::pos2(controls_left.max(rect.left()), rect.top()),
+            Vec2::new(controls_width, rect.height()),
+        );
+        let status_rect = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(
+                (controls_rect.left() - 12.0).max(rect.left()),
+                rect.bottom(),
+            ),
+        );
 
-                if show_status {
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(if active_calls == 1 {
-                                    "1 peer in session".to_owned()
-                                } else {
-                                    format!("{active_calls} peers in session")
-                                })
-                                .color(pal.text2)
-                                .size(ui_font_size(13.0)),
-                            );
-                            ui.horizontal(|ui| {
-                                dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
-                                ui.label(
-                                    RichText::new(if active_calls > 0 {
-                                        "direct connection"
-                                    } else {
-                                        "ready to connect"
-                                    })
-                                    .color(pal.dim)
-                                    .size(ui_font_size(12.0)),
-                                );
-                            });
-                        });
-                    });
-                }
-
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        if active_calls > 0 {
-                            ui.add_space(4.0);
-                        }
-                        if dock_control(
-                            ui,
-                            pal,
-                            if self.muted {
-                                ph::MICROPHONE_SLASH
-                            } else {
-                                ph::MICROPHONE
-                            },
-                            if self.muted { "Muted" } else { "Mute" },
-                            self.muted,
-                        )
-                        .on_hover_text("Mute or unmute your microphone")
-                        .clicked()
-                        {
-                            self.muted = !self.muted;
-                            self.play_control_sound(self.muted);
-                            self.cmd(Command::SetMuted { muted: self.muted });
-                        }
-                        ui.add_space(2.0);
-                        if dock_control(
-                            ui,
-                            pal,
-                            ph::HEADPHONES,
-                            if self.deafened { "Deafened" } else { "Deafen" },
-                            self.deafened,
-                        )
-                        .on_hover_text("Silence or restore all incoming call audio")
-                        .clicked()
-                        {
-                            self.deafened = !self.deafened;
-                            self.play_control_sound(self.deafened);
-                            self.cmd(Command::SetDeafened {
-                                deafened: self.deafened,
-                            });
-                        }
-                        ui.add_space(2.0);
-                        if dock_control(
-                            ui,
-                            pal,
-                            ph::MONITOR,
-                            if self.sharing_active { "Stop" } else { "Share" },
-                            self.sharing_active,
-                        )
-                        .on_hover_text(if self.sharing_active {
-                            "Stop sharing"
+        if show_status {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(if active_calls == 1 {
+                            "1 peer in session".to_owned()
                         } else {
-                            "Share your screen"
+                            format!("{active_calls} peers in session")
                         })
-                        .clicked()
-                        {
-                            let enabled = !self.sharing_active;
-                            self.play_control_sound(enabled);
-                            self.cmd(Command::ToggleSharing { enabled });
-                        }
-                        if active_calls > 0 {
-                            ui.add_space(8.0);
-                            v_sep(ui, pal.line);
-                            ui.add_space(8.0);
-                            if leave_button(ui, pal).clicked() {
-                                let peers: Vec<_> = self.calls.keys().copied().collect();
-                                if !peers.is_empty() {
-                                    self.play_sound(Sound::Whoosh1);
-                                }
-                                for node_id in peers {
-                                    self.voluntary_hangups
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    self.cmd(Command::Abort { node_id });
-                                }
-                            }
-                        }
+                        .color(pal.text2)
+                        .size(ui_font_size(13.0)),
+                    );
+                    ui.horizontal(|ui| {
+                        dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
+                        ui.label(
+                            RichText::new(if active_calls > 0 {
+                                "direct connection"
+                            } else {
+                                "ready to connect"
+                            })
+                            .color(pal.dim)
+                            .size(ui_font_size(12.0)),
+                        );
                     });
                 });
+            });
+        }
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                if active_calls > 0 {
+                    ui.add_space(4.0);
+                }
+                if dock_control(
+                    ui,
+                    pal,
+                    if self.muted {
+                        ph::MICROPHONE_SLASH
+                    } else {
+                        ph::MICROPHONE
+                    },
+                    if self.muted { "Muted" } else { "Mute" },
+                    self.muted,
+                )
+                .on_hover_text("Mute or unmute your microphone")
+                .clicked()
+                {
+                    self.muted = !self.muted;
+                    self.play_control_sound(self.muted);
+                    self.cmd(Command::SetMuted { muted: self.muted });
+                }
+                ui.add_space(2.0);
+                if dock_control(
+                    ui,
+                    pal,
+                    ph::HEADPHONES,
+                    if self.deafened { "Deafened" } else { "Deafen" },
+                    self.deafened,
+                )
+                .on_hover_text("Silence or restore all incoming call audio")
+                .clicked()
+                {
+                    self.deafened = !self.deafened;
+                    self.play_control_sound(self.deafened);
+                    self.cmd(Command::SetDeafened {
+                        deafened: self.deafened,
+                    });
+                }
+                ui.add_space(2.0);
+                if dock_control(
+                    ui,
+                    pal,
+                    ph::MONITOR,
+                    if self.sharing_active { "Stop" } else { "Share" },
+                    self.sharing_active,
+                )
+                .on_hover_text(if self.sharing_active {
+                    "Stop sharing"
+                } else {
+                    "Share your screen"
+                })
+                .clicked()
+                {
+                    let enabled = !self.sharing_active;
+                    self.play_control_sound(enabled);
+                    self.cmd(Command::ToggleSharing { enabled });
+                }
+                if active_calls > 0 {
+                    ui.add_space(8.0);
+                    v_sep(ui, pal.line);
+                    ui.add_space(8.0);
+                    if leave_button(ui, pal).clicked() {
+                        let peers: Vec<_> = self.calls.keys().copied().collect();
+                        if !peers.is_empty() {
+                            self.play_sound(Sound::Whoosh1);
+                        }
+                        for node_id in peers {
+                            self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
+                            self.cmd(Command::Abort { node_id });
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn ui_stage(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
@@ -1526,6 +1601,7 @@ impl AppState {
                     preview.generation,
                     &mut preview.uploaded_generation,
                     &mut preview.texture,
+                    &mut preview.upload_stats,
                 );
                 if let Some(tex) = &preview.texture {
                     let max_w = ui.available_width();
@@ -1766,6 +1842,7 @@ impl AppState {
                     preview.generation,
                     &mut preview.uploaded_generation,
                     &mut preview.texture,
+                    &mut preview.upload_stats,
                 );
                 let texture_id = preview.texture.as_ref().map(|tex| tex.id());
                 (width, height, texture_id)
@@ -1785,6 +1862,7 @@ impl AppState {
                     frame.generation,
                     &mut frame.uploaded_generation,
                     &mut frame.texture,
+                    &mut frame.upload_stats,
                 );
                 let texture_id = frame.texture.as_ref().map(|tex| tex.id());
                 (width, height, texture_id)
@@ -2006,7 +2084,10 @@ impl AppState {
                                     .show_ui(ui, |ui| {
                                         for theme in Theme::ALL {
                                             if ui
-                                                .selectable_label(self.theme == theme, theme.label())
+                                                .selectable_label(
+                                                    self.theme == theme,
+                                                    theme.label(),
+                                                )
                                                 .clicked()
                                             {
                                                 self.theme = theme;
@@ -2565,10 +2646,12 @@ fn sync_rgba_texture(
     generation: u64,
     uploaded_generation: &mut u64,
     texture: &mut Option<egui::TextureHandle>,
+    stats: &mut TextureUploadStats,
 ) {
     if *uploaded_generation == generation || width == 0 || height == 0 || data.is_empty() {
         return;
     }
+    let started = std::time::Instant::now();
     let color_image =
         egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], data);
     let options = egui::TextureOptions::LINEAR;
@@ -2578,6 +2661,27 @@ fn sync_rgba_texture(
         *texture = Some(ui.ctx().load_texture(id.to_string(), color_image, options));
     }
     *uploaded_generation = generation;
+    stats.frames += 1;
+    stats
+        .samples_ms
+        .push(started.elapsed().as_secs_f64() * 1000.0);
+    if stats.last_log.elapsed() >= Duration::from_secs(5) {
+        let elapsed = stats.last_log.elapsed().as_secs_f64();
+        let avg = stats.samples_ms.iter().sum::<f64>() / stats.samples_ms.len() as f64;
+        stats.samples_ms.sort_by(f64::total_cmp);
+        let p95 = stats.samples_ms[((stats.samples_ms.len() - 1) as f64 * 0.95).round() as usize];
+        info!(
+            "texture upload {id}: {:.1} fps, {:.1} ms avg / {:.1} ms p95 ({}x{})",
+            stats.frames as f64 / elapsed,
+            avg,
+            p95,
+            width,
+            height
+        );
+        stats.samples_ms.clear();
+        stats.frames = 0;
+        stats.last_log = std::time::Instant::now();
+    }
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -2748,7 +2852,7 @@ struct Worker {
     audio_context: Option<AudioContext>,
     rtt_interval: time::Interval,
     video_config: VideoConfig,
-    video_frame_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    video_frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
     keyframe_tx: tokio::sync::broadcast::Sender<()>,
     video_peers: BTreeMap<NodeId, VideoPeerTasks>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
@@ -2777,9 +2881,13 @@ impl Worker {
                 .build()
                 .expect("failed to start tokio runtime");
             rt.block_on(async move {
-                let mut worker = Worker::start(event_tx, command_rx)
-                    .await
-                    .expect("worker failed to start");
+                let mut worker = match Worker::start(event_tx, command_rx).await {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        warn!("worker failed to start: {error:#}");
+                        return;
+                    }
+                };
                 if let Err(err) = worker.run().await {
                     warn!("worker stopped with error: {err:?}");
                 }
@@ -3285,7 +3393,7 @@ impl Worker {
 
 async fn run_video_send(
     conn: RtcConnection,
-    frame_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
     keyframe_tx: tokio::sync::broadcast::Sender<()>,
     node_id: NodeId,
 ) {
@@ -3297,60 +3405,114 @@ async fn run_video_send(
         let mut rx = frame_tx.subscribe();
         let _ = keyframe_tx.send(());
         let mut sent = 0u64;
-        let mut resets = 0u64;
+        let mut skipped = 0u64;
+        let mut resyncs = 0u64;
+        let mut keyframe_gate = transport::KeyframeGate::waiting();
+        let mut replace_stream = false;
+        let mut window_sent = 0u64;
+        let mut window_bytes = 0u64;
+        let mut window_send_ms = Vec::with_capacity(300);
+        let mut last_stats_log = std::time::Instant::now();
         loop {
             let frame = match rx.recv().await {
                 Ok(frame) => frame,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    skipped += count;
+                    keyframe_gate.require_keyframe();
+                    replace_stream = true;
+                    let _ = keyframe_tx.send(());
+                    warn!(
+                        "video send to {} lagged by {} frame(s); waiting for IDR",
+                        node_id.fmt_short(),
+                        count
+                    );
+                    continue;
+                }
                 Err(_) => break,
             };
-            let mut latest = frame;
-            let mut source_closed = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(frame) => latest = frame,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        source_closed = true;
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                }
+            let was_waiting = keyframe_gate.is_waiting();
+            if !keyframe_gate.accept(&frame) {
+                skipped += 1;
+                continue;
             }
-            if source_closed {
-                break;
+            if was_waiting {
+                resyncs += 1;
+            }
+            if replace_stream {
+                let _ = send.reset(VIDEO_STREAM_RESET_CODE);
+                let (new_send, recv) = conn.transport().open_bi().await?;
+                send = new_send;
+                let _ = send.set_priority(10);
+                tokio::spawn(drain_quic_recv(recv));
+                replace_stream = false;
+                info!(
+                    "replaced video stream to {} at IDR sequence {} ({} skipped, {} resyncs)",
+                    node_id.fmt_short(),
+                    frame.sequence,
+                    skipped,
+                    resyncs
+                );
             }
             let send_start = std::time::Instant::now();
-            if let Err(e) = transport::send_frame(&mut send, &latest).await {
+            if let Err(e) = transport::send_frame(&mut send, frame.as_ref()).await {
                 info!("video send to {} failed: {e:?}", node_id.fmt_short());
                 break;
             }
-            let send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
-            if send_ms > 1000.0 {
-                resets += 1;
-                if resets <= 3 || resets % 30 == 0 {
-                    warn!(
-                        "video send to {} took {:.0}ms for {} bytes (backpressured by receiver/network)",
-                        node_id.fmt_short(),
-                        send_ms,
-                        latest.len()
-                    );
-                }
+            let send_elapsed = send_start.elapsed();
+            window_sent += 1;
+            window_bytes += frame.data.len() as u64;
+            window_send_ms.push(send_elapsed.as_secs_f64() * 1000.0);
+            let latency_budget = std::cmp::max(
+                Duration::from_millis(250),
+                conn.transport().rtt().saturating_mul(3),
+            );
+            if send_elapsed > latency_budget {
+                keyframe_gate.require_keyframe();
+                replace_stream = true;
+                let _ = keyframe_tx.send(());
+                warn!(
+                    "video send to {} took {:.0}ms for {} bytes (budget {:.0}ms); scheduling frame-boundary resync",
+                    node_id.fmt_short(),
+                    send_elapsed.as_secs_f64() * 1000.0,
+                    frame.data.len(),
+                    latency_budget.as_secs_f64() * 1000.0,
+                );
             }
             sent += 1;
             if sent == 1 {
                 info!(
                     "sent first video frame ({} bytes) to {}",
-                    latest.len(),
+                    frame.data.len(),
                     node_id.fmt_short()
                 );
-            } else if send_start.elapsed() > Duration::from_millis(75) {
+            } else if send_elapsed > Duration::from_millis(75) {
                 info!(
                     "video send to {} took {:.0}ms for {} bytes",
                     node_id.fmt_short(),
-                    send_start.elapsed().as_secs_f64() * 1000.0,
-                    latest.len()
+                    send_elapsed.as_secs_f64() * 1000.0,
+                    frame.data.len()
                 );
+            }
+            if last_stats_log.elapsed() >= Duration::from_secs(5) {
+                let elapsed = last_stats_log.elapsed().as_secs_f64();
+                let avg = window_send_ms.iter().sum::<f64>() / window_send_ms.len() as f64;
+                window_send_ms.sort_by(f64::total_cmp);
+                let p95 = window_send_ms
+                    [((window_send_ms.len() - 1) as f64 * 0.95).round() as usize];
+                info!(
+                    "video send pipeline to {}: {:.1} fps, {:.1} Mbps, {:.1} ms avg / {:.1} ms p95, {} skipped, {} resyncs",
+                    node_id.fmt_short(),
+                    window_sent as f64 / elapsed,
+                    window_bytes as f64 * 8.0 / elapsed / 1_000_000.0,
+                    avg,
+                    p95,
+                    skipped,
+                    resyncs
+                );
+                window_sent = 0;
+                window_bytes = 0;
+                window_send_ms.clear();
+                last_stats_log = std::time::Instant::now();
             }
         }
         let _ = send.reset(VIDEO_STREAM_RESET_CODE);
@@ -3443,16 +3605,32 @@ async fn recv_video_on_stream(
     let mut received_bytes = 0u64;
     let mut received_age_ms = 0.0;
     let mut max_age_ms = 0.0;
+    let mut age_samples = Vec::with_capacity(300);
+    let mut last_sequence: Option<u64> = None;
     let mut last_stats_log = std::time::Instant::now();
 
     loop {
         match transport::recv_frame(recv).await {
-            Ok(Some((data, sent_at_micros))) => {
+            Ok(Some(frame)) => {
+                if let Some(previous) = last_sequence {
+                    let expected = previous.wrapping_add(1);
+                    if frame.sequence != expected {
+                        warn!(
+                            "video sequence gap from {}: expected {}, received {} (keyframe={})",
+                            node_id.fmt_short(),
+                            expected,
+                            frame.sequence,
+                            frame.keyframe
+                        );
+                    }
+                }
+                last_sequence = Some(frame.sequence);
                 received += 1;
-                received_bytes += data.len() as u64;
-                if let Some(age_ms) = transport::frame_age_ms(sent_at_micros) {
+                received_bytes += frame.data.len() as u64;
+                if let Some(age_ms) = transport::frame_age_ms(frame.sent_at_micros) {
                     received_age_ms += age_ms;
                     max_age_ms = f64::max(max_age_ms, age_ms);
+                    age_samples.push(age_ms);
                 }
                 if last_stats_log.elapsed() >= Duration::from_secs(5) {
                     let elapsed = last_stats_log.elapsed().as_secs_f64();
@@ -3471,12 +3649,19 @@ async fn recv_video_on_stream(
                     } else {
                         0.0
                     };
+                    age_samples.sort_by(f64::total_cmp);
+                    let p95_age_ms = if age_samples.is_empty() {
+                        0.0
+                    } else {
+                        age_samples[((age_samples.len() - 1) as f64 * 0.95).round() as usize]
+                    };
                     info!(
-                        "video receive pipeline from {}: {:.1} fps, {:.1} KiB/frame, {:.0}ms avg age, {:.0}ms max age",
+                        "video receive pipeline from {}: {:.1} fps, {:.1} KiB/frame, {:.0}ms avg / {:.0}ms p95 / {:.0}ms max age",
                         node_id.fmt_short(),
                         recv_fps,
                         avg_packet_kb,
                         avg_age_ms,
+                        p95_age_ms,
                         max_age_ms
                     );
                     last_stats_log = std::time::Instant::now();
@@ -3484,8 +3669,9 @@ async fn recv_video_on_stream(
                     received_bytes = 0;
                     received_age_ms = 0.0;
                     max_age_ms = 0.0;
+                    age_samples.clear();
                 }
-                worker.submit(data);
+                worker.submit(frame.data, frame.keyframe);
             }
             Ok(None) => break,
             Err(e) => {

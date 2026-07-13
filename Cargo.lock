@@ -3461,9 +3461,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.171"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c19937216e9d3aa9956d9bb8dfc0b0c8beb6058fc4f7a4dc4d850edf86a237d6"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libdbus-sys"
@@ -8495,7 +8495,7 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -8518,13 +8518,15 @@ dependencies = [
  "sha2",
  "spin_sleep",
  "strum 0.27.1",
+ "sysinfo",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "windows 0.60.0",
+ "windows 0.61.3",
  "windows-capture",
  "wire",
  "xcap",
+ "yuvutils-rs",
  "zed-scap",
  "zip",
 ]
@@ -8769,6 +8771,16 @@ dependencies = [
  "quote",
  "syn 2.0.100",
  "synstructure",
+]
+
+[[package]]
+name = "yuvutils-rs"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b699b6503cd14c70b258eaffedd7ada5a781ea23206eeb9066736b99ba37af1"
+dependencies = [
+ "num-traits",
+ "rayon",
 ]
 
 [[package]]

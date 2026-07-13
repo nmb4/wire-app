@@ -51,7 +51,10 @@ fn run_config_migration(current: &Path) {
         }
 
         if let Err(err) = migrate_legacy_config_inner(&legacy, current) {
-            warn!("failed to migrate legacy config from {}: {err}", legacy.display());
+            warn!(
+                "failed to migrate legacy config from {}: {err}",
+                legacy.display()
+            );
         }
     });
 }
@@ -133,10 +136,12 @@ fn should_replace_with_legacy(source: &Path, destination: &Path) -> Result<bool>
     };
 
     match name {
-        "friends.json" => Ok(is_empty_friends_file(destination)? && !is_empty_friends_file(source)?),
-        "settings.json" => Ok(
-            std::fs::metadata(destination)?.len() == 0 && std::fs::metadata(source)?.len() > 0,
-        ),
+        "friends.json" => {
+            Ok(is_empty_friends_file(destination)? && !is_empty_friends_file(source)?)
+        }
+        "settings.json" => {
+            Ok(std::fs::metadata(destination)?.len() == 0 && std::fs::metadata(source)?.len() > 0)
+        }
         _ => Ok(false),
     }
 }
@@ -148,8 +153,13 @@ fn is_empty_friends_file(path: &Path) -> Result<bool> {
 }
 
 fn copy_and_remove_legacy(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::copy(source, destination)
-        .with_context(|| format!("failed to copy {} to {}", source.display(), destination.display()))?;
+    std::fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
     let _ = std::fs::remove_file(source);
     Ok(())
 }
@@ -207,6 +217,14 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
         let _ = std::fs::write(&key_path, secret_key.to_string());
     }
     Ok(secret_key)
+}
+
+/// Generates a node identity that is never persisted.
+///
+/// Intended for isolated development instances that must not reuse the normal
+/// application identity.
+pub fn generate_ephemeral_secret_key() -> SecretKey {
+    SecretKey::generate(&mut rand::rngs::OsRng)
 }
 
 pub async fn bind_endpoint() -> Result<Endpoint> {

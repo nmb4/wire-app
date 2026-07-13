@@ -95,31 +95,6 @@ fn avg_rgb(row0: &[u8], i0: usize, row1: &[u8], i1: usize) -> (i32, i32, i32) {
     (r, g, b)
 }
 
-/// BGRA8 -> RGBA8 for display (MF RGB32 output).
-pub fn bgra_to_rgba(bgra: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(bgra.len(), out.len());
-    #[cfg(windows)]
-    {
-        bgra.par_chunks_exact(4)
-            .zip(out.par_chunks_exact_mut(4))
-            .for_each(|(src, dst)| {
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = 255;
-            });
-    }
-    #[cfg(not(windows))]
-    {
-        for (src, dst) in bgra.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-            dst[3] = 255;
-        }
-    }
-}
-
 /// NV12 -> RGBA8 for display. Processes 2x2 blocks to reduce UV fetches.
 pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let w = width as usize;
@@ -130,36 +105,90 @@ pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
 
     let (y_plane, uv_plane) = nv12.split_at(y_size);
 
-    for y in (0..h).step_by(2) {
-        let uv_row = &uv_plane[(y / 2) * w..];
-        for x in (0..w).step_by(2) {
-            let u = uv_row[x] as i32 - 128;
-            let v = uv_row[x + 1] as i32 - 128;
-            let rv = (1436 * v) >> 10;
-            let gu = (352 * u) >> 10;
-            let gv = (731 * v) >> 10;
-            let bu = (1814 * u) >> 10;
+    #[cfg(windows)]
+    {
+        use yuvutils_rs::{
+            yuv_nv12_to_rgba, YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix,
+        };
 
-            for dy in 0..2 {
-                let py = y + dy;
-                if py >= h {
+        let image = YuvBiPlanarImage {
+            y_plane,
+            y_stride: width,
+            uv_plane,
+            uv_stride: width,
+            width,
+            height,
+        };
+        yuv_nv12_to_rgba(
+            &image,
+            out,
+            width * 4,
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        )
+        .expect("validated NV12 frame dimensions");
+    }
+
+    #[cfg(not(windows))]
+    for (block_y, out_rows) in out.chunks_mut(w * 4 * 2).enumerate() {
+        convert_nv12_rows(y_plane, uv_plane, w, h, block_y * 2, out_rows);
+    }
+}
+
+#[cfg(not(windows))]
+fn convert_nv12_rows(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    width: usize,
+    height: usize,
+    y: usize,
+    out_rows: &mut [u8],
+) {
+    let uv_row = &uv_plane[(y / 2) * width..(y / 2 + 1) * width];
+    for x in (0..width).step_by(2) {
+        let u = uv_row[x] as i32 - 128;
+        let v = uv_row[x + 1] as i32 - 128;
+        let rv = (1436 * v) >> 10;
+        let gu = (352 * u) >> 10;
+        let gv = (731 * v) >> 10;
+        let bu = (1814 * u) >> 10;
+
+        for dy in 0..2 {
+            let py = y + dy;
+            if py >= height {
+                continue;
+            }
+            let y_row = &y_plane[py * width..(py + 1) * width];
+            let out_row = &mut out_rows[dy * width * 4..(dy + 1) * width * 4];
+            for dx in 0..2 {
+                let px = x + dx;
+                if px >= width {
                     continue;
                 }
-                let y_row = &y_plane[py * w..(py + 1) * w];
-                let out_row = &mut out[py * w * 4..(py + 1) * w * 4];
-                for dx in 0..2 {
-                    let px = x + dx;
-                    if px >= w {
-                        continue;
-                    }
-                    let y_val = y_row[px] as i32;
-                    let i = px * 4;
-                    out_row[i] = (y_val + rv).clamp(0, 255) as u8;
-                    out_row[i + 1] = (y_val - gu - gv).clamp(0, 255) as u8;
-                    out_row[i + 2] = (y_val + bu).clamp(0, 255) as u8;
-                    out_row[i + 3] = 255;
-                }
+                let y_val = y_row[px] as i32;
+                let i = px * 4;
+                out_row[i] = (y_val + rv).clamp(0, 255) as u8;
+                out_row[i + 1] = (y_val - gu - gv).clamp(0, 255) as u8;
+                out_row[i + 2] = (y_val + bu).clamp(0, 255) as u8;
+                out_row[i + 3] = 255;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nv12_to_rgba;
+
+    #[test]
+    fn nv12_limited_range_maps_black_and_white() {
+        let nv12 = [16, 235, 16, 235, 128, 128];
+        let mut rgba = [0u8; 16];
+        nv12_to_rgba(&nv12, 2, 2, &mut rgba);
+        assert!(rgba[0] <= 2 && rgba[1] <= 2 && rgba[2] <= 2);
+        assert!(rgba[4] >= 253 && rgba[5] >= 253 && rgba[6] >= 253);
+        assert_eq!(rgba[3], 255);
+        assert_eq!(rgba[7], 255);
     }
 }

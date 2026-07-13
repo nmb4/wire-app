@@ -1,4 +1,6 @@
 pub mod app;
+mod dev_pair;
+mod resource_monitor;
 mod sounds;
 mod title_bar;
 pub mod window_frame;

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HMODULE, LUID};
+use windows::Win32::Foundation::{HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_10_0;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_10_1;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -10,11 +10,17 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_1;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_WRITE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_WRITE, D3D11_SDK_VERSION,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
@@ -64,6 +70,30 @@ fn adapter_for_luid(luid: LUID) -> Result<IDXGIAdapter1> {
 }
 
 impl MfD3d {
+    pub fn from_device(device: &ID3D11Device) -> Result<Self> {
+        let context = unsafe { device.GetImmediateContext()? };
+        unsafe {
+            if let Ok(mt) = device.cast::<ID3D10Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
+        }
+        let mut reset_token = 0u32;
+        let mut manager = None;
+        unsafe {
+            MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)?;
+        }
+        let manager = manager.context("DXGI device manager was null")?;
+        unsafe {
+            manager.ResetDevice(device, reset_token)?;
+        }
+        Ok(Self {
+            device: device.clone(),
+            context,
+            manager,
+            reset_token,
+        })
+    }
+
     pub fn try_new_with_adapter(adapter: &IDXGIAdapter1) -> Result<Self> {
         Self::create_device(Some(adapter))
     }
@@ -332,5 +362,164 @@ impl GpuNv12Frames {
             }
         }
         Ok(sample)
+    }
+
+    pub fn allocate_sample(&self, timestamp: i64, duration: i64) -> Result<IMFSample> {
+        let sample = unsafe { self.allocator.AllocateSample()? };
+        unsafe {
+            let buffer = sample.GetBufferByIndex(0)?;
+            buffer.SetCurrentLength(buffer.GetMaxLength()?)?;
+            if timestamp >= 0 {
+                sample.SetSampleTime(timestamp)?;
+            }
+            if duration > 0 {
+                sample.SetSampleDuration(duration)?;
+            }
+        }
+        Ok(sample)
+    }
+
+    pub fn sample_texture(sample: &IMFSample) -> Result<ID3D11Texture2D> {
+        let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0)? };
+        let dxgi: IMFDXGIBuffer = buffer.cast().context("encoder sample is not DXGI")?;
+        let mut resource: Option<windows::core::IUnknown> = None;
+        unsafe {
+            dxgi.GetResource(
+                &ID3D11Texture2D::IID,
+                &mut resource as *mut _ as *mut *mut _,
+            )?;
+        }
+        resource
+            .context("encoder DXGI resource was null")?
+            .cast()
+            .context("encoder DXGI resource was not a texture")
+    }
+}
+
+pub struct GpuVideoProcessor {
+    video_device: ID3D11VideoDevice,
+    video_context: ID3D11VideoContext,
+    enumerator: ID3D11VideoProcessorEnumerator,
+    processor: ID3D11VideoProcessor,
+    src_rect: RECT,
+    dst_rect: RECT,
+}
+
+impl GpuVideoProcessor {
+    pub fn new(
+        d3d: &MfD3d,
+        src_width: u32,
+        src_height: u32,
+        dst_width: u32,
+        dst_height: u32,
+        framerate: u32,
+    ) -> Result<Self> {
+        let video_device: ID3D11VideoDevice = d3d.device.cast()?;
+        let video_context: ID3D11VideoContext = d3d.context.cast()?;
+        let rate = DXGI_RATIONAL {
+            Numerator: framerate.max(1),
+            Denominator: 1,
+        };
+        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: src_width,
+            InputHeight: src_height,
+            OutputFrameRate: rate,
+            OutputWidth: dst_width,
+            OutputHeight: dst_height,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc)? };
+        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+        Ok(Self {
+            video_device,
+            video_context,
+            enumerator,
+            processor,
+            src_rect: RECT {
+                left: 0,
+                top: 0,
+                right: src_width as i32,
+                bottom: src_height as i32,
+            },
+            dst_rect: RECT {
+                left: 0,
+                top: 0,
+                right: dst_width as i32,
+                bottom: dst_height as i32,
+            },
+        })
+    }
+
+    pub fn convert(&self, source: &ID3D11Texture2D, destination: &ID3D11Texture2D) -> Result<()> {
+        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut input_view = None;
+        let mut output_view = None;
+        unsafe {
+            self.video_device
+                .CreateVideoProcessorInputView(
+                    source,
+                    &self.enumerator,
+                    &input_desc,
+                    Some(&mut input_view),
+                )
+                .context("creating video processor input view")?;
+            self.video_device
+                .CreateVideoProcessorOutputView(
+                    destination,
+                    &self.enumerator,
+                    &output_desc,
+                    Some(&mut output_view),
+                )
+                .context("creating video processor output view")?;
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &self.processor,
+                0,
+                true,
+                Some(&self.src_rect),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                0,
+                true,
+                Some(&self.dst_rect),
+            );
+            self.video_context.VideoProcessorSetOutputTargetRect(
+                &self.processor,
+                true,
+                Some(&self.dst_rect),
+            );
+            let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: true.into(),
+                pInputSurface: std::mem::ManuallyDrop::new(input_view),
+                ..Default::default()
+            };
+            let output_view = output_view.context("video processor output view was null")?;
+            let result = self.video_context.VideoProcessorBlt(
+                &self.processor,
+                &output_view,
+                0,
+                std::slice::from_ref(&stream),
+            );
+            std::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
+            result.context("running D3D11 video processor blit")?;
+        }
+        Ok(())
     }
 }

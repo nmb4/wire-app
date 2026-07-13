@@ -6,7 +6,10 @@ use eframe::egui::{
 };
 use lucide_icons::Icon;
 
-use crate::theme::{kh_family, lucide, Palette};
+use crate::{
+    resource_monitor::ResourceUsage,
+    theme::{kh_family, lucide, Palette},
+};
 
 pub const HEIGHT: f32 = 32.0;
 const ICON_SIZE: f32 = 14.0;
@@ -17,6 +20,7 @@ pub fn ui(
     title_bar_rect: egui::Rect,
     pal: &Palette,
     title: &str,
+    resources: ResourceUsage,
     always_on_top: &mut bool,
     rounded: bool,
 ) {
@@ -35,6 +39,25 @@ pub fn ui(
         egui::FontId::new(16.0, kh_family()),
         pal.text,
     );
+
+    if title_bar_rect.width() >= 500.0 {
+        let gpu = resources
+            .gpu_percent
+            .map(|value| format!("{value:.0}%"))
+            .unwrap_or_else(|| "--".to_owned());
+        let memory_mib = resources.memory_bytes as f64 / (1024.0 * 1024.0);
+        let resource_text = format!(
+            "CPU {:.0}%   GPU {}   RAM {:.0} MB",
+            resources.cpu_percent, gpu, memory_mib
+        );
+        painter.text(
+            title_bar_rect.right_center() - Vec2::new(BUTTON_SIZE * 4.0 + 12.0, 0.0),
+            Align2::RIGHT_CENTER,
+            resource_text,
+            egui::FontId::monospace(11.0),
+            pal.text2,
+        );
+    }
 
     if title_bar_response.double_clicked() {
         let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -71,11 +94,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
     } else {
         Icon::Maximize
     };
-    let maximize_hint = if is_maximized {
-        "Restore"
-    } else {
-        "Maximize"
-    };
+    let maximize_hint = if is_maximized { "Restore" } else { "Maximize" };
     if title_bar_icon_button(ui, pal, maximize_icon, false, false, rounded)
         .on_hover_text(maximize_hint)
         .clicked()
@@ -106,7 +125,8 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
         } else {
             WindowLevel::Normal
         };
-        ui.ctx().send_viewport_cmd(ViewportCommand::WindowLevel(level));
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::WindowLevel(level));
     }
 }
 
@@ -142,7 +162,11 @@ fn title_bar_icon_button(
 
     ui.painter().rect_filled(
         rect,
-        if rounded { egui::CornerRadius::same(5) } else { egui::CornerRadius::ZERO },
+        if rounded {
+            egui::CornerRadius::same(5)
+        } else {
+            egui::CornerRadius::ZERO
+        },
         fill,
     );
     if active {
