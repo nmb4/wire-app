@@ -8509,6 +8509,7 @@ dependencies = [
  "iroh",
  "lucide-icons",
  "n0-future",
+ "raw-window-handle",
  "rayon",
  "reqwest",
  "rodio",

@@ -1,0 +1,83 @@
+nodeid abstraction, should just use the stardive api i guess.
+fix group calls after that.
+> nvm, stable ids are easy and work like friend ids now
+
+settings should be saved in a toml file. audio, video and theme settings
+
+more costumization:
+set names yourself, same for color of name and profile pic, all shared via gossip, no server
+it should be saved for each friend on each machine next to the chat. and the user can set all of that in his client and when saving its saved locally and a hash of all of those is calculated, which will be sent with every message the user sends or call he joins, and if a mismatch happens on the other clients they request the new raw data of the customized settings.
+
+system wide triggerable hot keys for muting and deafen like discord.
+
+simple volume based threshold for audio activation.
+
+hard coded bots as well as ai powered bots in the chat.
+
+maybe change bitrate in video stream as well? also if performance is fixed, try 1440p or 120fps
+
+check more defaults, just found out that downscaler was defaulting to a high quality one which caused performance issues...
+
+benchmark on startup maybe, get encoding timings and limits, as well as max bandwidth
+
+let me see my own stream, done
+
+stream quality should be changable while streaming which reloads and restarts the stream with the new settings
+
+if i call someone and they're client isnt running or reachable my client should show that so i can see if i can hang up instead of wait.
+
+video diffing for streaming?
+
+maybe make it more flexible? so that clients themselfs can decide what res, framerate and bitrate they want other streams to come in at.
+and if everyone of the viewers are viewing ones stream at lower settings, there should be a notification on the streamers side that recommends to lower the settings to the next lowest of the viewers settings for each target (res, framerate and bitrate)
+
+system notifs with sounds
+
+auto start with system
+
+update button in ui, like the codex app. should compare its own version or hash with the one laying on the files stardive api on startup and on a repeating timed task, maybe every 10 mins.
+
+tray icon?
+
+bug: if once connected and sharing screens, then ending call, then dialing again the screenshare starts showign in the calling client again without the called one accepting
+
+bug: if stopping stream then start it again it doesnt work its still frozen.
+btw frozen: if a user stops his stream, the last image is still shown in the ui, it should be cleared.
+
+only add the version suffix in the zip file, not the exe file so that shortcuts on windows still work. also the app should have its version baked in for it to know its version.
+
+rename everything. the app is called WIRE, the exe should be wire-app.exe, the top left name in the ui should show WIRE, the repo should also be called wire
+
+atmostpehre-2 should be used for when i get called by someone, but in a loop. the fail and success sounds should be played when a call is accepted or declined, on both clients. whoosh-2 should be played when the app starts. button-1 is a nice tick sound and button-2 a good click, use them for the control buttons, like muting, button-1 when state is changed to muted and button-2 when switch back to unmuted, same for the deafen and stream buttons. also play woosh-1 when leaving a call.
+
+there should be a volume slider in the settings for ui sounds.
+
+user facing labels should say "Wire" with capital W always, allcaps "WIRE" is implied by using the kh font because its uppercase only. dev facing strings should just be lowercase wire and dashes for seperation, like "wire-app", name the gui crate like that aswell. except the exe for now as i said should be called wire-app.exe. and yes i want to keep the cli, rename it too. also merge stage 2 and 3 together, sounds better and safer to me. runtime paths need migration and cleanup. the release and auto update pipeline needs migration and cleanup too, the transition should not leave anything legacy behind. platform identiry is what i mentally included in the cargo configs, but while we're at it you can change the identifier to "live.stardive.wire", and ignore the whole mobile story for now, we will set that up in the far future so just delete the android stuff.
+
+custom title bar?
+
+consider bevy instead of eframe, maybe better libs and performance for video and audio?
+
+get rid of the firewall warnign everytime the app is started.
+
+create a WASM version for a voice call only demo in the browser.
+
+minimal theme colors:
+#080807
+#DDDDD5
+
+amp colors:
+
+
+fonts:
+KH INTERFERENCE - upper caps only so headers
+IBM Plex Sans - Normal font
+PP Fraktion Mono - Mono font
+
+alts:
+Geist and Geist Mono
+Berkeley Mono
+PP Fraktion Sans
+0Arame
+
+with an option to just use the Mono font for chat text as well

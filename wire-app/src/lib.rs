@@ -22,4 +22,6 @@ pub mod win_mf_codec;
 #[cfg(windows)]
 mod win_mf_d3d;
 #[cfg(windows)]
+mod win_video_presenter;
+#[cfg(windows)]
 mod yuv_convert;

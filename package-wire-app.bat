@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 
 for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json; ($metadata.packages | Where-Object { $_.name -eq 'wire-app' }).version"`) do set "VERSION=%%V"
 if not defined VERSION (
@@ -20,7 +20,7 @@ if errorlevel 1 (
 )
 
 echo Building release build...
-cargo build --release -p wire-app --no-default-features
+call :cargo_quiet build --release -p wire-app --no-default-features
 if errorlevel 1 (
     echo Build failed.
     exit /b 1
@@ -42,3 +42,19 @@ if errorlevel 1 (
 
 echo Done. Created %EXE_PATH% and %ZIP_PATH%.
 endlocal
+exit /b 0
+
+
+:cargo_quiet
+setlocal DisableDelayedExpansion
+set "CARGO_LOG=%TEMP%\cargo-%RANDOM%-%RANDOM%.log"
+
+cargo %* > "%CARGO_LOG%" 2>&1
+set "CARGO_EXIT=%ERRORLEVEL%"
+
+if not "%CARGO_EXIT%"=="0" (
+    type "%CARGO_LOG%" >&2
+)
+
+del "%CARGO_LOG%" >nul 2>&1
+endlocal & exit /b %CARGO_EXIT%

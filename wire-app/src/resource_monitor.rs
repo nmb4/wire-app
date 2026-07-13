@@ -183,7 +183,11 @@ mod windows_gpu {
                     item_count as usize,
                 )
             };
-            let mut total = 0.0f64;
+            // Task Manager's per-process GPU column reports the busiest engine,
+            // not the sum of independent 3D/decode/copy engine percentages.
+            // Summing them made a decoder at 8% plus presentation at 18% look
+            // like one GPU was 26% saturated, which is not a meaningful total.
+            let mut busiest_engine = 0.0f64;
             let mut found = false;
             for item in items {
                 let Ok(name) = (unsafe { item.szName.to_string() }) else {
@@ -199,11 +203,11 @@ mod windows_gpu {
                 }
                 let value = unsafe { item.FmtValue.Anonymous.doubleValue };
                 if value.is_finite() && value > 0.0 {
-                    total += value;
+                    busiest_engine = busiest_engine.max(value);
                 }
                 found = true;
             }
-            found.then_some(total.clamp(0.0, 100.0) as f32)
+            found.then_some(busiest_engine.clamp(0.0, 100.0) as f32)
         }
     }
 

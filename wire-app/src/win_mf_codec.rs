@@ -1,6 +1,6 @@
 //! Windows Media Foundation hardware H.264 encoder/decoder.
 
-use std::sync::Once;
+use std::sync::{mpsc, Once};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
@@ -16,12 +16,239 @@ use std::sync::Arc;
 use crate::win_mf_d3d::{enumerate_adapters, GpuNv12Frames, GpuVideoProcessor, MfD3d};
 use crate::yuv_convert::{bgra_to_nv12, nv12_to_rgba};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11Texture2D, D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
 static MF_INIT: Once = Once::new();
+
+const DECODE_PRESENTATION_TEXTURES: usize = 4;
+
+struct ReturnedVideoTexture {
+    generation: u64,
+    texture: ID3D11Texture2D,
+}
+
+/// A decoder-owned NV12 surface copied out of Media Foundation's sample pool.
+///
+/// The surface is moved to the UI thread and returned to the decoder when the
+/// displayed frame is replaced. This keeps the decoder sample pool free while
+/// avoiding a GPU-to-CPU readback and a second GPU upload.
+pub struct D3d11VideoFrame {
+    texture: Option<ID3D11Texture2D>,
+    device: ID3D11Device,
+    return_tx: mpsc::Sender<ReturnedVideoTexture>,
+    generation: u64,
+}
+
+impl D3d11VideoFrame {
+    pub(crate) fn texture(&self) -> &ID3D11Texture2D {
+        self.texture
+            .as_ref()
+            .expect("video frame texture was taken")
+    }
+
+    pub(crate) fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// Expensive compatibility path used only if native D3D11 presentation
+    /// cannot be initialized on this machine.
+    pub(crate) fn to_rgba(&self, width: u32, height: u32) -> Result<Vec<u8>> {
+        let texture = self.texture();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .context("creating decoder fallback staging texture")?;
+        }
+        let staging = staging.context("decoder fallback staging texture was null")?;
+        let context = unsafe { self.device.GetImmediateContext()? };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context.CopyResource(&staging, texture);
+            context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("mapping decoder fallback staging texture")?;
+        }
+        let pitch = mapped.RowPitch as usize;
+        let width_usize = width as usize;
+        let height_usize = height as usize;
+        let mut nv12 = vec![0; width_usize * height_usize * 3 / 2];
+        unsafe {
+            let base = mapped.pData as *const u8;
+            for row in 0..height_usize {
+                std::ptr::copy_nonoverlapping(
+                    base.add(row * pitch),
+                    nv12.as_mut_ptr().add(row * width_usize),
+                    width_usize,
+                );
+            }
+            let uv_offset = width_usize * height_usize;
+            for row in 0..height_usize / 2 {
+                std::ptr::copy_nonoverlapping(
+                    base.add((height_usize + row) * pitch),
+                    nv12.as_mut_ptr().add(uv_offset + row * width_usize),
+                    width_usize,
+                );
+            }
+            context.Unmap(&staging, 0);
+        }
+        let mut rgba = vec![0; width_usize * height_usize * 4];
+        nv12_to_rgba(&nv12, width, height, &mut rgba);
+        Ok(rgba)
+    }
+}
+
+impl Drop for D3d11VideoFrame {
+    fn drop(&mut self) {
+        if let Some(texture) = self.texture.take() {
+            let _ = self.return_tx.send(ReturnedVideoTexture {
+                generation: self.generation,
+                texture,
+            });
+        }
+    }
+}
+
+struct DecoderPresentationPool {
+    d3d: Arc<MfD3d>,
+    return_tx: mpsc::Sender<ReturnedVideoTexture>,
+    return_rx: mpsc::Receiver<ReturnedVideoTexture>,
+    available: Vec<ID3D11Texture2D>,
+    allocated: usize,
+    width: u32,
+    height: u32,
+    generation: u64,
+    skipped: u64,
+    last_skip_log: std::time::Instant,
+}
+
+impl DecoderPresentationPool {
+    fn new(d3d: Arc<MfD3d>, width: u32, height: u32, generation: u64) -> Self {
+        let (return_tx, return_rx) = mpsc::channel();
+        Self {
+            d3d,
+            return_tx,
+            return_rx,
+            available: Vec::with_capacity(DECODE_PRESENTATION_TEXTURES),
+            allocated: 0,
+            width,
+            height,
+            generation,
+            skipped: 0,
+            last_skip_log: std::time::Instant::now(),
+        }
+    }
+
+    fn reclaim(&mut self) {
+        while let Ok(returned) = self.return_rx.try_recv() {
+            if returned.generation == self.generation {
+                self.available.push(returned.texture);
+            }
+        }
+    }
+
+    fn allocate_texture(&mut self) -> Result<Option<ID3D11Texture2D>> {
+        self.reclaim();
+        if let Some(texture) = self.available.pop() {
+            return Ok(Some(texture));
+        }
+        if self.allocated >= DECODE_PRESENTATION_TEXTURES {
+            self.skipped += 1;
+            if self.last_skip_log.elapsed() >= std::time::Duration::from_secs(5) {
+                warn!(
+                    "native decoder presentation pool skipped {} display frame(s) while the UI held all {} surfaces",
+                    self.skipped, DECODE_PRESENTATION_TEXTURES
+                );
+                self.skipped = 0;
+                self.last_skip_log = std::time::Instant::now();
+            }
+            return Ok(None);
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            self.d3d
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut texture))
+                .context("creating decoder presentation texture")?;
+        }
+        self.allocated += 1;
+        Ok(texture)
+    }
+
+    fn copy_sample(&mut self, sample: &IMFSample) -> Result<Option<D3d11VideoFrame>> {
+        let Some(destination) = self.allocate_texture()? else {
+            return Ok(None);
+        };
+        let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0)? };
+        let dxgi: IMFDXGIBuffer = buffer
+            .cast()
+            .context("decoder output buffer is not a DXGI surface")?;
+        let mut resource: Option<windows::core::IUnknown> = None;
+        unsafe {
+            dxgi.GetResource(
+                &ID3D11Texture2D::IID,
+                &mut resource as *mut _ as *mut *mut _,
+            )?;
+        }
+        let source: ID3D11Texture2D = resource
+            .context("decoder output DXGI resource was null")?
+            .cast()?;
+        let source_subresource = unsafe { dxgi.GetSubresourceIndex()? };
+        unsafe {
+            self.d3d.context.CopySubresourceRegion(
+                &destination,
+                0,
+                0,
+                0,
+                0,
+                &source,
+                source_subresource,
+                None,
+            );
+            self.d3d.context.Flush();
+        }
+        Ok(Some(D3d11VideoFrame {
+            texture: Some(destination),
+            device: self.d3d.device.clone(),
+            return_tx: self.return_tx.clone(),
+            generation: self.generation,
+        }))
+    }
+}
 
 fn ensure_media_foundation() -> Result<()> {
     let mut err = Ok(());
@@ -1499,6 +1726,10 @@ pub struct MfH264Decoder {
     async_mode: bool,
     nv12: Vec<u8>,
     rgba: Vec<u8>,
+    presentation_pool: Option<DecoderPresentationPool>,
+    presentation_generation: u64,
+    native_output_logged: bool,
+    native_output_failed: bool,
     frame_index: i64,
     frame_duration: i64,
     _d3d: Option<Arc<MfD3d>>,
@@ -1592,6 +1823,10 @@ impl MfH264Decoder {
             async_mode,
             nv12: Vec::new(),
             rgba: Vec::new(),
+            presentation_pool: None,
+            presentation_generation: 0,
+            native_output_logged: false,
+            native_output_failed: false,
             frame_index: 0,
             frame_duration: 10_000_000 / 60,
             _d3d: d3d,
@@ -1613,14 +1848,60 @@ impl MfH264Decoder {
         if dimensions_changed {
             self.nv12.resize((width * height * 3 / 2) as usize, 0);
             self.rgba.resize((width * height * 4) as usize, 0);
+            self.presentation_generation = self.presentation_generation.wrapping_add(1);
+            self.presentation_pool = self._d3d.as_ref().map(|d3d| {
+                DecoderPresentationPool::new(
+                    d3d.clone(),
+                    width,
+                    height,
+                    self.presentation_generation,
+                )
+            });
+            self.native_output_failed = false;
         }
         info!("MF decoder output negotiated: {width}x{height}");
         Ok(())
     }
 
-    fn sample_to_rgba(&mut self, sample: &IMFSample) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    fn sample_to_frame(
+        &mut self,
+        sample: &IMFSample,
+    ) -> Result<Option<crate::video_decode::DecodedFrame>> {
         let w = self.width;
         let h = self.height;
+        if !self.native_output_failed {
+            if let Some(pool) = &mut self.presentation_pool {
+                match pool.copy_sample(sample) {
+                    Ok(Some(frame)) => {
+                        if !self.native_output_logged {
+                            info!(
+                                "MF decoder native D3D11 presentation enabled ({} pooled NV12 surfaces)",
+                                DECODE_PRESENTATION_TEXTURES
+                            );
+                            self.native_output_logged = true;
+                        }
+                        return Ok(Some(crate::video_decode::DecodedFrame {
+                            data: crate::video_decode::DecodedFrameData::D3d11(frame),
+                            width: w,
+                            height: h,
+                        }));
+                    }
+                    Ok(None) => {
+                        // All bounded presentation surfaces are still owned by the UI.
+                        // Dropping this display frame is safe: the decoder has already
+                        // consumed it and retained its reference picture internally.
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "MF native decoder surface handoff failed; using CPU presentation fallback: {error:#}"
+                        );
+                        self.native_output_failed = true;
+                        self.presentation_pool = None;
+                    }
+                }
+            }
+        }
         let len = (w * h * 4) as usize;
         read_sample_topdown_into(sample, w, h, true, &mut self.nv12)?;
         if self.rgba.len() != len {
@@ -1630,10 +1911,14 @@ impl MfH264Decoder {
         let mut out = Vec::with_capacity(len);
         std::mem::swap(&mut self.rgba, &mut out);
         self.rgba.resize(len, 0);
-        Ok(Some((out, w, h)))
+        Ok(Some(crate::video_decode::DecodedFrame {
+            data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(out)),
+            width: w,
+            height: h,
+        }))
     }
 
-    fn drain_available_output(&mut self) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+    fn drain_available_output(&mut self) -> Result<Vec<crate::video_decode::DecodedFrame>> {
         let mut frames = Vec::new();
         loop {
             match process_decoder_output_once(&self.transform, 0)? {
@@ -1641,7 +1926,7 @@ impl MfH264Decoder {
                     if !self.configured {
                         self.renegotiate_output_type()?;
                     }
-                    if let Some(frame) = self.sample_to_rgba(&sample)? {
+                    if let Some(frame) = self.sample_to_frame(&sample)? {
                         frames.push(frame);
                     }
                 }
@@ -1655,7 +1940,7 @@ impl MfH264Decoder {
         Ok(frames)
     }
 
-    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<crate::video_decode::DecodedFrame>> {
         let data = wire::video::bitstream::normalize_h264_for_decode(data);
         let timestamp = self.frame_index * self.frame_duration;
         let sample = create_h264_sample(&data, timestamp, self.frame_duration)?;

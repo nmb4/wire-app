@@ -32,7 +32,7 @@ use crate::{
     theme::*,
     title_bar,
     update::{self, ReleaseInfo},
-    video_decode::VideoDecodeWorker,
+    video_decode::{DecodedFrame, DecodedFrameData, VideoDecodeWorker},
     window_frame,
 };
 
@@ -204,10 +204,14 @@ struct VideoFrameState {
     width: u32,
     height: u32,
     generation: u64,
-    data: Arc<Vec<u8>>,
+    data: DecodedFrameData,
     texture: Option<egui::TextureHandle>,
     uploaded_generation: u64,
     upload_stats: TextureUploadStats,
+    #[cfg(windows)]
+    presenter: Option<crate::win_video_presenter::NativeVideoPresenter>,
+    #[cfg(windows)]
+    native_present_failed: bool,
 }
 
 struct TextureUploadStats {
@@ -299,7 +303,7 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.is_first_update {
             self.is_first_update = false;
             let repaint_ctx = ctx.clone();
@@ -316,8 +320,15 @@ impl eframe::App for App {
             .min_height(40.)
             .show(ctx, |_ui| {});
 
-        self.state
-            .update(ctx, &mut self.always_on_top, &mut self.viewport_transparent);
+        #[cfg(windows)]
+        let parent_hwnd = native_parent_hwnd(frame);
+        self.state.update(
+            ctx,
+            &mut self.always_on_top,
+            &mut self.viewport_transparent,
+            #[cfg(windows)]
+            parent_hwnd,
+        );
     }
 }
 
@@ -412,6 +423,7 @@ impl AppState {
         ctx: &egui::Context,
         always_on_top: &mut bool,
         viewport_transparent: &mut Option<bool>,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         // Keep the process resource readout current even while the rest of the UI is idle.
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -424,11 +436,25 @@ impl AppState {
         ctx.set_visuals(visuals_for(&pal));
 
         self.process_events();
+        #[cfg(windows)]
+        for frame in self.video_frames.values_mut() {
+            if let Some(presenter) = &mut frame.presenter {
+                presenter.mark_unused();
+            }
+        }
         self.handle_view_mode_input(ctx);
 
         if !self.stream_view_mode.is_fullscreen() {
             let rounded = window_frame::effective_rounded(ctx, self.window_frame_style);
-            self.ui_with_chrome(ctx, &pal, rounded, always_on_top, viewport_transparent);
+            self.ui_with_chrome(
+                ctx,
+                &pal,
+                rounded,
+                always_on_top,
+                viewport_transparent,
+                #[cfg(windows)]
+                parent_hwnd,
+            );
         } else {
             if *viewport_transparent != Some(false) {
                 window_frame::sync_viewport_transparent(ctx, false);
@@ -437,7 +463,15 @@ impl AppState {
             }
             egui::CentralPanel::default()
                 .frame(Frame::NONE)
-                .show(ctx, |ui| self.ui_stage(ui, ctx, &pal));
+                .show(ctx, |ui| {
+                    self.ui_stage(
+                        ui,
+                        ctx,
+                        &pal,
+                        #[cfg(windows)]
+                        parent_hwnd,
+                    )
+                });
         }
 
         if self.show_settings || !self.configured {
@@ -445,6 +479,15 @@ impl AppState {
         }
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
+        }
+        #[cfg(windows)]
+        {
+            let force_hide = self.show_settings || !self.configured || self.show_update_prompt;
+            for frame in self.video_frames.values_mut() {
+                if let Some(presenter) = &mut frame.presenter {
+                    presenter.hide_if_unused(force_hide);
+                }
+            }
         }
     }
 
@@ -592,12 +635,7 @@ impl AppState {
                 Event::SetRtt(node_id, rtt) => {
                     self.rtts.insert(node_id, rtt);
                 }
-                Event::VideoFrame {
-                    node_id,
-                    data,
-                    width,
-                    height,
-                } => {
+                Event::VideoFrame { node_id, frame } => {
                     if !matches!(self.calls.get(&node_id), Some(CallState::Active)) {
                         continue;
                     }
@@ -611,14 +649,22 @@ impl AppState {
                                 width: 0,
                                 height: 0,
                                 generation: 0,
-                                data: Arc::new(Vec::new()),
+                                data: DecodedFrameData::Rgba(Arc::new(Vec::new())),
                                 texture: None,
                                 uploaded_generation: 0,
                                 upload_stats: TextureUploadStats::default(),
+                                #[cfg(windows)]
+                                presenter: None,
+                                #[cfg(windows)]
+                                native_present_failed: false,
                             });
-                    state.width = width;
-                    state.height = height;
-                    state.data = data;
+                    state.width = frame.width;
+                    state.height = frame.height;
+                    state.data = frame.data;
+                    #[cfg(windows)]
+                    if matches!(&state.data, DecodedFrameData::D3d11(_)) {
+                        state.texture = None;
+                    }
                     state.generation += 1;
                 }
                 Event::VideoStreamEnded(node_id) => {
@@ -695,7 +741,11 @@ impl AppState {
         for node_id in self.video_frames.keys() {
             if self.video_frames[node_id].width > 0
                 && self.video_frames[node_id].height > 0
-                && !self.video_frames[node_id].data.is_empty()
+                && match &self.video_frames[node_id].data {
+                    DecodedFrameData::Rgba(data) => !data.is_empty(),
+                    #[cfg(windows)]
+                    DecodedFrameData::D3d11(_) => true,
+                }
             {
                 sources.push(StreamSource::Remote(*node_id));
             }
@@ -799,6 +849,7 @@ impl AppState {
         rounded: bool,
         always_on_top: &mut bool,
         viewport_transparent: &mut Option<bool>,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         let transparent = rounded;
         if *viewport_transparent != Some(transparent) {
@@ -836,7 +887,14 @@ impl AppState {
 
                     let mut body_rect = app_rect;
                     body_rect.min.y = title_bar_rect.max.y;
-                    self.ui_chrome_body(ui, ctx, pal, body_rect);
+                    self.ui_chrome_body(
+                        ui,
+                        ctx,
+                        pal,
+                        body_rect,
+                        #[cfg(windows)]
+                        parent_hwnd,
+                    );
                     window_frame::resize_edges(ui, ctx.screen_rect());
                 });
             });
@@ -848,6 +906,7 @@ impl AppState {
         ctx: &egui::Context,
         pal: &Palette,
         body: egui::Rect,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         const TOP_BAR_HEIGHT: f32 = 54.0;
         const DOCK_HEIGHT: f32 = 86.0;
@@ -882,7 +941,15 @@ impl AppState {
             } else {
                 Frame::new().inner_margin(egui::Margin::symmetric(20, 14))
             };
-            frame.show(ui, |ui| self.ui_stage(ui, ctx, pal));
+            frame.show(ui, |ui| {
+                self.ui_stage(
+                    ui,
+                    ctx,
+                    pal,
+                    #[cfg(windows)]
+                    parent_hwnd,
+                )
+            });
         });
     }
 
@@ -1087,9 +1154,20 @@ impl AppState {
         });
     }
 
-    fn ui_stage(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
+    fn ui_stage(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        pal: &Palette,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
+    ) {
         if self.stream_view_mode != StreamViewMode::Normal {
-            self.ui_stream_panel(ui, ctx);
+            self.ui_stream_panel(
+                ui,
+                ctx,
+                #[cfg(windows)]
+                parent_hwnd,
+            );
             return;
         }
 
@@ -1108,7 +1186,14 @@ impl AppState {
         ui.allocate_ui_with_layout(
             Vec2::new(stage_width, stage_height),
             Layout::top_down(Align::Min),
-            |ui| self.ui_stream_panel(ui, ctx),
+            |ui| {
+                self.ui_stream_panel(
+                    ui,
+                    ctx,
+                    #[cfg(windows)]
+                    parent_hwnd,
+                )
+            },
         );
         ui.add_space(8.0);
 
@@ -1616,7 +1701,12 @@ impl AppState {
         });
     }
 
-    fn ui_stream_panel(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+    fn ui_stream_panel(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
+    ) {
         let pal = Palette::for_theme(self.theme);
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
         let streams = self.active_stream_sources();
@@ -1675,7 +1765,15 @@ impl AppState {
             .filter(|source| streams.contains(source))
         {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area), |ui| {
-                self.ui_stream_tile(ui, &pal, focused, true, immersive);
+                self.ui_stream_tile(
+                    ui,
+                    &pal,
+                    focused,
+                    true,
+                    immersive,
+                    #[cfg(windows)]
+                    parent_hwnd,
+                );
             });
             return;
         }
@@ -1699,7 +1797,15 @@ impl AppState {
                 Vec2::new(cell_w, cell_h),
             );
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_rect), |ui| {
-                self.ui_stream_tile(ui, &pal, *source, false, immersive);
+                self.ui_stream_tile(
+                    ui,
+                    &pal,
+                    *source,
+                    false,
+                    immersive,
+                    #[cfg(windows)]
+                    parent_hwnd,
+                );
             });
         }
     }
@@ -1798,22 +1904,15 @@ impl AppState {
         source: StreamSource,
         expanded: bool,
         immersive: bool,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         let available = ui.available_size();
-        let (tile_rect, _tile_response) = ui.allocate_exact_size(available, egui::Sense::hover());
-        let corner = if immersive { 0.0 } else { 10.0 };
-        let corner_radius = CornerRadius::same(corner as u8);
-        let btn_size = 30.0;
-        let btn_rect = egui::Rect::from_min_size(
-            tile_rect.right_top() + egui::vec2(-btn_size - 8.0, 8.0),
-            Vec2::splat(btn_size),
-        );
-        let pointer_over = ui
-            .ctx()
-            .pointer_hover_pos()
-            .is_some_and(|pos| tile_rect.contains(pos) || btn_rect.contains(pos));
-        let show_controls = expanded || pointer_over;
-
+        let (tile_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        let corner_radius = if immersive {
+            CornerRadius::ZERO
+        } else {
+            CornerRadius::same(10)
+        };
         ui.painter()
             .rect_filled(tile_rect, corner_radius, Color32::from_rgb(12, 12, 14));
         if !immersive {
@@ -1825,128 +1924,145 @@ impl AppState {
             );
         }
 
+        // Native child windows necessarily sit above the parent's OpenGL
+        // surface. Keep controls in a small egui-owned header and limit the
+        // child to the image rectangle so it never obscures interaction.
+        let header_height = if tile_rect.height() >= 80.0 {
+            34.0
+        } else {
+            0.0
+        };
+        let header_rect = egui::Rect::from_min_max(
+            tile_rect.min,
+            egui::pos2(tile_rect.max.x, tile_rect.min.y + header_height),
+        );
         let label = ellipsize(&self.stream_label(source), 30);
-        let (width, height, texture_id) = match source {
-            StreamSource::Local => {
-                let Some(preview) = &mut self.preview else {
-                    return;
-                };
-                let width = preview.width;
-                let height = preview.height;
-                sync_rgba_texture(
-                    ui,
-                    "preview-stage",
-                    width,
-                    height,
-                    &preview.data,
-                    preview.generation,
-                    &mut preview.uploaded_generation,
-                    &mut preview.texture,
-                    &mut preview.upload_stats,
-                );
-                let texture_id = preview.texture.as_ref().map(|tex| tex.id());
-                (width, height, texture_id)
-            }
-            StreamSource::Remote(node_id) => {
-                let Some(frame) = self.video_frames.get_mut(&node_id) else {
-                    return;
-                };
-                let width = frame.width;
-                let height = frame.height;
-                sync_rgba_texture(
-                    ui,
-                    &format!("video-{node_id}"),
-                    width,
-                    height,
-                    &frame.data,
-                    frame.generation,
-                    &mut frame.uploaded_generation,
-                    &mut frame.texture,
-                    &mut frame.upload_stats,
-                );
-                let texture_id = frame.texture.as_ref().map(|tex| tex.id());
-                (width, height, texture_id)
-            }
-        };
-
-        let Some(texture_id) = texture_id else {
+        if header_height > 0.0 {
             ui.painter().text(
-                tile_rect.center(),
-                Align2::CENTER_CENTER,
-                "Waiting for video…",
-                sans(13.0),
-                pal.dim,
+                header_rect.left_center() + egui::vec2(10.0, 0.0),
+                Align2::LEFT_CENTER,
+                &label,
+                sans(11.0),
+                pal.text,
             );
-            return;
-        };
-
-        let aspect = width as f32 / height.max(1) as f32;
-        let image_rect = egui::Rect::from_center_size(
-            tile_rect.center(),
-            video_display_size(tile_rect.shrink(4.0).size(), aspect, expanded),
-        );
-        ui.painter().image(
-            texture_id,
-            image_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-
-        let label_galley = ui
-            .painter()
-            .layout_no_wrap(label.clone(), sans(11.0), pal.text);
-        let name_bg = egui::Rect::from_min_size(
-            tile_rect.left_bottom() + egui::vec2(8.0, -30.0),
-            egui::vec2((label_galley.size().x + 16.0).clamp(64.0, 240.0), 22.0),
-        );
-        ui.painter().rect_filled(
-            name_bg,
-            CornerRadius::same(4),
-            Color32::from_rgba_unmultiplied(0, 0, 0, 170),
-        );
-        ui.painter().text(
-            name_bg.left_center() + egui::vec2(8.0, 0.0),
-            Align2::LEFT_CENTER,
-            &label,
-            sans(11.0),
-            pal.text,
-        );
-
-        if show_controls && !expanded {
-            ui.painter().rect_filled(
-                tile_rect,
-                corner_radius,
-                Color32::from_rgba_unmultiplied(0, 0, 0, 50),
+            let button_rect = egui::Rect::from_min_size(
+                header_rect.right_top() + egui::vec2(-34.0, 2.0),
+                Vec2::splat(30.0),
             );
-        }
-
-        let icon = if expanded {
-            ph::SQUARES_FOUR
-        } else {
-            ph::ARROWS_OUT_SIMPLE
-        };
-        let tooltip = if expanded {
-            "Show all streams"
-        } else {
-            "Focus this stream"
-        };
-        if show_controls {
+            let icon = if expanded {
+                ph::SQUARES_FOUR
+            } else {
+                ph::ARROWS_OUT_SIMPLE
+            };
+            let tooltip = if expanded {
+                "Show all streams"
+            } else {
+                "Focus this stream"
+            };
             if ui
                 .put(
-                    btn_rect,
+                    button_rect,
                     egui::Button::new(RichText::new(icon).size(ui_font_size(15.0)))
-                        .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 190))
+                        .fill(Color32::from_rgb(20, 20, 23))
                         .stroke(Stroke::new(1.0, pal.line_br)),
                 )
                 .on_hover_text(tooltip)
                 .clicked()
             {
-                if expanded {
-                    self.focused_stream = None;
-                } else {
-                    self.focused_stream = Some(source);
+                self.focused_stream = if expanded { None } else { Some(source) };
+            }
+        }
+
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2(tile_rect.min.x + 4.0, tile_rect.min.y + header_height + 2.0),
+            tile_rect.max - egui::vec2(4.0, 4.0),
+        );
+        let (width, height) = match source {
+            StreamSource::Local => self
+                .preview
+                .as_ref()
+                .map(|preview| (preview.width, preview.height)),
+            StreamSource::Remote(node_id) => self
+                .video_frames
+                .get(&node_id)
+                .map(|frame| (frame.width, frame.height)),
+        }
+        .unwrap_or_default();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let aspect = width as f32 / height as f32;
+        let image_rect = egui::Rect::from_center_size(
+            content_rect.center(),
+            video_display_size(content_rect.size(), aspect, expanded),
+        );
+
+        let mut texture_id = None;
+        let mut native_presented = false;
+        match source {
+            StreamSource::Local => {
+                if let Some(preview) = &mut self.preview {
+                    sync_rgba_texture(
+                        ui,
+                        "preview-stage",
+                        width,
+                        height,
+                        &preview.data,
+                        preview.generation,
+                        &mut preview.uploaded_generation,
+                        &mut preview.texture,
+                        &mut preview.upload_stats,
+                    );
+                    texture_id = preview.texture.as_ref().map(|texture| texture.id());
                 }
             }
+            StreamSource::Remote(node_id) => {
+                #[cfg(windows)]
+                let allow_native =
+                    self.configured && !self.show_settings && !self.show_update_prompt;
+                let Some(frame) = self.video_frames.get_mut(&node_id) else {
+                    return;
+                };
+                #[cfg(windows)]
+                if allow_native && matches!(&frame.data, DecodedFrameData::D3d11(_)) {
+                    let rect = physical_video_rect(image_rect, ui.ctx().pixels_per_point());
+                    match present_native_video(frame, parent_hwnd, rect) {
+                        Ok(presented) => native_presented = presented,
+                        Err(error) => warn!("native video fallback failed: {error:#}"),
+                    }
+                }
+                if let DecodedFrameData::Rgba(data) = &frame.data {
+                    sync_rgba_texture(
+                        ui,
+                        &format!("video-{node_id}"),
+                        width,
+                        height,
+                        data,
+                        frame.generation,
+                        &mut frame.uploaded_generation,
+                        &mut frame.texture,
+                        &mut frame.upload_stats,
+                    );
+                    texture_id = frame.texture.as_ref().map(|texture| texture.id());
+                }
+            }
+        }
+
+        if let Some(texture_id) = texture_id {
+            ui.painter().image(
+                texture_id,
+                image_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else if !native_presented {
+            ui.painter().text(
+                content_rect.center(),
+                Align2::CENTER_CENTER,
+                "Waiting for video...",
+                sans(13.0),
+                pal.dim,
+            );
         }
     }
 
@@ -2626,6 +2742,95 @@ fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
     best
 }
 
+#[cfg(windows)]
+fn native_parent_hwnd(frame: &eframe::Frame) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = frame.window_handle().ok()?.as_raw();
+    let RawWindowHandle::Win32(handle) = handle else {
+        return None;
+    };
+    Some(windows::Win32::Foundation::HWND(
+        handle.hwnd.get() as *mut std::ffi::c_void
+    ))
+}
+
+#[cfg(windows)]
+fn physical_video_rect(
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> crate::win_video_presenter::PhysicalVideoRect {
+    let min_x = (rect.min.x * pixels_per_point).round() as i32;
+    let min_y = (rect.min.y * pixels_per_point).round() as i32;
+    let max_x = (rect.max.x * pixels_per_point).round() as i32;
+    let max_y = (rect.max.y * pixels_per_point).round() as i32;
+    crate::win_video_presenter::PhysicalVideoRect {
+        x: min_x,
+        y: min_y,
+        width: max_x.saturating_sub(min_x).max(1) as u32,
+        height: max_y.saturating_sub(min_y).max(1) as u32,
+    }
+}
+
+#[cfg(windows)]
+fn present_native_video(
+    frame: &mut VideoFrameState,
+    parent: Option<windows::Win32::Foundation::HWND>,
+    rect: crate::win_video_presenter::PhysicalVideoRect,
+) -> Result<bool> {
+    let was_disabled = frame.native_present_failed;
+    let present_result: Result<()> = (|| {
+        if was_disabled {
+            anyhow::bail!("native presentation disabled after an earlier initialization failure");
+        }
+        let gpu_frame = match &frame.data {
+            DecodedFrameData::D3d11(frame) => frame,
+            DecodedFrameData::Rgba(_) => return Ok(()),
+        };
+        let parent = parent.context("eframe did not expose a Win32 parent handle")?;
+        if frame
+            .presenter
+            .as_ref()
+            .is_some_and(|presenter| !presenter.uses_device(gpu_frame))
+        {
+            frame.presenter = None;
+        }
+        if frame.presenter.is_none() {
+            frame.presenter = Some(crate::win_video_presenter::NativeVideoPresenter::new(
+                parent, gpu_frame, rect,
+            )?);
+        }
+        frame
+            .presenter
+            .as_mut()
+            .context("native presenter was not created")?
+            .present(gpu_frame, frame.width, frame.height, rect, frame.generation)
+    })();
+
+    match present_result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if !was_disabled {
+                warn!("native D3D11 video presentation failed; using egui fallback: {error:#}");
+            }
+            frame.native_present_failed = true;
+            if let Some(presenter) = &mut frame.presenter {
+                presenter.hide();
+            }
+            let rgba = match &frame.data {
+                DecodedFrameData::D3d11(gpu_frame) => {
+                    gpu_frame.to_rgba(frame.width, frame.height)?
+                }
+                DecodedFrameData::Rgba(_) => return Ok(false),
+            };
+            frame.data = DecodedFrameData::Rgba(Arc::new(rgba));
+            frame.texture = None;
+            frame.uploaded_generation = 0;
+            Ok(false)
+        }
+    }
+}
+
 fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 {
     if available.x <= 0.0 || available.y <= 0.0 || aspect <= 0.0 {
         return available;
@@ -2771,9 +2976,7 @@ enum Event {
     SetRtt(NodeId, Duration),
     VideoFrame {
         node_id: NodeId,
-        width: u32,
-        height: u32,
-        data: Arc<Vec<u8>>,
+        frame: DecodedFrame,
     },
     VideoStreamEnded(NodeId),
     SharingToggled(bool),
@@ -3588,12 +3791,7 @@ async fn recv_video_on_stream(
     let ended_callback = callback.cloned();
     let worker = VideoDecodeWorker::spawn(move |frame| {
         if frame_event_tx
-            .try_send(Event::VideoFrame {
-                node_id,
-                data: frame.data,
-                width: frame.width,
-                height: frame.height,
-            })
+            .try_send(Event::VideoFrame { node_id, frame })
             .is_ok()
         {
             if let Some(cb) = &frame_callback {

@@ -8,8 +8,10 @@
 //! decoder's reference picture chain: a P-frame whose reference was skipped
 //! makes OpenH264 report "no decodable frame found", and while it is erroring
 //! the UI just holds the last good frame — that is the freeze. So we never skip
-//! frames here; when the decoder cannot keep up we backpressure the sender via
-//! QUIC flow control instead of discarding pictures.
+//! encoded pictures here; when the decoder cannot keep up we backpressure the
+//! sender via QUIC flow control instead of breaking the reference chain. After
+//! a picture has been decoded, the Windows presenter may safely skip displaying
+//! it when its bounded surface pool is busy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -21,9 +23,15 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 pub struct DecodedFrame {
-    pub data: Arc<Vec<u8>>,
+    pub data: DecodedFrameData,
     pub width: u32,
     pub height: u32,
+}
+
+pub enum DecodedFrameData {
+    Rgba(Arc<Vec<u8>>),
+    #[cfg(windows)]
+    D3d11(crate::win_mf_codec::D3d11VideoFrame),
 }
 
 /// Common interface for the two decoder backends.
@@ -32,7 +40,7 @@ pub struct DecodedFrame {
 /// MF encoder), so it never crosses thread boundaries even though the underlying
 /// COM `IMFTransform` is `!Send`.
 trait FrameDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>>;
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>>;
 }
 
 struct OpenH264Decoder(wire::video::codec::VideoDecoder);
@@ -45,8 +53,14 @@ impl OpenH264Decoder {
 }
 
 impl FrameDecoder for OpenH264Decoder {
-    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
-        self.0.decode(data).map(|frame| vec![frame])
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
+        self.0.decode(data).map(|(rgba, width, height)| {
+            vec![DecodedFrame {
+                data: DecodedFrameData::Rgba(Arc::new(rgba)),
+                width,
+                height,
+            }]
+        })
     }
 }
 
@@ -63,7 +77,7 @@ impl MfDecoder {
 
 #[cfg(windows)]
 impl FrameDecoder for MfDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
         self.0.decode(data)
     }
 }
@@ -161,8 +175,6 @@ where
 {
     let (mut decoder, mut hardware_decoder) = make_decoder()?;
     let mut waiting_for_keyframe = false;
-    let mut seen_keyframe = false;
-    let mut empty_output_streak = 0u32;
     let mut decoded = 0u64;
     let mut decode_errors = 0u64;
     // A freshly joined stream starts mid-GOP, so the decoder cannot produce a
@@ -187,7 +199,6 @@ where
         }
         if packet.keyframe {
             waiting_for_keyframe = false;
-            seen_keyframe = true;
         }
 
         let packet_len = packet.data.len() as u64;
@@ -198,34 +209,17 @@ where
                 window_decode_ms += decode_ms;
                 decode_samples_ms.push(decode_ms);
                 decode_errors = 0;
-                if frames.is_empty() && hardware_decoder && seen_keyframe {
-                    empty_output_streak += 1;
-                } else if !frames.is_empty() {
-                    empty_output_streak = 0;
-                }
-                for (rgba, w, h) in frames {
+                for frame in frames {
                     decoded += 1;
                     window_decoded += 1;
                     window_bytes += packet_len;
                     if decoded == 1 {
-                        info!("decoded first video frame ({w}x{h})");
+                        info!(
+                            "decoded first video frame ({}x{})",
+                            frame.width, frame.height
+                        );
                     }
-                    on_frame(DecodedFrame {
-                        data: Arc::new(rgba),
-                        width: w,
-                        height: h,
-                    });
-                }
-                #[cfg(windows)]
-                if hardware_decoder && empty_output_streak >= 30 {
-                    warn!(
-                        "MF decoder stopped producing output; falling back to OpenH264 at next IDR"
-                    );
-                    decoder = Box::new(OpenH264Decoder::try_new()?);
-                    hardware_decoder = false;
-                    waiting_for_keyframe = true;
-                    seen_keyframe = false;
-                    empty_output_streak = 0;
+                    on_frame(frame);
                 }
             }
             Err(e) => {
@@ -239,8 +233,6 @@ where
                     decoder = Box::new(OpenH264Decoder::try_new()?);
                     hardware_decoder = false;
                     waiting_for_keyframe = true;
-                    seen_keyframe = false;
-                    empty_output_streak = 0;
                     decode_errors = 0;
                 }
             }
