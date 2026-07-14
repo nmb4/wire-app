@@ -14,10 +14,12 @@ const LOG_DIR_NAME: &str = "wire";
 const LEGACY_LOG_DIR_NAME: &str = "callme";
 const LOG_FILE_PREFIX: &str = "wire-app";
 const DEV_PAIR_SESSION_ENV: &str = "WIRE_DEV_PAIR_SESSION";
+const DEV_PAIR_INDEX_ENV: &str = "WIRE_DEV_PAIR_INDEX";
+const DEV_CALL_PARTICIPANTS: usize = 3;
 
 struct LaunchConfig {
     dev_pair_session: Option<String>,
-    dev_child: bool,
+    dev_peer_index: usize,
     dev_auto_share: bool,
 }
 
@@ -25,11 +27,14 @@ impl LaunchConfig {
     fn from_args() -> Self {
         let mut args = std::env::args().skip(1).peekable();
         let mut dev_pair_session = None;
-        let mut dev_child = false;
+        let mut dev_peer_index = 0;
         let mut dev_auto_share = false;
         while let Some(argument) = args.next() {
             if argument == "--dev-child" {
-                dev_child = true;
+                // Keep old hand-written invocations working as participant 1.
+                dev_peer_index = 1;
+            } else if let Some(value) = argument.strip_prefix("--dev-peer-index=") {
+                dev_peer_index = value.parse().unwrap_or(0);
             } else if argument == "--dev-auto-share" {
                 dev_auto_share = true;
             } else if let Some(value) = argument.strip_prefix("--dev-pair=") {
@@ -43,7 +48,7 @@ impl LaunchConfig {
         }
         Self {
             dev_pair_session,
-            dev_child,
+            dev_peer_index,
             dev_auto_share,
         }
     }
@@ -90,7 +95,7 @@ fn cleanup_legacy_log_dir() {
     let _ = fs::remove_dir(&legacy);
 }
 
-fn init_logging(dev_pair: Option<(&str, bool)>) {
+fn init_logging(dev_pair: Option<(&str, usize)>) {
     let mut filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wire=info,wire_app=info"));
     if dev_pair.is_some() {
@@ -106,9 +111,13 @@ fn init_logging(dev_pair: Option<(&str, bool)>) {
     }
 
     let log_path = log_dir().map(|root| match dev_pair {
-        Some((session, child)) => root.join(format!(
+        Some((session, peer_index)) => root.join(format!(
             "{LOG_FILE_PREFIX}-dev-{session}-{}-{}.log",
-            if child { "peer" } else { "host" },
+            if peer_index == 0 {
+                "host".to_owned()
+            } else {
+                format!("peer-{peer_index}")
+            },
             std::process::id()
         )),
         None => root.join(format!("{LOG_FILE_PREFIX}-{}.log", std::process::id())),
@@ -145,10 +154,14 @@ fn init_logging(dev_pair: Option<(&str, bool)>) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-fn spawn_dev_peer(session: &str) -> std::io::Result<()> {
+fn spawn_dev_peer(session: &str, peer_index: usize) -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
     let mut command = std::process::Command::new(executable);
-    command.args(["--dev-pair", session, "--dev-child"]);
+    command.args([
+        "--dev-pair",
+        session,
+        &format!("--dev-peer-index={peer_index}"),
+    ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -163,12 +176,13 @@ fn main() -> Result<(), eframe::Error> {
     let launch = LaunchConfig::from_args();
     if let Some(session) = launch.dev_pair_session.as_deref() {
         std::env::set_var(DEV_PAIR_SESSION_ENV, session);
+        std::env::set_var(DEV_PAIR_INDEX_ENV, launch.dev_peer_index.to_string());
         std::env::set_var(
             "IROH_SECRET",
             wire::net::generate_ephemeral_secret_key().to_string(),
         );
     }
-    if launch.dev_auto_share && !launch.dev_child {
+    if launch.dev_auto_share && launch.dev_peer_index == 0 {
         std::env::set_var("WIRE_DEV_AUTO_SHARE", "1");
     } else {
         std::env::remove_var("WIRE_DEV_AUTO_SHARE");
@@ -177,18 +191,21 @@ fn main() -> Result<(), eframe::Error> {
         launch
             .dev_pair_session
             .as_deref()
-            .map(|session| (session, launch.dev_child)),
+            .map(|session| (session, launch.dev_peer_index)),
     );
     if let Some(session) = launch.dev_pair_session.as_deref() {
         info!(
-            "starting isolated dev-pair instance '{}' (role={})",
-            session,
-            if launch.dev_child { "peer" } else { "host" }
+            "starting isolated dev-call instance '{}' (participant={})",
+            session, launch.dev_peer_index
         );
-        if !launch.dev_child {
-            match spawn_dev_peer(session) {
-                Ok(()) => info!("spawned second dev-pair window"),
-                Err(error) => tracing::warn!("failed to spawn second dev-pair window: {error}"),
+        if launch.dev_peer_index == 0 {
+            for peer_index in 1..DEV_CALL_PARTICIPANTS {
+                match spawn_dev_peer(session, peer_index) {
+                    Ok(()) => info!("spawned dev-call participant {peer_index}"),
+                    Err(error) => {
+                        tracing::warn!("failed to spawn dev-call participant {peer_index}: {error}")
+                    }
+                }
             }
         }
     }

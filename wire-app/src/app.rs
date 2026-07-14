@@ -555,18 +555,18 @@ impl AppState {
             match event {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
-                    let dev_peer = match self.dev_pair.as_mut() {
+                    let dev_peers = match self.dev_pair.as_mut() {
                         Some(dev_pair) => match dev_pair.register(node_id) {
-                            Ok(peer) => peer,
+                            Ok(peers) => peers,
                             Err(error) => {
-                                warn!("dev-pair rendezvous failed: {error:#}");
-                                None
+                                warn!("dev-call rendezvous failed: {error:#}");
+                                Vec::new()
                             }
                         },
-                        None => None,
+                        None => Vec::new(),
                     };
-                    if let Some(peer) = dev_peer {
-                        info!("dev pair initiating automatic call to {}", peer.fmt_short());
+                    for peer in dev_peers {
+                        info!("dev call initiating automatic call to {}", peer.fmt_short());
                         self.cmd(Command::Call { node_id: peer });
                     }
                 }
@@ -616,7 +616,7 @@ impl AppState {
                     }
                     if auto_accept {
                         info!(
-                            "dev pair automatically accepting call from {}",
+                            "dev call automatically accepting call from {}",
                             node_id.fmt_short()
                         );
                         self.cmd(Command::HandleIncoming {
@@ -625,7 +625,7 @@ impl AppState {
                         });
                     }
                     if auto_share {
-                        info!("dev pair automatically starting the explicit test share");
+                        info!("dev call automatically starting the explicit test share");
                         self.cmd(Command::ToggleSharing { enabled: true });
                     }
                 }
@@ -773,14 +773,22 @@ impl AppState {
 
     fn peer_display_name(&self, node_id: NodeId) -> String {
         self.friend_name(node_id)
-            .unwrap_or("Unknown peer")
-            .to_owned()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Peer {}", node_id.fmt_short()))
     }
 
     fn peer_initial(&self, node_id: NodeId) -> String {
         self.friend_name(node_id)
             .and_then(|name| name.chars().find(|c| c.is_alphanumeric()))
             .map(|c| c.to_uppercase().to_string())
+            .or_else(|| {
+                node_id
+                    .fmt_short()
+                    .to_string()
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+            })
             .unwrap_or_else(|| "?".to_owned())
     }
 
@@ -1243,17 +1251,30 @@ impl AppState {
         if self.calls.is_empty() {
             self.ui_empty_peer_tile(ui, pal);
         } else {
-            ui.horizontal_wrapped(|ui| {
-                let calls: Vec<_> = self
-                    .calls
-                    .iter()
-                    .map(|(node_id, state)| (*node_id, *state))
-                    .collect();
-                for (node_id, state) in calls {
-                    self.ui_peer_tile(ui, pal, node_id, state);
-                    ui.add_space(10.0);
+            let calls: Vec<_> = self
+                .calls
+                .iter()
+                .map(|(node_id, state)| (*node_id, *state))
+                .collect();
+            let column_count = participant_grid_columns(ui.available_width(), calls.len());
+            let tile_width =
+                participant_tile_width(ui.available_width(), column_count, PARTICIPANT_GRID_GAP);
+
+            for (row_index, row) in calls.chunks(column_count).enumerate() {
+                if row_index > 0 {
+                    ui.add_space(PARTICIPANT_GRID_GAP);
                 }
-            });
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.x = PARTICIPANT_GRID_GAP;
+                    for &(node_id, state) in row {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(tile_width, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| self.ui_peer_tile(ui, pal, node_id, state, tile_width),
+                        );
+                    }
+                });
+            }
         }
     }
 
@@ -1301,7 +1322,14 @@ impl AppState {
             });
     }
 
-    fn ui_peer_tile(&mut self, ui: &mut Ui, pal: &Palette, node_id: NodeId, state: CallState) {
+    fn ui_peer_tile(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        node_id: NodeId,
+        state: CallState,
+        tile_width: f32,
+    ) {
         Frame::new()
             .fill(pal.panel)
             .stroke(Stroke::new(
@@ -1315,7 +1343,7 @@ impl AppState {
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
-                ui.set_min_width(208.0);
+                ui.set_width((tile_width - 28.0).max(1.0));
                 let peer_name = self.peer_display_name(node_id);
                 let peer_initial = self.peer_initial(node_id);
                 ui.horizontal(|ui| {
@@ -2715,6 +2743,25 @@ fn rtt_label(rtt: Duration) -> RichText {
     RichText::new(text).color(color).small()
 }
 
+const PARTICIPANT_TILE_MIN_WIDTH: f32 = 360.0;
+const PARTICIPANT_GRID_GAP: f32 = 10.0;
+
+fn participant_grid_columns(available_width: f32, participant_count: usize) -> usize {
+    if participant_count == 0 {
+        return 1;
+    }
+    let fitting_columns = ((available_width + PARTICIPANT_GRID_GAP)
+        / (PARTICIPANT_TILE_MIN_WIDTH + PARTICIPANT_GRID_GAP))
+        .floor()
+        .max(1.0) as usize;
+    fitting_columns.min(participant_count).min(3)
+}
+
+fn participant_tile_width(available_width: f32, columns: usize, gap: f32) -> f32 {
+    let columns = columns.max(1);
+    ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
+}
+
 fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
     if count <= 1 || available.x <= 0.0 || available.y <= 0.0 {
         return (1, 1);
@@ -2947,6 +2994,21 @@ mod layout_tests {
         assert_eq!(stream_grid_dims(2, Vec2::new(1200.0, 400.0)), (2, 1));
         assert_eq!(stream_grid_dims(2, Vec2::new(400.0, 1200.0)), (1, 2));
         assert_eq!(stream_grid_dims(4, Vec2::new(800.0, 800.0)), (2, 2));
+    }
+
+    #[test]
+    fn participant_grid_keeps_every_peer_on_screen() {
+        assert_eq!(participant_grid_columns(1570.0, 2), 2);
+        assert_eq!(participant_grid_columns(1570.0, 3), 3);
+        assert_eq!(participant_grid_columns(700.0, 2), 1);
+
+        let width = participant_tile_width(1570.0, 2, PARTICIPANT_GRID_GAP);
+        assert!((width - 780.0).abs() < f32::EPSILON);
+        assert_eq!(
+            width * 2.0 + PARTICIPANT_GRID_GAP,
+            1570.0,
+            "tiles and gap must consume exactly the visible width"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-rem Build and launch two local Wire instances for peer testing.
+rem Build and launch a three-participant local Wire group call.
 rem Logs: %LOCALAPPDATA%\wire\wire-app-<pid>.log
 
 cd /d "%~dp0"
@@ -21,9 +21,8 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
-echo Starting two instances...
-start "" "%EXE%"
-start "" "%EXE%"
+echo Starting three-instance full-mesh call...
+start "" "%EXE%" --dev-pair
 
 echo Done. Check logs in %LOCALAPPDATA%\wire\
 
