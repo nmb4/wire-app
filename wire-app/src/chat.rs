@@ -644,6 +644,39 @@ impl ChatService {
         }
     }
 
+    pub async fn restore_message(&mut self, conversation_id: String, message_id: String) {
+        match self.restore_message_locally(&conversation_id, &message_id) {
+            Ok(()) => {
+                info!(
+                    conversation = %log_id(&conversation_id),
+                    message = %log_id(&message_id),
+                    "local message tombstone removed"
+                );
+                if let Err(error) = self.publish_timeline(&conversation_id).await {
+                    self.queued.push_back(ChatNotification::Error(format!(
+                        "Could not refresh restored message: {error:#}"
+                    )));
+                }
+            }
+            Err(error) => {
+                warn!(
+                    conversation = %log_id(&conversation_id),
+                    message = %log_id(&message_id),
+                    "failed to restore message: {error:#}"
+                );
+                if let Err(refresh_error) = self.publish_timeline(&conversation_id).await {
+                    warn!(
+                        conversation = %log_id(&conversation_id),
+                        "failed to roll back optimistic message restore: {refresh_error:#}"
+                    );
+                }
+                self.queued.push_back(ChatNotification::Error(format!(
+                    "Could not restore message: {error:#}"
+                )));
+            }
+        }
+    }
+
     async fn create_conversation(
         &self,
         id: String,
@@ -945,10 +978,8 @@ impl ChatService {
             &self.local_deletions,
         ) {
             if inserted {
-                if let Some(message_ids) = self
-                    .local_deletions
-                    .conversations
-                    .get_mut(conversation_id)
+                if let Some(message_ids) =
+                    self.local_deletions.conversations.get_mut(conversation_id)
                 {
                     message_ids.remove(message_id);
                     if message_ids.is_empty() {
@@ -956,6 +987,43 @@ impl ChatService {
                     }
                 }
             }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn restore_message_locally(&mut self, conversation_id: &str, message_id: &str) -> Result<()> {
+        if !self.index.conversations.contains_key(conversation_id) {
+            bail!("unknown conversation");
+        }
+        if !is_message_id(message_id) {
+            bail!("invalid message id");
+        }
+        let removed = self
+            .local_deletions
+            .conversations
+            .get_mut(conversation_id)
+            .is_some_and(|message_ids| message_ids.remove(message_id));
+        if !removed {
+            bail!("message is not deleted locally");
+        }
+        if self
+            .local_deletions
+            .conversations
+            .get(conversation_id)
+            .is_some_and(BTreeSet::is_empty)
+        {
+            self.local_deletions.conversations.remove(conversation_id);
+        }
+        if let Err(error) = save_local_deletions(
+            &self.root.join("local-deletions.json"),
+            &self.local_deletions,
+        ) {
+            self.local_deletions
+                .conversations
+                .entry(conversation_id.to_owned())
+                .or_default()
+                .insert(message_id.to_owned());
             return Err(error);
         }
         Ok(())
@@ -1396,6 +1464,25 @@ mod tests {
         wait_for_deletion(&mut left, &outbound_id, MessageDeletion::Everyone).await?;
         wait_for_deletion(&mut right, &outbound_id, MessageDeletion::Everyone).await?;
         wait_for_deletion(&mut right, &later_id, MessageDeletion::Local).await?;
+
+        right
+            .restore_message(conversation_id.clone(), later_id.clone())
+            .await;
+        let right_stored = right.index.conversations[&conversation_id].clone();
+        let restored_messages = right.load_messages(&right_stored).await?;
+        let restored = restored_messages
+            .iter()
+            .find(|message| message.message_id == later_id)
+            .context("restored message disappeared")?;
+        assert_eq!(restored.deletion, None);
+        assert_eq!(restored.body, "later live message");
+        assert!(
+            !load_local_deletions(&right.root.join("local-deletions.json"))
+                .conversations
+                .get(&conversation_id)
+                .is_some_and(|message_ids| message_ids.contains(&later_id)),
+            "restoring a message must remove its persisted local tombstone"
+        );
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())

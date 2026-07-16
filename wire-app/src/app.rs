@@ -1520,6 +1520,7 @@ impl AppState {
         };
         let time = format_chat_time(message.sent_at);
         let mut requested_deletion = None;
+        let mut requested_restore = false;
         ui.with_layout(
             if own {
                 Layout::right_to_left(Align::Min)
@@ -1537,20 +1538,33 @@ impl AppState {
                                     .color(pal.dim.gamma_multiply(opacity))
                                     .size(ui_font_size(10.5)),
                             );
-                            if message.deletion.is_none() {
-                                ui.menu_button(
-                                    RichText::new(ph::DOTS_THREE)
-                                        .color(pal.dim)
-                                        .size(ui_font_size(12.0)),
+                            if message.deletion != Some(MessageDeletion::Everyone) {
+                                egui::menu::menu_custom_button(
+                                    ui,
+                                    egui::Button::new(
+                                        RichText::new(ph::DOTS_THREE)
+                                            .color(pal.dim)
+                                            .size(ui_font_size(9.5)),
+                                    )
+                                    .small()
+                                    .frame(false)
+                                    .min_size(Vec2::new(18.0, 16.0)),
                                     |ui| {
-                                        let (label, scope) = if own {
-                                            ("Delete for everyone", DeleteScope::Everyone)
+                                        if message.deletion == Some(MessageDeletion::Local) {
+                                            if ui.button("Restore message").clicked() {
+                                                requested_restore = true;
+                                                ui.close_menu();
+                                            }
                                         } else {
-                                            ("Delete for me", DeleteScope::Local)
-                                        };
-                                        if ui.button(label).clicked() {
-                                            requested_deletion = Some(scope);
-                                            ui.close_menu();
+                                            let (label, scope) = if own {
+                                                ("Delete for everyone", DeleteScope::Everyone)
+                                            } else {
+                                                ("Delete for me", DeleteScope::Local)
+                                            };
+                                            if ui.button(label).clicked() {
+                                                requested_deletion = Some(scope);
+                                                ui.close_menu();
+                                            }
                                         }
                                     },
                                 )
@@ -1583,7 +1597,12 @@ impl AppState {
                                 });
                             });
                         bubble.response.context_menu(|ui| {
-                            if message.deletion.is_none() {
+                            if message.deletion == Some(MessageDeletion::Local) {
+                                if ui.button("Restore message").clicked() {
+                                    requested_restore = true;
+                                    ui.close_menu();
+                                }
+                            } else if message.deletion.is_none() {
                                 let (label, scope) = if own {
                                     ("Delete for everyone", DeleteScope::Everyone)
                                 } else {
@@ -1619,7 +1638,9 @@ impl AppState {
                 );
             },
         );
-        if let Some(scope) = requested_deletion {
+        if requested_restore {
+            self.restore_chat_message(conversation_id, &message.message_id);
+        } else if let Some(scope) = requested_deletion {
             self.delete_chat_message(conversation_id, &message.message_id, scope);
         }
     }
@@ -1645,6 +1666,25 @@ impl AppState {
             conversation_id: conversation_id.to_owned(),
             message_id: message_id.to_owned(),
             scope,
+        });
+    }
+
+    fn restore_chat_message(&mut self, conversation_id: &str, message_id: &str) {
+        if let Some(message) = self
+            .chat
+            .timelines
+            .get_mut(conversation_id)
+            .and_then(|timeline| {
+                timeline
+                    .iter_mut()
+                    .find(|message| message.message_id == message_id)
+            })
+        {
+            message.deletion = None;
+        }
+        self.cmd(Command::RestoreChatMessage {
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
         });
     }
 
@@ -4206,6 +4246,10 @@ enum Command {
         message_id: String,
         scope: DeleteScope,
     },
+    RestoreChatMessage {
+        conversation_id: String,
+        message_id: String,
+    },
 }
 
 struct Worker {
@@ -4808,6 +4852,12 @@ impl Worker {
                 self.chat
                     .delete_message(conversation_id, message_id, scope)
                     .await;
+            }
+            Command::RestoreChatMessage {
+                conversation_id,
+                message_id,
+            } => {
+                self.chat.restore_message(conversation_id, message_id).await;
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {
