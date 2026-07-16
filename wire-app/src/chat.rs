@@ -34,6 +34,7 @@ pub const CHAT_ALPN: &[u8] = b"wire/chat-invite/1";
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_BYTES: usize = 256 * 1024;
 const MESSAGE_PREFIX: &[u8] = b"message/";
+const DELETION_PREFIX: &[u8] = b"deletion/";
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +76,20 @@ pub struct ChatMessage {
     pub sent_at: i64,
     pub body: String,
     pub nonce: u64,
+    #[serde(skip)]
+    pub deletion: Option<MessageDeletion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDeletion {
+    Local,
+    Everyone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteScope {
+    Local,
+    Everyone,
 }
 
 impl ChatMessage {
@@ -94,6 +109,7 @@ impl ChatMessage {
             sent_at,
             body,
             nonce,
+            deletion: None,
         }
     }
 
@@ -114,8 +130,39 @@ impl ChatMessage {
         if self.body.len() > MAX_MESSAGE_BYTES {
             bail!("message is larger than the 1 MiB safety cap");
         }
-        if self.message_id.is_empty() || self.author_id.is_empty() {
+        if !is_message_id(&self.message_id) || self.author_id.is_empty() {
             bail!("message identity is incomplete");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicatedDeletion {
+    version: u8,
+    message_id: String,
+    deleted_at: i64,
+}
+
+impl ReplicatedDeletion {
+    fn new(message_id: String) -> Self {
+        Self {
+            version: 1,
+            message_id,
+            deleted_at: now_millis(),
+        }
+    }
+
+    fn entry_key(&self) -> String {
+        format!("deletion/{}", self.message_id)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("unsupported deletion version {}", self.version);
+        }
+        if !is_message_id(&self.message_id) {
+            bail!("deletion has an invalid message id");
         }
         Ok(())
     }
@@ -196,6 +243,12 @@ struct ChatIndex {
     conversations: BTreeMap<String, StoredConversation>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LocalDeletionIndex {
+    #[serde(default)]
+    conversations: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatInvite {
     version: u8,
@@ -267,11 +320,12 @@ pub struct ChatService {
     author: AuthorId,
     root: PathBuf,
     index: ChatIndex,
+    local_deletions: LocalDeletionIndex,
     our_node_id: NodeId,
     invite_rx: async_channel::Receiver<IncomingInvite>,
-    doc_event_tx: async_channel::Sender<String>,
-    doc_event_rx: async_channel::Receiver<String>,
-    subscriptions: BTreeSet<String>,
+    doc_event_tx: async_channel::Sender<DocumentSignal>,
+    doc_event_rx: async_channel::Receiver<DocumentSignal>,
+    subscriptions: BTreeMap<String, String>,
     queued: VecDeque<ChatNotification>,
     retry: tokio::time::Interval,
     #[cfg(test)]
@@ -280,8 +334,17 @@ pub struct ChatService {
 
 pub(crate) enum ChatInput {
     Invite(IncomingInvite),
-    DocumentChanged(String),
+    Document(DocumentSignal),
     Retry,
+}
+
+#[derive(Debug)]
+pub(crate) enum DocumentSignal {
+    Changed(String),
+    SubscriptionEnded {
+        conversation_id: String,
+        document_id: String,
+    },
 }
 
 impl ChatService {
@@ -304,6 +367,7 @@ impl ChatService {
         let author = client.authors().default().await?;
         let (doc_event_tx, doc_event_rx) = async_channel::bounded(256);
         let index = load_index(&root.join("index.json"));
+        let local_deletions = load_local_deletions(&root.join("local-deletions.json"));
         let conversation_count = index.conversations.len();
         let mut service = Self {
             endpoint: endpoint.clone(),
@@ -312,11 +376,12 @@ impl ChatService {
             author,
             root,
             index,
+            local_deletions,
             our_node_id: endpoint.node_id(),
             invite_rx,
             doc_event_tx,
             doc_event_rx,
-            subscriptions: BTreeSet::new(),
+            subscriptions: BTreeMap::new(),
             queued: VecDeque::new(),
             retry: tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(30),
@@ -375,7 +440,7 @@ impl ChatService {
             incoming = self.invite_rx.recv() => ChatInput::Invite(
                 incoming.expect("chat invitation protocol channel closed")
             ),
-            changed = self.doc_event_rx.recv() => ChatInput::DocumentChanged(
+            changed = self.doc_event_rx.recv() => ChatInput::Document(
                 changed.expect("chat document event channel closed")
             ),
             _ = self.retry.tick() => ChatInput::Retry,
@@ -391,14 +456,41 @@ impl ChatService {
                     )));
                 }
             }
-            ChatInput::DocumentChanged(id) => {
-                if let Err(error) = self.publish_timeline(&id).await {
-                    return Some(ChatNotification::Error(format!(
-                        "Could not refresh chat: {error:#}"
-                    )));
+            ChatInput::Document(signal) => match signal {
+                DocumentSignal::Changed(id) => {
+                    if let Err(error) = self.publish_timeline(&id).await {
+                        return Some(ChatNotification::Error(format!(
+                            "Could not refresh chat: {error:#}"
+                        )));
+                    }
+                }
+                DocumentSignal::SubscriptionEnded {
+                    conversation_id,
+                    document_id,
+                } => {
+                    if self.subscriptions.get(&conversation_id) == Some(&document_id) {
+                        self.subscriptions.remove(&conversation_id);
+                        warn!(
+                            conversation = %log_id(&conversation_id),
+                            "chat document subscription stopped; reattaching"
+                        );
+                        if let Err(error) = self.open_and_publish(&conversation_id).await {
+                            return Some(ChatNotification::Error(format!(
+                                "Could not restore live chat updates: {error:#}"
+                            )));
+                        }
+                    }
+                }
+            },
+            ChatInput::Retry => {
+                self.retry_invites();
+                let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
+                for id in ids {
+                    if let Err(error) = self.open_and_publish(&id).await {
+                        warn!(conversation = %log_id(&id), "periodic chat reconciliation failed: {error:#}");
+                    }
                 }
             }
-            ChatInput::Retry => self.retry_invites(),
         }
         self.pop_notification()
     }
@@ -505,6 +597,53 @@ impl ChatService {
         }
     }
 
+    pub async fn delete_message(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        scope: DeleteScope,
+    ) {
+        let result = match scope {
+            DeleteScope::Local => self.delete_message_locally(&conversation_id, &message_id),
+            DeleteScope::Everyone => {
+                self.insert_replicated_deletion(&conversation_id, &message_id)
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => {
+                info!(
+                    conversation = %log_id(&conversation_id),
+                    message = %log_id(&message_id),
+                    ?scope,
+                    "message tombstone committed"
+                );
+                if let Err(error) = self.publish_timeline(&conversation_id).await {
+                    self.queued.push_back(ChatNotification::Error(format!(
+                        "Could not refresh deleted message: {error:#}"
+                    )));
+                }
+            }
+            Err(error) => {
+                warn!(
+                    conversation = %log_id(&conversation_id),
+                    message = %log_id(&message_id),
+                    ?scope,
+                    "failed to delete message: {error:#}"
+                );
+                if let Err(refresh_error) = self.publish_timeline(&conversation_id).await {
+                    warn!(
+                        conversation = %log_id(&conversation_id),
+                        "failed to roll back optimistic message deletion: {refresh_error:#}"
+                    );
+                }
+                self.queued.push_back(ChatNotification::Error(format!(
+                    "Could not delete message: {error:#}"
+                )));
+            }
+        }
+    }
+
     async fn create_conversation(
         &self,
         id: String,
@@ -595,8 +734,16 @@ impl ChatService {
         self.open_and_publish(&id).await?;
         info!(conversation = %log_id(&id), "chat invitation imported");
         for message in migrated {
+            let migrate_deletion = message.deletion == Some(MessageDeletion::Everyone);
             if let Err(error) = self.insert_message(&id, &message).await {
                 warn!(conversation = %log_id(&id), "failed to migrate a message to the canonical chat document: {error:#}");
+            } else if migrate_deletion {
+                if let Err(error) = self
+                    .insert_replicated_deletion(&id, &message.message_id)
+                    .await
+                {
+                    warn!(conversation = %log_id(&id), "failed to migrate a message deletion to the canonical chat document: {error:#}");
+                }
             }
         }
         Ok(())
@@ -610,23 +757,30 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let ticket = DocTicket::from_str(&stored.ticket)?;
+        let mut peers = ticket.nodes.clone();
         let document_id = NamespaceId::from_str(&stored.public.document_id)?;
         let doc = match self.docs.open(document_id).await {
             Ok(Some(doc)) => doc,
             _ => self.docs.import(ticket).await?,
         };
-        let peers = stored
+        for node in stored
             .public
             .members
             .iter()
             .filter_map(|value| NodeId::from_str(value).ok())
             .filter(|node| *node != self.our_node_id)
-            .map(NodeAddr::from)
-            .collect();
+        {
+            if !peers.iter().any(|addr| addr.node_id == node) {
+                peers.push(NodeAddr::from(node));
+            }
+        }
         doc.start_sync(peers).await?;
-        if self.subscriptions.insert(id.to_owned()) {
+        let document_id = document_id.to_string();
+        if self.subscriptions.get(id) != Some(&document_id) {
             info!(conversation = %log_id(id), "subscribed to chat document events");
             let mut events = doc.subscribe().await?;
+            self.subscriptions
+                .insert(id.to_owned(), document_id.clone());
             let tx = self.doc_event_tx.clone();
             let id = id.to_owned();
             tokio::spawn(async move {
@@ -634,19 +788,25 @@ impl ChatService {
                     match event {
                         Ok(LiveEvent::InsertLocal { .. }) => {
                             debug!(conversation = %log_id(&id), source = "local", "chat document changed");
-                            if tx.send(id.clone()).await.is_err() {
+                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
                                 break;
                             }
                         }
                         Ok(LiveEvent::InsertRemote { .. }) => {
                             debug!(conversation = %log_id(&id), source = "remote", "chat document changed");
-                            if tx.send(id.clone()).await.is_err() {
+                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
                                 break;
                             }
                         }
                         Ok(LiveEvent::ContentReady { .. }) | Ok(LiveEvent::PendingContentReady) => {
                             debug!(conversation = %log_id(&id), source = "content-ready", "chat document changed");
-                            if tx.send(id.clone()).await.is_err() {
+                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(LiveEvent::SyncFinished(_)) => {
+                            debug!(conversation = %log_id(&id), source = "sync-finished", "chat document changed");
+                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
                                 break;
                             }
                         }
@@ -657,6 +817,13 @@ impl ChatService {
                         }
                     }
                 }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = tx
+                    .send(DocumentSignal::SubscriptionEnded {
+                        conversation_id: id,
+                        document_id,
+                    })
+                    .await;
             });
         }
         self.publish_timeline(id).await
@@ -692,7 +859,7 @@ impl ChatService {
         let mut entries = doc
             .get_many(Query::key_prefix(MESSAGE_PREFIX).build())
             .await?;
-        let mut messages = BTreeMap::<String, ChatMessage>::new();
+        let mut messages = BTreeMap::<String, (ChatMessage, AuthorId)>::new();
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
@@ -713,12 +880,133 @@ impl ChatService {
             if message.validate().is_ok() {
                 messages
                     .entry(message.message_id.clone())
-                    .or_insert(message);
+                    .or_insert((message, entry.author()));
             }
         }
-        let mut messages: Vec<_> = messages.into_values().collect();
+
+        let mut deletion_entries = doc
+            .get_many(Query::key_prefix(DELETION_PREFIX).build())
+            .await?;
+        while let Some(entry) = deletion_entries.next().await {
+            let entry = entry?;
+            let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
+            if len == 0 || len > 16 * 1024 {
+                continue;
+            }
+            let Some(blob) = self.blobs.get(&entry.content_hash()).await? else {
+                continue;
+            };
+            if !blob.is_complete() {
+                continue;
+            }
+            let mut reader = blob.data_reader();
+            let bytes = reader.read_at(0, len).await?;
+            let Ok(deletion) = serde_json::from_slice::<ReplicatedDeletion>(&bytes) else {
+                continue;
+            };
+            if deletion.validate().is_err() {
+                continue;
+            }
+            if let Some((message, message_author)) = messages.get_mut(&deletion.message_id) {
+                if entry.author() == *message_author {
+                    message.deletion = Some(MessageDeletion::Everyone);
+                }
+            }
+        }
+
+        if let Some(locally_deleted) = self.local_deletions.conversations.get(&stored.public.id) {
+            for message_id in locally_deleted {
+                if let Some((message, _)) = messages.get_mut(message_id) {
+                    message.deletion = Some(MessageDeletion::Local);
+                }
+            }
+        }
+
+        let mut messages: Vec<_> = messages.into_values().map(|(message, _)| message).collect();
         messages.sort();
         Ok(messages)
+    }
+
+    fn delete_message_locally(&mut self, conversation_id: &str, message_id: &str) -> Result<()> {
+        if !self.index.conversations.contains_key(conversation_id) {
+            bail!("unknown conversation");
+        }
+        if !is_message_id(message_id) {
+            bail!("invalid message id");
+        }
+        let inserted = self
+            .local_deletions
+            .conversations
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(message_id.to_owned());
+        if let Err(error) = save_local_deletions(
+            &self.root.join("local-deletions.json"),
+            &self.local_deletions,
+        ) {
+            if inserted {
+                if let Some(message_ids) = self
+                    .local_deletions
+                    .conversations
+                    .get_mut(conversation_id)
+                {
+                    message_ids.remove(message_id);
+                    if message_ids.is_empty() {
+                        self.local_deletions.conversations.remove(conversation_id);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn insert_replicated_deletion(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        if !is_message_id(message_id) {
+            bail!("invalid message id");
+        }
+        let stored = self
+            .index
+            .conversations
+            .get(conversation_id)
+            .context("unknown conversation")?;
+        let messages = self.load_messages(stored).await?;
+        let message = messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .context("message is no longer available")?;
+        if message.author_id != self.our_node_id.to_string() {
+            bail!("only the author can delete a message for everyone");
+        }
+
+        let ticket = DocTicket::from_str(&stored.ticket)?;
+        let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+        let doc = match self.docs.open(document_id).await {
+            Ok(Some(doc)) => doc,
+            _ => self.docs.import(ticket).await?,
+        };
+        let mut authored_entries = doc
+            .get_many(
+                Query::author(self.author)
+                    .key_exact(message.entry_key())
+                    .build(),
+            )
+            .await?;
+        if authored_entries.next().await.transpose()?.is_none() {
+            bail!("the local identity did not author this message");
+        }
+        let deletion = ReplicatedDeletion::new(message_id.to_owned());
+        doc.set_bytes(
+            self.author,
+            deletion.entry_key(),
+            serde_json::to_vec(&deletion)?,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn insert_message(&self, conversation_id: &str, message: &ChatMessage) -> Result<()> {
@@ -840,6 +1128,13 @@ fn hex_bytes(bytes: &[u8]) -> String {
     result
 }
 
+fn is_message_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn load_index(path: &Path) -> ChatIndex {
     std::fs::read(path)
         .ok()
@@ -847,7 +1142,22 @@ fn load_index(path: &Path) -> ChatIndex {
         .unwrap_or_default()
 }
 
+fn load_local_deletions(path: &Path) -> LocalDeletionIndex {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 fn save_index(path: &Path, index: &ChatIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(index)?)?;
+    Ok(())
+}
+
+fn save_local_deletions(path: &Path, index: &LocalDeletionIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -881,6 +1191,16 @@ mod tests {
         assert_ne!(first.entry_key(), second.entry_key());
         assert!(first.entry_key().starts_with("message/"));
         assert!(first.validate().is_ok());
+    }
+
+    #[test]
+    fn deletion_state_is_never_embedded_in_the_message_blob() {
+        let mut message = ChatMessage::new(node(1), "sensitive text".to_owned());
+        message.deletion = Some(MessageDeletion::Local);
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let decoded: ChatMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.deletion, None);
+        assert!(!String::from_utf8(encoded).unwrap().contains("deletion"));
     }
 
     #[test]
@@ -942,6 +1262,29 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_deletion(
+        service: &mut ChatService,
+        message_id: &str,
+        expected: MessageDeletion,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Conversation { messages, .. } =
+                    service.next_notification().await
+                {
+                    if messages.iter().any(|message| {
+                        message.message_id == message_id && message.deletion == Some(expected)
+                    }) {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for replicated message deletion")?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_exchange_and_reload_messages_without_calls() -> Result<()> {
         let _ = tracing_subscriber::fmt()
@@ -965,13 +1308,78 @@ mod tests {
             .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
             .await?;
         let outbound = ChatMessage::new(left_endpoint.node_id(), "offline from calls".to_owned());
-        left.send_message(conversation_id, outbound).await;
+        let outbound_id = outbound.message_id.clone();
+        left.send_message(conversation_id.clone(), outbound).await;
         wait_for_body(&mut right, "offline from calls").await?;
         assert_eq!(
             right.invite_attempts.load(Ordering::Relaxed),
             0,
             "accepting an invite must not immediately echo another invite"
         );
+
+        left.delete_message(
+            conversation_id.clone(),
+            outbound_id.clone(),
+            DeleteScope::Everyone,
+        )
+        .await;
+        wait_for_deletion(&mut right, &outbound_id, MessageDeletion::Everyone).await?;
+
+        let document_id = right
+            .index
+            .conversations
+            .get(&conversation_id)
+            .context("right replica did not import the conversation")?
+            .public
+            .document_id
+            .clone();
+        let _ = right
+            .process_input(ChatInput::Document(DocumentSignal::SubscriptionEnded {
+                conversation_id: conversation_id.clone(),
+                document_id: document_id.clone(),
+            }))
+            .await;
+        assert_eq!(
+            right.subscriptions.get(&conversation_id),
+            Some(&document_id),
+            "an ended live subscription must be reattached without restarting"
+        );
+
+        let later = ChatMessage::new(left_endpoint.node_id(), "later live message".to_owned());
+        let later_id = later.message_id.clone();
+        left.send_message(conversation_id.clone(), later).await;
+        wait_for_body(&mut right, "later live message").await?;
+
+        right
+            .delete_message(
+                conversation_id.clone(),
+                later_id.clone(),
+                DeleteScope::Local,
+            )
+            .await;
+        let right_stored = right.index.conversations[&conversation_id].clone();
+        let right_messages = right.load_messages(&right_stored).await?;
+        assert_eq!(
+            right_messages
+                .iter()
+                .find(|message| message.message_id == later_id)
+                .and_then(|message| message.deletion),
+            Some(MessageDeletion::Local)
+        );
+        let left_stored = left.index.conversations[&conversation_id].clone();
+        let left_messages = left.load_messages(&left_stored).await?;
+        assert_eq!(
+            left_messages
+                .iter()
+                .find(|message| message.message_id == later_id)
+                .and_then(|message| message.deletion),
+            None,
+            "a local deletion must never replicate"
+        );
+
+        let reply = ChatMessage::new(right_endpoint.node_id(), "live reply".to_owned());
+        right.send_message(conversation_id.clone(), reply).await;
+        wait_for_body(&mut left, "live reply").await?;
 
         left_router.shutdown().await?;
         right_router.shutdown().await?;
@@ -985,8 +1393,9 @@ mod tests {
         left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
         right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
 
-        wait_for_body(&mut left, "offline from calls").await?;
-        wait_for_body(&mut right, "offline from calls").await?;
+        wait_for_deletion(&mut left, &outbound_id, MessageDeletion::Everyone).await?;
+        wait_for_deletion(&mut right, &outbound_id, MessageDeletion::Everyone).await?;
+        wait_for_deletion(&mut right, &later_id, MessageDeletion::Local).await?;
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())

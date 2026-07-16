@@ -27,8 +27,8 @@ use wire::{
 
 use crate::{
     chat::{
-        self, ChatConversation, ChatMessage, ChatNotification, ConversationKind, DeliveryState,
-        RetentionPolicy,
+        self, ChatConversation, ChatMessage, ChatNotification, ConversationKind, DeleteScope,
+        DeliveryState, MessageDeletion, RetentionPolicy,
     },
     dev_pair::DevPairState,
     resource_monitor::ResourceMonitor,
@@ -689,6 +689,33 @@ impl AppState {
                     if auto_share {
                         info!("dev call automatically starting the explicit test share");
                         self.cmd(Command::ToggleSharing { enabled: true });
+                        if let Some(cycles) = std::env::var("WIRE_DEV_SHARE_TOGGLE_CYCLES")
+                            .ok()
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .filter(|cycles| *cycles > 0)
+                        {
+                            let command_tx = self.worker.command_tx.clone();
+                            std::thread::spawn(move || {
+                                for cycle in 0..cycles {
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    if command_tx
+                                        .send_blocking(Command::ToggleSharing { enabled: false })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    if cycle + 1 < cycles {
+                                        std::thread::sleep(Duration::from_secs(1));
+                                        if command_tx
+                                            .send_blocking(Command::ToggleSharing { enabled: true })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
                 Event::VolumeHandle(node_id, volume) => {
@@ -1413,16 +1440,18 @@ impl AppState {
                         .cloned()
                         .unwrap_or_default();
                     let now = chat::now_millis();
+                    let retention = self.chat_retention;
                     egui::ScrollArea::vertical()
                         .id_salt(("chat-timeline", &conversation.id))
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             ui.add_space(8.0);
-                            for message in timeline.into_iter().filter(|message| {
-                                self.chat_retention.includes(message.sent_at, now)
-                            }) {
-                                self.ui_chat_message(ui, pal, &message);
+                            for message in timeline
+                                .into_iter()
+                                .filter(|message| retention.includes(message.sent_at, now))
+                            {
+                                self.ui_chat_message(ui, pal, &conversation.id, &message);
                                 ui.add_space(9.0);
                             }
                         });
@@ -1460,7 +1489,13 @@ impl AppState {
         });
     }
 
-    fn ui_chat_message(&self, ui: &mut Ui, pal: &Palette, message: &ChatMessage) {
+    fn ui_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+    ) {
         let own = self
             .our_node_id
             .is_some_and(|node| message.author_id == node.to_string());
@@ -1484,6 +1519,7 @@ impl AppState {
             1.0
         };
         let time = format_chat_time(message.sent_at);
+        let mut requested_deletion = None;
         ui.with_layout(
             if own {
                 Layout::right_to_left(Align::Min)
@@ -1495,12 +1531,34 @@ impl AppState {
                     Vec2::new(ui.available_width().min(680.0), 0.0),
                     Layout::top_down(if own { Align::Max } else { Align::Min }),
                     |ui| {
-                        ui.label(
-                            RichText::new(format!("{author} · {time}"))
-                                .color(pal.dim.gamma_multiply(opacity))
-                                .size(ui_font_size(10.5)),
-                        );
-                        Frame::new()
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{author} · {time}"))
+                                    .color(pal.dim.gamma_multiply(opacity))
+                                    .size(ui_font_size(10.5)),
+                            );
+                            if message.deletion.is_none() {
+                                ui.menu_button(
+                                    RichText::new(ph::DOTS_THREE)
+                                        .color(pal.dim)
+                                        .size(ui_font_size(12.0)),
+                                    |ui| {
+                                        let (label, scope) = if own {
+                                            ("Delete for everyone", DeleteScope::Everyone)
+                                        } else {
+                                            ("Delete for me", DeleteScope::Local)
+                                        };
+                                        if ui.button(label).clicked() {
+                                            requested_deletion = Some(scope);
+                                            ui.close_menu();
+                                        }
+                                    },
+                                )
+                                .response
+                                .on_hover_text("Message actions");
+                            }
+                        });
+                        let bubble = Frame::new()
                             .fill(if own {
                                 chat_selected_surface(pal).gamma_multiply(opacity)
                             } else {
@@ -1511,21 +1569,42 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_max_width(640.0);
-                                ui.label(
-                                    RichText::new(&message.body)
-                                        .color(pal.text.gamma_multiply(opacity))
-                                        .size(ui_font_size(13.0)),
-                                );
+                                let body = RichText::new(match message.deletion {
+                                    Some(MessageDeletion::Local) => "You deleted this message",
+                                    Some(MessageDeletion::Everyone) => "This message was deleted",
+                                    None => &message.body,
+                                })
+                                .color(pal.text.gamma_multiply(opacity))
+                                .size(ui_font_size(13.0));
+                                ui.label(if message.deletion.is_some() {
+                                    body.italics()
+                                } else {
+                                    body
+                                });
                             });
-                        match state {
-                            DeliveryState::Pending => {
+                        bubble.response.context_menu(|ui| {
+                            if message.deletion.is_none() {
+                                let (label, scope) = if own {
+                                    ("Delete for everyone", DeleteScope::Everyone)
+                                } else {
+                                    ("Delete for me", DeleteScope::Local)
+                                };
+                                if ui.button(label).clicked() {
+                                    requested_deletion = Some(scope);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        match (message.deletion, state) {
+                            (Some(_), _) => {}
+                            (None, DeliveryState::Pending) => {
                                 ui.label(
                                     RichText::new("syncing…")
                                         .color(pal.dim2)
                                         .size(ui_font_size(9.5)),
                                 );
                             }
-                            DeliveryState::Failed => {
+                            (None, DeliveryState::Failed) => {
                                 ui.label(
                                     RichText::new(
                                         detail.unwrap_or_else(|| "failed to send".to_owned()),
@@ -1534,12 +1613,39 @@ impl AppState {
                                     .size(ui_font_size(9.5)),
                                 );
                             }
-                            DeliveryState::Synced => {}
+                            (None, DeliveryState::Synced) => {}
                         }
                     },
                 );
             },
         );
+        if let Some(scope) = requested_deletion {
+            self.delete_chat_message(conversation_id, &message.message_id, scope);
+        }
+    }
+
+    fn delete_chat_message(&mut self, conversation_id: &str, message_id: &str, scope: DeleteScope) {
+        if let Some(message) = self
+            .chat
+            .timelines
+            .get_mut(conversation_id)
+            .and_then(|timeline| {
+                timeline
+                    .iter_mut()
+                    .find(|message| message.message_id == message_id)
+            })
+        {
+            message.deletion = Some(match scope {
+                DeleteScope::Local => MessageDeletion::Local,
+                DeleteScope::Everyone => MessageDeletion::Everyone,
+            });
+        }
+        self.chat.delivery.remove(message_id);
+        self.cmd(Command::DeleteChatMessage {
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            scope,
+        });
     }
 
     fn send_chat_composer(&mut self, conversation_id: &str) {
@@ -4095,6 +4201,11 @@ enum Command {
         conversation_id: String,
         message: ChatMessage,
     },
+    DeleteChatMessage {
+        conversation_id: String,
+        message_id: String,
+        scope: DeleteScope,
+    },
 }
 
 struct Worker {
@@ -4117,6 +4228,8 @@ struct Worker {
     video_peers: BTreeMap<NodeId, VideoPeerTasks>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
     capture_stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    capture_preview_task: Option<tokio::task::JoinHandle<()>>,
+    capture_idle_trim_task: Option<tokio::task::JoinHandle<()>>,
     sharing_active: bool,
     muted: bool,
     deafened: bool,
@@ -4226,6 +4339,8 @@ impl Worker {
             video_peers: Default::default(),
             capture_thread: None,
             capture_stop_flag: None,
+            capture_preview_task: None,
+            capture_idle_trim_task: None,
             sharing_active: false,
             muted: false,
             deafened: false,
@@ -4530,6 +4645,9 @@ impl Worker {
     }
 
     fn start_capture(&mut self) -> Result<()> {
+        if let Some(trim_task) = self.capture_idle_trim_task.take() {
+            trim_task.abort();
+        }
         let config = self.video_config;
         let target_w = config.resolution.width();
         let target_h = config.resolution.height();
@@ -4539,7 +4657,10 @@ impl Worker {
             async_channel::bounded::<crate::screen_capture::PreviewUpdate>(4);
         let event_tx = self.event_tx.clone();
         let callback = self.update_callback.clone();
-        tokio::task::spawn(async move {
+        if let Some(stale_task) = self.capture_preview_task.take() {
+            stale_task.abort();
+        }
+        self.capture_preview_task = Some(tokio::task::spawn(async move {
             while let Ok(update) = preview_rx.recv().await {
                 let _ = event_tx
                     .send(Event::PreviewFrame {
@@ -4554,7 +4675,7 @@ impl Worker {
                     cb();
                 }
             }
-        });
+        }));
 
         let thread = crate::screen_capture::start(
             config,
@@ -4574,10 +4695,6 @@ impl Worker {
             config.effective_bitrate() / 1000,
             self.video_peers.len()
         );
-        let event_tx = self.event_tx.clone();
-        tokio::task::spawn(async move {
-            let _ = event_tx.send(Event::SharingToggled(true)).await;
-        });
         Ok(())
     }
 
@@ -4591,12 +4708,40 @@ impl Worker {
         self.capture_stop_flag = None;
     }
 
-    async fn stop_capture(&mut self) {
+    async fn stop_capture_pipeline(&mut self) {
         self.stop_capture_thread();
+        if let Some(preview_task) = self.capture_preview_task.take() {
+            preview_task.abort();
+            let _ = preview_task.await;
+        }
+        info!("screen capture pipeline fully stopped");
+    }
+
+    async fn stop_capture(&mut self) {
+        self.stop_capture_pipeline().await;
         self.sharing_active = false;
         self.finish_all_video_send().await;
-        let event_tx = self.event_tx.clone();
-        let _ = event_tx.send(Event::SharingToggled(false)).await;
+        let _ = self.emit(Event::SharingToggled(false)).await;
+        self.schedule_idle_working_set_trim();
+    }
+
+    fn schedule_idle_working_set_trim(&mut self) {
+        const IDLE_TRIM_DELAY: Duration = Duration::from_secs(5);
+
+        if let Some(trim_task) = self.capture_idle_trim_task.take() {
+            trim_task.abort();
+        }
+        self.capture_idle_trim_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(IDLE_TRIM_DELAY).await;
+            #[cfg(target_os = "windows")]
+            match trim_process_working_set() {
+                Ok(()) => info!(
+                    "released inactive screen-sharing pages after {:?} idle",
+                    IDLE_TRIM_DELAY
+                ),
+                Err(error) => warn!("could not release inactive screen-sharing pages: {error:#}"),
+            }
+        }));
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<()> {
@@ -4613,7 +4758,7 @@ impl Worker {
             Command::SetVideoConfig { video_config } => {
                 let restart_capture = self.sharing_active;
                 if restart_capture {
-                    self.stop_capture_thread();
+                    self.stop_capture_pipeline().await;
                 }
                 self.video_config = video_config;
                 if restart_capture {
@@ -4626,6 +4771,7 @@ impl Worker {
                     let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
                     self.start_capture()?;
+                    self.emit(Event::SharingToggled(true)).await?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture().await;
                 }
@@ -4653,6 +4799,15 @@ impl Worker {
                 message,
             } => {
                 self.chat.send_message(conversation_id, message).await;
+            }
+            Command::DeleteChatMessage {
+                conversation_id,
+                message_id,
+                scope,
+            } => {
+                self.chat
+                    .delete_message(conversation_id, message_id, scope)
+                    .await;
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {
@@ -4723,7 +4878,6 @@ async fn run_video_send(
         let mut skipped = 0u64;
         let mut resyncs = 0u64;
         let mut keyframe_gate = transport::KeyframeGate::waiting();
-        let mut replace_stream = false;
         let mut window_sent = 0u64;
         let mut window_bytes = 0u64;
         let mut window_send_ms = Vec::with_capacity(300);
@@ -4733,11 +4887,14 @@ async fn run_video_send(
                 Ok(frame) => frame,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     skipped += count;
+                    // A broadcast lag means this sender missed encoded pictures, not
+                    // that the QUIC stream itself is broken. Keep the existing stream
+                    // and resume at an IDR: an IDR resets the receiver's H.264 reference
+                    // chain without forcing it to recreate its decoder and GPU surfaces.
                     keyframe_gate.require_keyframe();
-                    replace_stream = true;
                     let _ = keyframe_tx.send(());
                     warn!(
-                        "video send to {} lagged by {} frame(s); waiting for IDR",
+                        "video send to {} lagged by {} frame(s); recovering on the existing stream at the next IDR",
                         node_id.fmt_short(),
                         count
                     );
@@ -4753,24 +4910,6 @@ async fn run_video_send(
             if was_waiting {
                 resyncs += 1;
             }
-            if replace_stream {
-                // Open the replacement before resetting the old stream. If the
-                // connection cannot allocate a new stream, the peer keeps the
-                // old one instead of being stranded on a permanent last frame.
-                let (new_send, recv) = conn.transport().open_bi().await?;
-                let _ = new_send.set_priority(10);
-                tokio::spawn(drain_quic_recv(recv));
-                let mut old_send = std::mem::replace(&mut send, new_send);
-                let _ = old_send.reset(VIDEO_STREAM_RESET_CODE);
-                replace_stream = false;
-                info!(
-                    "replaced video stream to {} at IDR sequence {} ({} skipped, {} resyncs)",
-                    node_id.fmt_short(),
-                    frame.sequence,
-                    skipped,
-                    resyncs
-                );
-            }
             let send_start = std::time::Instant::now();
             if let Err(e) = transport::send_frame(&mut send, frame.as_ref()).await {
                 info!("video send to {} failed: {e:?}", node_id.fmt_short());
@@ -4785,11 +4924,13 @@ async fn run_video_send(
                 conn.transport().rtt().saturating_mul(3),
             );
             if send_elapsed > latency_budget {
+                // Congestion is recoverable in-band. Replacing a healthy QUIC stream
+                // here used to create a decoder/presenter allocation storm on the peer
+                // during sustained screen sharing.
                 keyframe_gate.require_keyframe();
-                replace_stream = true;
                 let _ = keyframe_tx.send(());
                 warn!(
-                    "video send to {} took {:.0}ms for {} bytes (budget {:.0}ms); scheduling frame-boundary resync",
+                    "video send to {} took {:.0}ms for {} bytes (budget {:.0}ms); recovering at the next IDR without replacing the stream",
                     node_id.fmt_short(),
                     send_elapsed.as_secs_f64() * 1000.0,
                     frame.data.len(),
@@ -4854,12 +4995,35 @@ async fn drain_quic_recv(mut recv: impl tokio::io::AsyncRead + Unpin + Send + 's
     }
 }
 
+#[cfg(target_os = "windows")]
+fn trim_process_working_set() -> Result<()> {
+    use windows::Win32::System::{
+        ProcessStatus::EmptyWorkingSet,
+        Threading::GetCurrentProcess,
+    };
+
+    unsafe { EmptyWorkingSet(GetCurrentProcess()) }
+        .ok()
+        .context("EmptyWorkingSet failed")
+}
+
 async fn run_video_recv(
     conn: RtcConnection,
     node_id: NodeId,
     event_tx: async_channel::Sender<Event>,
     callback: Option<UpdateCallback>,
 ) {
+    const DECODER_IDLE_GRACE: Duration = Duration::from_secs(5);
+
+    // Keep one decoder across brief share restarts. Media Foundation and the GPU
+    // driver retain sizeable allocator caches when a decoder is destroyed and
+    // immediately recreated, which makes repeated button presses look like a
+    // leak even though every COM object is eventually released. The UI is told
+    // about the stream end immediately; only the decoder itself gets a short
+    // idle grace before it is released. It remains lazy so a voice-only call
+    // does not allocate any video resources.
+    let mut worker = None;
+    let mut decoder_idle_deadline: Option<tokio::time::Instant> = None;
     loop {
         let accept = conn.transport().accept_bi();
         tokio::select! {
@@ -4873,23 +5037,60 @@ async fn run_video_recv(
                 }
                 break;
             }
+            _ = wait_until_optional(decoder_idle_deadline) => {
+                worker = None;
+                decoder_idle_deadline = None;
+                info!(
+                    "released idle video decoder for {} after {:?}",
+                    node_id.fmt_short(),
+                    DECODER_IDLE_GRACE
+                );
+                #[cfg(target_os = "windows")]
+                match trim_process_working_set() {
+                    Ok(()) => info!(
+                        "released inactive video receive pages for {}",
+                        node_id.fmt_short()
+                    ),
+                    Err(error) => warn!(
+                        "could not release inactive video receive pages for {}: {error:#}",
+                        node_id.fmt_short()
+                    ),
+                }
+            }
             stream = accept => {
                 match stream {
                     Ok((_send, mut recv)) => {
                         info!("receiving video from {}", node_id.fmt_short());
-                        match recv_video_on_stream(
+                        if worker.is_none() {
+                            match spawn_video_decode_worker(
+                                node_id,
+                                event_tx.clone(),
+                                callback.clone(),
+                            ) {
+                                Ok(new_worker) => worker = Some(new_worker),
+                                Err(error) => {
+                                    warn!(
+                                        "could not start video decoder for {}: {error:?}",
+                                        node_id.fmt_short()
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        let stream_result = recv_video_on_stream(
                             &mut recv,
                             node_id,
-                            &event_tx,
-                            callback.as_ref(),
+                            worker.as_ref().expect("video decoder was initialized"),
                         )
-                        .await
-                        {
+                        .await;
+                        match stream_result {
                             Ok(()) => {
                                 info!(
-                                    "video stream from {} ended cleanly; waiting for another share",
-                                    node_id.fmt_short()
+                                    "video stream from {} ended cleanly; retaining decoder for {:?}",
+                                    node_id.fmt_short(),
+                                    DECODER_IDLE_GRACE
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                                 notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                             Err(error) if is_video_stream_replacement_error(&error) => {
@@ -4897,12 +5098,14 @@ async fn run_video_recv(
                                     "video stream from {} was replaced at a frame boundary; waiting for the resync stream",
                                     node_id.fmt_short()
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                             }
                             Err(error) => {
                                 warn!(
                                     "video stream from {} failed: {error:?}; waiting for a replacement stream",
                                     node_id.fmt_short()
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                                 notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                         }
@@ -4916,6 +5119,30 @@ async fn run_video_recv(
         }
     }
     notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+}
+
+async fn wait_until_optional(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn spawn_video_decode_worker(
+    node_id: NodeId,
+    event_tx: async_channel::Sender<Event>,
+    callback: Option<UpdateCallback>,
+) -> Result<VideoDecodeWorker> {
+    VideoDecodeWorker::spawn(move |frame| {
+        if event_tx
+            .try_send(Event::VideoFrame { node_id, frame })
+            .is_ok()
+        {
+            if let Some(callback) = &callback {
+                callback();
+            }
+        }
+    })
 }
 
 fn notify_video_stream_ended(
@@ -4938,21 +5165,8 @@ fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {
 async fn recv_video_on_stream(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     node_id: NodeId,
-    event_tx: &async_channel::Sender<Event>,
-    callback: Option<&UpdateCallback>,
+    worker: &VideoDecodeWorker,
 ) -> Result<()> {
-    let frame_event_tx = event_tx.clone();
-    let frame_callback = callback.cloned();
-    let worker = VideoDecodeWorker::spawn(move |frame| {
-        if frame_event_tx
-            .try_send(Event::VideoFrame { node_id, frame })
-            .is_ok()
-        {
-            if let Some(cb) = &frame_callback {
-                cb();
-            }
-        }
-    })?;
     let mut received = 0u64;
     let mut received_bytes = 0u64;
     let mut received_age_ms = 0.0;
@@ -5032,6 +5246,5 @@ async fn recv_video_on_stream(
         }
     }
 
-    drop(worker);
     Ok(())
 }

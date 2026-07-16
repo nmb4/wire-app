@@ -396,6 +396,14 @@ impl GpuNv12Frames {
     }
 }
 
+impl Drop for GpuNv12Frames {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.allocator.UninitializeSampleAllocator();
+        }
+    }
+}
+
 pub struct GpuVideoProcessor {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
