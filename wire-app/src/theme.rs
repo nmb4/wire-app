@@ -6,8 +6,9 @@
 
 use eframe::egui;
 use egui::{
-    text::{LayoutJob, TextFormat}, Color32, CornerRadius, FontData, FontFamily, FontId, FontTweak,
-    Margin, RichText, Stroke, TextStyle, Vec2,
+    text::{LayoutJob, TextFormat},
+    Color32, CornerRadius, FontData, FontFamily, FontId, FontTweak, Margin, RichText, Stroke,
+    TextStyle, Vec2,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 // uppercase display font family used for headers / big text
@@ -313,25 +314,30 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
     visuals.widgets.noninteractive.weak_bg_fill = pal.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.line);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text2);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
     visuals.widgets.inactive.weak_bg_fill = pal.panel2;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.line);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.hovered.bg_fill = pal.panel2;
     visuals.widgets.hovered.weak_bg_fill = pal.panel2;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.line_br);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.active.bg_fill = pal.panel2;
     visuals.widgets.active.weak_bg_fill = pal.panel2;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, pal.line_br);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, pal.accent);
+    visuals.widgets.active.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.open.bg_fill = pal.panel2;
     visuals.widgets.open.weak_bg_fill = pal.panel2;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, pal.line_br);
+    visuals.widgets.open.corner_radius = CornerRadius::same(10);
 
     visuals.selection.bg_fill = pal.accent_dim;
     visuals.window_stroke = Stroke::new(1.0, pal.line);
@@ -408,11 +414,6 @@ pub fn theme_badge(ui: &mut egui::Ui, pal: &Palette, name: &str) -> egui::Respon
                         .color(pal.text2)
                         .size(ui_font_size(12.5)),
                 );
-                ui.label(
-                    RichText::new("(T)")
-                        .color(pal.dim2)
-                        .size(ui_font_size(11.0)),
-                );
             });
         })
         .response
@@ -434,7 +435,7 @@ pub fn action_button(
         egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(6))
+            .corner_radius(CornerRadius::same(10))
             .min_size(Vec2::new(0.0, 34.0)),
     )
 }
@@ -455,7 +456,7 @@ pub fn action_button_full(
         egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(6)),
+            .corner_radius(CornerRadius::same(10)),
     )
 }
 
@@ -507,25 +508,26 @@ pub fn toolbar_button(
         egui::Button::new(content)
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(7))
+            .corner_radius(CornerRadius::same(10))
             .min_size(Vec2::new(0.0, 32.0)),
     )
 }
-pub fn ghost_icon_button(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    glyph: &str,
-) -> egui::Response {
+pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
     if response.hovered() || response.has_focus() {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), pal.panel2);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(10), pal.panel2);
     }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph,
         sans(18.0),
-        if response.hovered() { pal.text } else { pal.text2 },
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.text2
+        },
     );
     response
 }

@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.2.5"
+version = "0.3.2"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -25,8 +25,13 @@ egui = { version = "0.31.0", default-features = false, features = [
 egui-phosphor = "0.9"
 lucide-icons = "1.24"
 iroh = { version = "0.33.0", default-features = false }
+iroh-blobs = { version = "0.33.1", default-features = false, features = ["fs-store", "net_protocol", "rpc"] }
+iroh-docs = { version = "0.33.0", default-features = false, features = ["engine", "rpc"] }
+iroh-gossip = { version = "0.33.0", default-features = false, features = ["net"] }
+iroh-io = "0.6.2"
 wire = { version = "0.1.0", path = "../wire", default-features = false }
 n0-future = "0.1.2"
+futures-lite = "2.6"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "io-util"] }
 xcap = "0.4"
 image = "0.25"
@@ -78,3 +83,6 @@ audio-processing = ["wire/audio-processing"]
 [package.metadata.bundle]
 name = "Wire"
 identifier = "live.stardive.wire"
+
+[dev-dependencies]
+tempfile = "3"
