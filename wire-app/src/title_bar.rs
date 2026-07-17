@@ -172,7 +172,7 @@ fn title_bar_icon_button(
     if active {
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
-            Stroke::new(2.0, pal.accent),
+            Stroke::new(2.0_f32, pal.accent),
         );
     }
     ui.painter().text(

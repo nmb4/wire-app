@@ -154,6 +154,7 @@ struct AppState {
     video_frames: BTreeMap<NodeId, VideoFrameState>,
     focused_stream: Option<StreamSource>,
     sharing_active: bool,
+    capture_error: Option<String>,
     preview: Option<PreviewState>,
     friends: Vec<Friend>,
     new_friend_name: String,
@@ -174,6 +175,7 @@ struct AppState {
     dev_auto_share: bool,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 enum UpdateStatus {
     Idle,
     Checking,
@@ -183,6 +185,7 @@ enum UpdateStatus {
     Error(String),
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 enum UpdateMessage {
     CheckFinished(anyhow::Result<Option<ReleaseInfo>>),
     DownloadFinished(anyhow::Result<PathBuf>),
@@ -303,7 +306,7 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_first_update {
             self.is_first_update = false;
             let repaint_ctx = ctx.clone();
@@ -321,7 +324,7 @@ impl eframe::App for App {
             .show(ctx, |_ui| {});
 
         #[cfg(windows)]
-        let parent_hwnd = native_parent_hwnd(frame);
+        let parent_hwnd = native_parent_hwnd(_frame);
         self.state.update(
             ctx,
             &mut self.always_on_top,
@@ -371,6 +374,7 @@ impl App {
             video_frames: Default::default(),
             focused_stream: None,
             sharing_active: false,
+            capture_error: None,
             preview: None,
             friends: load_friends(),
             new_friend_name: String::new(),
@@ -491,6 +495,7 @@ impl AppState {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn start_update_check(&mut self, ctx: &egui::Context) {
         if matches!(self.update_status, UpdateStatus::Checking) {
             return;
@@ -675,6 +680,9 @@ impl AppState {
                 }
                 Event::SharingToggled(active) => {
                     self.sharing_active = active;
+                    if active {
+                        self.capture_error = None;
+                    }
                     self.reset_home_scroll = true;
                     if !active {
                         self.preview = None;
@@ -682,6 +690,12 @@ impl AppState {
                             self.focused_stream = None;
                         }
                     }
+                }
+                Event::SharingFailed(message) => {
+                    self.sharing_active = false;
+                    self.preview = None;
+                    self.capture_error = Some(message);
+                    self.reset_home_scroll = true;
                 }
                 Event::PreviewFrame {
                     width,
@@ -1028,8 +1042,11 @@ impl AppState {
 
     fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette) {
         let rect = ui.max_rect();
-        ui.painter()
-            .hline(rect.x_range(), rect.top() - 8.0, Stroke::new(1.0, pal.line));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top() - 8.0,
+            Stroke::new(1.0_f32, pal.line),
+        );
         let active_calls = self
             .calls
             .values()
@@ -1281,7 +1298,7 @@ impl AppState {
     fn ui_empty_peer_tile(&self, ui: &mut Ui, pal: &Palette) {
         Frame::new()
             .fill(pal.panel)
-            .stroke(Stroke::new(1.0, pal.line))
+            .stroke(Stroke::new(1.0_f32, pal.line))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(16, 10))
             .show(ui, |ui| {
@@ -1294,7 +1311,7 @@ impl AppState {
                     ui.painter().circle_stroke(
                         icon_rect.center(),
                         17.0,
-                        Stroke::new(1.0, pal.line_br),
+                        Stroke::new(1.0_f32, pal.line_br),
                     );
                     ui.painter().text(
                         icon_rect.center(),
@@ -1333,7 +1350,7 @@ impl AppState {
         Frame::new()
             .fill(pal.panel)
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 if matches!(state, CallState::Active) {
                     pal.line_br
                 } else {
@@ -1410,6 +1427,7 @@ impl AppState {
             });
     }
 
+    #[allow(dead_code)]
     fn ui_sidebar(&mut self, ui: &mut Ui) {
         self.ui_identity_card(ui);
         ui.add_space(12.0);
@@ -1596,6 +1614,7 @@ impl AppState {
         self.new_friend_id.clear();
     }
 
+    #[allow(dead_code)]
     fn ui_calls_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
         section_card(ui, &pal, "Calls", |ui| {
@@ -1613,7 +1632,7 @@ impl AppState {
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(10.0)
                     .stroke(Stroke::new(
-                        1.0,
+                        1.0_f32,
                         ui.visuals().widgets.noninteractive.bg_stroke.color,
                     ))
                     .show(ui, |ui| {
@@ -1679,6 +1698,7 @@ impl AppState {
         });
     }
 
+    #[allow(dead_code)]
     fn ui_sharing_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
         section_card(ui, &pal, "Screen sharing", |ui| {
@@ -1855,13 +1875,22 @@ impl AppState {
             ui.painter().rect_stroke(
                 area,
                 corner_radius,
-                Stroke::new(1.0, pal.line),
+                Stroke::new(1.0_f32, pal.line),
                 egui::StrokeKind::Inside,
             );
         }
 
         let roomy = area.height() >= 150.0;
-        let block_height = if roomy { 142.0 } else { 70.0 };
+        let has_capture_error = self.capture_error.is_some();
+        let block_height = if roomy {
+            if has_capture_error {
+                190.0
+            } else {
+                142.0
+            }
+        } else {
+            70.0
+        };
         let block_size = Vec2::new((area.width() - 24.0).min(440.0), block_height);
         let block_rect = egui::Rect::from_center_size(area.center(), block_size);
 
@@ -1871,12 +1900,17 @@ impl AppState {
                     ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
                 ui.painter()
                     .circle_filled(icon_rect.center(), 20.0, pal.panel2);
-                ui.painter()
-                    .circle_stroke(icon_rect.center(), 20.0, Stroke::new(1.0, pal.line_br));
+                ui.painter().circle_stroke(
+                    icon_rect.center(),
+                    20.0,
+                    Stroke::new(1.0_f32, pal.line_br),
+                );
                 ui.painter().text(
                     icon_rect.center(),
                     Align2::CENTER_CENTER,
-                    if self.sharing_active {
+                    if has_capture_error {
+                        ph::WARNING
+                    } else if self.sharing_active {
                         ph::SPINNER_GAP
                     } else {
                         ph::MONITOR
@@ -1884,13 +1918,17 @@ impl AppState {
                     sans(17.0),
                     if self.sharing_active {
                         pal.accent
+                    } else if has_capture_error {
+                        pal.err
                     } else {
                         pal.dim
                     },
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(if self.sharing_active {
+                    RichText::new(if has_capture_error {
+                        "Screen sharing needs access"
+                    } else if self.sharing_active {
                         "Starting your screen share"
                     } else {
                         "Nothing is being shared"
@@ -1900,16 +1938,31 @@ impl AppState {
                 );
 
                 if roomy {
-                    ui.label(
-                        RichText::new(if self.sharing_active {
+                    let detail = self.capture_error.as_deref().unwrap_or_else(|| {
+                        if self.sharing_active {
                             "Preparing the first frame. This usually takes a moment."
                         } else {
                             "Shared screens and incoming video will appear here."
-                        })
-                        .color(pal.dim)
-                        .size(ui_font_size(11.5)),
+                        }
+                    });
+                    ui.label(
+                        RichText::new(detail)
+                            .color(pal.dim)
+                            .size(ui_font_size(11.5)),
                     );
                     ui.add_space(6.0);
+                    #[cfg(target_os = "macos")]
+                    if has_capture_error
+                        && action_button(
+                            ui,
+                            pal,
+                            "Open Screen Recording settings",
+                            ButtonTone::Primary,
+                        )
+                        .clicked()
+                    {
+                        open_screen_recording_settings();
+                    }
                     let (label, tone) = if self.sharing_active {
                         ("Stop sharing", ButtonTone::Secondary)
                     } else {
@@ -1947,7 +2000,7 @@ impl AppState {
             ui.painter().rect_stroke(
                 tile_rect,
                 corner_radius,
-                Stroke::new(1.0, pal.line),
+                Stroke::new(1.0_f32, pal.line),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1992,7 +2045,7 @@ impl AppState {
                     button_rect,
                     egui::Button::new(RichText::new(icon).size(ui_font_size(15.0)))
                         .fill(Color32::from_rgb(20, 20, 23))
-                        .stroke(Stroke::new(1.0, pal.line_br)),
+                        .stroke(Stroke::new(1.0_f32, pal.line_br)),
                 )
                 .on_hover_text(tooltip)
                 .clicked()
@@ -2026,7 +2079,10 @@ impl AppState {
         );
 
         let mut texture_id = None;
+        #[cfg(windows)]
         let mut native_presented = false;
+        #[cfg(not(windows))]
+        let native_presented = false;
         match source {
             StreamSource::Local => {
                 if let Some(preview) = &mut self.preview {
@@ -2059,19 +2115,23 @@ impl AppState {
                         Err(error) => warn!("native video fallback failed: {error:#}"),
                     }
                 }
-                if let DecodedFrameData::Rgba(data) = &frame.data {
-                    sync_rgba_texture(
-                        ui,
-                        &format!("video-{node_id}"),
-                        width,
-                        height,
-                        data,
-                        frame.generation,
-                        &mut frame.uploaded_generation,
-                        &mut frame.texture,
-                        &mut frame.upload_stats,
-                    );
-                    texture_id = frame.texture.as_ref().map(|texture| texture.id());
+                match &frame.data {
+                    DecodedFrameData::Rgba(data) => {
+                        sync_rgba_texture(
+                            ui,
+                            &format!("video-{node_id}"),
+                            width,
+                            height,
+                            data,
+                            frame.generation,
+                            &mut frame.uploaded_generation,
+                            &mut frame.texture,
+                            &mut frame.upload_stats,
+                        );
+                        texture_id = frame.texture.as_ref().map(|texture| texture.id());
+                    }
+                    #[cfg(windows)]
+                    DecodedFrameData::D3d11(_) => {}
                 }
             }
         }
@@ -2176,7 +2236,7 @@ impl AppState {
             .frame(
                 Frame::new()
                     .fill(pal.bg)
-                    .stroke(Stroke::new(1.0, pal.line_br))
+                    .stroke(Stroke::new(1.0_f32, pal.line_br))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(0.0),
             )
@@ -2373,7 +2433,7 @@ impl AppState {
                                     ui.add_space(8.0);
                                     Frame::new()
                                         .fill(pal.panel2)
-                                        .stroke(Stroke::new(1.0, pal.line))
+                                        .stroke(Stroke::new(1.0_f32, pal.line))
                                         .corner_radius(CornerRadius::same(7))
                                         .inner_margin(egui::Margin::symmetric(10, 5))
                                         .show(ui, |ui| {
@@ -2706,7 +2766,7 @@ fn section_card<R>(
         .fill(pal.panel)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(12.0)
-        .stroke(Stroke::new(1.0, pal.line))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -2721,6 +2781,7 @@ fn section_card<R>(
         .inner
 }
 
+#[allow(dead_code)]
 fn call_state_badge(ui: &mut Ui, state: &CallState) {
     let (text, color) = match state {
         CallState::Incoming => ("Incoming", Color32::from_rgb(255, 200, 80)),
@@ -3053,6 +3114,7 @@ enum Event {
     },
     VideoStreamEnded(NodeId),
     SharingToggled(bool),
+    SharingFailed(String),
     PreviewFrame {
         width: u32,
         height: u32,
@@ -3088,12 +3150,6 @@ impl VideoPeerTasks {
             h.abort();
         }
         if let Some(h) = self.recv.take() {
-            h.abort();
-        }
-    }
-
-    fn abort_send(&mut self) {
-        if let Some(h) = self.send.take() {
             h.abort();
         }
     }
@@ -3224,7 +3280,10 @@ impl Worker {
         loop {
             tokio::select! {
                 command = self.command_rx.recv() => {
-                    let command = command?;
+                    let Ok(command) = command else {
+                        info!("worker command channel closed; stopping");
+                        break;
+                    };
                     if let Err(err) = self.handle_command(command).await {
                         warn!("command failed: {err}");
                     }
@@ -3535,7 +3594,7 @@ impl Worker {
             self.video_frame_tx.clone(),
             preview_tx,
             self.keyframe_tx.clone(),
-        );
+        )?;
 
         self.capture_thread = Some(thread);
         self.capture_stop_flag = Some(stop_flag);
@@ -3547,10 +3606,6 @@ impl Worker {
             config.effective_bitrate() / 1000,
             self.video_peers.len()
         );
-        let event_tx = self.event_tx.clone();
-        tokio::task::spawn(async move {
-            let _ = event_tx.send(Event::SharingToggled(true)).await;
-        });
         Ok(())
     }
 
@@ -3590,15 +3645,39 @@ impl Worker {
                 }
                 self.video_config = video_config;
                 if restart_capture {
-                    self.start_capture()?;
+                    if let Err(error) = self.start_capture() {
+                        self.sharing_active = false;
+                        self.finish_all_video_send().await;
+                        self.emit(Event::SharingFailed(format!(
+                            "Screen capture could not restart: {error:#}"
+                        )))
+                        .await?;
+                    }
                 }
             }
             Command::ToggleSharing { enabled } => {
                 if enabled && !self.sharing_active {
-                    self.sharing_active = true;
+                    if let Err(error) = crate::screen_capture::ensure_capture_permission() {
+                        warn!("screen sharing permission unavailable: {error:#}");
+                        self.emit(Event::SharingFailed(error.to_string())).await?;
+                        return Ok(());
+                    }
                     let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
-                    self.start_capture()?;
+                    match self.start_capture() {
+                        Ok(()) => {
+                            self.sharing_active = true;
+                            self.emit(Event::SharingToggled(true)).await?;
+                        }
+                        Err(error) => {
+                            warn!("screen capture failed to start: {error:#}");
+                            self.finish_all_video_send().await;
+                            self.emit(Event::SharingFailed(format!(
+                                "Screen capture could not start: {error:#}"
+                            )))
+                            .await?;
+                        }
+                    }
                 } else if !enabled && self.sharing_active {
                     self.stop_capture().await;
                 }
@@ -3664,6 +3743,16 @@ impl Worker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_screen_recording_settings() {
+    if let Err(error) = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .spawn()
+    {
+        warn!("failed to open Screen Recording settings: {error}");
     }
 }
 

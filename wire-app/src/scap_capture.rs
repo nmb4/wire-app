@@ -1,7 +1,6 @@
-//! Windows Graphics Capture via zed-scap (same stack Zed uses).
+//! Native Windows/macOS screen capture via zed-scap.
 
 use anyhow::{anyhow, Context, Result};
-use wire::video::VideoResolution;
 use fast_image_resize as fr;
 use fr::images::Image;
 use fr::{PixelType, Resizer};
@@ -20,11 +19,11 @@ pub struct ScapCapturer {
 
 impl ScapCapturer {
     pub fn try_new(target_w: u32, target_h: u32, framerate: u32) -> Result<Self> {
-        if !zed_scap::is_supported() {
+        if !cfg!(target_os = "macos") && !zed_scap::is_supported() {
             return Err(anyhow!("zed-scap not supported on this system"));
         }
-        if !zed_scap::has_permission() && !zed_scap::request_permission() {
-            return Err(anyhow!("screen capture permission denied"));
+        if !zed_scap::has_permission() {
+            return Err(anyhow!("screen capture permission is not granted"));
         }
 
         let output_resolution = map_resolution(target_w);
@@ -39,13 +38,25 @@ impl ScapCapturer {
             excluded_targets: None,
         };
 
+        // zed-scap 0.0.8 compares the macOS version as newline-terminated text,
+        // incorrectly rejecting exactly 12.3. We already preflight permission,
+        // and the app bundle enforces Apple's real ScreenCaptureKit minimum.
+        #[cfg(target_os = "macos")]
+        #[allow(deprecated)]
+        let mut capturer = Capturer::new(options).context("failed to build scap capturer")?;
+        #[cfg(not(target_os = "macos"))]
         let mut capturer = Capturer::build(options).context("failed to build scap capturer")?;
         capturer.start_capture();
 
         let [out_w, out_h] = capturer.get_output_frame_size();
         let needs_resize = out_w != target_w || out_h != target_h;
+        let backend = if cfg!(target_os = "macos") {
+            "ScreenCaptureKit"
+        } else {
+            "Windows Graphics Capture"
+        };
         info!(
-            "WGC capture started via zed-scap (native ~{out_w}x{out_h} -> {target_w}x{target_h}, resize={needs_resize})"
+            "{backend} capture started via zed-scap (native ~{out_w}x{out_h} -> {target_w}x{target_h}, resize={needs_resize})"
         );
 
         Ok(Self {
@@ -66,6 +77,11 @@ impl ScapCapturer {
             Frame::RGBx(f) => (f.width as u32, f.height as u32, f.data),
             other => return Err(anyhow!("unexpected scap frame type: {other:?}")),
         };
+        // ScreenCaptureKit emits empty "idle" updates when nothing changed.
+        // Return control to the capture loop so it can observe a stop request.
+        if src_w == 0 || src_h == 0 || data.is_empty() {
+            return Ok(Vec::new());
+        }
 
         if !self.needs_resize && src_w == self.target_w && src_h == self.target_h {
             return Ok(data);
@@ -80,19 +96,17 @@ impl ScapCapturer {
     }
 }
 
+impl Drop for ScapCapturer {
+    fn drop(&mut self) {
+        self.capturer.stop_capture();
+    }
+}
+
 fn map_resolution(target_w: u32) -> ScapResolution {
     match target_w {
         w if w <= 1280 => ScapResolution::_720p,
         w if w <= 1920 => ScapResolution::_1080p,
         w if w <= 2560 => ScapResolution::_1440p,
         _ => ScapResolution::_2160p,
-    }
-}
-
-pub fn resolution_from_config(res: VideoResolution) -> ScapResolution {
-    match res {
-        VideoResolution::P720 => ScapResolution::_720p,
-        VideoResolution::P1080 => ScapResolution::_1080p,
-        VideoResolution::P1440 => ScapResolution::_1440p,
     }
 }

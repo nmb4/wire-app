@@ -5,9 +5,11 @@
 // intentionally NOT ported -- they don't map onto this real wire app.
 
 use eframe::egui;
+#[cfg(any(wire_has_font_fraktion_sans, wire_has_font_fraktion_mono))]
+use egui::FontTweak;
 use egui::{
-    text::{LayoutJob, TextFormat}, Color32, CornerRadius, FontData, FontFamily, FontId, FontTweak,
-    Margin, RichText, Stroke, TextStyle, Vec2,
+    text::{LayoutJob, TextFormat},
+    Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 // uppercase display font family used for headers / big text
@@ -221,67 +223,89 @@ pub fn setup_fonts(ctx: &egui::Context) {
         "lucide".into(),
         FontData::from_static(LUCIDE_FONT_BYTES).into(),
     );
-    fonts
-        .families
-        .insert(lucide_family(), vec!["lucide".into()]);
+    let mut lucide_fonts = vec!["lucide".into()];
+    lucide_fonts.extend(
+        fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts.families.insert(lucide_family(), lucide_fonts);
 
-    fonts.font_data.insert(
-        "FraktionSans".into(),
-        FontData::from_owned(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/fonts/PPFraktionSans-Light.otf"
-            ))
-            .to_vec(),
-        )
-        .tweak(FontTweak {
-            y_offset: 1.0,
-            ..Default::default()
-        })
-        .into(),
-    );
-    fonts.font_data.insert(
-        "FraktionMono".into(),
-        FontData::from_owned(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/fonts/PPFraktionMono-Regular.otf"
-            ))
-            .to_vec(),
-        )
-        .tweak(FontTweak {
-            y_offset: 1.0,
-            ..Default::default()
-        })
-        .into(),
-    );
-    fonts.font_data.insert(
-        "KhInterference".into(),
-        FontData::from_owned(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/fonts/Kh-Interference.otf"
-            ))
-            .to_vec(),
-        )
-        .into(),
-    );
+    #[cfg(wire_has_font_fraktion_sans)]
+    {
+        fonts.font_data.insert(
+            "FraktionSans".into(),
+            FontData::from_owned(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/fonts/PPFraktionSans-Light.otf"
+                ))
+                .to_vec(),
+            )
+            .tweak(FontTweak {
+                y_offset: 1.0,
+                ..Default::default()
+            })
+            .into(),
+        );
+        // Prefer the custom face while retaining egui's bundled fallbacks.
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "FraktionSans".into());
+    }
 
-    // normal UI text -> Fraktion Sans (phosphor listed last so it's only used
-    // as a fallback for the icon codepoints it actually owns)
-    fonts.families.insert(
-        FontFamily::Proportional,
-        vec!["FraktionSans".into(), "phosphor".into()],
-    );
-    // monospace UI text (timestamps, code paths, stats) -> Fraktion Mono
-    fonts.families.insert(
-        FontFamily::Monospace,
-        vec!["FraktionMono".into(), "phosphor".into()],
-    );
-    // uppercase display font for headers / big text
-    fonts
+    #[cfg(wire_has_font_fraktion_mono)]
+    {
+        fonts.font_data.insert(
+            "FraktionMono".into(),
+            FontData::from_owned(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/fonts/PPFraktionMono-Regular.otf"
+                ))
+                .to_vec(),
+            )
+            .tweak(FontTweak {
+                y_offset: 1.0,
+                ..Default::default()
+            })
+            .into(),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "FraktionMono".into());
+    }
+
+    #[allow(unused_mut)]
+    let mut display_fonts = fonts
         .families
-        .insert(kh_family(), vec!["KhInterference".into()]);
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    #[cfg(wire_has_font_kh_interference)]
+    {
+        fonts.font_data.insert(
+            "KhInterference".into(),
+            FontData::from_owned(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/fonts/Kh-Interference.otf"
+                ))
+                .to_vec(),
+            )
+            .into(),
+        );
+        display_fonts.insert(0, "KhInterference".into());
+    }
+    // The named display family must always resolve because callers use it even
+    // when the optional display font is absent.
+    fonts.families.insert(kh_family(), display_fonts);
 
     ctx.set_fonts(fonts);
 
@@ -311,30 +335,30 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
 
     visuals.widgets.noninteractive.bg_fill = pal.panel;
     visuals.widgets.noninteractive.weak_bg_fill = pal.panel;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.line);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text2);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.line);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.text2);
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
     visuals.widgets.inactive.weak_bg_fill = pal.panel2;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.line);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
 
     visuals.widgets.hovered.bg_fill = pal.panel2;
     visuals.widgets.hovered.weak_bg_fill = pal.panel2;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.line_br);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text);
 
     visuals.widgets.active.bg_fill = pal.panel2;
     visuals.widgets.active.weak_bg_fill = pal.panel2;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, pal.line_br);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, pal.accent);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, pal.accent);
 
     visuals.widgets.open.bg_fill = pal.panel2;
     visuals.widgets.open.weak_bg_fill = pal.panel2;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, pal.line_br);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
 
     visuals.selection.bg_fill = pal.accent_dim;
-    visuals.window_stroke = Stroke::new(1.0, pal.line);
+    visuals.window_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.window_corner_radius = CornerRadius::same(10);
     visuals.menu_corner_radius = CornerRadius::same(8);
     visuals
@@ -346,19 +370,19 @@ pub fn separator_line(ui: &mut egui::Ui, color: Color32) {
     let rect = ui.available_rect_before_wrap();
     let y = rect.top();
     ui.painter()
-        .hline(rect.x_range(), y, Stroke::new(1.0, color));
+        .hline(rect.x_range(), y, Stroke::new(1.0_f32, color));
 }
 
 pub fn separator_line_full(ui: &mut egui::Ui, color: Color32) {
     let rect = ui.max_rect();
     ui.painter()
-        .hline(rect.x_range(), rect.top(), Stroke::new(1.0, color));
+        .hline(rect.x_range(), rect.top(), Stroke::new(1.0_f32, color));
 }
 
 pub fn v_sep(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 26.0), egui::Sense::hover());
     ui.painter()
-        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0, color));
+        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, color));
 }
 
 pub fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
@@ -371,7 +395,7 @@ pub fn circle_avatar(ui: &mut egui::Ui, pal: &Palette, initial: &str, size: f32)
     ui.painter()
         .circle_filled(rect.center(), size / 2.0, pal.panel2);
     ui.painter()
-        .circle_stroke(rect.center(), size / 2.0, Stroke::new(1.0, pal.line_br));
+        .circle_stroke(rect.center(), size / 2.0, Stroke::new(1.0_f32, pal.line_br));
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -426,9 +450,9 @@ pub fn action_button(
     tone: ButtonTone,
 ) -> egui::Response {
     let (fill, stroke, text) = match tone {
-        ButtonTone::Primary => (pal.accent, Stroke::new(1.0, pal.accent), pal.bg),
-        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0, pal.line_br), pal.text2),
-        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0, pal.err), pal.err),
+        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
+        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0_f32, pal.line_br), pal.text2),
+        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0_f32, pal.err), pal.err),
     };
     ui.add(
         egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
@@ -446,9 +470,9 @@ pub fn action_button_full(
     tone: ButtonTone,
 ) -> egui::Response {
     let (fill, stroke, text) = match tone {
-        ButtonTone::Primary => (pal.accent, Stroke::new(1.0, pal.accent), pal.bg),
-        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0, pal.line_br), pal.text2),
-        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0, pal.err), pal.err),
+        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
+        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0_f32, pal.line_br), pal.text2),
+        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0_f32, pal.err), pal.err),
     };
     ui.add_sized(
         Vec2::new(ui.available_width(), 34.0),
@@ -468,9 +492,9 @@ pub fn toolbar_button(
 ) -> egui::Response {
     let fill = if selected { pal.accent_dim } else { pal.panel2 };
     let stroke = if selected {
-        Stroke::new(1.0, pal.accent)
+        Stroke::new(1.0_f32, pal.accent)
     } else {
-        Stroke::new(1.0, pal.line_br)
+        Stroke::new(1.0_f32, pal.line_br)
     };
     let text = if selected { pal.accent } else { pal.text2 };
 
@@ -511,21 +535,22 @@ pub fn toolbar_button(
             .min_size(Vec2::new(0.0, 32.0)),
     )
 }
-pub fn ghost_icon_button(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    glyph: &str,
-) -> egui::Response {
+pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
     if response.hovered() || response.has_focus() {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), pal.panel2);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), pal.panel2);
     }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph,
         sans(18.0),
-        if response.hovered() { pal.text } else { pal.text2 },
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.text2
+        },
     );
     response
 }
@@ -543,7 +568,7 @@ pub fn dock_icon_btn(
 
     ui.painter().circle_filled(rect.center(), 21.0, fill);
     ui.painter()
-        .circle_stroke(rect.center(), 21.0, Stroke::new(1.0, border));
+        .circle_stroke(rect.center(), 21.0, Stroke::new(1.0_f32, border));
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,

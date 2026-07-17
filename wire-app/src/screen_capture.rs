@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use anyhow::Context;
 use anyhow::Result;
 use async_channel::Sender;
@@ -15,13 +15,12 @@ use wire::video::{
     bitstream::contains_idr, codec::VideoEncoder, transport::EncodedVideoFrame, VideoConfig,
 };
 
-use fast_image_resize as fr;
-use fr::images::Image;
-use fr::{PixelType, Resizer};
-#[cfg(not(windows))]
+#[cfg(not(target_os = "macos"))]
+use fast_image_resize::{images::Image, PixelType, Resizer};
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use image::DynamicImage;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::scap_capture::ScapCapturer;
 #[cfg(windows)]
 use crate::win_capture::{GpuCapturedFrame, GpuPreviewScaler, WindowsCapturer};
@@ -151,12 +150,14 @@ pub fn start(
     encoded_tx: broadcast::Sender<Arc<EncodedVideoFrame>>,
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>> {
     let target_w = config.resolution.width();
     let target_h = config.resolution.height();
     let target_interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
 
-    thread::spawn(move || {
+    let startup_stop = stop_flag.clone();
+    let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let handle = thread::spawn(move || {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<CaptureFrame>(FRAME_CHANNEL_DEPTH);
         let (preview_input_tx, preview_input_rx) =
             mpsc::sync_channel::<PreviewInput>(PREVIEW_CHANNEL_DEPTH);
@@ -168,7 +169,20 @@ pub fn start(
         let capture_stop = stop_flag.clone();
         let capture_fps = config.framerate;
         let capture_handle = thread::spawn(move || {
+            let source = match init_capture_source(target_w, target_h, capture_fps) {
+                Ok(source) => {
+                    let _ = startup_tx.send(Ok(()));
+                    source
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let _ = startup_tx.send(Err(message));
+                    capture_stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
             if let Err(e) = run_capture_loop(
+                source,
                 &capture_stop,
                 target_w,
                 target_h,
@@ -195,15 +209,55 @@ pub fn start(
             info!("encode thread stopped: {e:?}");
         }
 
+        encode_stop.store(true, Ordering::Relaxed);
         let _ = capture_handle.join();
         let _ = preview_handle.join();
-    })
+    });
+
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(message)) => {
+            startup_stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+            Err(anyhow::anyhow!(message))
+        }
+        Err(error) => {
+            startup_stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+            Err(anyhow::anyhow!(
+                "capture startup stopped unexpectedly: {error}"
+            ))
+        }
+    }
+}
+
+pub fn ensure_capture_permission() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if zed_scap::has_permission() {
+            return Ok(());
+        }
+
+        info!("requesting macOS Screen Recording permission");
+        if zed_scap::request_permission() && zed_scap::has_permission() {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Allow Wire in System Settings > Privacy & Security > Screen & System Audio Recording, then quit and reopen Wire."
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Ok(())
 }
 
 enum CaptureSource {
     #[cfg(windows)]
     Windows(WindowsCapturer),
     #[cfg(windows)]
+    Scap(ScapCapturer),
+    #[cfg(target_os = "macos")]
     Scap(ScapCapturer),
     #[cfg(windows)]
     Gdi {
@@ -212,11 +266,11 @@ enum CaptureSource {
         src_w: i32,
         src_h: i32,
     },
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     Xcap {
         monitor: xcap::Monitor,
         resizer: Resizer,
-        dst: Image,
+        dst: Image<'static>,
     },
 }
 
@@ -238,7 +292,13 @@ fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<C
         info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
         Ok(CaptureSource::Gdi { x, y, src_w, src_h })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(CaptureSource::Scap(ScapCapturer::try_new(
+            target_w, target_h, framerate,
+        )?))
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let monitors = xcap::Monitor::all().context("failed to enumerate monitors")?;
         let monitor = monitors
@@ -256,10 +316,15 @@ fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<C
 }
 
 fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Result<CaptureFrame> {
+    #[cfg(not(windows))]
+    let _ = (target_w, target_h);
+
     match source {
         #[cfg(windows)]
         CaptureSource::Windows(capturer) => capturer.capture_gpu().map(CaptureFrame::Gpu),
         #[cfg(windows)]
+        CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::Cpu),
+        #[cfg(target_os = "macos")]
         CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::Cpu),
         #[cfg(windows)]
         CaptureSource::Gdi { x, y, src_w, src_h } => {
@@ -268,7 +333,7 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
             )
             .map(CaptureFrame::Cpu)
         }
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         CaptureSource::Xcap {
             monitor,
             resizer,
@@ -287,6 +352,7 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
 }
 
 fn run_capture_loop(
+    mut source: CaptureSource,
     stop_flag: &AtomicBool,
     target_w: u32,
     target_h: u32,
@@ -294,7 +360,6 @@ fn run_capture_loop(
     framerate: u32,
     frame_tx: &mpsc::SyncSender<CaptureFrame>,
 ) -> Result<()> {
-    let mut source = init_capture_source(target_w, target_h, framerate)?;
     let sleeper = SpinSleeper::default();
     let mut window_captured = 0u64;
     let mut window_dropped = 0u64;
@@ -306,6 +371,9 @@ fn run_capture_loop(
         let frame_start = Instant::now();
 
         let frame = capture_frame(&mut source, target_w, target_h)?;
+        if matches!(&frame, CaptureFrame::Cpu(data) if data.is_empty()) {
+            continue;
+        }
         match frame_tx.try_send(frame) {
             Ok(()) => {
                 window_captured += 1;
@@ -340,7 +408,9 @@ fn run_capture_loop(
             window_captured = 0;
             window_dropped = 0;
         }
-        if elapsed < target_interval {
+        // ScreenCaptureKit is callback-paced at the requested frame rate. An
+        // extra sleep would consume its callback queue too slowly.
+        if !cfg!(target_os = "macos") && elapsed < target_interval {
             sleeper.sleep(target_interval - elapsed);
         }
     }
@@ -454,7 +524,7 @@ fn run_encode_loop(
         });
         #[cfg(not(windows))]
         let encoded_result = has_subscribers.then(|| match &frame {
-            CaptureFrame::Cpu(rgba) => encoder.encode_frame(rgba, false),
+            CaptureFrame::Cpu(data) => encoder.encode_frame(data, cfg!(target_os = "macos")),
         });
         match encoded_result {
             Some(Ok(encoded)) if encoded.is_empty() => {
@@ -602,7 +672,7 @@ fn run_encode_loop(
             if let Some((data, width, height)) = preview_source {
                 let input = PreviewInput {
                     data,
-                    bgra: cfg!(windows),
+                    bgra: cfg!(any(windows, target_os = "macos")),
                     width,
                     height,
                     output_width: (target_w / PREVIEW_DIVISOR).max(1),

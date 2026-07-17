@@ -7,7 +7,7 @@ pub mod window_frame;
 /// The application version embedded at compile time from this package's Cargo manifest.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod scap_capture;
 mod screen_capture;
 pub mod theme;

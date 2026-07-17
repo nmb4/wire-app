@@ -194,7 +194,10 @@ fn run_decode_loop<F>(
 where
     F: Fn(DecodedFrame),
 {
+    #[cfg(windows)]
     let (mut decoder, mut hardware_decoder) = make_decoder()?;
+    #[cfg(not(windows))]
+    let (mut decoder, _) = make_decoder()?;
     let mut waiting_for_keyframe = false;
     let mut decoded = 0u64;
     let mut decode_errors = 0u64;

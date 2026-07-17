@@ -78,3 +78,5 @@ audio-processing = ["wire/audio-processing"]
 [package.metadata.bundle]
 name = "Wire"
 identifier = "live.stardive.wire"
+osx_minimum_system_version = "12.3"
+osx_info_plist_exts = ["Info.plist"]

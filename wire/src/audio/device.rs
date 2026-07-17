@@ -162,6 +162,13 @@ pub fn find_input_stream_config(
         })?
     };
 
+    #[cfg(target_os = "macos")]
+    let ideal_buffer_size = AudioFormat {
+        sample_rate: config.sample_rate(),
+        channel_count: config.channels(),
+    }
+    .block_count(DURATION_20MS) as u32;
+    #[cfg(not(target_os = "macos"))]
     let ideal_buffer_size = format.sample_count(DURATION_20MS) as u32;
     info!("selected capture stream config: {config:?}");
     Ok(StreamConfigWithFormat::new(config, ideal_buffer_size))
@@ -193,6 +200,13 @@ pub fn find_output_stream_config(
     };
     info!("selected playback stream config: {config:?}");
 
+    #[cfg(target_os = "macos")]
+    let ideal_buffer_size = AudioFormat {
+        sample_rate: config.sample_rate(),
+        channel_count: config.channels(),
+    }
+    .block_count(DURATION_20MS) as u32;
+    #[cfg(not(target_os = "macos"))]
     let ideal_buffer_size = format.sample_count(DURATION_20MS) as u32;
     Ok(StreamConfigWithFormat::new(config, ideal_buffer_size))
 }

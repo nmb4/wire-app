@@ -16,7 +16,7 @@ use cpal::{
     Device, SampleFormat,
 };
 use dasp_sample::ToSample;
-use fixed_resample::{FixedResampler, ResampleQuality};
+use fixed_resample::FixedResampler;
 use ringbuf::{
     traits::{Consumer as _, Observer, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
@@ -26,7 +26,8 @@ use tracing::{debug, error, info, span, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_input_stream_config, Direction, StreamConfigWithFormat},
-    AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
+    device_resampler, AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS,
+    ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
     codec::opus::{AudioQuality, MediaTrackOpusEncoder},
@@ -73,6 +74,9 @@ impl AudioCapture {
                 buffer_size as u32,
                 ENGINE_FORMAT.sample_rate.0,
             ) {
+                #[cfg(target_os = "macos")]
+                debug!("macOS kept the capture worker at normal priority: {err:?}");
+                #[cfg(not(target_os = "macos"))]
                 warn!("failed to set capture thread to realtime priority: {err:?}");
             }
 
@@ -129,17 +133,17 @@ fn start_capture_stream(
     let d = device.name()?;
     let config = &stream_config.config;
 
-    #[cfg(feature = "audio-processing")]
+    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
+    processor.init_capture(ENGINE_FORMAT.channel_count as usize)?;
+    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
     processor.init_capture(config.channels as usize)?;
 
     let capture_format = stream_config.audio_format();
 
-    let resampler = FixedResampler::new(
+    let resampler = device_resampler(
         NonZeroUsize::new(ENGINE_FORMAT.channel_count as usize).unwrap(),
         capture_format.sample_rate.0,
         ENGINE_FORMAT.sample_rate.0,
-        ResampleQuality::High,
-        true,
     );
     let state = CaptureState {
         format: capture_format,
@@ -191,6 +195,8 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
     // this will grow as needed and contains samples directly from the input buf
     // (before resampling) but with channels adjusted
     let mut input_buf: Vec<f32> = Vec::with_capacity(processor_chunk_size);
+    let mut dropped_samples = 0usize;
+    let mut last_xrun_warning = Instant::now();
 
     device.build_input_stream::<S, _, _>(
         config,
@@ -252,11 +258,13 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
                 pushed += n;
 
                 if n < chunk.len() {
-                    warn!(
-                        "record xrun: failed to push out {} of {}",
-                        chunk.len() - n,
-                        chunk.len()
-                    );
+                    dropped_samples += chunk.len() - n;
+                    let now = Instant::now();
+                    if now.duration_since(last_xrun_warning) >= Duration::from_secs(1) {
+                        warn!("capture xrun: dropped {dropped_samples} samples in the last second");
+                        dropped_samples = 0;
+                        last_xrun_warning = now;
+                    }
                     break;
                 }
             }
@@ -284,6 +292,78 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
     )
 }
 
+#[cfg(target_os = "macos")]
+fn capture_loop(
+    mut consumer: Consumer<f32>,
+    mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
+    muted: Arc<AtomicBool>,
+) {
+    let span = tracing::span!(Level::TRACE, "capture-loop");
+    let _guard = span.enter();
+    info!("capture loop start");
+
+    let tick_duration = DURATION_20MS;
+    let samples_per_tick = ENGINE_FORMAT.sample_count(tick_duration);
+    let mut buf = vec![0.; samples_per_tick];
+    let mut sinks = vec![];
+
+    let mut tick = 0;
+    loop {
+        // poll incoming sources
+        loop {
+            match sink_receiver.try_recv() {
+                Ok(sink) => {
+                    info!("new sink added to capture loop");
+                    sinks.push(sink);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("stop playback mixer loop: channel closed");
+                    return;
+                }
+            }
+        }
+        // Follow the hardware clock instead of an independent sleep timer. A
+        // relative 20 ms timer drifts on macOS when realtime promotion is not
+        // available, eventually filling the capture ring and dropping audio.
+        let available_frames = consumer.occupied_len() / samples_per_tick;
+        if available_frames == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        for _ in 0..available_frames {
+            let start = Instant::now();
+            let count = consumer.pop_slice(&mut buf);
+            debug_assert_eq!(count, samples_per_tick);
+            if muted.load(AtomicOrdering::Relaxed) {
+                buf.fill(0.0);
+            }
+
+            sinks.retain_mut(|sink| match sink.tick(&buf) {
+                Ok(ControlFlow::Continue(())) => true,
+                Ok(ControlFlow::Break(())) => {
+                    debug!("remove encoder: closed");
+                    false
+                }
+                Err(err) => {
+                    warn!("remove encoder: failed {err:?}");
+                    false
+                }
+            });
+            trace!("tick {tick} took {:?} pulled {count}", start.elapsed());
+            if start.elapsed() > tick_duration {
+                warn!(
+                    "capture thread tick exceeded interval (took {:?})",
+                    start.elapsed()
+                );
+            }
+            tick += 1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
@@ -302,7 +382,6 @@ fn capture_loop(
     loop {
         let start = Instant::now();
 
-        // poll incoming sources
         loop {
             match sink_receiver.try_recv() {
                 Ok(sink) => {
@@ -316,6 +395,7 @@ fn capture_loop(
                 }
             }
         }
+
         let count = consumer.pop_slice(&mut buf);
         if muted.load(AtomicOrdering::Relaxed) {
             buf[..count].fill(0.0);
@@ -339,8 +419,7 @@ fn capture_loop(
                 start.elapsed()
             );
         } else {
-            let sleep_time = tick_duration.saturating_sub(start.elapsed());
-            spin_sleep::sleep(sleep_time);
+            spin_sleep::sleep(tick_duration.saturating_sub(start.elapsed()));
         }
         tick += 1;
     }

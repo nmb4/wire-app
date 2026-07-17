@@ -13,7 +13,7 @@ use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Device, Sample, SampleFormat,
 };
-use fixed_resample::{FixedResampler, ResampleQuality};
+use fixed_resample::FixedResampler;
 use ringbuf::{
     traits::{Consumer as _, Observer as _, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
@@ -23,12 +23,16 @@ use tracing::{debug, error, info, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_output_stream_config, Direction, StreamConfigWithFormat},
-    AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
+    device_resampler, AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS,
+    ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
     codec::opus::MediaTrackOpusDecoder,
     rtc::{MediaFrame, MediaTrack},
 };
+
+#[cfg(target_os = "macos")]
+const PLAYBACK_PREBUFFER_CHUNKS: usize = 3;
 
 pub trait AudioSource: Send + 'static {
     fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>>;
@@ -71,7 +75,18 @@ impl AudioPlayback {
         let stream_config = find_output_stream_config(&device, &ENGINE_FORMAT)?;
 
         let buffer_size = ENGINE_FORMAT.sample_count(DURATION_20MS) * 32;
-        let (producer, consumer) = ringbuf::HeapRb::<f32>::new(buffer_size).split();
+        #[allow(unused_mut)]
+        let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(buffer_size).split();
+
+        #[cfg(target_os = "macos")]
+        {
+            // Prime the device before stream.play() can invoke its first callback.
+            // Three 20 ms chunks cover one CoreAudio callback plus scheduler jitter.
+            let prebuffer =
+                vec![0.0; ENGINE_FORMAT.sample_count(DURATION_20MS) * PLAYBACK_PREBUFFER_CHUNKS];
+            let primed = producer.push_slice(&prebuffer);
+            debug_assert_eq!(primed, prebuffer.len());
+        }
 
         let (source_sender, source_receiver) = mpsc::channel(16);
         let deafened = Arc::new(AtomicBool::new(false));
@@ -83,6 +98,9 @@ impl AudioPlayback {
                 buffer_size as u32,
                 ENGINE_FORMAT.sample_rate.0,
             ) {
+                #[cfg(target_os = "macos")]
+                debug!("macOS kept the playback worker at normal priority: {err:?}");
+                #[cfg(not(target_os = "macos"))]
                 warn!("failed to set playback thread to realtime priority: {err:?}");
             }
             let stream = match start_playback_stream(&device, &stream_config, processor, consumer) {
@@ -137,6 +155,7 @@ impl AudioPlayback {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn playback_loop(
     mut producer: Producer<f32>,
     mut source_receiver: mpsc::Receiver<Box<dyn AudioSource>>,
@@ -152,16 +171,8 @@ fn playback_loop(
     let mut out_buf = vec![0.; buffer_size];
     let mut sources: Vec<Box<dyn AudioSource>> = vec![];
 
-    // todo: do we want this?
-    let initial_latency = ENGINE_FORMAT.sample_count(DURATION_20MS);
-    let initial_silence = vec![0.; initial_latency];
-    let n = producer.push_slice(&initial_silence);
-    debug_assert_eq!(n, initial_silence.len());
-
     let mut tick = 0;
     loop {
-        let start = Instant::now();
-
         // pull incoming sources
         loop {
             match source_receiver.try_recv() {
@@ -177,7 +188,108 @@ fn playback_loop(
             }
         }
 
-        out_buf.fill(0.);
+        // Refill based on what CoreAudio actually consumed. This keeps a small
+        // stable cushion without relying on a second clock that can drift.
+        let target_samples = buffer_size * PLAYBACK_PREBUFFER_CHUNKS;
+        let missing_frames = target_samples
+            .saturating_sub(producer.occupied_len())
+            .div_ceil(buffer_size);
+        if missing_frames == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        for _ in 0..missing_frames {
+            let start = Instant::now();
+            out_buf.fill(0.0);
+            sources.retain_mut(|source| match source.tick(&mut work_buf) {
+                Ok(ControlFlow::Continue(count)) => {
+                    for i in 0..count {
+                        out_buf[i] += work_buf[i];
+                    }
+                    if count < work_buf.len() {
+                        debug!(
+                            "audio source xrun: missing {} of {}",
+                            work_buf.len() - count,
+                            work_buf.len()
+                        );
+                    }
+                    true
+                }
+                Ok(ControlFlow::Break(())) => {
+                    debug!("remove decoder: closed");
+                    false
+                }
+                Err(err) => {
+                    warn!("remove decoder: failed {err:?}");
+                    false
+                }
+            });
+
+            if deafened.load(Ordering::Relaxed) {
+                out_buf.fill(0.0);
+            }
+
+            let len = producer.push_slice(&out_buf);
+            if len < out_buf.len() {
+                warn!(
+                    "playback xrun: failed to queue {} of {} samples",
+                    out_buf.len() - len,
+                    out_buf.len()
+                );
+            }
+
+            trace!("tick {tick} took {:?} pushed {len}", start.elapsed());
+            if start.elapsed() > tick_duration {
+                warn!(
+                    "playback thread tick exceeded interval (took {:?})",
+                    start.elapsed()
+                );
+            }
+            tick += 1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn playback_loop(
+    mut producer: Producer<f32>,
+    mut source_receiver: mpsc::Receiver<Box<dyn AudioSource>>,
+    deafened: Arc<AtomicBool>,
+) {
+    let span = tracing::span!(Level::TRACE, "playback-loop");
+    let _guard = span.enter();
+    info!("playback loop start");
+
+    let tick_duration = DURATION_20MS;
+    let buffer_size = ENGINE_FORMAT.sample_count(tick_duration);
+    let mut work_buf = vec![0.; buffer_size];
+    let mut out_buf = vec![0.; buffer_size];
+    let mut sources: Vec<Box<dyn AudioSource>> = vec![];
+
+    let initial_silence = vec![0.; buffer_size];
+    let n = producer.push_slice(&initial_silence);
+    debug_assert_eq!(n, initial_silence.len());
+
+    let mut tick = 0;
+    loop {
+        let start = Instant::now();
+
+        loop {
+            match source_receiver.try_recv() {
+                Ok(source) => {
+                    info!("add new track to decoder");
+                    sources.push(source);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("stop playback mixer loop: channel closed");
+                    return;
+                }
+            }
+        }
+
+        out_buf.fill(0.0);
         sources.retain_mut(|source| match source.tick(&mut work_buf) {
             Ok(ControlFlow::Continue(count)) => {
                 for i in 0..count {
@@ -206,7 +318,7 @@ fn playback_loop(
             out_buf.fill(0.0);
         }
 
-        let len = producer.push_slice(&out_buf[..]);
+        let len = producer.push_slice(&out_buf);
         if len < out_buf.len() {
             warn!(
                 "xrun: failed to push {} of {}",
@@ -222,8 +334,7 @@ fn playback_loop(
                 start.elapsed()
             );
         } else {
-            let sleep_time = tick_duration.saturating_sub(start.elapsed());
-            spin_sleep::sleep(sleep_time);
+            spin_sleep::sleep(tick_duration.saturating_sub(start.elapsed()));
         }
         tick += 1;
     }
@@ -237,14 +348,14 @@ fn start_playback_stream(
 ) -> Result<cpal::Stream> {
     let config = &stream_config.config;
     let format = stream_config.audio_format();
-    #[cfg(feature = "audio-processing")]
+    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
+    processor.init_playback(ENGINE_FORMAT.channel_count as usize)?;
+    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
     processor.init_playback(config.channels as usize)?;
-    let resampler = FixedResampler::new(
+    let resampler = device_resampler(
         NonZeroUsize::new(format.channel_count as usize).unwrap(),
         SAMPLE_RATE.0,
         format.sample_rate.0,
-        ResampleQuality::High,
-        true,
     );
     let state = PlaybackState {
         consumer,
@@ -283,9 +394,14 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
     config: &cpal::StreamConfig,
     mut state: PlaybackState,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    #[cfg(target_os = "macos")]
+    let frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
+    #[cfg(not(target_os = "macos"))]
     let frame_size = state.format.sample_count(DURATION_10MS);
     let mut unprocessed: Vec<f32> = Vec::with_capacity(frame_size);
     let mut processed: Vec<f32> = Vec::with_capacity(frame_size);
+    #[cfg(target_os = "macos")]
+    let mut resample_input: Vec<f32> = Vec::with_capacity(frame_size);
     let mut resampled: Vec<f32> = Vec::with_capacity(frame_size);
     let mut tick = 0;
     let mut last_warning = Instant::now();
@@ -307,14 +423,31 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             };
 
             if tick % 100 == 0 {
-                trace!("callback tick {tick} len={} delay={delay:?}", data.len());
+                trace!(
+                    "callback tick {tick} len={} delay={delay:?} resampled={} ring={}",
+                    data.len(),
+                    resampled.len(),
+                    state.consumer.occupied_len()
+                );
             }
 
 
             #[cfg(feature = "audio-processing")]
             state.processor.set_playback_delay(delay);
 
-            // pop from channel
+            // CoreAudio may invoke this callback with a buffer smaller than the
+            // playback ring's latency cushion. Pulling the entire ring moves that
+            // cushion into `resampled`, where the producer can no longer see it
+            // and refills it on every callback. Only pull enough engine audio for
+            // this callback on macOS, keeping the latency bounded in the ring.
+            #[cfg(target_os = "macos")]
+            {
+                let missing_output = data.len().saturating_sub(resampled.len());
+                let required_input = required_engine_samples(missing_output, state.format)
+                    .saturating_sub(unprocessed.len());
+                unprocessed.extend(state.consumer.pop_iter().take(required_input));
+            }
+            #[cfg(not(target_os = "macos"))]
             unprocessed.extend(state.consumer.pop_iter());
 
             // process
@@ -330,7 +463,32 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             unprocessed.copy_within(end.., 0);
             unprocessed.truncate(remainder_len);
 
-            // resample
+            // The mixer ring uses the 48 kHz stereo engine format. Adapt its
+            // channels to the selected macOS device before resampling; a mono
+            // Bluetooth output must not interpret interleaved stereo samples as
+            // twice as many mono frames.
+            #[cfg(target_os = "macos")]
+            {
+                match state.format.channel_count {
+                    1 => resample_input.extend(
+                        processed
+                            .chunks_exact(2)
+                            .map(|frame| (frame[0] + frame[1]) * 0.5),
+                    ),
+                    2 => resample_input.extend_from_slice(&processed),
+                    _ => unreachable!("audio device channel count validated at startup"),
+                }
+                state.resampler.process_interleaved(
+                    &resample_input,
+                    |samples| {
+                        resampled.extend_from_slice(samples);
+                    },
+                    None,
+                    false,
+                );
+                resample_input.clear();
+            }
+            #[cfg(not(target_os = "macos"))]
             state.resampler.process_interleaved(&processed, |samples|{
                 resampled.extend_from_slice(samples);
             } , None, false);
@@ -343,6 +501,7 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             for (i, sample) in data[..out_len].iter_mut().enumerate() {
                 *sample = resampled[i].to_sample()
             }
+            data[out_len..].fill(S::default());
             resampled.copy_within(out_len.., 0);
             resampled.truncate(remaining);
 
@@ -368,4 +527,33 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
         },
         None,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn required_engine_samples(output_samples: usize, output_format: AudioFormat) -> usize {
+    if output_samples == 0 {
+        return 0;
+    }
+
+    let output_channels = output_format.channel_count as usize;
+    let output_frames = output_samples.div_ceil(output_channels);
+    let engine_frames =
+        (output_frames * SAMPLE_RATE.0 as usize).div_ceil(output_format.sample_rate.0 as usize);
+    let engine_samples = engine_frames * ENGINE_FORMAT.channel_count as usize;
+    let processor_frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
+    engine_samples.div_ceil(processor_frame_size) * processor_frame_size
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_bluetooth_callback_to_one_engine_chunk() {
+        let bluetooth_format = AudioFormat::new2(16_000, 1);
+        assert_eq!(
+            required_engine_samples(320, bluetooth_format),
+            ENGINE_FORMAT.sample_count(DURATION_20MS)
+        );
+    }
 }

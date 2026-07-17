@@ -2,6 +2,19 @@ use std::io::Cursor;
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
+macro_rules! optional_sound {
+    ($cfg:ident, $path:literal) => {{
+        #[cfg($cfg)]
+        {
+            Some(include_bytes!($path).as_slice())
+        }
+        #[cfg(not($cfg))]
+        {
+            None
+        }
+    }};
+}
+
 #[derive(Clone, Copy)]
 pub enum Sound {
     Whoosh1,
@@ -14,18 +27,33 @@ pub enum Sound {
 }
 
 impl Sound {
-    fn bytes(self) -> &'static [u8] {
+    fn bytes(self) -> Option<&'static [u8]> {
         match self {
-            Sound::Whoosh1 => include_bytes!("../sound-kit/whoosh-1.wav"),
-            Sound::Whoosh2 => include_bytes!("../sound-kit/whoosh-2.wav"),
-            Sound::Button1 => include_bytes!("../sound-kit/button-1.wav"),
-            Sound::Button2 => include_bytes!("../sound-kit/button-2.wav"),
-            Sound::Success => include_bytes!("../sound-kit/success.wav"),
-            Sound::Fail => include_bytes!("../sound-kit/fail.wav"),
-            Sound::IncomingRing => include_bytes!("../sound-kit/atmostphere-2.wav"),
+            Sound::Whoosh1 => optional_sound!(wire_has_sound_whoosh_1, "../sound-kit/whoosh-1.wav"),
+            Sound::Whoosh2 => optional_sound!(wire_has_sound_whoosh_2, "../sound-kit/whoosh-2.wav"),
+            Sound::Button1 => optional_sound!(wire_has_sound_button_1, "../sound-kit/button-1.wav"),
+            Sound::Button2 => optional_sound!(wire_has_sound_button_2, "../sound-kit/button-2.wav"),
+            Sound::Success => {
+                optional_sound!(wire_has_sound_success, "../sound-kit/success.wav")
+            }
+            Sound::Fail => optional_sound!(wire_has_sound_fail, "../sound-kit/fail.wav"),
+            Sound::IncomingRing => optional_sound!(
+                wire_has_sound_incoming_ring,
+                "../sound-kit/atmostphere-2.wav"
+            ),
         }
     }
 }
+
+const HAS_ANY_SOUND: bool = cfg!(any(
+    wire_has_sound_whoosh_1,
+    wire_has_sound_whoosh_2,
+    wire_has_sound_button_1,
+    wire_has_sound_button_2,
+    wire_has_sound_success,
+    wire_has_sound_fail,
+    wire_has_sound_incoming_ring,
+));
 
 pub struct Sounds {
     _stream: OutputStream,
@@ -35,6 +63,9 @@ pub struct Sounds {
 
 impl Sounds {
     pub fn try_new() -> Option<Self> {
+        if !HAS_ANY_SOUND {
+            return None;
+        }
         let (stream, handle) = OutputStream::try_default().ok()?;
         Some(Self {
             _stream: stream,
@@ -44,10 +75,13 @@ impl Sounds {
     }
 
     pub fn play(&self, sound: Sound) {
+        let Some(bytes) = sound.bytes() else {
+            return;
+        };
         let Ok(sink) = Sink::try_new(&self.handle) else {
             return;
         };
-        let Ok(decoder) = Decoder::new(Cursor::new(sound.bytes())) else {
+        let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else {
             return;
         };
         sink.append(decoder);
@@ -62,7 +96,10 @@ impl Sounds {
             let Ok(sink) = Sink::try_new(&self.handle) else {
                 return;
             };
-            let Ok(decoder) = Decoder::new(Cursor::new(Sound::IncomingRing.bytes())) else {
+            let Some(bytes) = Sound::IncomingRing.bytes() else {
+                return;
+            };
+            let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else {
                 return;
             };
             sink.append(decoder.repeat_infinite());

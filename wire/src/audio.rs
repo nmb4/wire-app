@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::Result;
 use bytes::Bytes;
 use cpal::{ChannelCount, SampleRate};
+use fixed_resample::{FixedResampler, ResampleQuality};
 
 use self::{
     capture::AudioCapture, device::list_devices, playback::AudioPlayback,
@@ -34,6 +35,42 @@ pub const ENGINE_FORMAT: AudioFormat = AudioFormat::new(SAMPLE_RATE, 2);
 
 const DURATION_10MS: Duration = Duration::from_millis(10);
 const DURATION_20MS: Duration = Duration::from_millis(20);
+
+fn device_resampler(
+    channels: NonZeroUsize,
+    input_rate: u32,
+    output_rate: u32,
+) -> FixedResampler<f32, 2> {
+    #[cfg(target_os = "macos")]
+    {
+        use fixed_resample::rubato::{FastFixedIn, PolynomialDegree};
+
+        // fixed-resample's convenience constructor uses 1,024-frame blocks,
+        // which is 64 ms at a 16 kHz Bluetooth device. Use 10 ms blocks so
+        // capture and playback can continuously feed the 20 ms call pipeline.
+        let input_block_frames = (input_rate as usize / 100).max(1);
+        let inner = FastFixedIn::<f32>::new(
+            output_rate as f64 / input_rate as f64,
+            1.0,
+            PolynomialDegree::Linear,
+            input_block_frames,
+            channels.get(),
+        )
+        .expect("valid fixed device resampling ratio");
+        FixedResampler::from_custom(inner, input_rate, output_rate, true)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        FixedResampler::new(
+            channels,
+            input_rate,
+            output_rate,
+            ResampleQuality::High,
+            true,
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AudioContext {
@@ -187,5 +224,42 @@ impl AudioFormat {
 
     pub const fn sample_count(&self, duration: Duration) -> usize {
         self.block_count(duration) * self.channel_count as usize
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_device_frames_from_interleaved_samples() {
+        assert_eq!(ENGINE_FORMAT.block_count(DURATION_20MS), 960);
+        assert_eq!(ENGINE_FORMAT.sample_count(DURATION_20MS), 1_920);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_resampler_emits_twenty_ms_without_batching() {
+        let mut capture = device_resampler(NonZeroUsize::new(2).unwrap(), 16_000, 48_000);
+        let capture_input = vec![0.0; 320 * 2];
+        let mut capture_output = 0;
+        capture.process_interleaved(
+            &capture_input,
+            |samples| capture_output += samples.len(),
+            None,
+            false,
+        );
+        assert!((960..=1_920).contains(&capture_output));
+
+        let mut playback = device_resampler(NonZeroUsize::new(1).unwrap(), 48_000, 16_000);
+        let playback_input = vec![0.0; 960];
+        let mut playback_output = 0;
+        playback.process_interleaved(
+            &playback_input,
+            |samples| playback_output += samples.len(),
+            None,
+            false,
+        );
+        assert!((160..=320).contains(&playback_output));
     }
 }
