@@ -22,6 +22,7 @@ const OUTER_PADDING: f32 = 8.0;
 const STACK_GAP: f32 = 7.0;
 const RIGHT_MARGIN: f32 = 20.0;
 const TOP_MARGIN: f32 = 20.0;
+const STAGING_COORDINATE: f32 = -20_000.0;
 const ENTER_TIME: Duration = Duration::from_millis(210);
 const LEAVE_TIME: Duration = Duration::from_millis(180);
 const GROUP_WINDOW: Duration = Duration::from_secs(30);
@@ -30,6 +31,14 @@ const MAX_FUSED_ROWS: usize = 4;
 
 fn notification_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("wire-notification-overlay")
+}
+
+fn notification_window_title() -> String {
+    format!("Wire Notifications ({})", std::process::id())
+}
+
+fn staging_position() -> egui::Pos2 {
+    egui::pos2(STAGING_COORDINATE, STAGING_COORDINATE)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,7 +307,17 @@ impl NotificationStore {
             group.render_y += (target_y - group.render_y) * follow;
             target_y += group.height() + STACK_GAP;
         }
-        (target_y - STACK_GAP + OUTER_PADDING).max(1.0)
+        self.host_height()
+    }
+
+    fn host_height(&self) -> f32 {
+        let content_height = self
+            .visible
+            .iter()
+            .map(NotificationGroup::height)
+            .sum::<f32>();
+        let gaps = self.visible.len().saturating_sub(1) as f32 * STACK_GAP;
+        (content_height + gaps + OUTER_PADDING * 2.0).max(1.0)
     }
 
     fn has_notifications(&self) -> bool {
@@ -334,6 +353,8 @@ struct NotificationRuntime {
     command_rx: mpsc::Receiver<NotificationCommand>,
     resize_target: Option<Vec2>,
     settled_frames: u8,
+    #[cfg(windows)]
+    window_region: Vec<[i32; 4]>,
 }
 
 impl NotificationRuntime {
@@ -350,6 +371,7 @@ impl NotificationRuntime {
 pub(crate) struct NotificationService {
     runtime: Arc<Mutex<NotificationRuntime>>,
     active: Arc<AtomicBool>,
+    viewport_created: Arc<AtomicBool>,
     viewport_ready: Arc<AtomicBool>,
     sound_pending: AtomicBool,
     command_tx: mpsc::Sender<NotificationCommand>,
@@ -367,8 +389,11 @@ impl Default for NotificationService {
                 command_rx,
                 resize_target: None,
                 settled_frames: 0,
+                #[cfg(windows)]
+                window_region: Vec::new(),
             })),
             active: Arc::new(AtomicBool::new(false)),
+            viewport_created: Arc::new(AtomicBool::new(false)),
             viewport_ready: Arc::new(AtomicBool::new(false)),
             sound_pending: AtomicBool::new(false),
             command_tx,
@@ -466,13 +491,23 @@ impl NotificationService {
     }
 
     fn push(&self, spec: NotificationSpec) {
+        let kind = spec.kind;
+        let key = spec.group_key.clone();
         if self
             .command_tx
             .send(NotificationCommand::Push(spec))
             .is_ok()
         {
-            self.active.store(true, Ordering::Release);
+            if !self.active.swap(true, Ordering::AcqRel) {
+                self.viewport_created.store(false, Ordering::Release);
+                self.viewport_ready.store(false, Ordering::Release);
+            }
             self.sound_pending.store(true, Ordering::Release);
+            info!(
+                ?kind,
+                key = key.as_deref().unwrap_or("-"),
+                "notification queued"
+            );
         }
     }
 
@@ -495,32 +530,61 @@ impl NotificationService {
             return;
         }
 
-        let monitor_size = ctx.input(|input| input.viewport().monitor_size);
-        let initial_position = monitor_size.map(|size| {
+        // Apply queued entries on the root viewport so a newly created native
+        // window can be built at the correct size. The deferred viewport used
+        // to start at INITIAL_HOST_HEIGHT while hidden and resize itself from
+        // its first paint callback. A hidden window may never receive that
+        // callback, especially after the eframe/wgpu 0.33 upgrade.
+        let initial_host_size = self
+            .runtime
+            .lock()
+            .ok()
+            .map(|mut runtime| {
+                let now = Instant::now();
+                runtime.apply_commands(now);
+                runtime.store.advance(now);
+                Vec2::new(HOST_WIDTH, runtime.store.host_height())
+            })
+            .unwrap_or_else(|| Vec2::new(HOST_WIDTH, INITIAL_HOST_HEIGHT));
+        let first_creation = !self.viewport_created.swap(true, Ordering::AcqRel);
+
+        let monitor_size = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
+        let target_position = {
             egui::pos2(
-                (size.x - HOST_WIDTH - RIGHT_MARGIN).max(0.0),
+                (monitor_size.x - HOST_WIDTH - RIGHT_MARGIN).max(0.0),
                 platform_top_margin(),
             )
-        });
+        };
+        let viewport_ready = self.viewport_ready.load(Ordering::Acquire);
         let mut builder = ViewportBuilder::default()
-            .with_title("Wire Notifications")
-            .with_inner_size([HOST_WIDTH, INITIAL_HOST_HEIGHT])
+            .with_title(notification_window_title())
             .with_decorations(false)
             .with_resizable(false)
             .with_transparent(true)
             .with_active(false)
-            .with_visible(self.viewport_ready.load(Ordering::Acquire))
+            // Hidden native windows do not receive deferred paint callbacks on
+            // Windows. Keep the viewport renderable but stage it off-screen
+            // until its transparent surface has completed prepaint.
+            .with_visible(true)
+            .with_position(if viewport_ready {
+                target_position
+            } else {
+                staging_position()
+            })
             .with_taskbar(false)
             .with_window_level(WindowLevel::AlwaysOnTop);
-        if let Some(position) = initial_position {
-            builder = builder.with_position(position);
+        if first_creation {
+            // Supplying the final estimated size at creation avoids exposing
+            // the native window's opaque backing store during its first resize.
+            builder = builder.with_inner_size(initial_host_size);
         }
-
         let runtime = Arc::clone(&self.runtime);
         let active = Arc::clone(&self.active);
+        let viewport_created = Arc::clone(&self.viewport_created);
         let viewport_ready = Arc::clone(&self.viewport_ready);
         let action_tx = self.action_tx.clone();
-        ctx.request_repaint_of(notification_viewport_id());
         ctx.show_viewport_deferred(
             notification_viewport_id(),
             builder,
@@ -530,12 +594,17 @@ impl NotificationService {
                     class,
                     &runtime,
                     &active,
+                    &viewport_created,
                     &viewport_ready,
+                    target_position,
                     &action_tx,
                     theme,
                 );
             },
         );
+        // Keep an explicit repaint request for platforms that do not issue an
+        // initial redraw when creating the off-screen deferred viewport.
+        ctx.request_repaint_of(notification_viewport_id());
     }
 }
 
@@ -555,7 +624,9 @@ fn render_overlay(
     class: ViewportClass,
     runtime: &Arc<Mutex<NotificationRuntime>>,
     active: &Arc<AtomicBool>,
+    viewport_created: &Arc<AtomicBool>,
     viewport_ready: &Arc<AtomicBool>,
+    target_position: egui::Pos2,
     action_tx: &mpsc::Sender<NotificationAction>,
     theme: Theme,
 ) {
@@ -572,12 +643,17 @@ fn render_overlay(
         store,
         resize_target,
         settled_frames,
+        #[cfg(windows)]
+        window_region,
         ..
     } = &mut *runtime;
     if close_requested {
         info!("notification viewport close requested");
         store.clear();
+        #[cfg(windows)]
+        window_region.clear();
         active.store(false, Ordering::Release);
+        viewport_created.store(false, Ordering::Release);
         viewport_ready.store(false, Ordering::Release);
         ctx.request_repaint_of(ViewportId::ROOT);
         return;
@@ -585,28 +661,35 @@ fn render_overlay(
     store.advance(now);
     if !store.has_notifications() {
         active.store(false, Ordering::Release);
+        #[cfg(windows)]
+        window_region.clear();
+        viewport_created.store(false, Ordering::Release);
         viewport_ready.store(false, Ordering::Release);
+        *resize_target = None;
+        *settled_frames = 0;
         ctx.request_repaint_of(ViewportId::ROOT);
         return;
     }
 
     let host_height = store.layout(now);
     if class != ViewportClass::Embedded {
+        #[cfg(windows)]
+        update_windows_window_region(ctx, store, window_region);
         let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
         let desired_size = Vec2::new(HOST_WIDTH, host_height);
-        let target_changed = resize_target
-            .is_none_or(|target| (target - desired_size).length() > 1.0);
+        let target_changed =
+            resize_target.is_none_or(|target| (target - desired_size).length() > 1.0);
         if target_changed {
             *resize_target = Some(desired_size);
             *settled_frames = 0;
         }
         if current_size.is_none_or(|size| (size - desired_size).length() > 1.0) {
-            // On Windows, resizing a visible transparent WGPU surface can leave
-            // pixels from the initial opaque backing store in the newly exposed
-            // region. Keep the viewport hidden until it has rendered a complete
-            // frame at its final size, then reveal it atomically.
+            // Move off-screen while resizing so Windows never exposes the
+            // transparent WGPU surface's opaque backing store in the newly
+            // exposed area. Unlike a hidden window, this still receives paint
+            // callbacks and can reliably advance to the reveal state.
             viewport_ready.store(false, Ordering::Release);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(staging_position()));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired_size));
             *settled_frames = 0;
             ctx.request_repaint();
@@ -615,18 +698,33 @@ fn render_overlay(
             *settled_frames = 1;
             ctx.request_repaint();
         } else if !viewport_ready.swap(true, Ordering::AcqRel) {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(target_position));
+            info!("notification viewport revealed after off-screen transparent prepaint");
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
 
+    let host_frame = if cfg!(windows) {
+        // Windows wgpu surfaces do not reliably preserve per-pixel alpha. The
+        // native window region below removes everything outside the cards, so
+        // give the remaining pixels an opaque, deterministic backing color.
+        Frame::NONE.fill(pal.panel)
+    } else {
+        Frame::NONE
+    };
     egui::CentralPanel::default()
-        .frame(Frame::NONE)
+        .frame(host_frame)
         .show(ctx, |_ui| {});
 
     let mut dismiss = Vec::new();
     for group in &mut store.visible {
-        let opacity = group.opacity(now);
+        // A shaped Windows window cannot fade as one composited alpha surface.
+        // Keep cards opaque there; entry/exit timing and stacking still work.
+        let opacity = if cfg!(windows) {
+            1.0
+        } else {
+            group.opacity(now)
+        };
         let x_offset = (1.0 - opacity) * 28.0;
         let position = egui::pos2(OUTER_PADDING + x_offset, group.render_y);
         let area = egui::Area::new(Id::new(("notification-group", group.id)))
@@ -653,6 +751,88 @@ fn render_overlay(
 
     if let Some(delay) = store.next_repaint(now) {
         ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
+    }
+}
+
+#[cfg(windows)]
+fn windows_region_rects(store: &NotificationStore, pixels_per_point: f32) -> Vec<[i32; 4]> {
+    store
+        .visible
+        .iter()
+        .map(|group| {
+            [
+                (OUTER_PADDING * pixels_per_point).floor() as i32,
+                (group.render_y * pixels_per_point).floor() as i32,
+                ((OUTER_PADDING + CARD_WIDTH) * pixels_per_point).ceil() as i32,
+                ((group.render_y + group.height()) * pixels_per_point).ceil() as i32,
+            ]
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn update_windows_window_region(
+    ctx: &egui::Context,
+    store: &NotificationStore,
+    previous_rects: &mut Vec<[i32; 4]>,
+) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_OR,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let rects = windows_region_rects(store, ctx.pixels_per_point());
+    if rects == *previous_rects || rects.is_empty() {
+        return;
+    }
+    let first_apply = previous_rects.is_empty();
+
+    let mut title: Vec<u16> = notification_window_title().encode_utf16().collect();
+    title.push(0);
+    let Ok(hwnd) = (unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) }) else {
+        return;
+    };
+
+    let corner_diameter = (20.0 * ctx.pixels_per_point()).round().max(1.0) as i32;
+    let mut combined: Option<HRGN> = None;
+    for [left, top, right, bottom] in &rects {
+        let card = unsafe {
+            CreateRoundRectRgn(
+                *left,
+                *top,
+                *right + 1,
+                *bottom + 1,
+                corner_diameter,
+                corner_diameter,
+            )
+        };
+        if let Some(region) = combined {
+            unsafe {
+                CombineRgn(Some(region), Some(region), Some(card), RGN_OR);
+                let _ = DeleteObject(card.into());
+            }
+        } else {
+            combined = Some(card);
+        }
+    }
+
+    let Some(region) = combined else {
+        return;
+    };
+    if unsafe { SetWindowRgn(hwnd, Some(region), true) } != 0 {
+        // SetWindowRgn owns the region after a successful call.
+        *previous_rects = rects;
+        if first_apply {
+            info!(
+                cards = previous_rects.len(),
+                "notification window region applied"
+            );
+        }
+    } else {
+        unsafe {
+            let _ = DeleteObject(region.into());
+        }
     }
 }
 
@@ -965,5 +1145,57 @@ mod tests {
 
         service.info("third", "Wire", "Third notification");
         assert!(service.take_sound_request());
+    }
+
+    #[test]
+    fn first_notification_activates_at_its_final_estimated_size() {
+        let service = NotificationService::default();
+        assert!(!service.active.load(Ordering::Acquire));
+
+        service.info("first", "Wire", "First notification");
+
+        assert!(service.active.load(Ordering::Acquire));
+        let mut runtime = service.runtime.lock().unwrap();
+        runtime.apply_commands(Instant::now());
+        assert_eq!(runtime.store.visible.len(), 1);
+        assert_eq!(runtime.store.host_height(), 94.0);
+    }
+
+    #[test]
+    fn native_notification_viewport_prepaints_offscreen_at_final_size() {
+        let service = NotificationService::default();
+        service.info("first", "Wire", "First notification");
+        let context = egui::Context::default();
+        context.set_embed_viewports(false);
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            service.show(ctx, Theme::Amber);
+        });
+
+        let viewport = output
+            .viewport_output
+            .get(&notification_viewport_id())
+            .expect("notification viewport should be requested");
+        assert_eq!(viewport.builder.visible, Some(true));
+        assert_eq!(viewport.builder.position, Some(staging_position()));
+        assert_eq!(
+            viewport.builder.inner_size,
+            Some(Vec2::new(HOST_WIDTH, 94.0))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_region_contains_only_the_card_bounds() {
+        let service = NotificationService::default();
+        service.info("first", "Wire", "First notification");
+        let mut runtime = service.runtime.lock().unwrap();
+        let now = Instant::now();
+        runtime.apply_commands(now);
+        runtime.store.layout(now);
+
+        assert_eq!(
+            windows_region_rects(&runtime.store, 1.5),
+            vec![[12, -30, 510, 88]]
+        );
     }
 }

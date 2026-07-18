@@ -476,6 +476,14 @@ impl App {
             "wire",
             options,
             Box::new(|cc| {
+                if let Some(render_state) = &cc.wgpu_render_state {
+                    let adapter = render_state.adapter.get_info();
+                    tracing::info!(
+                        backend = ?adapter.backend,
+                        adapter = %adapter.name,
+                        "initialized UI renderer"
+                    );
+                }
                 setup_fonts(&cc.egui_ctx);
                 Ok(Box::new(app))
             }),
