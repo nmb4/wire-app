@@ -23,8 +23,8 @@ const STACK_GAP: f32 = 7.0;
 const RIGHT_MARGIN: f32 = 20.0;
 const TOP_MARGIN: f32 = 20.0;
 const STAGING_COORDINATE: f32 = -20_000.0;
-const ENTER_TIME: Duration = Duration::from_millis(210);
-const LEAVE_TIME: Duration = Duration::from_millis(180);
+const ENTER_TIME: Duration = Duration::from_millis(260);
+const LEAVE_TIME: Duration = Duration::from_millis(320);
 const GROUP_WINDOW: Duration = Duration::from_secs(30);
 const MAX_VISIBLE: usize = 4;
 const MAX_FUSED_ROWS: usize = 4;
@@ -39,6 +39,14 @@ fn notification_window_title() -> String {
 
 fn staging_position() -> egui::Pos2 {
     egui::pos2(STAGING_COORDINATE, STAGING_COORDINATE)
+}
+
+fn resize_requires_staging(viewport_ready: bool) -> bool {
+    if cfg!(windows) {
+        !viewport_ready
+    } else {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,7 +309,7 @@ impl NotificationStore {
             .as_secs_f32()
             .min(0.1);
         self.last_frame = now;
-        let follow = 1.0 - (-18.0 * dt).exp();
+        let follow = 1.0 - (-14.0 * dt).exp();
         let mut target_y = OUTER_PADDING;
         for group in &mut self.visible {
             group.render_y += (target_y - group.render_y) * follow;
@@ -674,7 +682,7 @@ fn render_overlay(
     let host_height = store.layout(now);
     if class != ViewportClass::Embedded {
         #[cfg(windows)]
-        update_windows_window_region(ctx, store, window_region);
+        update_windows_window_region(ctx, store, window_region, now);
         let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
         let desired_size = Vec2::new(HOST_WIDTH, host_height);
         let target_changed =
@@ -684,12 +692,13 @@ fn render_overlay(
             *settled_frames = 0;
         }
         if current_size.is_none_or(|size| (size - desired_size).length() > 1.0) {
-            // Move off-screen while resizing so Windows never exposes the
-            // transparent WGPU surface's opaque backing store in the newly
-            // exposed area. Unlike a hidden window, this still receives paint
-            // callbacks and can reliably advance to the reveal state.
-            viewport_ready.store(false, Ordering::Release);
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(staging_position()));
+            // The shaped Windows window has an opaque backing only inside the
+            // card regions, so it can resize in place without flashing. Other
+            // platforms still prepaint dynamic resizes off-screen.
+            if resize_requires_staging(viewport_ready.load(Ordering::Acquire)) {
+                viewport_ready.store(false, Ordering::Release);
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(staging_position()));
+            }
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired_size));
             *settled_frames = 0;
             ctx.request_repaint();
@@ -718,14 +727,14 @@ fn render_overlay(
 
     let mut dismiss = Vec::new();
     for group in &mut store.visible {
-        // A shaped Windows window cannot fade as one composited alpha surface.
-        // Keep cards opaque there; entry/exit timing and stacking still work.
-        let opacity = if cfg!(windows) {
-            1.0
+        let animation = group.opacity(now);
+        // A shaped Windows window cannot fade as one composited alpha surface,
+        // so slide the opaque card fully through the right edge instead.
+        let (opacity, x_offset) = if cfg!(windows) {
+            (1.0, windows_slide_offset(animation))
         } else {
-            group.opacity(now)
+            (animation, (1.0 - animation) * 28.0)
         };
-        let x_offset = (1.0 - opacity) * 28.0;
         let position = egui::pos2(OUTER_PADDING + x_offset, group.render_y);
         let area = egui::Area::new(Id::new(("notification-group", group.id)))
             .order(egui::Order::Foreground)
@@ -754,16 +763,25 @@ fn render_overlay(
     }
 }
 
+fn windows_slide_offset(animation: f32) -> f32 {
+    (1.0 - animation) * (HOST_WIDTH - OUTER_PADDING)
+}
+
 #[cfg(windows)]
-fn windows_region_rects(store: &NotificationStore, pixels_per_point: f32) -> Vec<[i32; 4]> {
+fn windows_region_rects(
+    store: &NotificationStore,
+    pixels_per_point: f32,
+    now: Instant,
+) -> Vec<[i32; 4]> {
     store
         .visible
         .iter()
         .map(|group| {
+            let x = OUTER_PADDING + windows_slide_offset(group.opacity(now));
             [
-                (OUTER_PADDING * pixels_per_point).floor() as i32,
+                (x * pixels_per_point).floor() as i32,
                 (group.render_y * pixels_per_point).floor() as i32,
-                ((OUTER_PADDING + CARD_WIDTH) * pixels_per_point).ceil() as i32,
+                ((x + CARD_WIDTH) * pixels_per_point).ceil() as i32,
                 ((group.render_y + group.height()) * pixels_per_point).ceil() as i32,
             ]
         })
@@ -775,6 +793,7 @@ fn update_windows_window_region(
     ctx: &egui::Context,
     store: &NotificationStore,
     previous_rects: &mut Vec<[i32; 4]>,
+    now: Instant,
 ) {
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{
@@ -782,7 +801,7 @@ fn update_windows_window_region(
     };
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
-    let rects = windows_region_rects(store, ctx.pixels_per_point());
+    let rects = windows_region_rects(store, ctx.pixels_per_point(), now);
     if rects == *previous_rects || rects.is_empty() {
         return;
     }
@@ -820,7 +839,7 @@ fn update_windows_window_region(
     let Some(region) = combined else {
         return;
     };
-    if unsafe { SetWindowRgn(hwnd, Some(region), true) } != 0 {
+    if unsafe { SetWindowRgn(hwnd, Some(region), false) } != 0 {
         // SetWindowRgn owns the region after a successful call.
         *previous_rects = rects;
         if first_apply {
@@ -848,7 +867,15 @@ fn render_group(
         .fill(tint(pal.panel))
         .stroke(Stroke::new(1.0, tint(pal.line)))
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(14, 10))
+        .inner_margin(Margin {
+            left: 14,
+            right: 14,
+            // The header row's controls already provide their own vertical
+            // inset. An additional frame inset makes the visible top gap much
+            // larger than the body-to-bottom gap at common Windows DPI scales.
+            top: 0,
+            bottom: 10,
+        })
         .shadow(Shadow {
             offset: [0, 2],
             blur: 8,
@@ -1194,8 +1221,22 @@ mod tests {
         runtime.store.layout(now);
 
         assert_eq!(
-            windows_region_rects(&runtime.store, 1.5),
-            vec![[12, -30, 510, 88]]
+            windows_region_rects(&runtime.store, 1.5, now),
+            vec![[522, -30, 1020, 88]]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stack_updates_stay_onscreen_and_slide_through_the_edge() {
+        assert!(!resize_requires_staging(true));
+        assert!(resize_requires_staging(false));
+        assert_eq!(windows_slide_offset(0.0), HOST_WIDTH - OUTER_PADDING);
+        assert_eq!(
+            windows_slide_offset(0.5),
+            (HOST_WIDTH - OUTER_PADDING) / 2.0
+        );
+        assert_eq!(windows_slide_offset(1.0), 0.0);
+        assert!(LEAVE_TIME >= Duration::from_millis(300));
     }
 }
