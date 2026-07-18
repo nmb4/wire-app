@@ -21,6 +21,10 @@ fn main() {
         ("wire_has_sound_success", "sound-kit/success.wav"),
         ("wire_has_sound_fail", "sound-kit/fail.wav"),
         (
+            "wire_has_sound_notification_pop",
+            "sound-kit/notification-pop.wav",
+        ),
+        (
             "wire_has_sound_incoming_ring",
             "sound-kit/atmostphere-2.wav",
         ),

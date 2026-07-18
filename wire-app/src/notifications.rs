@@ -351,6 +351,7 @@ pub(crate) struct NotificationService {
     runtime: Arc<Mutex<NotificationRuntime>>,
     active: Arc<AtomicBool>,
     viewport_ready: Arc<AtomicBool>,
+    sound_pending: AtomicBool,
     command_tx: mpsc::Sender<NotificationCommand>,
     action_tx: mpsc::Sender<NotificationAction>,
     action_rx: mpsc::Receiver<NotificationAction>,
@@ -369,6 +370,7 @@ impl Default for NotificationService {
             })),
             active: Arc::new(AtomicBool::new(false)),
             viewport_ready: Arc::new(AtomicBool::new(false)),
+            sound_pending: AtomicBool::new(false),
             command_tx,
             action_tx,
             action_rx,
@@ -470,7 +472,12 @@ impl NotificationService {
             .is_ok()
         {
             self.active.store(true, Ordering::Release);
+            self.sound_pending.store(true, Ordering::Release);
         }
+    }
+
+    pub(crate) fn take_sound_request(&self) -> bool {
+        self.sound_pending.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn dismiss_key(&self, key: &str) {
@@ -945,5 +952,18 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |ctx| {
             service.show(ctx, Theme::Amber);
         });
+    }
+
+    #[test]
+    fn notification_sounds_coalesce_until_consumed() {
+        let service = NotificationService::default();
+        service.info("first", "Wire", "First notification");
+        service.info("second", "Wire", "Second notification");
+
+        assert!(service.take_sound_request());
+        assert!(!service.take_sound_request());
+
+        service.info("third", "Wire", "Third notification");
+        assert!(service.take_sound_request());
     }
 }

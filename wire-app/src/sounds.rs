@@ -23,6 +23,7 @@ pub enum Sound {
     Button2,
     Success,
     Fail,
+    Notification,
     IncomingRing,
 }
 
@@ -37,6 +38,10 @@ impl Sound {
                 optional_sound!(wire_has_sound_success, "../sound-kit/success.wav")
             }
             Sound::Fail => optional_sound!(wire_has_sound_fail, "../sound-kit/fail.wav"),
+            Sound::Notification => optional_sound!(
+                wire_has_sound_notification_pop,
+                "../sound-kit/notification-pop.wav"
+            ),
             Sound::IncomingRing => optional_sound!(
                 wire_has_sound_incoming_ring,
                 "../sound-kit/atmostphere-2.wav"
@@ -52,6 +57,7 @@ const HAS_ANY_SOUND: bool = cfg!(any(
     wire_has_sound_button_2,
     wire_has_sound_success,
     wire_has_sound_fail,
+    wire_has_sound_notification_pop,
     wire_has_sound_incoming_ring,
 ));
 
@@ -107,5 +113,18 @@ impl Sounds {
         } else if let Some(sink) = self.ringtone.take() {
             sink.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_sound_is_embedded_and_decodable() {
+        let bytes = Sound::Notification
+            .bytes()
+            .expect("notification Pop sound should be embedded");
+        assert!(Decoder::new(Cursor::new(bytes)).is_ok());
     }
 }

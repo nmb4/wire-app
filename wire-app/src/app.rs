@@ -498,6 +498,9 @@ impl AppState {
 
         self.process_notification_actions(ctx);
         self.process_events(ctx);
+        if self.notifications.take_sound_request() {
+            self.play_sound(Sound::Notification);
+        }
         #[cfg(windows)]
         for frame in self.video_frames.values_mut() {
             if let Some(presenter) = &mut frame.presenter {
