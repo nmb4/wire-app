@@ -2654,20 +2654,10 @@ impl AppState {
             self.reset_home_scroll = false;
         }
         scroll_area.show(ui, |ui| {
-            if ui.available_width() >= 760.0 {
-                ui.columns(2, |columns| {
-                    self.ui_identity_card(&mut columns[0]);
-                    columns[0].add_space(10.0);
-                    self.ui_dial_card(&mut columns[0]);
-                    self.ui_friends_card(&mut columns[1]);
-                });
-            } else {
-                self.ui_identity_card(ui);
-                ui.add_space(10.0);
-                self.ui_dial_card(ui);
-                ui.add_space(10.0);
-                self.ui_friends_card(ui);
-            }
+            // Friends-first home: contacts are primary; dial / ID / add-friend sit behind More.
+            self.ui_friends_card(ui);
+            ui.add_space(12.0);
+            self.ui_call_more_options(ui);
         });
     }
 
@@ -2864,20 +2854,55 @@ impl AppState {
         self.ui_sharing_card(ui);
     }
 
+    /// Collapsed tools: one-off dial, copy own ID, add friend.
+    fn ui_call_more_options(&mut self, ui: &mut Ui) {
+        let pal = Palette::for_theme(self.theme);
+        Frame::new()
+            .fill(pal.panel)
+            .corner_radius(CornerRadius::same(CHROME_RADIUS))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .stroke(Stroke::new(1.0_f32, chat_hairline(&pal)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::CollapsingHeader::new(
+                    RichText::new("More options")
+                        .color(pal.text2)
+                        .size(ui_font_size(12.5)),
+                )
+                .id_salt("call-more-options")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(6.0);
+                    self.ui_identity_card(ui);
+                    ui.add_space(10.0);
+                    self.ui_dial_card(ui);
+                    ui.add_space(10.0);
+                    self.ui_add_friend_card(ui);
+                });
+            });
+    }
+
     fn ui_identity_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
         section_card(ui, &pal, "Your identity", |ui| {
             if let Some(node_id) = &self.our_node_id {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(fmt_node_id(&node_id.fmt_short()));
-                    if action_button(ui, &pal, "Copy", ButtonTone::Secondary).clicked() {
-                        copy_to_clipboard(&node_id.to_string());
-                    }
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if action_button(ui, &pal, "Copy ID", ButtonTone::Secondary).clicked()
+                            {
+                                copy_to_clipboard(&node_id.to_string());
+                            }
+                        });
+                    });
                 });
                 ui.label(
-                    RichText::new("This is your stable ID (saved locally). Share it so friends can add and call you.")
-                        .small()
-                        .weak(),
+                    RichText::new(
+                        "Your stable Wire ID (saved locally). Share it so friends can add and call you.",
+                    )
+                    .small()
+                    .weak(),
                 );
             } else {
                 ui.label(RichText::new("Waiting for network…").weak());
@@ -2887,12 +2912,18 @@ impl AppState {
 
     fn ui_dial_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
-        section_card(ui, &pal, "Place a call", |ui| {
+        section_card(ui, &pal, "One-off call", |ui| {
+            ui.label(
+                RichText::new("Call someone by node ID without saving them as a friend.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.remote_node_input)
                         .hint_text("Paste remote node ID")
-                        .desired_width(ui.available_width() - 64.0),
+                        .desired_width((ui.available_width() - 72.0).max(80.0)),
                 );
                 if response.changed() {
                     self.remote_node_id = if self.remote_node_input.is_empty() {
@@ -2938,60 +2969,9 @@ impl AppState {
         });
     }
 
-    fn ui_friends_card(&mut self, ui: &mut Ui) {
+    fn ui_add_friend_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
-        section_card(ui, &pal, "Friends", |ui| {
-            let mut call: Option<NodeId> = None;
-            let mut remove_idx: Option<usize> = None;
-
-            if self.friends.is_empty() {
-                ui.label(RichText::new("No friends yet. Add one below.").weak());
-            }
-            for (idx, friend) in self.friends.iter().enumerate() {
-                let parsed = NodeId::from_str(&friend.node_id);
-                let display_name = if friend.name.trim().is_empty()
-                    || friend.name.trim() == friend.node_id.trim()
-                {
-                    "Unnamed contact"
-                } else {
-                    friend.name.trim()
-                };
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(display_name)
-                                .color(pal.text)
-                                .size(ui_font_size(13.0)),
-                        );
-                        if parsed.is_err() {
-                            ui.label(RichText::new("invalid id").small().weak());
-                        }
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if action_button(ui, &pal, "Remove", ButtonTone::Danger).clicked() {
-                            remove_idx = Some(idx);
-                        }
-                        if action_button(ui, &pal, "Call", ButtonTone::Primary).clicked() {
-                            if let Ok(id) = parsed {
-                                call = Some(id);
-                            }
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-            }
-
-            if let Some(id) = call {
-                self.play_sound(Sound::Button2);
-                self.cmd(Command::Call { node_id: id });
-            }
-            if let Some(idx) = remove_idx {
-                self.friends.remove(idx);
-                save_friends(&self.friends);
-            }
-
-            ui.separator();
-            ui.label(RichText::new("Add a friend").strong());
+        section_card(ui, &pal, "Add a friend", |ui| {
             let name_width = ui.available_width();
             ui.add(
                 egui::TextEdit::singleline(&mut self.new_friend_name)
@@ -3007,10 +2987,186 @@ impl AppState {
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.add_friend();
             }
+            ui.add_space(4.0);
             if action_button_full(ui, &pal, "Add friend", ButtonTone::Primary).clicked() {
                 self.add_friend();
             }
         });
+    }
+
+    fn ui_friends_card(&mut self, ui: &mut Ui) {
+        let pal = Palette::for_theme(self.theme);
+        Frame::new()
+            .fill(pal.panel)
+            .corner_radius(CornerRadius::same(CHROME_RADIUS))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .stroke(Stroke::new(1.0_f32, chat_hairline(&pal)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("FRIENDS")
+                            .family(kh_family())
+                            .color(pal.dim)
+                            .size(11.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(if self.friends.is_empty() {
+                                "no contacts".to_owned()
+                            } else if self.friends.len() == 1 {
+                                "1 contact".to_owned()
+                            } else {
+                                format!("{} contacts", self.friends.len())
+                            })
+                            .color(pal.dim2)
+                            .size(ui_font_size(11.5)),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+
+                let mut call: Option<NodeId> = None;
+                let mut remove_idx: Option<usize> = None;
+                let mut copy_id: Option<String> = None;
+
+                if self.friends.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No friends yet. Open More options below to add someone by node ID.",
+                        )
+                        .color(pal.dim)
+                        .size(ui_font_size(12.5)),
+                    );
+                }
+
+                for (idx, friend) in self.friends.iter().enumerate() {
+                    let parsed = NodeId::from_str(friend.node_id.trim());
+                    let display_name = if friend.name.trim().is_empty()
+                        || friend.name.trim() == friend.node_id.trim()
+                    {
+                        "Unnamed contact"
+                    } else {
+                        friend.name.trim()
+                    };
+                    let initial = display_name
+                        .chars()
+                        .find(|c| c.is_alphanumeric())
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_else(|| "?".to_owned());
+                    let short_id = parsed
+                        .as_ref()
+                        .ok()
+                        .map(|id| id.fmt_short().to_string())
+                        .unwrap_or_else(|| {
+                            let raw = friend.node_id.trim();
+                            if raw.len() > 12 {
+                                format!("{}…", &raw[..10])
+                            } else {
+                                raw.to_owned()
+                            }
+                        });
+
+                    Frame::new()
+                        .fill(chat_surface(&pal))
+                        .stroke(Stroke::new(1.0_f32, chat_hairline(&pal)))
+                        .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(40.0);
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                circle_avatar(ui, &pal, &initial, 32.0);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(
+                                        RichText::new(display_name)
+                                            .color(pal.text)
+                                            .size(ui_font_size(13.0)),
+                                    );
+                                    ui.label(
+                                        RichText::new(if parsed.is_err() {
+                                            "invalid id".to_owned()
+                                        } else {
+                                            short_id
+                                        })
+                                        .monospace()
+                                        .color(if parsed.is_err() {
+                                            pal.err
+                                        } else {
+                                            pal.dim
+                                        })
+                                        .size(ui_font_size(10.5)),
+                                    );
+                                });
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                                    let menu_response = ui
+                                        .menu_button(
+                                            RichText::new(char::from(Icon::EllipsisVertical))
+                                                .font(lucide(16.0))
+                                                .color(pal.text2),
+                                            |ui| {
+                                                ui.set_min_width(148.0);
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Copy node ID")
+                                                            .size(ui_font_size(12.5)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    copy_id = Some(friend.node_id.clone());
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Remove")
+                                                                .color(pal.err)
+                                                                .size(ui_font_size(12.5)),
+                                                        )
+                                                        .fill(Color32::TRANSPARENT),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    remove_idx = Some(idx);
+                                                    ui.close();
+                                                }
+                                            },
+                                        )
+                                        .response;
+                                    menu_response.on_hover_text("More actions");
+
+                                    ui.add_enabled_ui(parsed.is_ok(), |ui| {
+                                        if action_button(ui, &pal, "Call", ButtonTone::Primary)
+                                            .clicked()
+                                        {
+                                            if let Ok(id) = parsed {
+                                                call = Some(id);
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
+                if let Some(id) = call {
+                    self.play_sound(Sound::Button2);
+                    self.cmd(Command::Call { node_id: id });
+                }
+                if let Some(idx) = remove_idx {
+                    self.friends.remove(idx);
+                    save_friends(&self.friends);
+                }
+                if let Some(node_id) = copy_id {
+                    copy_to_clipboard(&node_id);
+                }
+            });
     }
 
     fn add_friend(&mut self) {
@@ -4260,10 +4416,10 @@ fn section_card<R>(
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> R {
     Frame::new()
-        .fill(pal.panel)
-        .corner_radius(CornerRadius::same(10))
+        .fill(chat_surface(pal))
+        .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
         .inner_margin(12.0)
-        .stroke(Stroke::new(1.0_f32, pal.line))
+        .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
