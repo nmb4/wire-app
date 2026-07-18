@@ -83,6 +83,17 @@ impl FrameEncoder {
         }
     }
 
+    fn try_new_for_cpu_input(config: &VideoConfig) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            Self::try_new_with_mf(config)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::try_new(config)
+        }
+    }
+
     fn is_media_foundation(&self) -> bool {
         #[cfg(windows)]
         {
@@ -150,14 +161,12 @@ pub fn start(
     encoded_tx: broadcast::Sender<Arc<EncodedVideoFrame>>,
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
-) -> Result<JoinHandle<()>> {
+) -> JoinHandle<()> {
     let target_w = config.resolution.width();
     let target_h = config.resolution.height();
     let target_interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
 
-    let startup_stop = stop_flag.clone();
-    let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-    let handle = thread::spawn(move || {
+    thread::spawn(move || {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<CaptureFrame>(FRAME_CHANNEL_DEPTH);
         let (preview_input_tx, preview_input_rx) =
             mpsc::sync_channel::<PreviewInput>(PREVIEW_CHANNEL_DEPTH);
@@ -169,20 +178,7 @@ pub fn start(
         let capture_stop = stop_flag.clone();
         let capture_fps = config.framerate;
         let capture_handle = thread::spawn(move || {
-            let source = match init_capture_source(target_w, target_h, capture_fps) {
-                Ok(source) => {
-                    let _ = startup_tx.send(Ok(()));
-                    source
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    let _ = startup_tx.send(Err(message));
-                    capture_stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-            };
             if let Err(e) = run_capture_loop(
-                source,
                 &capture_stop,
                 target_w,
                 target_h,
@@ -209,26 +205,10 @@ pub fn start(
             info!("encode thread stopped: {e:?}");
         }
 
-        encode_stop.store(true, Ordering::Relaxed);
         let _ = capture_handle.join();
         let _ = preview_handle.join();
-    });
-
-    match startup_rx.recv() {
-        Ok(Ok(())) => Ok(handle),
-        Ok(Err(message)) => {
-            startup_stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-            Err(anyhow::anyhow!(message))
-        }
-        Err(error) => {
-            startup_stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-            Err(anyhow::anyhow!(
-                "capture startup stopped unexpectedly: {error}"
-            ))
-        }
-    }
+        info!("capture, encode, and preview threads exited");
+    })
 }
 
 pub fn ensure_capture_permission() -> Result<()> {
@@ -270,7 +250,7 @@ enum CaptureSource {
     Xcap {
         monitor: xcap::Monitor,
         resizer: Resizer,
-        dst: Image<'static>,
+        dst: Image,
     },
 }
 
@@ -352,7 +332,6 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
 }
 
 fn run_capture_loop(
-    mut source: CaptureSource,
     stop_flag: &AtomicBool,
     target_w: u32,
     target_h: u32,
@@ -360,6 +339,7 @@ fn run_capture_loop(
     framerate: u32,
     frame_tx: &mpsc::SyncSender<CaptureFrame>,
 ) -> Result<()> {
+    let mut source = init_capture_source(target_w, target_h, framerate)?;
     let sleeper = SpinSleeper::default();
     let mut window_captured = 0u64;
     let mut window_dropped = 0u64;
@@ -408,8 +388,6 @@ fn run_capture_loop(
             window_captured = 0;
             window_dropped = 0;
         }
-        // ScreenCaptureKit is callback-paced at the requested frame rate. An
-        // extra sleep would consume its callback queue too slowly.
         if !cfg!(target_os = "macos") && elapsed < target_interval {
             sleeper.sleep(target_interval - elapsed);
         }
@@ -427,10 +405,11 @@ fn run_encode_loop(
     preview_input_tx: mpsc::SyncSender<PreviewInput>,
     keyframe_tx: broadcast::Sender<()>,
 ) -> Result<()> {
-    #[cfg(windows)]
-    let mut encoder = FrameEncoder::try_new_with_mf(&config)?;
-    #[cfg(not(windows))]
-    let mut encoder = FrameEncoder::try_new(&config)?;
+    // Encoder creation is deliberately lazy. Local preview needs no encoder, and
+    // a WGC frame should initialize directly on WGC's D3D device instead of first
+    // creating and immediately discarding a second hardware encoder.
+    let mut encoder: Option<FrameEncoder> = None;
+    let mut force_keyframe_pending = false;
     let mut keyframe_rx = keyframe_tx.subscribe();
     let mut frame_count = 0u64;
     let mut encoded_count = 0u64;
@@ -449,8 +428,6 @@ fn run_encode_loop(
     #[cfg(windows)]
     let mut gpu_encoder_ready = false;
     #[cfg(windows)]
-    let mut gpu_encoder_failed = false;
-    #[cfg(windows)]
     let mut cpu_resizer = Resizer::new();
     #[cfg(windows)]
     let mut cpu_resize_dst = Image::new(target_w, target_h, PixelType::U8x4);
@@ -459,7 +436,13 @@ fn run_encode_loop(
 
     while !stop_flag.load(Ordering::Relaxed) {
         while keyframe_rx.try_recv().is_ok() {
-            encoder.force_keyframe();
+            force_keyframe_pending = true;
+        }
+        if force_keyframe_pending {
+            if let Some(encoder) = &mut encoder {
+                encoder.force_keyframe();
+                force_keyframe_pending = false;
+            }
         }
 
         let mut frame = match frame_rx.recv_timeout(Duration::from_millis(50)) {
@@ -477,7 +460,7 @@ fn run_encode_loop(
         let has_subscribers = encoded_tx.receiver_count() != 0;
         if has_subscribers && !had_subscribers {
             // A receiver may have joined in the middle of a GOP while capture was idle.
-            encoder.force_keyframe();
+            force_keyframe_pending = true;
             info!("video receiver joined; encoder resumed from a keyframe");
         }
         had_subscribers = has_subscribers;
@@ -494,17 +477,22 @@ fn run_encode_loop(
         #[cfg(windows)]
         let encoded_result = has_subscribers.then(|| match &frame {
             CaptureFrame::Gpu(gpu) => {
-                if !gpu_encoder_ready && !gpu_encoder_failed {
+                if encoder.is_none() {
                     match FrameEncoder::try_new_with_wgc_device(&config, &gpu.device) {
                         Ok(new_encoder) => {
-                            encoder = new_encoder;
+                            encoder = Some(new_encoder);
                             gpu_encoder_ready = true;
                         }
                         Err(e) => {
                             warn!("GPU-native encode unavailable; using CPU fallback: {e:#}");
-                            gpu_encoder_failed = true;
+                            encoder = Some(FrameEncoder::try_new_for_cpu_input(&config)?);
                         }
                     }
+                }
+                let encoder = encoder.as_mut().expect("video encoder was initialized");
+                if force_keyframe_pending {
+                    encoder.force_keyframe();
+                    force_keyframe_pending = false;
                 }
                 if gpu_encoder_ready {
                     encoder.encode_gpu_frame(gpu)
@@ -520,15 +508,38 @@ fn run_encode_loop(
                     encoder.encode_frame(&resized, true)
                 }
             }
-            CaptureFrame::Cpu(bgra) => encoder.encode_frame(bgra, true),
+            CaptureFrame::Cpu(bgra) => {
+                let encoder = match encoder.as_mut() {
+                    Some(encoder) => encoder,
+                    None => encoder.insert(FrameEncoder::try_new_for_cpu_input(&config)?),
+                };
+                if force_keyframe_pending {
+                    encoder.force_keyframe();
+                    force_keyframe_pending = false;
+                }
+                encoder.encode_frame(bgra, true)
+            }
         });
         #[cfg(not(windows))]
         let encoded_result = has_subscribers.then(|| match &frame {
-            CaptureFrame::Cpu(data) => encoder.encode_frame(data, cfg!(target_os = "macos")),
+            CaptureFrame::Cpu(data) => {
+                let encoder = match encoder.as_mut() {
+                    Some(encoder) => encoder,
+                    None => encoder.insert(FrameEncoder::try_new_for_cpu_input(&config)?),
+                };
+                if force_keyframe_pending {
+                    encoder.force_keyframe();
+                    force_keyframe_pending = false;
+                }
+                encoder.encode_frame(data, cfg!(target_os = "macos"))
+            }
         });
         match encoded_result {
             Some(Ok(encoded)) if encoded.is_empty() => {
-                if encoder.is_media_foundation() {
+                if encoder
+                    .as_ref()
+                    .is_some_and(FrameEncoder::is_media_foundation)
+                {
                     mf_empty_streak += 1;
                     if mf_empty_streak == MF_EMPTY_FALLBACK {
                         #[cfg(windows)]
@@ -536,18 +547,17 @@ fn run_encode_loop(
                             warn!(
                                 "GPU-native MF encoder produced no output for {MF_EMPTY_FALLBACK} frames; retrying the proven CPU-fed MF path"
                             );
-                            encoder = FrameEncoder::try_new_with_mf(&config)?;
+                            encoder = Some(FrameEncoder::try_new_with_mf(&config)?);
                             gpu_encoder_ready = false;
-                            gpu_encoder_failed = true;
                         } else {
                             warn!(
                                 "MF encoder produced no output for {MF_EMPTY_FALLBACK} frames, switching to OpenH264"
                             );
-                            encoder = FrameEncoder::try_new(&config)?;
+                            encoder = Some(FrameEncoder::try_new(&config)?);
                         }
                         #[cfg(not(windows))]
                         {
-                            encoder = FrameEncoder::try_new(&config)?;
+                            encoder = Some(FrameEncoder::try_new(&config)?);
                         }
                         mf_empty_streak = 0;
                     }
@@ -578,13 +588,16 @@ fn run_encode_loop(
                     warn!(
                         "GPU-native MF input failed; retaining hardware encode through the CPU-fed MF fallback (last: {e:#})"
                     );
-                    encoder = FrameEncoder::try_new_with_mf(&config)?;
+                    encoder = Some(FrameEncoder::try_new_with_mf(&config)?);
                     gpu_encoder_ready = false;
-                    gpu_encoder_failed = true;
                     encode_errors = 0;
-                } else if encoder.is_media_foundation() && encode_errors >= 5 {
+                } else if encoder
+                    .as_ref()
+                    .is_some_and(FrameEncoder::is_media_foundation)
+                    && encode_errors >= 5
+                {
                     warn!("switching to OpenH264 after repeated CPU-fed MF encode errors (last: {e:?})");
-                    encoder = FrameEncoder::try_new(&config)?;
+                    encoder = Some(FrameEncoder::try_new(&config)?);
                     encode_errors = 0;
                 }
             }
@@ -790,6 +803,75 @@ mod preview_tests {
     fn preserves_rgba_preview() {
         let rgba = [240, 20, 10, 255];
         assert_eq!(make_preview(&rgba, 1, 1, 1, 1, false), rgba);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and hardware video stack"]
+    fn repeated_capture_start_stop_reaches_a_memory_plateau() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        use tokio::sync::broadcast;
+        use wire::video::{VideoConfig, VideoResolution};
+
+        fn working_set_bytes() -> u64 {
+            let pid = Pid::from_u32(std::process::id());
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                ProcessRefreshKind::new().with_memory(),
+            );
+            system
+                .process(pid)
+                .map(|process| process.memory())
+                .unwrap_or(0)
+        }
+
+        let config = VideoConfig {
+            resolution: VideoResolution::P1080,
+            framerate: 30,
+            bitrate_bps: None,
+            sharing_enabled: true,
+        };
+        let mut stopped_memory = Vec::new();
+        for _ in 0..8 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (encoded_tx, encoded_rx) = broadcast::channel(32);
+            let (keyframe_tx, _) = broadcast::channel(4);
+            let (preview_tx, preview_rx) = async_channel::bounded(4);
+            let handle = super::start(config, stop.clone(), encoded_tx, preview_tx, keyframe_tx);
+            // Holding both receivers exercises the active GPU encode and preview paths.
+            let _receivers = (encoded_rx, preview_rx);
+            std::thread::sleep(Duration::from_secs(2));
+            stop.store(true, Ordering::Relaxed);
+            handle.join().expect("capture pipeline should stop cleanly");
+            drop(_receivers);
+            std::thread::sleep(Duration::from_millis(750));
+            stopped_memory.push(working_set_bytes());
+        }
+
+        let first = stopped_memory[0];
+        let last = *stopped_memory.last().unwrap();
+        let retained_growth = last.saturating_sub(first);
+        let late_growth = last.saturating_sub(stopped_memory[stopped_memory.len() / 2]);
+        println!(
+            "post-stop working sets (MiB): {:?}",
+            stopped_memory
+                .iter()
+                .map(|bytes| *bytes as f64 / (1024.0 * 1024.0))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            retained_growth < 128 * 1024 * 1024,
+            "capture memory kept growing after stop: {stopped_memory:?}"
+        );
+        assert!(
+            late_growth < 32 * 1024 * 1024,
+            "capture memory did not approach a plateau: {stopped_memory:?}"
+        );
     }
 }
 

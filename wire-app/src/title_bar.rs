@@ -115,7 +115,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
     } else {
         "Keep on top"
     };
-    if title_bar_icon_button(ui, pal, Icon::Layers2, *always_on_top, false, rounded)
+    if title_bar_icon_button(ui, pal, Icon::Pin, *always_on_top, false, rounded)
         .on_hover_text(pin_hint)
         .clicked()
     {

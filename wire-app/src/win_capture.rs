@@ -394,3 +394,48 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::WindowsCapturer;
+    use std::time::Duration;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    fn working_set_bytes() -> u64 {
+        let pid = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            ProcessRefreshKind::new().with_memory(),
+        );
+        system
+            .process(pid)
+            .map(|process| process.memory())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn repeated_wgc_start_stop_reaches_a_memory_plateau() {
+        let mut stopped_memory = Vec::new();
+        for _ in 0..8 {
+            let mut capture = WindowsCapturer::try_new(1920, 1080).unwrap();
+            for _ in 0..30 {
+                drop(capture.capture_gpu().unwrap());
+            }
+            drop(capture);
+            std::thread::sleep(Duration::from_millis(750));
+            stopped_memory.push(working_set_bytes());
+        }
+        println!(
+            "WGC-only post-stop working sets (MiB): {:?}",
+            stopped_memory
+                .iter()
+                .map(|bytes| *bytes as f64 / (1024.0 * 1024.0))
+                .collect::<Vec<_>>()
+        );
+        let last = *stopped_memory.last().unwrap();
+        let late_growth = last.saturating_sub(stopped_memory[stopped_memory.len() / 2]);
+        assert!(late_growth < 16 * 1024 * 1024, "WGC memory did not plateau");
+    }
+}

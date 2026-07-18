@@ -1129,6 +1129,17 @@ fn configure_processor(
     Ok(())
 }
 
+fn shutdown_transform(transform: &IMFTransform, detach_d3d: bool) {
+    unsafe {
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        if detach_d3d {
+            let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+        }
+    }
+}
+
 fn force_keyframe(transform: &IMFTransform) {
     unsafe {
         if let Ok(api) = transform.cast::<ICodecAPI>() {
@@ -1206,6 +1217,12 @@ impl MfColorConverter {
         }
         self.scratch[..out.len()].copy_from_slice(&out);
         Ok(Some(&self.scratch[..out.len()]))
+    }
+}
+
+impl Drop for MfColorConverter {
+    fn drop(&mut self) {
+        shutdown_transform(&self.transform, false);
     }
 }
 
@@ -1758,6 +1775,17 @@ impl MfH264Encoder {
     }
 }
 
+impl Drop for MfH264Encoder {
+    fn drop(&mut self) {
+        shutdown_transform(&self.transform, self.d3d.is_some());
+        self.gpu_processor = None;
+        self.gpu_nv12 = None;
+        self.bgra_to_nv12 = None;
+        self.d3d = None;
+        info!("MF H.264 encoder resources released");
+    }
+}
+
 fn decoder_nv12_output_type(transform: &IMFTransform) -> Result<IMFMediaType> {
     for index in 0..64 {
         match unsafe { transform.GetOutputAvailableType(0, index) } {
@@ -2111,6 +2139,17 @@ impl MfH264Decoder {
     }
 }
 
+impl Drop for MfH264Decoder {
+    fn drop(&mut self) {
+        // Hardware MFTs may retain decoder surfaces and driver allocations until
+        // the streaming session is explicitly ended. This matters especially when
+        // a remote stream genuinely fails and a decoder has to be recreated.
+        self.presentation_pool = None;
+        shutdown_transform(&self.transform, self._d3d.is_some());
+        info!("MF H.264 decoder resources released");
+    }
+}
+
 use windows::Win32::System::Com::CoTaskMemFree;
 
 #[cfg(test)]
@@ -2138,5 +2177,44 @@ mod tests {
     fn trims_h264_macroblock_padding_without_aperture_metadata() {
         assert_eq!(rect_size(fallback_display_rect(1920, 1088)), (1920, 1080));
         assert_eq!(rect_size(fallback_display_rect(1280, 720)), (1280, 720));
+    }
+
+    #[test]
+    #[ignore = "requires Windows Media Foundation hardware"]
+    fn repeated_encoder_start_stop_reaches_a_memory_plateau() {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        fn working_set_bytes() -> u64 {
+            let pid = Pid::from_u32(std::process::id());
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                ProcessRefreshKind::new().with_memory(),
+            );
+            system
+                .process(pid)
+                .map(|process| process.memory())
+                .unwrap_or(0)
+        }
+
+        let mut stopped_memory = Vec::new();
+        for _ in 0..8 {
+            drop(MfH264Encoder::try_new(&VideoConfig::default()).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            stopped_memory.push(working_set_bytes());
+        }
+        println!(
+            "encoder-only post-stop working sets (MiB): {:?}",
+            stopped_memory
+                .iter()
+                .map(|bytes| *bytes as f64 / (1024.0 * 1024.0))
+                .collect::<Vec<_>>()
+        );
+        let last = *stopped_memory.last().unwrap();
+        let late_growth = last.saturating_sub(stopped_memory[stopped_memory.len() / 2]);
+        assert!(
+            late_growth < 16 * 1024 * 1024,
+            "encoder memory did not plateau"
+        );
     }
 }

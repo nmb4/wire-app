@@ -15,6 +15,7 @@ const SESSION_ENV: &str = "WIRE_DEV_PAIR_SESSION";
 const PEER_INDEX_ENV: &str = "WIRE_DEV_PAIR_INDEX";
 const RENDEZVOUS_ATTEMPTS: usize = 100;
 const RENDEZVOUS_RETRY_DELAY: Duration = Duration::from_millis(50);
+const FIXTURE_PARTICIPANTS: usize = 3;
 
 #[derive(Serialize, Deserialize)]
 struct RendezvousRecord {
@@ -86,6 +87,27 @@ impl DevPairState {
             own_node_id.fmt_short(),
             peers.len()
         );
+        Ok(peers)
+    }
+
+    /// Returns every fixture participant independently of which side initiated
+    /// the automatic call. The app uses this list to seed local dev contacts, so
+    /// text chat can be exercised without relying on call state.
+    pub fn discover_fixture_peers(&self, own_node_id: NodeId) -> Result<Vec<NodeId>> {
+        let mut peers = Vec::with_capacity(FIXTURE_PARTICIPANTS.saturating_sub(1));
+        for index in 0..FIXTURE_PARTICIPANTS {
+            if index == self.peer_index {
+                continue;
+            }
+            let path = self.rendezvous_dir.join(format!("peer-{index}.json"));
+            let record = wait_for_live_record(&path)
+                .with_context(|| format!("waiting for dev participant {index}"))?;
+            let peer =
+                NodeId::from_str(&record.node_id).context("parsing dev participant node id")?;
+            if peer != own_node_id {
+                peers.push(peer);
+            }
+        }
         Ok(peers)
     }
 
@@ -222,6 +244,14 @@ mod tests {
         assert_eq!(
             states[2].register(node_ids[2]).unwrap(),
             vec![node_ids[0], node_ids[1]]
+        );
+        assert_eq!(
+            states[0].discover_fixture_peers(node_ids[0]).unwrap(),
+            vec![node_ids[1], node_ids[2]]
+        );
+        assert_eq!(
+            states[1].discover_fixture_peers(node_ids[1]).unwrap(),
+            vec![node_ids[0], node_ids[2]]
         );
     }
 }

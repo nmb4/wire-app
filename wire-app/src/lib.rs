@@ -1,4 +1,5 @@
 pub mod app;
+mod chat;
 mod dev_pair;
 mod resource_monitor;
 mod sounds;

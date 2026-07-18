@@ -228,11 +228,26 @@ pub fn generate_ephemeral_secret_key() -> SecretKey {
 }
 
 pub async fn bind_endpoint() -> Result<Endpoint> {
+    bind_endpoint_with_alpns(std::iter::empty()).await
+}
+
+/// Binds the persistent Wire endpoint and advertises application protocols in
+/// addition to the RTC protocol. The identity and discovery configuration are
+/// deliberately shared, while each protocol keeps an independent lifecycle.
+pub async fn bind_endpoint_with_alpns(
+    additional_alpns: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<Endpoint> {
     let secret_key = load_or_create_secret_key()?;
+    let mut alpns = vec![ALPN.to_vec()];
+    for alpn in additional_alpns {
+        if !alpns.contains(&alpn) {
+            alpns.push(alpn);
+        }
+    }
     Endpoint::builder()
         .secret_key(secret_key)
         .discovery_n0()
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(alpns)
         .bind()
         .await
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -26,6 +26,10 @@ use wire::{
 };
 
 use crate::{
+    chat::{
+        self, ChatConversation, ChatMessage, ChatNotification, ConversationKind, DeleteScope,
+        DeliveryState, MessageDeletion, RetentionPolicy,
+    },
     dev_pair::DevPairState,
     resource_monitor::ResourceMonitor,
     sounds::{Sound, Sounds},
@@ -173,6 +177,38 @@ struct AppState {
     resource_monitor: ResourceMonitor,
     dev_pair: Option<DevPairState>,
     dev_auto_share: bool,
+    app_mode: AppMode,
+    chat: ChatUiState,
+    chat_retention: RetentionPolicy,
+    chat_style: ChatStyle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Text,
+    Calls,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChatStyle {
+    #[default]
+    Bubbles,
+    Compact,
+}
+
+#[derive(Default)]
+struct ChatUiState {
+    conversations: BTreeMap<String, ChatConversation>,
+    timelines: BTreeMap<String, Vec<ChatMessage>>,
+    delivery: BTreeMap<String, (DeliveryState, Option<String>)>,
+    selected: Option<String>,
+    composer: String,
+    error: Option<String>,
+    service_error: Option<String>,
+    show_group_editor: bool,
+    group_name: String,
+    group_members: BTreeSet<NodeId>,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -250,6 +286,10 @@ struct Settings {
     #[serde(default)]
     window_frame_style: WindowFrameStyle,
     configured: bool,
+    #[serde(default)]
+    chat_retention: RetentionPolicy,
+    #[serde(default)]
+    chat_style: ChatStyle,
 }
 
 impl Default for Settings {
@@ -260,6 +300,8 @@ impl Default for Settings {
             theme: Theme::default(),
             window_frame_style: WindowFrameStyle::default(),
             configured: false,
+            chat_retention: RetentionPolicy::Unlimited,
+            chat_style: ChatStyle::default(),
         }
     }
 }
@@ -347,10 +389,12 @@ impl App {
         let devices =
             wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
         let saved_settings = load_settings();
+        let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some();
         let has_saved_settings = saved_settings
             .as_ref()
             .map(|settings| settings.configured)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || dev_fixture;
         let settings = saved_settings.unwrap_or_default();
         let (update_tx, update_rx) = mpsc::channel();
         let sounds = Sounds::try_new();
@@ -393,6 +437,10 @@ impl App {
             resource_monitor: ResourceMonitor::start(),
             dev_pair: DevPairState::from_env(),
             dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
+            app_mode: AppMode::Text,
+            chat: ChatUiState::default(),
+            chat_retention: settings.chat_retention,
+            chat_style: settings.chat_style,
         };
 
         if has_saved_settings {
@@ -432,10 +480,6 @@ impl AppState {
         // Keep the process resource readout current even while the rest of the UI is idle.
         ctx.request_repaint_after(Duration::from_secs(1));
         self.process_update_events(ctx);
-        if ctx.input(|i| i.key_pressed(egui::Key::T)) {
-            self.theme = self.theme.next();
-            self.persist_theme();
-        }
         let pal = Palette::for_theme(self.theme);
         ctx.set_visuals(visuals_for(&pal));
 
@@ -447,6 +491,9 @@ impl AppState {
             }
         }
         self.handle_view_mode_input(ctx);
+        if self.app_mode == AppMode::Text && self.stream_view_mode != StreamViewMode::Normal {
+            self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+        }
 
         if !self.stream_view_mode.is_fullscreen() {
             let rounded = window_frame::effective_rounded(ctx, self.window_frame_style);
@@ -476,6 +523,10 @@ impl AppState {
                         parent_hwnd,
                     )
                 });
+            egui::Area::new(egui::Id::new("fullscreen-mode-switcher"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(12.0, 12.0))
+                .show(ctx, |ui| self.ui_mode_switcher(ui, &pal));
         }
 
         if self.show_settings || !self.configured {
@@ -560,17 +611,41 @@ impl AppState {
             match event {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
-                    let dev_peers = match self.dev_pair.as_mut() {
+                    self.chat.service_error = None;
+                    let (dev_call_peers, dev_fixture_peers) = match self.dev_pair.as_mut() {
                         Some(dev_pair) => match dev_pair.register(node_id) {
-                            Ok(peers) => peers,
+                            Ok(call_peers) => match dev_pair.discover_fixture_peers(node_id) {
+                                Ok(fixture_peers) => (call_peers, fixture_peers),
+                                Err(error) => {
+                                    warn!("dev fixture discovery failed: {error:#}");
+                                    (call_peers.clone(), call_peers)
+                                }
+                            },
                             Err(error) => {
                                 warn!("dev-call rendezvous failed: {error:#}");
-                                Vec::new()
+                                (Vec::new(), Vec::new())
                             }
                         },
-                        None => Vec::new(),
+                        None => (Vec::new(), Vec::new()),
                     };
-                    for peer in dev_peers {
+                    let mut contacts_changed = false;
+                    for peer in dev_fixture_peers {
+                        let node_id = peer.to_string();
+                        if !self.friends.iter().any(|friend| friend.node_id == node_id) {
+                            self.friends.push(Friend {
+                                name: format!("DEV {}", peer.fmt_short()),
+                                node_id,
+                            });
+                            contacts_changed = true;
+                        }
+                    }
+                    if contacts_changed {
+                        self.friends
+                            .sort_by(|left, right| left.name.cmp(&right.name));
+                        save_friends(&self.friends);
+                        info!("added dev fixture peers as local chat contacts");
+                    }
+                    for peer in dev_call_peers {
                         info!("dev call initiating automatic call to {}", peer.fmt_short());
                         self.cmd(Command::Call { node_id: peer });
                     }
@@ -632,6 +707,33 @@ impl AppState {
                     if auto_share {
                         info!("dev call automatically starting the explicit test share");
                         self.cmd(Command::ToggleSharing { enabled: true });
+                        if let Some(cycles) = std::env::var("WIRE_DEV_SHARE_TOGGLE_CYCLES")
+                            .ok()
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .filter(|cycles| *cycles > 0)
+                        {
+                            let command_tx = self.worker.command_tx.clone();
+                            std::thread::spawn(move || {
+                                for cycle in 0..cycles {
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    if command_tx
+                                        .send_blocking(Command::ToggleSharing { enabled: false })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    if cycle + 1 < cycles {
+                                        std::thread::sleep(Duration::from_secs(1));
+                                        if command_tx
+                                            .send_blocking(Command::ToggleSharing { enabled: true })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
                 Event::VolumeHandle(node_id, volume) => {
@@ -725,7 +827,54 @@ impl AppState {
                     preview.data = data;
                     preview.generation += 1;
                 }
+                Event::Chat(notification) => self.apply_chat_notification(notification),
+                Event::WorkerFailed(error) => {
+                    warn!("Wire worker unavailable: {error}");
+                    self.chat.service_error = Some(error);
+                }
             }
+        }
+    }
+
+    fn apply_chat_notification(&mut self, notification: ChatNotification) {
+        match notification {
+            ChatNotification::Conversation {
+                conversation,
+                messages,
+            } => {
+                let id = conversation.id.clone();
+                self.chat.conversations.insert(id.clone(), conversation);
+                let mut by_id: BTreeMap<_, _> = messages
+                    .into_iter()
+                    .map(|message| (message.message_id.clone(), message))
+                    .collect();
+                if let Some(existing) = self.chat.timelines.get(&id) {
+                    for message in existing {
+                        if matches!(
+                            self.chat.delivery.get(&message.message_id),
+                            Some((DeliveryState::Pending | DeliveryState::Failed, _))
+                        ) {
+                            by_id
+                                .entry(message.message_id.clone())
+                                .or_insert_with(|| message.clone());
+                        }
+                    }
+                }
+                let mut timeline: Vec<_> = by_id.into_values().collect();
+                timeline.sort();
+                self.chat.timelines.insert(id.clone(), timeline);
+                if self.chat.selected.is_none() {
+                    self.chat.selected = Some(id);
+                }
+            }
+            ChatNotification::Delivery {
+                message_id,
+                state,
+                detail,
+            } => {
+                self.chat.delivery.insert(message_id, (state, detail));
+            }
+            ChatNotification::Error(error) => self.chat.error = Some(error),
         }
     }
 
@@ -828,20 +977,15 @@ impl AppState {
             theme: self.theme,
             window_frame_style: self.window_frame_style,
             configured: true,
+            chat_retention: self.chat_retention,
+            chat_style: self.chat_style,
         });
     }
 
-    fn persist_theme(&self) {
-        let mut settings = load_settings().unwrap_or_default();
-        settings.theme = self.theme;
-        save_settings(&settings);
-    }
-
     fn cmd(&self, command: Command) {
-        self.worker
-            .command_tx
-            .send_blocking(command)
-            .expect("worker thread is dead");
+        if self.worker.command_tx.send_blocking(command).is_err() {
+            warn!("ignored command because the Wire worker is unavailable");
+        }
     }
 
     fn play_sound(&self, sound: Sound) {
@@ -930,8 +1074,13 @@ impl AppState {
         body: egui::Rect,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
+        if self.app_mode == AppMode::Text {
+            self.ui_chat_chrome_body(ui, ctx, pal, body);
+            return;
+        }
         const TOP_BAR_HEIGHT: f32 = 54.0;
         const DOCK_HEIGHT: f32 = 86.0;
+        const PARTICIPANT_BAR_HEIGHT: f32 = 80.0;
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
 
         let top_rect = egui::Rect::from_min_max(
@@ -940,14 +1089,19 @@ impl AppState {
         );
         let dock_rect =
             egui::Rect::from_min_max(egui::pos2(body.min.x, body.max.y - DOCK_HEIGHT), body.max);
+        let participant_rect = egui::Rect::from_min_max(
+            egui::pos2(body.min.x, dock_rect.min.y - PARTICIPANT_BAR_HEIGHT),
+            egui::pos2(body.max.x, dock_rect.min.y),
+        );
         let stage_rect = egui::Rect::from_min_max(
             egui::pos2(body.min.x, top_rect.max.y),
-            egui::pos2(body.max.x, dock_rect.min.y),
+            egui::pos2(body.max.x, participant_rect.min.y),
         );
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
             Frame::new()
-                .inner_margin(egui::Margin::symmetric(20, 0))
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
         });
 
@@ -955,6 +1109,13 @@ impl AppState {
             Frame::new()
                 .inner_margin(egui::Margin::symmetric(20, 8))
                 .show(ui, |ui| self.ui_dock_content(ui, pal));
+        });
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
+            Frame::new()
+                .fill(pal.panel)
+                .inner_margin(egui::Margin::symmetric(20, 8))
+                .show(ui, |ui| self.ui_call_participant_bar(ui, pal));
         });
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(stage_rect), |ui| {
@@ -975,25 +1136,919 @@ impl AppState {
         });
     }
 
-    fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
-        let show_context_status = ui.max_rect().width() >= 760.0;
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            if self.sharing_active {
-                dot(ui, pal.accent, 6.0);
+    fn ui_mode_switcher(&mut self, ui: &mut Ui, pal: &Palette) {
+        Frame::new()
+            .fill(chat_surface(pal))
+            .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+            .corner_radius(CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let text_active = self.app_mode == AppMode::Text;
+                    if chat_segment_button(ui, pal, "Text chats", text_active).clicked() {
+                        self.app_mode = AppMode::Text;
+                    }
+                    let calls_active = self.app_mode == AppMode::Calls;
+                    if chat_segment_button(ui, pal, "Voice calls", calls_active).clicked() {
+                        self.app_mode = AppMode::Calls;
+                    }
+                });
+            });
+    }
+
+    fn ui_chat_chrome_body(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        pal: &Palette,
+        body: egui::Rect,
+    ) {
+        const TOP_HEIGHT: f32 = 54.0;
+        let top =
+            egui::Rect::from_min_max(body.min, egui::pos2(body.max.x, body.min.y + TOP_HEIGHT));
+        let content = egui::Rect::from_min_max(egui::pos2(body.min.x, top.max.y), body.max);
+        let sidebar_width = (content.width() * 0.27)
+            .clamp(220.0, 310.0)
+            .min(content.width() * 0.46);
+        let sidebar = egui::Rect::from_min_max(
+            content.min + Vec2::new(12.0, 10.0),
+            egui::pos2(content.min.x + sidebar_width - 6.0, content.max.y - 12.0),
+        );
+        let main = egui::Rect::from_min_max(
+            egui::pos2(content.min.x + sidebar_width + 6.0, content.min.y),
+            content.max,
+        );
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(top));
+            Frame::new()
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::symmetric(14, 6))
+                .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
+        });
+        paint_chat_card(ui, sidebar, pal, 18);
+        let sidebar_inner = sidebar.shrink2(Vec2::new(12.0, 12.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(sidebar_inner), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(sidebar_inner));
+            self.ui_chat_sidebar(ui, pal);
+        });
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(main), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(main));
+            Frame::new()
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::same(0))
+                .show(ui, |ui| self.ui_chat_main(ui, pal));
+        });
+        if self.chat.show_group_editor {
+            self.ui_group_editor(ctx, pal);
+        }
+    }
+
+    fn ui_chat_sidebar(&mut self, ui: &mut Ui, pal: &Palette) {
+        const FOOTER_HEIGHT: f32 = 62.0;
+        const FOOTER_GAP: f32 = 10.0;
+        let bounds = ui.max_rect();
+        let has_identity = self.our_node_id.is_some();
+        let footer_space = if has_identity {
+            FOOTER_HEIGHT + FOOTER_GAP
+        } else {
+            0.0
+        };
+        let list = egui::Rect::from_min_max(
+            bounds.min,
+            egui::pos2(
+                bounds.max.x,
+                (bounds.max.y - footer_space).max(bounds.min.y),
+            ),
+        );
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(list));
+            ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Sharing screen")
+                    RichText::new("CONVERSATIONS")
+                        .family(kh_family())
                         .color(pal.text2)
-                        .size(ui_font_size(12.0)),
+                        .size(12.0),
                 );
-            } else if self.our_node_id.is_some() {
-                dot(ui, pal.ok, 6.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ghost_icon_button(ui, pal, ph::PLUS)
+                        .on_hover_text("Create a group")
+                        .clicked()
+                        && self.our_node_id.is_some()
+                    {
+                        self.chat.show_group_editor = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+
+            egui::ScrollArea::vertical()
+                .id_salt("chat-conversations")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let friends = self.friends.clone();
+                    for friend in friends {
+                        let Ok(peer) = NodeId::from_str(friend.node_id.trim()) else {
+                            continue;
+                        };
+                        let id = self
+                            .our_node_id
+                            .map(|ours| chat::direct_conversation_id(ours, peer));
+                        let selected = id
+                            .as_ref()
+                            .is_some_and(|id| self.chat.selected.as_deref() == Some(id.as_str()));
+                        let label = format!("{}   {}", self.peer_initial(peer), friend.name);
+                        if chat_navigation_button(ui, pal, &label, selected).clicked() {
+                            if let Some(id) = id {
+                                self.chat.selected = Some(id.clone());
+                                if !self.chat.conversations.contains_key(&id) {
+                                    self.cmd(Command::EnsureDirectChat {
+                                        peer,
+                                        title: friend.name,
+                                    });
+                                }
+                            }
+                        }
+                        ui.add_space(3.0);
+                    }
+
+                    let groups: Vec<_> = self
+                        .chat
+                        .conversations
+                        .values()
+                        .filter(|conversation| matches!(conversation.kind, ConversationKind::Group))
+                        .cloned()
+                        .collect();
+                    if !groups.is_empty() {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("GROUPS")
+                                .family(kh_family())
+                                .color(pal.dim)
+                                .size(11.0),
+                        );
+                        ui.add_space(5.0);
+                    }
+                    for group in groups {
+                        let selected = self.chat.selected.as_deref() == Some(group.id.as_str());
+                        if chat_navigation_button(
+                            ui,
+                            pal,
+                            &format!("#   {}", group.title),
+                            selected,
+                        )
+                        .clicked()
+                        {
+                            self.chat.selected = Some(group.id);
+                        }
+                        ui.add_space(3.0);
+                    }
+                });
+        });
+
+        if let Some(node_id) = self.our_node_id {
+            let footer_bottom = bounds.max.y - 2.0;
+            let footer = egui::Rect::from_min_max(
+                egui::pos2(bounds.min.x, footer_bottom - FOOTER_HEIGHT),
+                egui::pos2(bounds.max.x, footer_bottom),
+            );
+            paint_chat_card(ui, footer, pal, 14);
+            let footer_inner = footer.shrink2(Vec2::new(11.0, 8.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
+                ui.set_clip_rect(footer);
+                ui.horizontal(|ui| {
+                    circle_avatar(ui, pal, "Y", 32.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("You")
+                                .color(pal.text)
+                                .size(ui_font_size(12.5)),
+                        );
+                        ui.label(
+                            RichText::new(node_id.fmt_short().to_string())
+                                .monospace()
+                                .color(pal.dim)
+                                .size(ui_font_size(10.5)),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if chat_lucide_icon_button(ui, pal, Icon::Copy)
+                            .on_hover_text("Copy my ID")
+                            .clicked()
+                        {
+                            copy_to_clipboard(&node_id.to_string());
+                        }
+                    });
+                });
+            });
+        }
+    }
+
+    fn ui_chat_main(&mut self, ui: &mut Ui, pal: &Palette) {
+        let selected = self
+            .chat
+            .selected
+            .as_ref()
+            .and_then(|id| self.chat.conversations.get(id))
+            .cloned();
+        let Some(conversation) = selected else {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    let unavailable = self.chat.service_error.as_deref();
+                    ui.label(
+                        RichText::new(if unavailable.is_some() {
+                            "Chat is unavailable"
+                        } else {
+                            "Choose a conversation"
+                        })
+                        .color(if unavailable.is_some() {
+                            pal.err
+                        } else {
+                            pal.text
+                        })
+                        .size(ui_font_size(18.0)),
+                    );
+                    ui.label(
+                        RichText::new(
+                            unavailable.unwrap_or("Messages are available independently of calls."),
+                        )
+                        .color(pal.dim)
+                        .size(ui_font_size(12.5)),
+                    );
+                });
+            });
+            return;
+        };
+        let display_title = conversation
+            .direct_peer()
+            .map(|peer| self.peer_display_name(peer))
+            .unwrap_or_else(|| conversation.title.clone());
+
+        const HEADER: f32 = 72.0;
+        const COMPOSER: f32 = 92.0;
+        const GAP: f32 = 10.0;
+        let rect = ui.max_rect();
+        let surface_rect = egui::Rect::from_min_max(
+            rect.min + Vec2::new(0.0, 10.0),
+            rect.max - Vec2::new(12.0, 12.0),
+        );
+        let header =
+            egui::Rect::from_min_size(surface_rect.min, Vec2::new(surface_rect.width(), HEADER));
+        let composer = egui::Rect::from_min_max(
+            egui::pos2(surface_rect.min.x, surface_rect.max.y - COMPOSER),
+            surface_rect.max,
+        );
+        let messages = egui::Rect::from_min_max(
+            egui::pos2(surface_rect.min.x, header.max.y + GAP),
+            egui::pos2(surface_rect.max.x, composer.min.y - GAP),
+        );
+
+        paint_chat_card(ui, header, pal, 18);
+        let header_inner = header.shrink2(Vec2::new(18.0, 12.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_inner), |ui| {
+            ui.set_clip_rect(header);
+            let show_call = ui.available_width() >= 430.0;
+            ui.horizontal(|ui| {
+                circle_avatar(
+                    ui,
+                    pal,
+                    &display_title
+                        .chars()
+                        .next()
+                        .unwrap_or('#')
+                        .to_uppercase()
+                        .to_string(),
+                    34.0,
+                );
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&display_title)
+                            .color(pal.text)
+                            .size(ui_font_size(15.0)),
+                    );
+                    ui.label(
+                        RichText::new(match &conversation.kind {
+                            ConversationKind::Direct { .. } => "Direct message".to_owned(),
+                            ConversationKind::Group => {
+                                format!("{} members", conversation.members.len())
+                            }
+                        })
+                        .color(pal.dim)
+                        .size(ui_font_size(11.5)),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if show_call {
+                        if let Some(peer) = conversation.direct_peer() {
+                            if action_button(ui, pal, "Start call", ButtonTone::Secondary)
+                                .on_hover_text("Start a separate voice call")
+                                .clicked()
+                            {
+                                self.cmd(Command::Call { node_id: peer });
+                                self.app_mode = AppMode::Calls;
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(messages), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(messages));
+            Frame::new()
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::symmetric(18, 8))
+                .show(ui, |ui| {
+                    let timeline = self
+                        .chat
+                        .timelines
+                        .get(&conversation.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let now = chat::now_millis();
+                    let retention = self.chat_retention;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("chat-timeline", &conversation.id))
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add_space(8.0);
+                            let visible_messages = timeline
+                                .into_iter()
+                                .filter(|message| retention.includes(message.sent_at, now))
+                                .collect::<Vec<_>>();
+                            for (index, message) in visible_messages.iter().enumerate() {
+                                let starts_group = index == 0
+                                    || !messages_share_compact_group(
+                                        &visible_messages[index - 1],
+                                        message,
+                                    );
+                                self.ui_chat_message(
+                                    ui,
+                                    pal,
+                                    &conversation.id,
+                                    message,
+                                    starts_group,
+                                );
+                                let next_is_grouped =
+                                    visible_messages.get(index + 1).is_some_and(|next| {
+                                        messages_share_compact_group(message, next)
+                                    });
+                                ui.add_space(match self.chat_style {
+                                    ChatStyle::Bubbles => 9.0,
+                                    ChatStyle::Compact if next_is_grouped => 2.0,
+                                    ChatStyle::Compact => 10.0,
+                                });
+                            }
+                        });
+                });
+        });
+
+        paint_chat_card(ui, composer, pal, 18);
+        let composer_inner = composer.shrink2(Vec2::new(14.0, 10.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(composer_inner), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(composer_inner));
+            ui.horizontal(|ui| {
+                let editor_width = (ui.available_width() - 68.0).max(80.0);
+                let edit = ui.add_sized(
+                    [editor_width, 42.0],
+                    egui::TextEdit::multiline(&mut self.chat.composer)
+                        .hint_text(format!("Message {display_title}"))
+                        .desired_rows(2)
+                        .frame(false),
+                );
+                let keyboard_send = edit.has_focus()
+                    && ui.input(|input| {
+                        !input.modifiers.shift && input.key_pressed(egui::Key::Enter)
+                    });
+                let button_send = chat_send_button(ui, pal).clicked();
+                if keyboard_send || button_send {
+                    self.send_chat_composer(&conversation.id);
+                }
+            });
+            if let Some(error) = self.chat.error.take() {
+                ui.add(
+                    egui::Label::new(RichText::new(error).color(pal.err).size(ui_font_size(10.5)))
+                        .truncate(),
+                );
+            }
+        });
+    }
+
+    fn ui_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+        starts_group: bool,
+    ) {
+        match self.chat_style {
+            ChatStyle::Bubbles => self.ui_bubble_chat_message(ui, pal, conversation_id, message),
+            ChatStyle::Compact => {
+                self.ui_compact_chat_message(ui, pal, conversation_id, message, starts_group)
+            }
+        }
+    }
+
+    fn ui_bubble_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+    ) {
+        let own = self
+            .our_node_id
+            .is_some_and(|node| message.author_id == node.to_string());
+        let (state, detail) = self
+            .chat
+            .delivery
+            .get(&message.message_id)
+            .cloned()
+            .unwrap_or((DeliveryState::Synced, None));
+        let author = if own {
+            "You".to_owned()
+        } else {
+            NodeId::from_str(&message.author_id)
+                .ok()
+                .map(|node| self.peer_display_name(node))
+                .unwrap_or_else(|| "Unknown peer".to_owned())
+        };
+        let opacity = if state == DeliveryState::Pending {
+            0.58
+        } else {
+            1.0
+        };
+        let time = format_chat_time(message.sent_at);
+        let mut requested_deletion = None;
+        let mut requested_restore = false;
+        ui.with_layout(
+            if own {
+                Layout::right_to_left(Align::Min)
+            } else {
+                Layout::left_to_right(Align::Min)
+            },
+            |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width().min(680.0), 0.0),
+                    Layout::top_down(if own { Align::Max } else { Align::Min }),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{author} · {time}"))
+                                    .color(pal.dim.gamma_multiply(opacity))
+                                    .size(ui_font_size(10.5)),
+                            );
+                        });
+                        let bubble = Frame::new()
+                            .fill(if own {
+                                chat_selected_surface(pal).gamma_multiply(opacity)
+                            } else {
+                                chat_surface(pal).gamma_multiply(opacity)
+                            })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                chat_hairline(pal).gamma_multiply(opacity),
+                            ))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .show(ui, |ui| {
+                                ui.set_max_width(640.0);
+                                let body = RichText::new(match message.deletion {
+                                    Some(MessageDeletion::Local) => "You deleted this message",
+                                    Some(MessageDeletion::Everyone) => "This message was deleted",
+                                    None => &message.body,
+                                })
+                                .color(pal.text.gamma_multiply(opacity))
+                                .size(ui_font_size(13.0));
+                                ui.label(if message.deletion.is_some() {
+                                    body.italics()
+                                } else {
+                                    body
+                                });
+                            });
+                        bubble.response.context_menu(|ui| {
+                            if message.deletion == Some(MessageDeletion::Local) {
+                                if ui.button("Restore message").clicked() {
+                                    requested_restore = true;
+                                    ui.close_menu();
+                                }
+                            } else if message.deletion.is_none() {
+                                let (label, scope) = if own {
+                                    ("Delete for everyone", DeleteScope::Everyone)
+                                } else {
+                                    ("Delete for me", DeleteScope::Local)
+                                };
+                                if ui.button(label).clicked() {
+                                    requested_deletion = Some(scope);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        match (message.deletion, state) {
+                            (Some(_), _) => {}
+                            (None, DeliveryState::Pending) => {
+                                ui.label(
+                                    RichText::new("syncing…")
+                                        .color(pal.dim2)
+                                        .size(ui_font_size(9.5)),
+                                );
+                            }
+                            (None, DeliveryState::Failed) => {
+                                ui.label(
+                                    RichText::new(
+                                        detail.unwrap_or_else(|| "failed to send".to_owned()),
+                                    )
+                                    .color(pal.err)
+                                    .size(ui_font_size(9.5)),
+                                );
+                            }
+                            (None, DeliveryState::Synced) => {}
+                        }
+                    },
+                );
+            },
+        );
+        if requested_restore {
+            self.restore_chat_message(conversation_id, &message.message_id);
+        } else if let Some(scope) = requested_deletion {
+            self.delete_chat_message(conversation_id, &message.message_id, scope);
+        }
+    }
+
+    fn ui_compact_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+        starts_group: bool,
+    ) {
+        let own = self
+            .our_node_id
+            .is_some_and(|node| message.author_id == node.to_string());
+        let (state, detail) = self
+            .chat
+            .delivery
+            .get(&message.message_id)
+            .cloned()
+            .unwrap_or((DeliveryState::Synced, None));
+        let author = if own {
+            "You".to_owned()
+        } else {
+            NodeId::from_str(&message.author_id)
+                .ok()
+                .map(|node| self.peer_display_name(node))
+                .unwrap_or_else(|| "Unknown peer".to_owned())
+        };
+        let initial = author
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string();
+        let opacity = if state == DeliveryState::Pending {
+            0.58
+        } else {
+            1.0
+        };
+        let mut requested_deletion = None;
+        let mut requested_restore = false;
+
+        ui.horizontal_top(|ui| {
+            if starts_group {
+                circle_avatar(ui, pal, &initial, 32.0);
+            } else {
+                ui.add_space(40.0);
+            }
+            ui.allocate_ui_with_layout(
+                Vec2::new((ui.available_width() - 4.0).max(80.0), 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    if starts_group {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&author)
+                                    .strong()
+                                    .color(pal.text.gamma_multiply(opacity))
+                                    .size(ui_font_size(13.0)),
+                            );
+                            ui.label(
+                                RichText::new(format_chat_time(message.sent_at))
+                                    .color(pal.dim.gamma_multiply(opacity))
+                                    .size(ui_font_size(10.5)),
+                            );
+                        });
+                    }
+
+                    ui.horizontal_top(|ui| {
+                        let body = RichText::new(match message.deletion {
+                            Some(MessageDeletion::Local) => "You deleted this message",
+                            Some(MessageDeletion::Everyone) => "This message was deleted",
+                            None => &message.body,
+                        })
+                        .color(pal.text.gamma_multiply(opacity))
+                        .size(ui_font_size(13.0));
+                        let body_response = ui.label(if message.deletion.is_some() {
+                            body.italics()
+                        } else {
+                            body
+                        });
+                        body_response.context_menu(|ui| {
+                            if message.deletion == Some(MessageDeletion::Local) {
+                                if ui.button("Restore message").clicked() {
+                                    requested_restore = true;
+                                    ui.close_menu();
+                                }
+                            } else if message.deletion.is_none() {
+                                let (label, scope) = if own {
+                                    ("Delete for everyone", DeleteScope::Everyone)
+                                } else {
+                                    ("Delete for me", DeleteScope::Local)
+                                };
+                                if ui.button(label).clicked() {
+                                    requested_deletion = Some(scope);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+
+                    match (message.deletion, state) {
+                        (Some(_), _) => {}
+                        (None, DeliveryState::Pending) => {
+                            ui.label(
+                                RichText::new("syncingâ€¦")
+                                    .color(pal.dim2)
+                                    .size(ui_font_size(9.5)),
+                            );
+                        }
+                        (None, DeliveryState::Failed) => {
+                            ui.label(
+                                RichText::new(
+                                    detail.unwrap_or_else(|| "failed to send".to_owned()),
+                                )
+                                .color(pal.err)
+                                .size(ui_font_size(9.5)),
+                            );
+                        }
+                        (None, DeliveryState::Synced) => {}
+                    }
+                },
+            );
+        });
+
+        if requested_restore {
+            self.restore_chat_message(conversation_id, &message.message_id);
+        } else if let Some(scope) = requested_deletion {
+            self.delete_chat_message(conversation_id, &message.message_id, scope);
+        }
+    }
+
+    fn delete_chat_message(&mut self, conversation_id: &str, message_id: &str, scope: DeleteScope) {
+        if let Some(message) = self
+            .chat
+            .timelines
+            .get_mut(conversation_id)
+            .and_then(|timeline| {
+                timeline
+                    .iter_mut()
+                    .find(|message| message.message_id == message_id)
+            })
+        {
+            message.deletion = Some(match scope {
+                DeleteScope::Local => MessageDeletion::Local,
+                DeleteScope::Everyone => MessageDeletion::Everyone,
+            });
+        }
+        self.chat.delivery.remove(message_id);
+        self.cmd(Command::DeleteChatMessage {
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            scope,
+        });
+    }
+
+    fn restore_chat_message(&mut self, conversation_id: &str, message_id: &str) {
+        if let Some(message) = self
+            .chat
+            .timelines
+            .get_mut(conversation_id)
+            .and_then(|timeline| {
+                timeline
+                    .iter_mut()
+                    .find(|message| message.message_id == message_id)
+            })
+        {
+            message.deletion = None;
+        }
+        self.cmd(Command::RestoreChatMessage {
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+        });
+    }
+
+    fn send_chat_composer(&mut self, conversation_id: &str) {
+        let body = self.chat.composer.trim().to_owned();
+        if body.is_empty() {
+            self.chat.composer.clear();
+            return;
+        }
+        let Some(author) = self.our_node_id else {
+            self.chat.error = Some("Chat is still connecting to Iroh.".to_owned());
+            return;
+        };
+        self.chat.composer.clear();
+        let message = ChatMessage::new(author, body);
+        self.chat
+            .delivery
+            .insert(message.message_id.clone(), (DeliveryState::Pending, None));
+        self.chat
+            .timelines
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .push(message.clone());
+        self.cmd(Command::SendChatMessage {
+            conversation_id: conversation_id.to_owned(),
+            message,
+        });
+    }
+
+    fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let mut open = self.chat.show_group_editor;
+        egui::Window::new("Create group")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Group name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.chat.group_name)
+                        .hint_text("Weekend plans")
+                        .desired_width(300.0),
+                );
+                ui.add_space(8.0);
+                ui.label("Members");
+                for friend in self.friends.clone() {
+                    let Ok(node) = NodeId::from_str(friend.node_id.trim()) else {
+                        continue;
+                    };
+                    let mut selected = self.chat.group_members.contains(&node);
+                    if ui.checkbox(&mut selected, friend.name).changed() {
+                        if selected {
+                            self.chat.group_members.insert(node);
+                        } else {
+                            self.chat.group_members.remove(&node);
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
+                        self.chat.show_group_editor = false;
+                    }
+                    if action_button(ui, pal, "Create", ButtonTone::Primary).clicked() {
+                        let title = self.chat.group_name.trim().to_owned();
+                        let members = self.chat.group_members.iter().copied().collect();
+                        if title.is_empty() || self.chat.group_members.is_empty() {
+                            self.chat.error = Some(
+                                "Give the group a name and choose at least one friend.".to_owned(),
+                            );
+                        } else {
+                            self.cmd(Command::CreateGroupChat { title, members });
+                            self.chat.group_name.clear();
+                            self.chat.group_members.clear();
+                            self.chat.show_group_editor = false;
+                        }
+                    }
+                });
+            });
+        self.chat.show_group_editor &= open;
+    }
+
+    fn ui_call_participant_bar(&mut self, ui: &mut Ui, pal: &Palette) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("PARTICIPANTS")
+                    .family(kh_family())
+                    .color(pal.dim)
+                    .size(11.0),
+            );
+            ui.add_space(8.0);
+            if self.calls.is_empty() {
                 ui.label(
-                    RichText::new("Ready")
-                        .color(pal.text2)
+                    RichText::new("No active call")
+                        .color(pal.dim2)
                         .size(ui_font_size(12.0)),
                 );
             } else {
-                ui.label(RichText::new("Connecting…").weak());
+                let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
+                for (node_id, state) in calls {
+                    Frame::new()
+                        .fill(pal.panel2)
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                circle_avatar(ui, pal, &self.peer_initial(node_id), 25.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(self.peer_display_name(node_id))
+                                            .color(pal.text2)
+                                            .size(ui_font_size(11.5)),
+                                    );
+                                    ui.label(
+                                        RichText::new(match state {
+                                            CallState::Incoming => "incoming",
+                                            CallState::Calling => "connecting",
+                                            CallState::Active => "connected",
+                                            CallState::Aborted => "ended",
+                                        })
+                                        .color(if matches!(state, CallState::Active) {
+                                            pal.ok
+                                        } else {
+                                            pal.dim
+                                        })
+                                        .size(ui_font_size(9.5)),
+                                    );
+                                });
+                                match state {
+                                    CallState::Incoming => {
+                                        if action_button(ui, pal, "Accept", ButtonTone::Primary)
+                                            .clicked()
+                                        {
+                                            self.cmd(Command::HandleIncoming {
+                                                node_id,
+                                                accept: true,
+                                            });
+                                        }
+                                        if action_button(ui, pal, "Decline", ButtonTone::Danger)
+                                            .clicked()
+                                        {
+                                            self.cmd(Command::HandleIncoming {
+                                                node_id,
+                                                accept: false,
+                                            });
+                                        }
+                                    }
+                                    CallState::Calling | CallState::Active => {
+                                        if let Some(volume) = self.volumes.get(&node_id) {
+                                            let mut value =
+                                                f32::from_bits(volume.load(Ordering::Relaxed));
+                                            if ui
+                                                .add_sized(
+                                                    [54.0, 18.0],
+                                                    egui::Slider::new(&mut value, 0.0..=2.0)
+                                                        .show_value(false),
+                                                )
+                                                .changed()
+                                            {
+                                                volume.store(value.to_bits(), Ordering::Relaxed);
+                                            }
+                                        }
+                                        if action_button(ui, pal, "End", ButtonTone::Danger)
+                                            .clicked()
+                                        {
+                                            self.hang_up_call(node_id);
+                                        }
+                                    }
+                                    CallState::Aborted => {}
+                                }
+                            });
+                        });
+                }
+            }
+        });
+    }
+
+    fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
+        let show_context_status = ui.max_rect().width() >= 760.0;
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            self.ui_mode_switcher(ui, pal);
+            if self.app_mode == AppMode::Calls {
+                ui.add_space(8.0);
+                v_sep(ui, pal.line);
+                ui.add_space(8.0);
+                if self.sharing_active {
+                    dot(ui, pal.accent, 6.0);
+                    ui.label(
+                        RichText::new("Sharing screen")
+                            .color(pal.text2)
+                            .size(ui_font_size(12.0)),
+                    );
+                } else if self.our_node_id.is_some() {
+                    dot(ui, pal.ok, 6.0);
+                    ui.label(
+                        RichText::new("Ready")
+                            .color(pal.text2)
+                            .size(ui_font_size(12.0)),
+                    );
+                } else {
+                    ui.label(RichText::new("Connecting…").weak());
+                }
             }
 
             let available_update = match &self.update_status {
@@ -1002,7 +2057,7 @@ impl AppState {
             };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost_icon_button(ui, pal, ph::GEAR_SIX)
-                    .on_hover_text("Audio and screen sharing options")
+                    .on_hover_text("Settings")
                     .clicked()
                 {
                     self.show_settings = true;
@@ -1020,21 +2075,36 @@ impl AppState {
                         self.start_update_download(ctx, release);
                     }
                 }
-                let active_calls = self
-                    .calls
-                    .values()
-                    .filter(|s| matches!(s, CallState::Active))
-                    .count();
-                if show_context_status && active_calls > 0 {
-                    ui.label(
-                        RichText::new(if active_calls == 1 {
-                            "1 active call".to_owned()
-                        } else {
-                            format!("{active_calls} active calls")
-                        })
-                        .color(pal.ok)
-                        .size(ui_font_size(12.0)),
-                    );
+                if self.app_mode == AppMode::Text {
+                    let (status, color) = if self.chat.service_error.is_some() {
+                        ("Chat unavailable", pal.err)
+                    } else if self.our_node_id.is_some() {
+                        ("Chat ready", pal.ok)
+                    } else {
+                        ("Connecting…", pal.dim)
+                    };
+                    let status =
+                        ui.label(RichText::new(status).color(color).size(ui_font_size(12.0)));
+                    if let Some(error) = &self.chat.service_error {
+                        status.on_hover_text(error);
+                    }
+                } else {
+                    let active_calls = self
+                        .calls
+                        .values()
+                        .filter(|s| matches!(s, CallState::Active))
+                        .count();
+                    if show_context_status && active_calls > 0 {
+                        ui.label(
+                            RichText::new(if active_calls == 1 {
+                                "1 active call".to_owned()
+                            } else {
+                                format!("{active_calls} active calls")
+                            })
+                            .color(pal.ok)
+                            .size(ui_font_size(12.0)),
+                        );
+                    }
                 }
             });
         });
@@ -1183,7 +2253,7 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
-        pal: &Palette,
+        _pal: &Palette,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         if self.stream_view_mode != StreamViewMode::Normal {
@@ -1222,9 +2292,6 @@ impl AppState {
         );
         ui.add_space(8.0);
 
-        self.ui_participant_strip(ui, pal);
-        ui.add_space(8.0);
-
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("home-cards-scroll")
             .auto_shrink([false, false]);
@@ -1250,6 +2317,7 @@ impl AppState {
         });
     }
 
+    #[allow(dead_code)]
     fn ui_participant_strip(&mut self, ui: &mut Ui, pal: &Palette) {
         ui.horizontal(|ui| {
             ui.label(
@@ -1295,6 +2363,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     fn ui_empty_peer_tile(&self, ui: &mut Ui, pal: &Palette) {
         Frame::new()
             .fill(pal.panel)
@@ -1339,6 +2408,7 @@ impl AppState {
             });
     }
 
+    #[allow(dead_code)]
     fn ui_peer_tile(
         &mut self,
         ui: &mut Ui,
@@ -2349,6 +3419,73 @@ impl AppState {
                                 settings_section_heading(
                                     ui,
                                     &pal,
+                                    "Text chat",
+                                    "Message appearance and local history visibility.",
+                                );
+                                settings_field_label(ui, &pal, "Message style", None);
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0_f32, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        let mut compact = self.chat_style == ChatStyle::Compact;
+                                        if ui
+                                            .checkbox(
+                                                &mut compact,
+                                                RichText::new("Compact (Discord-like)")
+                                                    .color(pal.text2)
+                                                    .size(ui_font_size(12.0)),
+                                            )
+                                            .changed()
+                                        {
+                                            self.chat_style = if compact {
+                                                ChatStyle::Compact
+                                            } else {
+                                                ChatStyle::Bubbles
+                                            };
+                                        }
+                                        ui.label(
+                                            RichText::new(
+                                                "Removes bubbles and groups consecutive messages from the same sender within one minute.",
+                                            )
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                    });
+                                ui.add_space(8.0);
+
+                                settings_field_label(ui, &pal, "Keep history", None);
+                                egui::ComboBox::from_id_salt("settings-chat-retention")
+                                    .width(ui.available_width())
+                                    .selected_text(
+                                        RichText::new(self.chat_retention.label())
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for policy in [
+                                            RetentionPolicy::Unlimited,
+                                            RetentionPolicy::Days(7),
+                                            RetentionPolicy::Days(30),
+                                            RetentionPolicy::Days(90),
+                                        ] {
+                                            if ui
+                                                .selectable_label(
+                                                    self.chat_retention == policy,
+                                                    policy.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.chat_retention = policy;
+                                            }
+                                        }
+                                    });
+
+                                settings_divider(ui);
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
                                     "Audio",
                                     "Input, playback and call quality.",
                                 );
@@ -2792,6 +3929,7 @@ fn call_state_badge(ui: &mut Ui, state: &CallState) {
     ui.label(RichText::new(text).color(color).small());
 }
 
+#[allow(dead_code)]
 fn rtt_label(rtt: Duration) -> RichText {
     let text = fmt_rtt(&rtt);
     let color = if rtt.as_millis() < 100 {
@@ -2804,9 +3942,11 @@ fn rtt_label(rtt: Duration) -> RichText {
     RichText::new(text).color(color).small()
 }
 
+#[allow(dead_code)]
 const PARTICIPANT_TILE_MIN_WIDTH: f32 = 360.0;
 const PARTICIPANT_GRID_GAP: f32 = 10.0;
 
+#[allow(dead_code)]
 fn participant_grid_columns(available_width: f32, participant_count: usize) -> usize {
     if participant_count == 0 {
         return 1;
@@ -2818,6 +3958,7 @@ fn participant_grid_columns(available_width: f32, participant_count: usize) -> u
     fitting_columns.min(participant_count).min(3)
 }
 
+#[allow(dead_code)]
 fn participant_tile_width(available_width: f32, columns: usize, gap: f32) -> f32 {
     let columns = columns.max(1);
     ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
@@ -3032,8 +4173,159 @@ fn fmt_error(text: &str) -> RichText {
     egui::RichText::new(text).color(Color32::LIGHT_RED)
 }
 
+#[allow(dead_code)]
 fn fmt_rtt(dur: &Duration) -> String {
     format!("{}ms", dur.as_millis())
+}
+
+fn mix_color(base: Color32, tint: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel =
+        |base: u8, tint: u8| (base as f32 + (tint as f32 - base as f32) * amount).round() as u8;
+    Color32::from_rgb(
+        channel(base.r(), tint.r()),
+        channel(base.g(), tint.g()),
+        channel(base.b(), tint.b()),
+    )
+}
+
+fn chat_surface(pal: &Palette) -> Color32 {
+    pal.panel
+}
+
+fn chat_hover_surface(pal: &Palette) -> Color32 {
+    mix_color(pal.bg, pal.panel2, 0.62)
+}
+
+fn chat_selected_surface(pal: &Palette) -> Color32 {
+    mix_color(pal.bg, pal.panel2, 0.76)
+}
+
+fn chat_hairline(pal: &Palette) -> Color32 {
+    mix_color(pal.bg, pal.line, 0.72)
+}
+
+fn paint_chat_card(ui: &Ui, rect: egui::Rect, pal: &Palette, radius: u8) {
+    let radius = CornerRadius::same(radius);
+    ui.painter().rect_filled(rect, radius, chat_surface(pal));
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0_f32, chat_hairline(pal)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(9), chat_hover_surface(pal));
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(15.0),
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.text2
+        },
+    );
+    response
+}
+
+fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(100.0, 36.0), egui::Sense::click());
+    let fill = if selected {
+        chat_selected_surface(pal)
+    } else if response.hovered() {
+        chat_hover_surface(pal)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(ui_font_size(12.0), egui::FontFamily::Proportional),
+        if selected { pal.text } else { pal.text2 },
+    );
+    response
+}
+
+fn chat_navigation_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), 42.0),
+        egui::Sense::click(),
+    );
+    let fill = if selected {
+        chat_selected_surface(pal)
+    } else if response.hovered() {
+        chat_hover_surface(pal)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
+    if selected {
+        let marker = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 3.0, rect.top() + 12.0),
+            egui::pos2(rect.left() + 6.0, rect.bottom() - 12.0),
+        );
+        ui.painter()
+            .rect_filled(marker, CornerRadius::same(2), pal.accent);
+    }
+    ui.painter().text(
+        rect.left_center() + Vec2::new(14.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(ui_font_size(13.0), egui::FontFamily::Proportional),
+        if selected { pal.text } else { pal.text2 },
+    );
+    response
+}
+
+fn chat_send_button(ui: &mut Ui, pal: &Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 42.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        mix_color(pal.bg, pal.panel2, 0.9)
+    } else {
+        chat_selected_surface(pal)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(11),
+        Stroke::new(1.0_f32, chat_hairline(pal)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "Send",
+        egui::FontId::new(ui_font_size(12.0), egui::FontFamily::Proportional),
+        pal.text,
+    );
+    response
+}
+
+fn format_chat_time(sent_at: i64) -> String {
+    let total_minutes = sent_at.div_euclid(60_000);
+    let hour = total_minutes.div_euclid(60).rem_euclid(24);
+    let minute = total_minutes.rem_euclid(60);
+    format!("{hour:02}:{minute:02}")
+}
+
+fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -> bool {
+    previous.author_id == current.author_id
+        && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
 }
 
 fn ellipsize(text: &str, max_chars: usize) -> String {
@@ -3090,6 +4382,38 @@ mod layout_tests {
     }
 
     #[test]
+    fn compact_chat_groups_only_same_author_in_same_minute() {
+        let message = |author: &str, sent_at| ChatMessage {
+            version: 1,
+            message_id: format!("{author}-{sent_at}"),
+            author_id: author.to_owned(),
+            sent_at,
+            body: "hello".to_owned(),
+            nonce: 0,
+            deletion: None,
+        };
+
+        assert!(messages_share_compact_group(
+            &message("alice", 60_001),
+            &message("alice", 119_999),
+        ));
+        assert!(!messages_share_compact_group(
+            &message("alice", 119_999),
+            &message("alice", 120_000),
+        ));
+        assert!(!messages_share_compact_group(
+            &message("alice", 60_001),
+            &message("bob", 60_002),
+        ));
+    }
+
+    #[test]
+    fn old_settings_default_to_bubble_chat() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.chat_style, ChatStyle::Bubbles);
+    }
+
+    #[test]
     fn recognizes_only_the_reserved_video_replacement_reset() {
         assert!(is_video_stream_replacement_error(&anyhow::anyhow!(
             "stream reset by peer: error 81"
@@ -3105,6 +4429,8 @@ mod layout_tests {
 
 enum Event {
     EndpointBound(NodeId),
+    Chat(ChatNotification),
+    WorkerFailed(String),
     SetCallState(NodeId, CallState),
     VolumeHandle(NodeId, VolumeHandle),
     SetRtt(NodeId, Duration),
@@ -3153,20 +4479,67 @@ impl VideoPeerTasks {
             h.abort();
         }
     }
+
+    #[allow(dead_code)]
+    fn abort_send(&mut self) {
+        if let Some(h) = self.send.take() {
+            h.abort();
+        }
+    }
 }
 
 type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
 
 enum Command {
-    SetUpdateCallback { callback: UpdateCallback },
-    SetAudioConfig { audio_config: AudioConfig },
-    SetVideoConfig { video_config: VideoConfig },
-    Call { node_id: NodeId },
-    HandleIncoming { node_id: NodeId, accept: bool },
-    Abort { node_id: NodeId },
-    ToggleSharing { enabled: bool },
-    SetMuted { muted: bool },
-    SetDeafened { deafened: bool },
+    SetUpdateCallback {
+        callback: UpdateCallback,
+    },
+    SetAudioConfig {
+        audio_config: AudioConfig,
+    },
+    SetVideoConfig {
+        video_config: VideoConfig,
+    },
+    Call {
+        node_id: NodeId,
+    },
+    HandleIncoming {
+        node_id: NodeId,
+        accept: bool,
+    },
+    Abort {
+        node_id: NodeId,
+    },
+    ToggleSharing {
+        enabled: bool,
+    },
+    SetMuted {
+        muted: bool,
+    },
+    SetDeafened {
+        deafened: bool,
+    },
+    EnsureDirectChat {
+        peer: NodeId,
+        title: String,
+    },
+    CreateGroupChat {
+        title: String,
+        members: Vec<NodeId>,
+    },
+    SendChatMessage {
+        conversation_id: String,
+        message: ChatMessage,
+    },
+    DeleteChatMessage {
+        conversation_id: String,
+        message_id: String,
+        scope: DeleteScope,
+    },
+    RestoreChatMessage {
+        conversation_id: String,
+        message_id: String,
+    },
 }
 
 struct Worker {
@@ -3189,9 +4562,12 @@ struct Worker {
     video_peers: BTreeMap<NodeId, VideoPeerTasks>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
     capture_stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    capture_preview_task: Option<tokio::task::JoinHandle<()>>,
+    capture_idle_trim_task: Option<tokio::task::JoinHandle<()>>,
     sharing_active: bool,
     muted: bool,
     deafened: bool,
+    chat: chat::ChatService,
 }
 
 struct WorkerHandle {
@@ -3208,20 +4584,33 @@ impl Worker {
             command_tx,
         };
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            info!("Wire worker thread starting");
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to start tokio runtime");
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let detail = format!("Could not start the background runtime: {error}");
+                    warn!("{detail}");
+                    let _ = event_tx.send_blocking(Event::WorkerFailed(detail));
+                    return;
+                }
+            };
             rt.block_on(async move {
-                let mut worker = match Worker::start(event_tx, command_rx).await {
+                let mut worker = match Worker::start(event_tx.clone(), command_rx).await {
                     Ok(worker) => worker,
                     Err(error) => {
+                        let detail = format!("Could not start Wire networking: {error:#}");
                         warn!("worker failed to start: {error:#}");
+                        let _ = event_tx.send(Event::WorkerFailed(detail)).await;
                         return;
                     }
                 };
                 if let Err(err) = worker.run().await {
                     warn!("worker stopped with error: {err:?}");
+                    let detail = format!("Wire networking stopped: {err:#}");
+                    let _ = worker.emit(Event::WorkerFailed(detail)).await;
                 }
             });
         });
@@ -3240,12 +4629,28 @@ impl Worker {
         event_tx: async_channel::Sender<Event>,
         command_rx: async_channel::Receiver<Command>,
     ) -> Result<Self> {
-        let endpoint = wire::net::bind_endpoint().await?;
+        info!("binding Wire networking endpoint");
+        let endpoint = wire::net::bind_endpoint_with_alpns([
+            iroh_blobs::ALPN.to_vec(),
+            iroh_docs::ALPN.to_vec(),
+            iroh_gossip::ALPN.to_vec(),
+            chat::CHAT_ALPN.to_vec(),
+        ])
+        .await?;
+        info!(node = %endpoint.node_id().fmt_short(), "Wire endpoint bound; opening chat storage");
         let handler = RtcProtocol::new(endpoint.clone());
+        let config_dir = wire::net::config_dir().context("missing Wire config directory")?;
+        let chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
+        info!("chat storage opened; starting protocol router");
         let _router = Router::builder(endpoint.clone())
             .accept(RtcProtocol::ALPN, handler.clone())
+            .accept(iroh_blobs::ALPN, chat_protocols.blobs.clone())
+            .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
+            .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
+            .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
             .spawn()
             .await?;
+        info!("Wire protocol router started");
         let (video_frame_tx, _) = tokio::sync::broadcast::channel(32);
         let (keyframe_tx, _) = tokio::sync::broadcast::channel(16);
         Ok(Self {
@@ -3268,9 +4673,12 @@ impl Worker {
             video_peers: Default::default(),
             capture_thread: None,
             capture_stop_flag: None,
+            capture_preview_task: None,
+            capture_idle_trim_task: None,
             sharing_active: false,
             muted: false,
             deafened: false,
+            chat: chat_protocols.service,
         })
     }
 
@@ -3278,10 +4686,14 @@ impl Worker {
         self.emit(Event::EndpointBound(self.endpoint.node_id()))
             .await?;
         loop {
+            if let Some(notification) = self.chat.pop_notification() {
+                self.emit(Event::Chat(notification)).await?;
+                continue;
+            }
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Ok(command) = command else {
-                        info!("worker command channel closed; stopping");
+                        info!("app command channel closed; stopping worker");
                         break;
                     };
                     if let Err(err) = self.handle_command(command).await {
@@ -3318,6 +4730,11 @@ impl Worker {
                 }
                 _ = self.rtt_interval.tick() => {
                     self.query_rtts().await?;
+                }
+                input = self.chat.wait_input() => {
+                    if let Some(notification) = self.chat.process_input(input).await {
+                        self.emit(Event::Chat(notification)).await?;
+                    }
                 }
             }
         }
@@ -3562,6 +4979,9 @@ impl Worker {
     }
 
     fn start_capture(&mut self) -> Result<()> {
+        if let Some(trim_task) = self.capture_idle_trim_task.take() {
+            trim_task.abort();
+        }
         let config = self.video_config;
         let target_w = config.resolution.width();
         let target_h = config.resolution.height();
@@ -3571,7 +4991,10 @@ impl Worker {
             async_channel::bounded::<crate::screen_capture::PreviewUpdate>(4);
         let event_tx = self.event_tx.clone();
         let callback = self.update_callback.clone();
-        tokio::task::spawn(async move {
+        if let Some(stale_task) = self.capture_preview_task.take() {
+            stale_task.abort();
+        }
+        self.capture_preview_task = Some(tokio::task::spawn(async move {
             while let Ok(update) = preview_rx.recv().await {
                 let _ = event_tx
                     .send(Event::PreviewFrame {
@@ -3586,7 +5009,7 @@ impl Worker {
                     cb();
                 }
             }
-        });
+        }));
 
         let thread = crate::screen_capture::start(
             config,
@@ -3594,7 +5017,7 @@ impl Worker {
             self.video_frame_tx.clone(),
             preview_tx,
             self.keyframe_tx.clone(),
-        )?;
+        );
 
         self.capture_thread = Some(thread);
         self.capture_stop_flag = Some(stop_flag);
@@ -3619,12 +5042,40 @@ impl Worker {
         self.capture_stop_flag = None;
     }
 
-    async fn stop_capture(&mut self) {
+    async fn stop_capture_pipeline(&mut self) {
         self.stop_capture_thread();
+        if let Some(preview_task) = self.capture_preview_task.take() {
+            preview_task.abort();
+            let _ = preview_task.await;
+        }
+        info!("screen capture pipeline fully stopped");
+    }
+
+    async fn stop_capture(&mut self) {
+        self.stop_capture_pipeline().await;
         self.sharing_active = false;
         self.finish_all_video_send().await;
-        let event_tx = self.event_tx.clone();
-        let _ = event_tx.send(Event::SharingToggled(false)).await;
+        let _ = self.emit(Event::SharingToggled(false)).await;
+        self.schedule_idle_working_set_trim();
+    }
+
+    fn schedule_idle_working_set_trim(&mut self) {
+        const IDLE_TRIM_DELAY: Duration = Duration::from_secs(5);
+
+        if let Some(trim_task) = self.capture_idle_trim_task.take() {
+            trim_task.abort();
+        }
+        self.capture_idle_trim_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(IDLE_TRIM_DELAY).await;
+            #[cfg(target_os = "windows")]
+            match trim_process_working_set() {
+                Ok(()) => info!(
+                    "released inactive screen-sharing pages after {:?} idle",
+                    IDLE_TRIM_DELAY
+                ),
+                Err(error) => warn!("could not release inactive screen-sharing pages: {error:#}"),
+            }
+        }));
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<()> {
@@ -3641,18 +5092,11 @@ impl Worker {
             Command::SetVideoConfig { video_config } => {
                 let restart_capture = self.sharing_active;
                 if restart_capture {
-                    self.stop_capture_thread();
+                    self.stop_capture_pipeline().await;
                 }
                 self.video_config = video_config;
                 if restart_capture {
-                    if let Err(error) = self.start_capture() {
-                        self.sharing_active = false;
-                        self.finish_all_video_send().await;
-                        self.emit(Event::SharingFailed(format!(
-                            "Screen capture could not restart: {error:#}"
-                        )))
-                        .await?;
-                    }
+                    self.start_capture()?;
                 }
             }
             Command::ToggleSharing { enabled } => {
@@ -3662,22 +5106,11 @@ impl Worker {
                         self.emit(Event::SharingFailed(error.to_string())).await?;
                         return Ok(());
                     }
+                    self.sharing_active = true;
                     let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
-                    match self.start_capture() {
-                        Ok(()) => {
-                            self.sharing_active = true;
-                            self.emit(Event::SharingToggled(true)).await?;
-                        }
-                        Err(error) => {
-                            warn!("screen capture failed to start: {error:#}");
-                            self.finish_all_video_send().await;
-                            self.emit(Event::SharingFailed(format!(
-                                "Screen capture could not start: {error:#}"
-                            )))
-                            .await?;
-                        }
-                    }
+                    self.start_capture()?;
+                    self.emit(Event::SharingToggled(true)).await?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture().await;
                 }
@@ -3693,6 +5126,33 @@ impl Worker {
                 if let Some(audio_context) = &self.audio_context {
                     audio_context.set_deafened(deafened);
                 }
+            }
+            Command::EnsureDirectChat { peer, title } => {
+                self.chat.ensure_direct(peer, title).await?;
+            }
+            Command::CreateGroupChat { title, members } => {
+                self.chat.create_group(title, members).await?;
+            }
+            Command::SendChatMessage {
+                conversation_id,
+                message,
+            } => {
+                self.chat.send_message(conversation_id, message).await;
+            }
+            Command::DeleteChatMessage {
+                conversation_id,
+                message_id,
+                scope,
+            } => {
+                self.chat
+                    .delete_message(conversation_id, message_id, scope)
+                    .await;
+            }
+            Command::RestoreChatMessage {
+                conversation_id,
+                message_id,
+            } => {
+                self.chat.restore_message(conversation_id, message_id).await;
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {
@@ -3773,7 +5233,6 @@ async fn run_video_send(
         let mut skipped = 0u64;
         let mut resyncs = 0u64;
         let mut keyframe_gate = transport::KeyframeGate::waiting();
-        let mut replace_stream = false;
         let mut window_sent = 0u64;
         let mut window_bytes = 0u64;
         let mut window_send_ms = Vec::with_capacity(300);
@@ -3783,11 +5242,14 @@ async fn run_video_send(
                 Ok(frame) => frame,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     skipped += count;
+                    // A broadcast lag means this sender missed encoded pictures, not
+                    // that the QUIC stream itself is broken. Keep the existing stream
+                    // and resume at an IDR: an IDR resets the receiver's H.264 reference
+                    // chain without forcing it to recreate its decoder and GPU surfaces.
                     keyframe_gate.require_keyframe();
-                    replace_stream = true;
                     let _ = keyframe_tx.send(());
                     warn!(
-                        "video send to {} lagged by {} frame(s); waiting for IDR",
+                        "video send to {} lagged by {} frame(s); recovering on the existing stream at the next IDR",
                         node_id.fmt_short(),
                         count
                     );
@@ -3803,24 +5265,6 @@ async fn run_video_send(
             if was_waiting {
                 resyncs += 1;
             }
-            if replace_stream {
-                // Open the replacement before resetting the old stream. If the
-                // connection cannot allocate a new stream, the peer keeps the
-                // old one instead of being stranded on a permanent last frame.
-                let (new_send, recv) = conn.transport().open_bi().await?;
-                let _ = new_send.set_priority(10);
-                tokio::spawn(drain_quic_recv(recv));
-                let mut old_send = std::mem::replace(&mut send, new_send);
-                let _ = old_send.reset(VIDEO_STREAM_RESET_CODE);
-                replace_stream = false;
-                info!(
-                    "replaced video stream to {} at IDR sequence {} ({} skipped, {} resyncs)",
-                    node_id.fmt_short(),
-                    frame.sequence,
-                    skipped,
-                    resyncs
-                );
-            }
             let send_start = std::time::Instant::now();
             if let Err(e) = transport::send_frame(&mut send, frame.as_ref()).await {
                 info!("video send to {} failed: {e:?}", node_id.fmt_short());
@@ -3835,11 +5279,13 @@ async fn run_video_send(
                 conn.transport().rtt().saturating_mul(3),
             );
             if send_elapsed > latency_budget {
+                // Congestion is recoverable in-band. Replacing a healthy QUIC stream
+                // here used to create a decoder/presenter allocation storm on the peer
+                // during sustained screen sharing.
                 keyframe_gate.require_keyframe();
-                replace_stream = true;
                 let _ = keyframe_tx.send(());
                 warn!(
-                    "video send to {} took {:.0}ms for {} bytes (budget {:.0}ms); scheduling frame-boundary resync",
+                    "video send to {} took {:.0}ms for {} bytes (budget {:.0}ms); recovering at the next IDR without replacing the stream",
                     node_id.fmt_short(),
                     send_elapsed.as_secs_f64() * 1000.0,
                     frame.data.len(),
@@ -3904,12 +5350,32 @@ async fn drain_quic_recv(mut recv: impl tokio::io::AsyncRead + Unpin + Send + 's
     }
 }
 
+#[cfg(target_os = "windows")]
+fn trim_process_working_set() -> Result<()> {
+    use windows::Win32::System::{ProcessStatus::EmptyWorkingSet, Threading::GetCurrentProcess};
+
+    unsafe { EmptyWorkingSet(GetCurrentProcess()) }
+        .ok()
+        .context("EmptyWorkingSet failed")
+}
+
 async fn run_video_recv(
     conn: RtcConnection,
     node_id: NodeId,
     event_tx: async_channel::Sender<Event>,
     callback: Option<UpdateCallback>,
 ) {
+    const DECODER_IDLE_GRACE: Duration = Duration::from_secs(5);
+
+    // Keep one decoder across brief share restarts. Media Foundation and the GPU
+    // driver retain sizeable allocator caches when a decoder is destroyed and
+    // immediately recreated, which makes repeated button presses look like a
+    // leak even though every COM object is eventually released. The UI is told
+    // about the stream end immediately; only the decoder itself gets a short
+    // idle grace before it is released. It remains lazy so a voice-only call
+    // does not allocate any video resources.
+    let mut worker = None;
+    let mut decoder_idle_deadline: Option<tokio::time::Instant> = None;
     loop {
         let accept = conn.transport().accept_bi();
         tokio::select! {
@@ -3923,23 +5389,60 @@ async fn run_video_recv(
                 }
                 break;
             }
+            _ = wait_until_optional(decoder_idle_deadline) => {
+                worker = None;
+                decoder_idle_deadline = None;
+                info!(
+                    "released idle video decoder for {} after {:?}",
+                    node_id.fmt_short(),
+                    DECODER_IDLE_GRACE
+                );
+                #[cfg(target_os = "windows")]
+                match trim_process_working_set() {
+                    Ok(()) => info!(
+                        "released inactive video receive pages for {}",
+                        node_id.fmt_short()
+                    ),
+                    Err(error) => warn!(
+                        "could not release inactive video receive pages for {}: {error:#}",
+                        node_id.fmt_short()
+                    ),
+                }
+            }
             stream = accept => {
                 match stream {
                     Ok((_send, mut recv)) => {
                         info!("receiving video from {}", node_id.fmt_short());
-                        match recv_video_on_stream(
+                        if worker.is_none() {
+                            match spawn_video_decode_worker(
+                                node_id,
+                                event_tx.clone(),
+                                callback.clone(),
+                            ) {
+                                Ok(new_worker) => worker = Some(new_worker),
+                                Err(error) => {
+                                    warn!(
+                                        "could not start video decoder for {}: {error:?}",
+                                        node_id.fmt_short()
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        let stream_result = recv_video_on_stream(
                             &mut recv,
                             node_id,
-                            &event_tx,
-                            callback.as_ref(),
+                            worker.as_ref().expect("video decoder was initialized"),
                         )
-                        .await
-                        {
+                        .await;
+                        match stream_result {
                             Ok(()) => {
                                 info!(
-                                    "video stream from {} ended cleanly; waiting for another share",
-                                    node_id.fmt_short()
+                                    "video stream from {} ended cleanly; retaining decoder for {:?}",
+                                    node_id.fmt_short(),
+                                    DECODER_IDLE_GRACE
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                                 notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                             Err(error) if is_video_stream_replacement_error(&error) => {
@@ -3947,12 +5450,14 @@ async fn run_video_recv(
                                     "video stream from {} was replaced at a frame boundary; waiting for the resync stream",
                                     node_id.fmt_short()
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                             }
                             Err(error) => {
                                 warn!(
                                     "video stream from {} failed: {error:?}; waiting for a replacement stream",
                                     node_id.fmt_short()
                                 );
+                                decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                                 notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                         }
@@ -3966,6 +5471,30 @@ async fn run_video_recv(
         }
     }
     notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+}
+
+async fn wait_until_optional(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn spawn_video_decode_worker(
+    node_id: NodeId,
+    event_tx: async_channel::Sender<Event>,
+    callback: Option<UpdateCallback>,
+) -> Result<VideoDecodeWorker> {
+    VideoDecodeWorker::spawn(move |frame| {
+        if event_tx
+            .try_send(Event::VideoFrame { node_id, frame })
+            .is_ok()
+        {
+            if let Some(callback) = &callback {
+                callback();
+            }
+        }
+    })
 }
 
 fn notify_video_stream_ended(
@@ -3988,21 +5517,8 @@ fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {
 async fn recv_video_on_stream(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     node_id: NodeId,
-    event_tx: &async_channel::Sender<Event>,
-    callback: Option<&UpdateCallback>,
+    worker: &VideoDecodeWorker,
 ) -> Result<()> {
-    let frame_event_tx = event_tx.clone();
-    let frame_callback = callback.cloned();
-    let worker = VideoDecodeWorker::spawn(move |frame| {
-        if frame_event_tx
-            .try_send(Event::VideoFrame { node_id, frame })
-            .is_ok()
-        {
-            if let Some(cb) = &frame_callback {
-                cb();
-            }
-        }
-    })?;
     let mut received = 0u64;
     let mut received_bytes = 0u64;
     let mut received_age_ms = 0.0;
@@ -4082,6 +5598,5 @@ async fn recv_video_on_stream(
         }
     }
 
-    drop(worker);
     Ok(())
 }
