@@ -1,6 +1,7 @@
 pub mod app;
 mod chat;
 mod dev_pair;
+mod notifications;
 mod resource_monitor;
 mod sounds;
 mod title_bar;

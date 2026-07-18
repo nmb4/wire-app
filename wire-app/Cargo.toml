@@ -47,7 +47,7 @@ eframe = { version = "0.31", default-features = false, features = [
     "accesskit",
     "x11",
     "wayland",
-    "glow",
+    "wgpu",
 ] }
 arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
 sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }

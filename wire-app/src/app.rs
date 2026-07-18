@@ -31,6 +31,7 @@ use crate::{
         DeliveryState, MessageDeletion, RetentionPolicy,
     },
     dev_pair::DevPairState,
+    notifications::{NotificationAction, NotificationService},
     resource_monitor::ResourceMonitor,
     sounds::{Sound, Sounds},
     theme::*,
@@ -168,6 +169,7 @@ struct AppState {
     muted: bool,
     deafened: bool,
     sounds: Option<Sounds>,
+    notifications: NotificationService,
     voluntary_hangups: AtomicU32,
     update_tx: mpsc::Sender<UpdateMessage>,
     update_rx: mpsc::Receiver<UpdateMessage>,
@@ -179,6 +181,7 @@ struct AppState {
     dev_auto_share: bool,
     app_mode: AppMode,
     chat: ChatUiState,
+    chat_notifications_ready: bool,
     chat_retention: RetentionPolicy,
     chat_style: ChatStyle,
 }
@@ -348,15 +351,15 @@ impl Default for UiAudioConfig {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.viewport_transparent == Some(true) {
-            egui::Rgba::TRANSPARENT.to_array()
-        } else {
-            let pal = Palette::for_theme(self.state.theme);
-            egui::Rgba::from(pal.bg).to_array()
-        }
+        // The notification viewport shares this clear color with the root viewport.
+        // Root panels paint their own opaque background when needed.
+        egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            info!("Wire root viewport close requested");
+        }
         if self.is_first_update {
             self.is_first_update = false;
             let repaint_ctx = ctx.clone();
@@ -436,6 +439,7 @@ impl App {
             muted: false,
             deafened: false,
             sounds,
+            notifications: NotificationService::default(),
             voluntary_hangups: AtomicU32::new(0),
             update_tx,
             update_rx,
@@ -447,6 +451,7 @@ impl App {
             dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
             app_mode: AppMode::Text,
             chat: ChatUiState::default(),
+            chat_notifications_ready: false,
             chat_retention: settings.chat_retention,
             chat_style: settings.chat_style,
         };
@@ -491,7 +496,8 @@ impl AppState {
         let pal = Palette::for_theme(self.theme);
         ctx.set_visuals(visuals_for(&pal));
 
-        self.process_events();
+        self.process_notification_actions(ctx);
+        self.process_events(ctx);
         #[cfg(windows)]
         for frame in self.video_frames.values_mut() {
             if let Some(presenter) = &mut frame.presenter {
@@ -543,6 +549,7 @@ impl AppState {
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
         }
+        self.notifications.show(ctx, self.theme);
         #[cfg(windows)]
         {
             let force_hide = self.show_settings || !self.configured || self.show_update_prompt;
@@ -614,7 +621,50 @@ impl AppState {
         }
     }
 
-    fn process_events(&mut self) {
+    fn process_notification_actions(&mut self, ctx: &egui::Context) {
+        while let Some(action) = self.notifications.try_action() {
+            match action {
+                NotificationAction::OpenConversation(conversation_id) => {
+                    if self.chat.conversations.contains_key(&conversation_id) {
+                        self.chat.selected = Some(conversation_id);
+                        self.app_mode = AppMode::Text;
+                        self.show_settings = false;
+                        self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                NotificationAction::OpenCalls => {
+                    self.app_mode = AppMode::Calls;
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                NotificationAction::AcceptCall(node_id) => {
+                    if let Ok(node_id) = NodeId::from_str(&node_id) {
+                        self.cmd(Command::HandleIncoming {
+                            node_id,
+                            accept: true,
+                        });
+                    }
+                    self.app_mode = AppMode::Calls;
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                NotificationAction::DeclineCall(node_id) => {
+                    if let Ok(node_id) = NodeId::from_str(&node_id) {
+                        self.cmd(Command::HandleIncoming {
+                            node_id,
+                            accept: false,
+                        });
+                    }
+                    self.app_mode = AppMode::Calls;
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+        }
+    }
+
+    fn process_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.worker.event_rx.try_recv() {
             match event {
                 Event::EndpointBound(node_id) => {
@@ -658,6 +708,7 @@ impl AppState {
                         self.cmd(Command::Call { node_id: peer });
                     }
                 }
+                Event::InitialChatLoaded => self.chat_notifications_ready = true,
                 Event::SetCallState(node_id, call_state) => {
                     let auto_accept =
                         self.dev_pair.is_some() && matches!(call_state, CallState::Incoming);
@@ -665,11 +716,28 @@ impl AppState {
                         && !self.sharing_active
                         && matches!(call_state, CallState::Active);
                     let previous = self.calls.get(&node_id).copied();
+                    let call_key = format!("call:{node_id}");
+                    if self.dev_pair.is_none()
+                        && !matches!(previous, Some(CallState::Incoming))
+                        && matches!(call_state, CallState::Incoming)
+                    {
+                        self.notifications
+                            .incoming_call(node_id.to_string(), self.peer_display_name(node_id));
+                    }
                     match call_state {
                         CallState::Active => {
                             self.play_sound(Sound::Success);
+                            self.notifications.dismiss_key(&call_key);
+                            if !matches!(previous, Some(CallState::Active)) {
+                                self.notifications.success(
+                                    format!("call-connected:{node_id}"),
+                                    "Call connected",
+                                    self.peer_display_name(node_id),
+                                );
+                            }
                         }
                         CallState::Aborted => {
+                            self.notifications.dismiss_key(&call_key);
                             if self.voluntary_hangups.load(Ordering::Relaxed) > 0 {
                                 self.voluntary_hangups.fetch_sub(1, Ordering::Relaxed);
                             } else if matches!(
@@ -792,6 +860,17 @@ impl AppState {
                     self.sharing_active = active;
                     if active {
                         self.capture_error = None;
+                        self.notifications.success(
+                            "screen-sharing",
+                            "Screen sharing started",
+                            "Your screen is now visible to the call.",
+                        );
+                    } else {
+                        self.notifications.info(
+                            "screen-sharing",
+                            "Screen sharing stopped",
+                            "Your screen is no longer being shared.",
+                        );
                     }
                     self.reset_home_scroll = true;
                     if !active {
@@ -804,6 +883,11 @@ impl AppState {
                 Event::SharingFailed(message) => {
                     self.sharing_active = false;
                     self.preview = None;
+                    self.notifications.error(
+                        "screen-sharing-error",
+                        "Could not share your screen",
+                        message.clone(),
+                    );
                     self.capture_error = Some(message);
                     self.reset_home_scroll = true;
                 }
@@ -835,22 +919,69 @@ impl AppState {
                     preview.data = data;
                     preview.generation += 1;
                 }
-                Event::Chat(notification) => self.apply_chat_notification(notification),
+                Event::Chat(notification) => self.apply_chat_notification(notification, ctx),
                 Event::WorkerFailed(error) => {
                     warn!("Wire worker unavailable: {error}");
+                    self.notifications.error(
+                        "wire-worker-error",
+                        "Wire is unavailable",
+                        error.clone(),
+                    );
                     self.chat.service_error = Some(error);
                 }
             }
         }
     }
 
-    fn apply_chat_notification(&mut self, notification: ChatNotification) {
+    fn apply_chat_notification(&mut self, notification: ChatNotification, ctx: &egui::Context) {
         match notification {
             ChatNotification::Conversation {
                 conversation,
                 messages,
             } => {
                 let id = conversation.id.clone();
+                let known_messages = self.chat.timelines.get(&id).map(|timeline| {
+                    timeline
+                        .iter()
+                        .map(|message| message.message_id.clone())
+                        .collect::<BTreeSet<_>>()
+                });
+                let root_focused = ctx.input(|input| input.viewport().focused == Some(true));
+                let conversation_is_open = root_focused
+                    && self.app_mode == AppMode::Text
+                    && self.chat.selected.as_deref() == Some(id.as_str());
+                let our_node_id = self.our_node_id.map(|node_id| node_id.to_string());
+                let new_remote_messages = known_messages
+                    .as_ref()
+                    .map(|known| {
+                        messages
+                            .iter()
+                            .filter(|message| {
+                                !known.contains(&message.message_id)
+                                    && message.deletion.is_none()
+                                    && our_node_id.as_deref() != Some(message.author_id.as_str())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        self.chat_notifications_ready.then(|| {
+                            let recent_cutoff = chat::now_millis() - 10 * 60 * 1000;
+                            messages
+                                .iter()
+                                .filter(|message| {
+                                    message.sent_at >= recent_cutoff
+                                        && message.deletion.is_none()
+                                        && our_node_id.as_deref()
+                                            != Some(message.author_id.as_str())
+                                })
+                                .max_by_key(|message| message.sent_at)
+                                .cloned()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                let conversation_title = conversation.title.clone();
                 self.chat.conversations.insert(id.clone(), conversation);
                 let mut by_id: BTreeMap<_, _> = messages
                     .into_iter()
@@ -872,7 +1003,21 @@ impl AppState {
                 timeline.sort();
                 self.chat.timelines.insert(id.clone(), timeline);
                 if self.chat.selected.is_none() {
-                    self.chat.selected = Some(id);
+                    self.chat.selected = Some(id.clone());
+                }
+                if !conversation_is_open {
+                    for message in new_remote_messages.into_iter().flatten() {
+                        let author = NodeId::from_str(&message.author_id)
+                            .ok()
+                            .map(|node_id| self.peer_display_name(node_id))
+                            .unwrap_or_else(|| "New message".to_owned());
+                        self.notifications.message(
+                            id.clone(),
+                            conversation_title.clone(),
+                            author,
+                            ellipsize(message.body.trim(), 180),
+                        );
+                    }
                 }
             }
             ChatNotification::Delivery {
@@ -882,7 +1027,11 @@ impl AppState {
             } => {
                 self.chat.delivery.insert(message_id, (state, detail));
             }
-            ChatNotification::Error(error) => self.chat.error = Some(error),
+            ChatNotification::Error(error) => {
+                self.notifications
+                    .error("chat-error", "Messages need attention", error.clone());
+                self.chat.error = Some(error);
+            }
         }
     }
 
@@ -4460,6 +4609,7 @@ mod layout_tests {
 
 enum Event {
     EndpointBound(NodeId),
+    InitialChatLoaded,
     Chat(ChatNotification),
     WorkerFailed(String),
     SetCallState(NodeId, CallState),
@@ -4716,9 +4866,15 @@ impl Worker {
     async fn run(&mut self) -> Result<()> {
         self.emit(Event::EndpointBound(self.endpoint.node_id()))
             .await?;
+        let mut initial_chat_loaded = false;
         loop {
             if let Some(notification) = self.chat.pop_notification() {
                 self.emit(Event::Chat(notification)).await?;
+                continue;
+            }
+            if !initial_chat_loaded {
+                initial_chat_loaded = true;
+                self.emit(Event::InitialChatLoaded).await?;
                 continue;
             }
             tokio::select! {

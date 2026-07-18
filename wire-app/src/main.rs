@@ -333,6 +333,7 @@ fn main() -> Result<(), eframe::Error> {
     let frame_style = App::initial_window_frame_style();
     let rounded = window_frame::style_wants_rounded(frame_style);
     let mut options = NativeOptions::default();
+    options.renderer = eframe::Renderer::Wgpu;
     options.viewport = options
         .viewport
         .with_title("Wire")
