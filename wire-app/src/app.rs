@@ -179,12 +179,21 @@ struct AppState {
     app_mode: AppMode,
     chat: ChatUiState,
     chat_retention: RetentionPolicy,
+    chat_style: ChatStyle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppMode {
     Text,
     Calls,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChatStyle {
+    #[default]
+    Bubbles,
+    Compact,
 }
 
 #[derive(Default)]
@@ -276,6 +285,8 @@ struct Settings {
     configured: bool,
     #[serde(default)]
     chat_retention: RetentionPolicy,
+    #[serde(default)]
+    chat_style: ChatStyle,
 }
 
 impl Default for Settings {
@@ -287,6 +298,7 @@ impl Default for Settings {
             window_frame_style: WindowFrameStyle::default(),
             configured: false,
             chat_retention: RetentionPolicy::Unlimited,
+            chat_style: ChatStyle::default(),
         }
     }
 }
@@ -424,6 +436,7 @@ impl App {
             app_mode: AppMode::Text,
             chat: ChatUiState::default(),
             chat_retention: settings.chat_retention,
+            chat_style: settings.chat_style,
         };
 
         if has_saved_settings {
@@ -951,6 +964,7 @@ impl AppState {
             window_frame_style: self.window_frame_style,
             configured: true,
             chat_retention: self.chat_retention,
+            chat_style: self.chat_style,
         });
     }
 
@@ -1447,12 +1461,32 @@ impl AppState {
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             ui.add_space(8.0);
-                            for message in timeline
+                            let visible_messages = timeline
                                 .into_iter()
                                 .filter(|message| retention.includes(message.sent_at, now))
-                            {
-                                self.ui_chat_message(ui, pal, &conversation.id, &message);
-                                ui.add_space(9.0);
+                                .collect::<Vec<_>>();
+                            for (index, message) in visible_messages.iter().enumerate() {
+                                let starts_group = index == 0
+                                    || !messages_share_compact_group(
+                                        &visible_messages[index - 1],
+                                        message,
+                                    );
+                                self.ui_chat_message(
+                                    ui,
+                                    pal,
+                                    &conversation.id,
+                                    message,
+                                    starts_group,
+                                );
+                                let next_is_grouped =
+                                    visible_messages.get(index + 1).is_some_and(|next| {
+                                        messages_share_compact_group(message, next)
+                                    });
+                                ui.add_space(match self.chat_style {
+                                    ChatStyle::Bubbles => 9.0,
+                                    ChatStyle::Compact if next_is_grouped => 2.0,
+                                    ChatStyle::Compact => 10.0,
+                                });
                             }
                         });
                 });
@@ -1490,6 +1524,22 @@ impl AppState {
     }
 
     fn ui_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+        starts_group: bool,
+    ) {
+        match self.chat_style {
+            ChatStyle::Bubbles => self.ui_bubble_chat_message(ui, pal, conversation_id, message),
+            ChatStyle::Compact => {
+                self.ui_compact_chat_message(ui, pal, conversation_id, message, starts_group)
+            }
+        }
+    }
+
+    fn ui_bubble_chat_message(
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
@@ -1538,39 +1588,6 @@ impl AppState {
                                     .color(pal.dim.gamma_multiply(opacity))
                                     .size(ui_font_size(10.5)),
                             );
-                            if message.deletion != Some(MessageDeletion::Everyone) {
-                                egui::menu::menu_custom_button(
-                                    ui,
-                                    egui::Button::new(
-                                        RichText::new(ph::DOTS_THREE)
-                                            .color(pal.dim)
-                                            .size(ui_font_size(9.5)),
-                                    )
-                                    .small()
-                                    .frame(false)
-                                    .min_size(Vec2::new(18.0, 16.0)),
-                                    |ui| {
-                                        if message.deletion == Some(MessageDeletion::Local) {
-                                            if ui.button("Restore message").clicked() {
-                                                requested_restore = true;
-                                                ui.close_menu();
-                                            }
-                                        } else {
-                                            let (label, scope) = if own {
-                                                ("Delete for everyone", DeleteScope::Everyone)
-                                            } else {
-                                                ("Delete for me", DeleteScope::Local)
-                                            };
-                                            if ui.button(label).clicked() {
-                                                requested_deletion = Some(scope);
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    },
-                                )
-                                .response
-                                .on_hover_text("Message actions");
-                            }
                         });
                         let bubble = Frame::new()
                             .fill(if own {
@@ -1638,6 +1655,135 @@ impl AppState {
                 );
             },
         );
+        if requested_restore {
+            self.restore_chat_message(conversation_id, &message.message_id);
+        } else if let Some(scope) = requested_deletion {
+            self.delete_chat_message(conversation_id, &message.message_id, scope);
+        }
+    }
+
+    fn ui_compact_chat_message(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+        starts_group: bool,
+    ) {
+        let own = self
+            .our_node_id
+            .is_some_and(|node| message.author_id == node.to_string());
+        let (state, detail) = self
+            .chat
+            .delivery
+            .get(&message.message_id)
+            .cloned()
+            .unwrap_or((DeliveryState::Synced, None));
+        let author = if own {
+            "You".to_owned()
+        } else {
+            NodeId::from_str(&message.author_id)
+                .ok()
+                .map(|node| self.peer_display_name(node))
+                .unwrap_or_else(|| "Unknown peer".to_owned())
+        };
+        let initial = author
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string();
+        let opacity = if state == DeliveryState::Pending {
+            0.58
+        } else {
+            1.0
+        };
+        let mut requested_deletion = None;
+        let mut requested_restore = false;
+
+        ui.horizontal_top(|ui| {
+            if starts_group {
+                circle_avatar(ui, pal, &initial, 32.0);
+            } else {
+                ui.add_space(40.0);
+            }
+            ui.allocate_ui_with_layout(
+                Vec2::new((ui.available_width() - 4.0).max(80.0), 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    if starts_group {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&author)
+                                    .strong()
+                                    .color(pal.text.gamma_multiply(opacity))
+                                    .size(ui_font_size(13.0)),
+                            );
+                            ui.label(
+                                RichText::new(format_chat_time(message.sent_at))
+                                    .color(pal.dim.gamma_multiply(opacity))
+                                    .size(ui_font_size(10.5)),
+                            );
+                        });
+                    }
+
+                    ui.horizontal_top(|ui| {
+                        let body = RichText::new(match message.deletion {
+                            Some(MessageDeletion::Local) => "You deleted this message",
+                            Some(MessageDeletion::Everyone) => "This message was deleted",
+                            None => &message.body,
+                        })
+                        .color(pal.text.gamma_multiply(opacity))
+                        .size(ui_font_size(13.0));
+                        let body_response = ui.label(if message.deletion.is_some() {
+                            body.italics()
+                        } else {
+                            body
+                        });
+                        body_response.context_menu(|ui| {
+                            if message.deletion == Some(MessageDeletion::Local) {
+                                if ui.button("Restore message").clicked() {
+                                    requested_restore = true;
+                                    ui.close_menu();
+                                }
+                            } else if message.deletion.is_none() {
+                                let (label, scope) = if own {
+                                    ("Delete for everyone", DeleteScope::Everyone)
+                                } else {
+                                    ("Delete for me", DeleteScope::Local)
+                                };
+                                if ui.button(label).clicked() {
+                                    requested_deletion = Some(scope);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+
+                    match (message.deletion, state) {
+                        (Some(_), _) => {}
+                        (None, DeliveryState::Pending) => {
+                            ui.label(
+                                RichText::new("syncingâ€¦")
+                                    .color(pal.dim2)
+                                    .size(ui_font_size(9.5)),
+                            );
+                        }
+                        (None, DeliveryState::Failed) => {
+                            ui.label(
+                                RichText::new(
+                                    detail.unwrap_or_else(|| "failed to send".to_owned()),
+                                )
+                                .color(pal.err)
+                                .size(ui_font_size(9.5)),
+                            );
+                        }
+                        (None, DeliveryState::Synced) => {}
+                    }
+                },
+            );
+        });
+
         if requested_restore {
             self.restore_chat_message(conversation_id, &message.message_id);
         } else if let Some(scope) = requested_deletion {
@@ -3208,8 +3354,41 @@ impl AppState {
                                     ui,
                                     &pal,
                                     "Text chat",
-                                    "Local history visibility. This never deletes messages from other devices.",
+                                    "Message appearance and local history visibility.",
                                 );
+                                settings_field_label(ui, &pal, "Message style", None);
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        let mut compact = self.chat_style == ChatStyle::Compact;
+                                        if ui
+                                            .checkbox(
+                                                &mut compact,
+                                                RichText::new("Compact (Discord-like)")
+                                                    .color(pal.text2)
+                                                    .size(ui_font_size(12.0)),
+                                            )
+                                            .changed()
+                                        {
+                                            self.chat_style = if compact {
+                                                ChatStyle::Compact
+                                            } else {
+                                                ChatStyle::Bubbles
+                                            };
+                                        }
+                                        ui.label(
+                                            RichText::new(
+                                                "Removes bubbles and groups consecutive messages from the same sender within one minute.",
+                                            )
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                    });
+                                ui.add_space(8.0);
+
                                 settings_field_label(ui, &pal, "Keep history", None);
                                 egui::ComboBox::from_id_salt("settings-chat-retention")
                                     .width(ui.available_width())
@@ -4072,6 +4251,11 @@ fn format_chat_time(sent_at: i64) -> String {
     format!("{hour:02}:{minute:02}")
 }
 
+fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -> bool {
+    previous.author_id == current.author_id
+        && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
+}
+
 fn ellipsize(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
@@ -4123,6 +4307,38 @@ mod layout_tests {
     fn long_stream_names_are_clipped_cleanly() {
         assert_eq!(ellipsize("Ada", 8), "Ada");
         assert_eq!(ellipsize("Long display name", 8), "Long di…");
+    }
+
+    #[test]
+    fn compact_chat_groups_only_same_author_in_same_minute() {
+        let message = |author: &str, sent_at| ChatMessage {
+            version: 1,
+            message_id: format!("{author}-{sent_at}"),
+            author_id: author.to_owned(),
+            sent_at,
+            body: "hello".to_owned(),
+            nonce: 0,
+            deletion: None,
+        };
+
+        assert!(messages_share_compact_group(
+            &message("alice", 60_001),
+            &message("alice", 119_999),
+        ));
+        assert!(!messages_share_compact_group(
+            &message("alice", 119_999),
+            &message("alice", 120_000),
+        ));
+        assert!(!messages_share_compact_group(
+            &message("alice", 60_001),
+            &message("bob", 60_002),
+        ));
+    }
+
+    #[test]
+    fn old_settings_default_to_bubble_chat() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.chat_style, ChatStyle::Bubbles);
     }
 
     #[test]
