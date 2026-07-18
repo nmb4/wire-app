@@ -1248,7 +1248,7 @@ impl AppState {
         }
         const TOP_BAR_HEIGHT: f32 = 54.0;
         const DOCK_HEIGHT: f32 = 86.0;
-        const PARTICIPANT_BAR_HEIGHT: f32 = 80.0;
+        const PARTICIPANT_BAR_HEIGHT: f32 = 68.0;
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
 
         let top_rect = egui::Rect::from_min_max(
@@ -1273,16 +1273,34 @@ impl AppState {
                 .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
         });
 
+        // Keep the call dock inset with the same side margins as the participants
+        // strip so controls never sit under the window edge / rounded corner.
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
             Frame::new()
-                .inner_margin(egui::Margin::symmetric(20, 8))
+                .fill(pal.bg)
+                .outer_margin(egui::Margin {
+                    left: CHROME_SIDE_INSET,
+                    right: CHROME_SIDE_INSET,
+                    top: 0,
+                    bottom: 8,
+                })
+                .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| self.ui_dock_content(ui, pal));
         });
 
+        // Rounded strip matching window bg — no hard separators / panel band.
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
             Frame::new()
-                .fill(pal.panel)
-                .inner_margin(egui::Margin::symmetric(20, 8))
+                .fill(pal.bg)
+                .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+                .corner_radius(CornerRadius::same(CHROME_RADIUS))
+                .outer_margin(egui::Margin {
+                    left: CHROME_SIDE_INSET,
+                    right: CHROME_SIDE_INSET,
+                    top: 4,
+                    bottom: 6,
+                })
+                .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| self.ui_call_participant_bar(ui, pal));
         });
 
@@ -1308,7 +1326,7 @@ impl AppState {
         Frame::new()
             .fill(chat_surface(pal))
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
-            .corner_radius(CornerRadius::same(14))
+            .corner_radius(CornerRadius::same(CHROME_RADIUS))
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2098,122 +2116,238 @@ impl AppState {
     }
 
     fn ui_call_participant_bar(&mut self, ui: &mut Ui, pal: &Palette) {
-        ui.horizontal(|ui| {
+        let bar_height = ui.available_height();
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_height(bar_height);
+            ui.spacing_mut().item_spacing.x = 10.0;
+
             ui.label(
                 RichText::new("PARTICIPANTS")
                     .family(kh_family())
                     .color(pal.dim)
-                    .size(11.0),
+                    .size(10.5),
             );
-            ui.add_space(8.0);
+
             if self.calls.is_empty() {
                 ui.label(
                     RichText::new("No active call")
                         .color(pal.dim2)
-                        .size(ui_font_size(12.0)),
+                        .size(ui_font_size(11.5)),
                 );
-            } else {
-                let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
-                for (node_id, state) in calls {
-                    Frame::new()
-                        .fill(pal.panel2)
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(egui::Margin::symmetric(8, 5))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                circle_avatar(ui, pal, &self.peer_initial(node_id), 25.0);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(self.peer_display_name(node_id))
-                                            .color(pal.text2)
-                                            .size(ui_font_size(11.5)),
-                                    );
-                                    ui.label(
-                                        RichText::new(match state {
-                                            CallState::Incoming => "incoming",
-                                            CallState::Calling => "connecting",
-                                            CallState::Active => "connected",
-                                            CallState::Aborted => "ended",
-                                        })
-                                        .color(if matches!(state, CallState::Active) {
-                                            pal.ok
-                                        } else {
-                                            pal.dim
-                                        })
-                                        .size(ui_font_size(9.5)),
-                                    );
-                                });
-                                match state {
-                                    CallState::Incoming => {
-                                        if action_button(ui, pal, "Accept", ButtonTone::Primary)
-                                            .clicked()
-                                        {
-                                            self.cmd(Command::HandleIncoming {
-                                                node_id,
-                                                accept: true,
-                                            });
-                                        }
-                                        if action_button(ui, pal, "Decline", ButtonTone::Danger)
-                                            .clicked()
-                                        {
-                                            self.cmd(Command::HandleIncoming {
-                                                node_id,
-                                                accept: false,
-                                            });
-                                        }
-                                    }
-                                    CallState::Calling | CallState::Active => {
-                                        if let Some(volume) = self.volumes.get(&node_id) {
-                                            let mut value =
-                                                f32::from_bits(volume.load(Ordering::Relaxed));
-                                            if ui
-                                                .add_sized(
-                                                    [54.0, 18.0],
-                                                    egui::Slider::new(&mut value, 0.0..=2.0)
-                                                        .show_value(false),
-                                                )
-                                                .changed()
-                                            {
-                                                volume.store(value.to_bits(), Ordering::Relaxed);
-                                            }
-                                        }
-                                        if action_button(ui, pal, "End", ButtonTone::Danger)
-                                            .clicked()
-                                        {
-                                            self.hang_up_call(node_id);
-                                        }
-                                    }
-                                    CallState::Aborted => {}
-                                }
-                            });
-                        });
-                }
+                return;
             }
+
+            let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
+            egui::ScrollArea::horizontal()
+                .id_salt("participant-bar-scroll")
+                .auto_shrink([true, false])
+                .max_height(bar_height)
+                .show(ui, |ui| {
+                    // Match bar height so chips center against the PARTICIPANTS label.
+                    ui.set_min_height(bar_height);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_min_height(bar_height);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (node_id, state) in calls {
+                            self.ui_participant_chip(ui, pal, node_id, state);
+                        }
+                        self.ui_self_participant_chip(ui, pal);
+                    });
+                });
         });
     }
 
+    fn ui_self_participant_chip(&self, ui: &mut Ui, pal: &Palette) {
+        Frame::new()
+            .fill(chat_surface(pal))
+            .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+            .inner_margin(egui::Margin::symmetric(10, 0))
+            .show(ui, |ui| {
+                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    circle_avatar(ui, pal, "Y", PARTICIPANT_AVATAR_SIZE);
+                    ui.label(
+                        RichText::new("You")
+                            .color(pal.text2)
+                            .size(ui_font_size(12.0)),
+                    );
+                    if self.sharing_active {
+                        dot(ui, pal.ok, 6.0);
+                    }
+                });
+            });
+    }
+
+    fn ui_participant_chip(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        node_id: NodeId,
+        state: CallState,
+    ) {
+        let is_active = matches!(state, CallState::Active);
+        let is_streaming = self
+            .video_frames
+            .get(&node_id)
+            .is_some_and(|frame| frame.width > 0 && frame.height > 0);
+        let (status_label, status_color) = match state {
+            CallState::Incoming => (Some("incoming"), pal.accent),
+            CallState::Calling => (Some("connecting"), pal.accent),
+            CallState::Active => (None, pal.ok),
+            CallState::Aborted => (Some("ended"), pal.dim),
+        };
+        let fill = if is_active {
+            chat_selected_surface(pal)
+        } else {
+            chat_surface(pal)
+        };
+
+        Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+            .inner_margin(egui::Margin::symmetric(10, 0))
+            .show(ui, |ui| {
+                // Fixed chip height keeps avatar / name / actions on one midline.
+                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    circle_avatar(ui, pal, &self.peer_initial(node_id), PARTICIPANT_AVATAR_SIZE);
+
+                    ui.label(
+                        RichText::new(self.peer_display_name(node_id))
+                            .color(if is_active { pal.text } else { pal.text2 })
+                            .size(ui_font_size(12.0)),
+                    );
+
+                    if is_streaming {
+                        dot(ui, pal.ok, 5.0);
+                    } else if let Some(status) = status_label {
+                        ui.label(
+                            RichText::new(status)
+                                .color(status_color)
+                                .size(ui_font_size(11.0)),
+                        );
+                    }
+
+                    match state {
+                        CallState::Incoming => {
+                            if compact_chip_button(ui, pal, "Accept", ButtonTone::Primary)
+                                .clicked()
+                            {
+                                self.cmd(Command::HandleIncoming {
+                                    node_id,
+                                    accept: true,
+                                });
+                            }
+                            if compact_chip_button(ui, pal, "Decline", ButtonTone::Danger)
+                                .clicked()
+                            {
+                                self.cmd(Command::HandleIncoming {
+                                    node_id,
+                                    accept: false,
+                                });
+                            }
+                        }
+                        CallState::Calling | CallState::Active => {
+                            if let Some(volume) = self.volumes.get(&node_id) {
+                                let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
+                                if ui
+                                    .add_sized(
+                                        [48.0, PARTICIPANT_ACTION_HEIGHT],
+                                        egui::Slider::new(&mut value, 0.0..=2.0).show_value(false),
+                                    )
+                                    .on_hover_text("Peer volume")
+                                    .changed()
+                                {
+                                    volume.store(value.to_bits(), Ordering::Relaxed);
+                                }
+                            }
+                            if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
+                                .on_hover_text("End call with this peer")
+                                .clicked()
+                            {
+                                self.hang_up_call(node_id);
+                            }
+                        }
+                        CallState::Aborted => {}
+                    }
+                });
+            });
+    }
+
     fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
-        let show_context_status = ui.max_rect().width() >= 760.0;
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             self.ui_mode_switcher(ui, pal);
-            if self.app_mode == AppMode::Calls {
+
+            // Compact active-call indicator — same chrome language as the mode switcher.
+            if let Some((label, color, detail)) = self.active_call_indicator(pal) {
                 ui.add_space(8.0);
-                v_sep(ui, pal.line);
-                ui.add_space(8.0);
+                let chip = Frame::new()
+                    .fill(chat_surface(pal))
+                    .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+                    .corner_radius(CornerRadius::same(CHROME_RADIUS))
+                    .inner_margin(egui::Margin::symmetric(12, 3))
+                    .show(ui, |ui| {
+                        ui.set_min_height(CHROME_CONTROL_HEIGHT);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            dot(ui, color, 6.0);
+                            ui.label(
+                                RichText::new(label)
+                                    .color(pal.text2)
+                                    .size(ui_font_size(12.0)),
+                            );
+                            if self.sharing_active {
+                                ui.label(
+                                    RichText::new("· sharing")
+                                        .color(pal.accent)
+                                        .size(ui_font_size(11.5)),
+                                );
+                            }
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_text(detail);
+                if chip.clicked() && self.app_mode != AppMode::Calls {
+                    self.app_mode = AppMode::Calls;
+                }
+            } else if self.app_mode == AppMode::Calls {
+                // Idle "Ready" stays plain (no pill). Active states use the brighter chip.
+                ui.add_space(10.0);
                 if self.sharing_active {
-                    dot(ui, pal.accent, 6.0);
-                    ui.label(
-                        RichText::new("Sharing screen")
-                            .color(pal.text2)
-                            .size(ui_font_size(12.0)),
-                    );
+                    Frame::new()
+                        .fill(chat_surface(pal))
+                        .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+                        .corner_radius(CornerRadius::same(CHROME_RADIUS))
+                        .inner_margin(egui::Margin::symmetric(12, 3))
+                        .show(ui, |ui| {
+                            ui.set_min_height(CHROME_CONTROL_HEIGHT);
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 7.0;
+                                dot(ui, pal.accent, 6.0);
+                                ui.label(
+                                    RichText::new("Sharing screen")
+                                        .color(pal.text2)
+                                        .size(ui_font_size(12.0)),
+                                );
+                            });
+                        });
                 } else if self.our_node_id.is_some() {
-                    dot(ui, pal.ok, 6.0);
-                    ui.label(
-                        RichText::new("Ready")
-                            .color(pal.text2)
-                            .size(ui_font_size(12.0)),
-                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 7.0;
+                        dot(ui, pal.ok, 6.0);
+                        ui.label(
+                            RichText::new("Ready")
+                                .color(pal.text2)
+                                .size(ui_font_size(12.0)),
+                        );
+                    });
                 } else {
                     ui.label(RichText::new("Connecting…").weak());
                 }
@@ -2256,51 +2390,99 @@ impl AppState {
                     if let Some(error) = &self.chat.service_error {
                         status.on_hover_text(error);
                     }
-                } else {
-                    let active_calls = self
-                        .calls
-                        .values()
-                        .filter(|s| matches!(s, CallState::Active))
-                        .count();
-                    if show_context_status && active_calls > 0 {
-                        ui.label(
-                            RichText::new(if active_calls == 1 {
-                                "1 active call".to_owned()
-                            } else {
-                                format!("{active_calls} active calls")
-                            })
-                            .color(pal.ok)
-                            .size(ui_font_size(12.0)),
-                        );
-                    }
                 }
             });
         });
     }
 
+    /// Compact summary for the chrome top bar: label, accent color, hover detail.
+    fn active_call_indicator(&self, pal: &Palette) -> Option<(String, Color32, String)> {
+        if self.calls.is_empty() {
+            return None;
+        }
+
+        let mut active: Vec<NodeId> = Vec::new();
+        let mut incoming: Vec<NodeId> = Vec::new();
+        let mut calling: Vec<NodeId> = Vec::new();
+        for (node_id, state) in &self.calls {
+            match state {
+                CallState::Active => active.push(*node_id),
+                CallState::Incoming => incoming.push(*node_id),
+                CallState::Calling => calling.push(*node_id),
+                CallState::Aborted => {}
+            }
+        }
+
+        let name = |id: NodeId| self.peer_display_name(id);
+        if !incoming.is_empty() {
+            let primary = name(incoming[0]);
+            let label = if incoming.len() == 1 {
+                format!("Incoming · {primary}")
+            } else {
+                format!("Incoming · {} +{}", primary, incoming.len() - 1)
+            };
+            let detail = incoming
+                .iter()
+                .map(|id| name(*id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some((label, Color32::from_rgb(255, 200, 80), detail));
+        }
+        if !active.is_empty() {
+            let primary = name(active[0]);
+            let label = if active.len() == 1 {
+                format!("In call · {primary}")
+            } else {
+                format!("In call · {} +{}", primary, active.len() - 1)
+            };
+            let detail = active
+                .iter()
+                .map(|id| name(*id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some((label, pal.ok, detail));
+        }
+        if !calling.is_empty() {
+            let primary = name(calling[0]);
+            let label = if calling.len() == 1 {
+                format!("Calling · {primary}")
+            } else {
+                format!("Calling · {} +{}", primary, calling.len() - 1)
+            };
+            let detail = calling
+                .iter()
+                .map(|id| name(*id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some((label, Color32::from_rgb(120, 170, 255), detail));
+        }
+        None
+    }
+
     fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette) {
         let rect = ui.max_rect();
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top() - 8.0,
-            Stroke::new(1.0_f32, pal.line),
-        );
         let active_calls = self
             .calls
             .values()
             .filter(|state| matches!(state, CallState::Active))
             .count();
 
-        let controls_width = if active_calls > 0 { 320.0 } else { 210.0 };
+        // Fit controls inside the inset dock rect — never past the right edge.
+        let desired_controls_width: f32 = if active_calls > 0 { 320.0 } else { 210.0 };
+        let controls_width = desired_controls_width.min(rect.width().max(0.0));
         let show_status = rect.width() >= controls_width + 180.0;
         let controls_left = if show_status {
-            rect.right() - controls_width
+            (rect.right() - controls_width).max(rect.left())
         } else {
-            rect.center().x - controls_width / 2.0
+            (rect.center().x - controls_width / 2.0)
+                .clamp(rect.left(), (rect.right() - controls_width).max(rect.left()))
         };
-        let controls_rect = egui::Rect::from_min_size(
-            egui::pos2(controls_left.max(rect.left()), rect.top()),
-            Vec2::new(controls_width, rect.height()),
+        let controls_rect = egui::Rect::from_min_max(
+            egui::pos2(controls_left, rect.top()),
+            egui::pos2(
+                (controls_left + controls_width).min(rect.right()),
+                rect.bottom(),
+            ),
         );
         let status_rect = egui::Rect::from_min_max(
             rect.left_top(),
@@ -2340,9 +2522,13 @@ impl AppState {
         }
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(controls_rect));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                if active_calls > 0 {
-                    ui.add_space(4.0);
+                // Center the control cluster inside the allocated dock slot.
+                let cluster_width = if active_calls > 0 { 300.0 } else { 204.0 };
+                let lead = ((ui.available_width() - cluster_width) * 0.5).max(0.0);
+                if lead > 0.0 {
+                    ui.add_space(lead);
                 }
                 if dock_control(
                     ui,
@@ -4092,6 +4278,45 @@ fn section_card<R>(
         .inner
 }
 
+/// Shared chrome radii so top-bar pills, participant strip, and chips feel unified.
+const CHROME_RADIUS: u8 = 14;
+const CHROME_INNER_RADIUS: u8 = 11;
+const CHROME_CONTROL_HEIGHT: f32 = 36.0;
+/// Side inset for bottom chrome (participants + call dock) so content clears the frame.
+const CHROME_SIDE_INSET: i8 = 14;
+/// Fixed participant-chip metrics keep avatar, label, and actions on one midline.
+const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
+const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
+const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
+
+fn compact_chip_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    tone: ButtonTone,
+) -> egui::Response {
+    let (fill, stroke, text) = match tone {
+        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
+        ButtonTone::Secondary => (
+            chat_surface(pal),
+            Stroke::new(1.0_f32, chat_hairline(pal)),
+            pal.text2,
+        ),
+        ButtonTone::Danger => (
+            Color32::TRANSPARENT,
+            Stroke::new(1.0_f32, pal.err),
+            pal.err,
+        ),
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(11.0)))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+            .min_size(Vec2::new(0.0, PARTICIPANT_ACTION_HEIGHT)),
+    )
+}
+
 #[allow(dead_code)]
 fn call_state_badge(ui: &mut Ui, state: &CallState) {
     let (text, color) = match state {
@@ -4411,7 +4636,8 @@ fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Resp
 }
 
 fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(100.0, 36.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(100.0, CHROME_CONTROL_HEIGHT), egui::Sense::click());
     let fill = if selected {
         chat_selected_surface(pal)
     } else if response.hovered() {
@@ -4419,7 +4645,8 @@ fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) 
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(11), fill);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(CHROME_INNER_RADIUS), fill);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
