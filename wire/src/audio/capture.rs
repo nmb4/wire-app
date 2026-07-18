@@ -26,8 +26,9 @@ use tracing::{debug, error, info, span, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_input_stream_config, Direction, StreamConfigWithFormat},
-    device_resampler, AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS,
-    ENGINE_FORMAT, SAMPLE_RATE,
+    device_resampler,
+    noise_suppression::RnnoiseSuppressor,
+    AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
     codec::opus::{AudioQuality, MediaTrackOpusEncoder},
@@ -50,6 +51,7 @@ impl AudioCapture {
         host: &cpal::Host,
         device: Option<&str>,
         processor: WebrtcAudioProcessor,
+        noise_suppression_enabled: bool,
         quality: AudioQuality,
     ) -> Result<Self> {
         let device = find_device(host, Direction::Capture, device)?;
@@ -80,7 +82,13 @@ impl AudioCapture {
                 warn!("failed to set capture thread to realtime priority: {err:?}");
             }
 
-            let stream = match start_capture_stream(&device, &stream_config, producer, processor) {
+            let stream = match start_capture_stream(
+                &device,
+                &stream_config,
+                producer,
+                processor,
+                noise_suppression_enabled,
+            ) {
                 Ok(stream) => {
                     init_tx.send(Ok(())).unwrap();
                     stream
@@ -129,6 +137,7 @@ fn start_capture_stream(
     stream_config: &StreamConfigWithFormat,
     producer: Producer<f32>,
     processor: WebrtcAudioProcessor,
+    noise_suppression_enabled: bool,
 ) -> Result<cpal::Stream> {
     let d = device.name()?;
     let config = &stream_config.config;
@@ -149,6 +158,8 @@ fn start_capture_stream(
         format: capture_format,
         producer,
         processor: processor.clone(),
+        noise_suppressor: noise_suppression_enabled
+            .then(|| RnnoiseSuppressor::new(ENGINE_FORMAT.channel_count as usize)),
         resampler,
     };
     let stream = match stream_config.sample_format {
@@ -172,6 +183,7 @@ struct CaptureState {
     producer: Producer<f32>,
     #[allow(unused)]
     processor: WebrtcAudioProcessor,
+    noise_suppressor: Option<RnnoiseSuppressor>,
     resampler: FixedResampler<f32, 2>,
 }
 
@@ -253,6 +265,10 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
             for chunk in &mut chunks {
                 #[cfg(feature = "audio-processing")]
                 state.processor.process_capture_frame(chunk).unwrap();
+
+                if let Some(suppressor) = &mut state.noise_suppressor {
+                    suppressor.process_interleaved(chunk);
+                }
 
                 let n = state.producer.push_slice(chunk);
                 pushed += n;

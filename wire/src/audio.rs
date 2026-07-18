@@ -28,6 +28,7 @@ pub struct WebrtcAudioProcessor;
 
 mod capture;
 mod device;
+mod noise_suppression;
 mod playback;
 
 pub const SAMPLE_RATE: SampleRate = SampleRate(48_000);
@@ -100,6 +101,7 @@ impl AudioContext {
             &host,
             config.input_device.as_deref(),
             processor.clone(),
+            config.noise_suppression_enabled,
             config.quality,
         )
         .await?;

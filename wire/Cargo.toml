@@ -19,6 +19,7 @@ futures-concurrency = "7.6.3"
 iroh = { version = "0.33.0", default-features = false }
 iroh-roq = "0.1.0"
 n0-future = "0.1.2"
+nnnoiseless = { version = "0.5.2", default-features = false }
 # opus = { package = "magnum-opus", version = "0.3" }
 opus = { git = "https://github.com/DCNick3/opus-rs.git", branch = "unsafe-libopus", default-features = false, features = [
     "unsafe-libopus-backend",

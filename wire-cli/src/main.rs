@@ -1,14 +1,14 @@
+use clap::Parser;
+use dialoguer::Confirm;
+use iroh::protocol::Router;
+use tokio::task::JoinSet;
+use tracing::{error, info, warn};
 use wire::{
     audio::{AudioConfig, AudioContext, AudioQuality},
     net,
     rtc::{handle_connection_with_audio_context, RtcConnection, RtcProtocol},
     NodeId,
 };
-use clap::Parser;
-use dialoguer::Confirm;
-use iroh::protocol::Router;
-use tokio::task::JoinSet;
-use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(about = "Wire CLI for iroh voice calls", long_about = None)]
@@ -22,6 +22,9 @@ struct Args {
     /// If set, audio processing and echo cancellation will be disabled.
     #[arg(long)]
     disable_processing: bool,
+    /// If set, RNNoise microphone noise suppression will be disabled.
+    #[arg(long)]
+    disable_noise_suppression: bool,
     /// Audio quality preset (low, medium, high, ultra).
     #[arg(long, default_value = "high", value_parser = |s: &str| -> Result<AudioQuality, String> { s.parse() })]
     quality: AudioQuality,
@@ -63,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         input_device: args.input_device,
         output_device: args.output_device,
         processing_enabled: !args.disable_processing,
+        noise_suppression_enabled: !args.disable_noise_suppression,
         quality: args.quality,
     };
     let mut endpoint_shutdown = None;

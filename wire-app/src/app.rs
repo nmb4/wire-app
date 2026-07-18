@@ -274,7 +274,13 @@ struct UiAudioConfig {
     selected_input: String,
     selected_output: String,
     processing_enabled: bool,
+    #[serde(default = "enabled_by_default")]
+    noise_suppression_enabled: bool,
     quality: AudioQuality,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -322,6 +328,7 @@ impl From<&UiAudioConfig> for AudioConfig {
             input_device,
             output_device,
             processing_enabled: value.processing_enabled,
+            noise_suppression_enabled: value.noise_suppression_enabled,
             quality: value.quality,
         }
     }
@@ -333,6 +340,7 @@ impl Default for UiAudioConfig {
             selected_input: DEFAULT.to_string(),
             selected_output: DEFAULT.to_string(),
             processing_enabled: true,
+            noise_suppression_enabled: true,
             quality: AudioQuality::default(),
         }
     }
@@ -3565,23 +3573,29 @@ impl AppState {
                                         }
                                     });
 
-                                #[cfg(feature = "audio-processing")]
-                                {
-                                    ui.add_space(8.0);
-                                    Frame::new()
-                                        .fill(pal.panel2)
-                                        .stroke(Stroke::new(1.0_f32, pal.line))
-                                        .corner_radius(CornerRadius::same(7))
-                                        .inner_margin(egui::Margin::symmetric(10, 5))
-                                        .show(ui, |ui| {
+                                ui.add_space(8.0);
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0_f32, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 5))
+                                    .show(ui, |ui| {
+                                        #[cfg(feature = "audio-processing")]
+                                        {
                                             ui.checkbox(
                                                 &mut self.audio_config.processing_enabled,
                                                 RichText::new("Echo cancellation")
                                                     .color(pal.text2)
                                                     .size(ui_font_size(12.0)),
                                             );
-                                        });
-                                }
+                                        }
+                                        ui.checkbox(
+                                            &mut self.audio_config.noise_suppression_enabled,
+                                            RichText::new("Noise suppression (RNNoise)")
+                                                .color(pal.text2)
+                                                .size(ui_font_size(12.0)),
+                                        );
+                                    });
 
                                 ui.add_space(8.0);
                                 settings_field_label(ui, &pal, "Audio quality", None);
@@ -4411,6 +4425,23 @@ mod layout_tests {
     fn old_settings_default_to_bubble_chat() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
+    }
+
+    #[test]
+    fn old_audio_settings_enable_noise_suppression() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "audio": {
+                    "selected_input": "<default>",
+                    "selected_output": "<default>",
+                    "processing_enabled": true,
+                    "quality": "High"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(settings.audio.noise_suppression_enabled);
     }
 
     #[test]

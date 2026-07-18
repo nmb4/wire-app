@@ -19,6 +19,8 @@ pub struct AudioConfig {
     pub output_device: Option<String>,
     /// If true, audio processing with echo cancellation is enabled.
     pub processing_enabled: bool,
+    /// If true, captured microphone audio is denoised with RNNoise.
+    pub noise_suppression_enabled: bool,
     /// Audio quality / bandwidth setting.
     pub quality: AudioQuality,
 }
@@ -39,6 +41,7 @@ impl Default for AudioConfig {
             input_device,
             output_device,
             processing_enabled: true,
+            noise_suppression_enabled: true,
             quality: AudioQuality::default(),
         }
     }
