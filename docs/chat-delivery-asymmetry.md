@@ -109,14 +109,34 @@ Fixes in code: wake (`SyncRequest`) immediately after local insert; reserve
 invites for create/clear/initialize; don’t invite on every delivery wake;
 avoid re-`start_sync` + full publish before waking peers.
 
+## Keep-alive footgun (fixed 2026-07-19)
+
+Session pooling introduced a worse failure mode than slow dials:
+
+1. Inbound accept and outbound dial both tried to own one pooled connection per
+   peer.
+2. The “losing” connection was **force-closed** (`chat-replaced` / `chat-dup-dial`).
+3. Logs: `chat session stream failed: closed by peer: chat-replaced`.
+4. SyncRequest could still ack on a short-lived path, so the UI kept probing,
+   but **docs/gossip never got a stable peer address** and stayed on
+   `Connect(DirectJoin) … timed out`.
+5. Symptom: first session “no connection / waiting for peer”; after restart a
+   few messages work; continuous chat only completes after many delivery
+   retries.
+
+Mitigations in code:
+
+- Never close a connection just because another session for that peer exists.
+- On every successful chat connect/accept, `endpoint.add_node_addr` with the
+  connection’s `remote_address()` so docs/gossip can dial the same path.
+- Pool forget on idle/failure without force-close.
+
 ## What still needs a real networking fix
 
-- Reliable docs/gossip connectivity when `Connect(DirectJoin)` fails (relay
-  preference, reuse RTC/endpoint path, or always rely on accept-side pull with
-  a faster wake).
+- Reliable docs/gossip when even addressed Connect fails (relay preference,
+  reuse RTC path).
 - Windows UDP 10040 / 1452-byte sends (PMTU, IPv6 vs IPv4, relay).
-- Confirm whether iroh-docs can piggyback on an already-open QUIC connection to
-  the peer (e.g. during a call) instead of a fresh DirectJoin.
+- True multipath: piggyback docs on an open chat/RTC QUIC connection.
 
-Until then, expect **asymmetric text latency** on some NATs even when calls look
-perfect.
+Until then, expect some NAT asymmetry even when calls look perfect — but chat
+should no longer *kill* its own working sessions.

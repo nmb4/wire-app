@@ -363,6 +363,10 @@ impl ProtocolHandler for ChatInviteProtocol {
             let connection = connecting.await?;
             let remote = connection.remote_node_id()?;
             info!(peer = %remote.fmt_short(), "received chat protocol connection");
+            // Teach the endpoint this peer's dialable address so docs/gossip can
+            // Connect — chat ALPN often works while docs DirectJoin still has no
+            // usable NodeAddr (see docs/chat-delivery-asymmetry.md).
+            sessions.remember_connection(remote, &connection);
             sessions.insert(remote, connection.clone()).await;
             // Keep accepting bi-streams until idle so rapid chatter reuses this
             // session instead of dialing again (see docs/chat-keepalive-sessions.md).
@@ -373,6 +377,7 @@ impl ProtocolHandler for ChatInviteProtocol {
                         match bi {
                             Ok((mut send, mut recv)) => {
                                 sessions.touch(remote).await;
+                                sessions.remember_connection(remote, &connection);
                                 idle.as_mut().reset(
                                     tokio::time::Instant::now() + CHAT_SESSION_IDLE,
                                 );
@@ -417,10 +422,9 @@ impl ProtocolHandler for ChatInviteProtocol {
                     _ = connection.closed() => break,
                 }
             }
-            // Drop both pool entry and the QUIC session so the peer does not
-            // keep a half-open pooled handle that hangs on open_bi.
-            sessions.invalidate(remote).await;
-            connection.close(0u32.into(), b"chat-idle");
+            // Forget the pool entry but do not force-close — the peer may still
+            // be using this QUIC session for in-flight docs/blob traffic.
+            sessions.forget(remote).await;
             Ok(())
         }
         .boxed()
@@ -470,12 +474,30 @@ impl ChatSessionPool {
             .clone()
     }
 
+    fn remember_connection(&self, peer: NodeId, _connection: &Connection) {
+        // After a successful chat ALPN connect/accept, magicsock knows how to
+        // reach this peer. Re-inject that RemoteInfo so docs/gossip DirectJoin
+        // can use the same path instead of timing out with no addresses.
+        let Some(info) = self.endpoint.remote_info(peer) else {
+            return;
+        };
+        let node_addr: NodeAddr = info.into();
+        if node_addr.direct_addresses.is_empty() && node_addr.relay_url.is_none() {
+            return;
+        }
+        if let Err(error) = self.endpoint.add_node_addr(node_addr) {
+            trace!(peer = %peer.fmt_short(), "failed to record chat peer address: {error:#}");
+        }
+    }
+
     async fn insert(&self, peer: NodeId, connection: Connection) {
+        self.remember_connection(peer, &connection);
         let mut guard = self.inner.lock().await;
         Self::sweep_locked(&mut guard.sessions);
-        // Keep an existing warm session; concurrent dials must not close it.
+        // Already have a warm session for this peer. Keep it and leave the new
+        // connection alone — closing "dup" inbound/outbound sessions was killing
+        // accept loops (`closed by peer: chat-replaced` / `chat-dup-dial`).
         if guard.sessions.contains_key(&peer) {
-            connection.close(0u32.into(), b"chat-dup-dial");
             if let Some(session) = guard.sessions.get_mut(&peer) {
                 session.last_used = tokio::time::Instant::now();
             }
@@ -507,24 +529,20 @@ impl ChatSessionPool {
             .map(|session| session.connection.clone())
     }
 
+    /// Drop a pooled handle without closing the QUIC connection.
+    async fn forget(&self, peer: NodeId) {
+        self.inner.lock().await.sessions.remove(&peer);
+    }
+
+    /// Drop a pooled handle after a failed stream. Only close if this was our
+    /// pooled connection — never close a live peer session on a guess.
     async fn invalidate(&self, peer: NodeId) {
-        if let Some(session) = self.inner.lock().await.sessions.remove(&peer) {
-            session.connection.close(0u32.into(), b"chat-invalid");
-        }
+        self.inner.lock().await.sessions.remove(&peer);
     }
 
     fn sweep_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
         let now = tokio::time::Instant::now();
-        let stale: Vec<_> = sessions
-            .iter()
-            .filter(|(_, session)| now.duration_since(session.last_used) >= CHAT_SESSION_IDLE)
-            .map(|(peer, _)| *peer)
-            .collect();
-        for peer in stale {
-            if let Some(session) = sessions.remove(&peer) {
-                session.connection.close(0u32.into(), b"chat-idle");
-            }
-        }
+        sessions.retain(|_, session| now.duration_since(session.last_used) < CHAT_SESSION_IDLE);
     }
 
     fn evict_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
@@ -536,9 +554,7 @@ impl ChatSessionPool {
             let Some(peer) = oldest else {
                 break;
             };
-            if let Some(session) = sessions.remove(&peer) {
-                session.connection.close(0u32.into(), b"chat-evicted");
-            }
+            sessions.remove(&peer);
         }
     }
 
@@ -553,6 +569,7 @@ impl ChatSessionPool {
         .await
         .context("chat connect timed out")?
         .context("chat connect failed")?;
+        self.remember_connection(peer, &connection);
         self.insert(peer, connection.clone()).await;
         // Another task may have won the insert race — prefer pooled session.
         Ok(self.get(peer).await.unwrap_or(connection))
@@ -2247,6 +2264,7 @@ async fn send_chat_packet(
         {
             Ok(Ok(())) => {
                 sessions.touch(peer).await;
+                sessions.remember_connection(peer, &connection);
                 log_chat_packet_sent(peer, &packet, true);
                 return Ok(());
             }
@@ -2255,22 +2273,33 @@ async fn send_chat_packet(
                     peer = %peer.fmt_short(),
                     "chat session reuse failed; redialing: {error:#}"
                 );
-                sessions.invalidate(peer).await;
+                sessions.forget(peer).await;
             }
             Err(_) => {
                 trace!(peer = %peer.fmt_short(), "chat session reuse timed out; redialing");
-                sessions.invalidate(peer).await;
+                sessions.forget(peer).await;
             }
         }
     }
     let connection = sessions.dial(peer).await?;
-    tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
+    match tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
         .await
-        .context("chat session send timed out")?
-        .context("chat session send failed")?;
-    sessions.touch(peer).await;
-    log_chat_packet_sent(peer, &packet, false);
-    Ok(())
+    {
+        Ok(Ok(())) => {
+            sessions.touch(peer).await;
+            sessions.remember_connection(peer, &connection);
+            log_chat_packet_sent(peer, &packet, false);
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            sessions.forget(peer).await;
+            Err(error).context("chat session send failed")
+        }
+        Err(_) => {
+            sessions.forget(peer).await;
+            bail!("chat session send timed out")
+        }
+    }
 }
 
 fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool) {
