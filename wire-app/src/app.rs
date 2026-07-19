@@ -5394,10 +5394,12 @@ impl Worker {
             iroh_docs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
             chat::CHAT_ALPN.to_vec(),
+            wire::remote_logs::LOGS_ALPN.to_vec(),
         ])
         .await?;
         info!(node = %endpoint.node_id().fmt_short(), "Wire endpoint bound; opening chat storage");
         let handler = RtcProtocol::new(endpoint.clone());
+        let logs_protocol = wire::remote_logs::LogsProtocol::new(endpoint.node_id());
         let config_dir = wire::net::config_dir().context("missing Wire config directory")?;
         let chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
         info!("chat storage opened; starting protocol router");
@@ -5407,6 +5409,7 @@ impl Worker {
             .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
             .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
             .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
+            .accept(wire::remote_logs::LOGS_ALPN, logs_protocol)
             .spawn()
             .await?;
         info!("Wire protocol router started");

@@ -9383,7 +9383,9 @@ dependencies = [
  "rand 0.8.5",
  "ringbuf",
  "serde",
+ "serde_json",
  "spin_sleep",
+ "tempfile",
  "testresult",
  "tokio",
  "tokio-util",
@@ -9396,7 +9398,7 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.4.6"
+version = "0.4.14"
 dependencies = [
  "anyhow",
  "arboard",

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use dialoguer::Confirm;
 use iroh::protocol::Router;
@@ -6,6 +8,7 @@ use tracing::{error, info, warn};
 use wire::{
     audio::{AudioConfig, AudioContext, AudioQuality},
     net,
+    remote_logs,
     rtc::{handle_connection_with_audio_context, RtcConnection, RtcProtocol},
     NodeId,
 };
@@ -49,6 +52,17 @@ enum Command {
     Feedback { mode: Option<FeedbackMode> },
     /// List the available audio devices
     ListDevices,
+    /// Fetch the latest GUI log file from a running Wire client (no UI prompt).
+    FetchLogs {
+        /// Target Wire node id.
+        node_id: NodeId,
+        /// Where to write the log (default: ./wire-remote-<short-id>.log).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Max bytes to pull from the tail of the remote log (default 8 MiB).
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum, Default)]
@@ -147,6 +161,40 @@ async fn main() -> anyhow::Result<()> {
             Command::ListDevices => {
                 let devices = AudioContext::list_devices().await?;
                 println!("{devices:?}");
+            }
+            Command::FetchLogs {
+                node_id,
+                output,
+                max_bytes,
+            } => {
+                let endpoint =
+                    net::bind_endpoint_with_alpns([remote_logs::LOGS_ALPN.to_vec()]).await?;
+                endpoint_shutdown = Some(endpoint.clone());
+                info!(
+                    target = %node_id.fmt_short(),
+                    max_bytes,
+                    "fetching remote Wire logs"
+                );
+                let fetched =
+                    remote_logs::fetch_latest_logs(&endpoint, node_id, max_bytes).await?;
+                let output = output.unwrap_or_else(|| {
+                    PathBuf::from(format!("wire-remote-{}.log", node_id.fmt_short()))
+                });
+                std::fs::write(&output, &fetched.bytes)?;
+                println!("wrote {} bytes to {}", fetched.bytes.len(), output.display());
+                if let Some(name) = &fetched.meta.file_name {
+                    println!("remote file: {name}");
+                }
+                if let Some(path) = &fetched.meta.path {
+                    println!("remote path: {path}");
+                }
+                println!(
+                    "remote node={} pid={} total_file_bytes={} truncated={}",
+                    fetched.meta.node_id,
+                    fetched.meta.pid,
+                    fetched.meta.total_file_bytes,
+                    fetched.meta.truncated
+                );
             }
         }
         anyhow::Ok(())

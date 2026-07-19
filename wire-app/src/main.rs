@@ -244,6 +244,7 @@ fn init_logging(dev_pair: Option<(&str, usize)>) {
         }
         match open_options.open(&path) {
             Ok(file) => {
+                wire::remote_logs::set_current_log_path(path.clone());
                 tracing_subscriber::fmt()
                     .with_env_filter(filter)
                     .with_writer(std::sync::Mutex::new(CappedLogFile::new(file)))

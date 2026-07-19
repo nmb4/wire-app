@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod codec;
 pub mod net;
+pub mod remote_logs;
 pub mod rtc;
 pub mod video;
 
