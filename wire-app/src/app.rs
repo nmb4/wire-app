@@ -1065,15 +1065,35 @@ impl AppState {
                     .into_iter()
                     .map(|message| (message.message_id.clone(), message))
                     .collect();
+                // Keep only very recent optimistic local sends that the service
+                // has not echoed yet. Older pending rows must not survive a
+                // replicated history clear (or any authoritative empty snapshot).
+                let optimistic_cutoff = chat::now_millis() - 30_000;
                 if let Some(existing) = self.chat.timelines.get(&id) {
                     for message in existing {
-                        if matches!(
-                            self.chat.delivery.get(&message.message_id),
-                            Some((DeliveryState::Pending | DeliveryState::Failed, _))
-                        ) {
+                        if by_id.contains_key(&message.message_id) {
+                            continue;
+                        }
+                        if message.sent_at < optimistic_cutoff {
+                            self.chat.delivery.remove(&message.message_id);
+                            continue;
+                        }
+                        if our_node_id.as_deref() == Some(message.author_id.as_str())
+                            && matches!(
+                                self.chat.delivery.get(&message.message_id),
+                                Some((
+                                    DeliveryState::Pending
+                                        | DeliveryState::Retrying
+                                        | DeliveryState::Failed,
+                                    _,
+                                ))
+                            )
+                        {
                             by_id
                                 .entry(message.message_id.clone())
                                 .or_insert_with(|| message.clone());
+                        } else {
+                            self.chat.delivery.remove(&message.message_id);
                         }
                     }
                 }
@@ -1692,7 +1712,36 @@ impl AppState {
                         .size(ui_font_size(11.5)),
                     );
                 });
+                let mut clear_history = false;
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let menu_response = ui
+                        .menu_button(
+                            RichText::new(char::from(Icon::EllipsisVertical))
+                                .font(lucide(16.0))
+                                .color(pal.text2),
+                            |ui| {
+                                ui.set_min_width(160.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Clear history")
+                                                .color(pal.err)
+                                                .size(ui_font_size(12.5)),
+                                        )
+                                        .fill(Color32::TRANSPARENT),
+                                    )
+                                    .on_hover_text(
+                                        "Permanently delete this chat history for everyone",
+                                    )
+                                    .clicked()
+                                {
+                                    clear_history = true;
+                                    ui.close();
+                                }
+                            },
+                        )
+                        .response;
+                    menu_response.on_hover_text("Chat actions");
                     if show_call {
                         if let Some(peer) = conversation.direct_peer() {
                             if action_button(ui, pal, "Start call", ButtonTone::Secondary)
@@ -1705,6 +1754,9 @@ impl AppState {
                         }
                     }
                 });
+                if clear_history {
+                    self.clear_chat_history(&conversation.id);
+                }
             });
         });
 
@@ -1821,7 +1873,7 @@ impl AppState {
             .delivery
             .get(&message.message_id)
             .cloned()
-            .unwrap_or((DeliveryState::Synced, None));
+            .unwrap_or((DeliveryState::Delivered, None));
         let author = if own {
             "You".to_owned()
         } else {
@@ -1910,6 +1962,15 @@ impl AppState {
                                         .size(ui_font_size(9.5)),
                                 );
                             }
+                            (None, DeliveryState::Retrying) => {
+                                ui.label(
+                                    RichText::new(
+                                        detail.unwrap_or_else(|| "retrying delivery…".to_owned()),
+                                    )
+                                    .color(pal.dim2)
+                                    .size(ui_font_size(9.5)),
+                                );
+                            }
                             (None, DeliveryState::Failed) => {
                                 ui.label(
                                     RichText::new(
@@ -1919,7 +1980,7 @@ impl AppState {
                                     .size(ui_font_size(9.5)),
                                 );
                             }
-                            (None, DeliveryState::Synced) => {}
+                            (None, DeliveryState::Delivered) => {}
                         }
                     },
                 );
@@ -1948,7 +2009,7 @@ impl AppState {
             .delivery
             .get(&message.message_id)
             .cloned()
-            .unwrap_or((DeliveryState::Synced, None));
+            .unwrap_or((DeliveryState::Delivered, None));
         let author = if own {
             "You".to_owned()
         } else {
@@ -2039,6 +2100,15 @@ impl AppState {
                                     .size(ui_font_size(9.5)),
                             );
                         }
+                        (None, DeliveryState::Retrying) => {
+                            ui.label(
+                                RichText::new(
+                                    detail.unwrap_or_else(|| "retrying delivery…".to_owned()),
+                                )
+                                .color(pal.dim2)
+                                .size(ui_font_size(9.5)),
+                            );
+                        }
                         (None, DeliveryState::Failed) => {
                             ui.label(
                                 RichText::new(
@@ -2048,7 +2118,7 @@ impl AppState {
                                 .size(ui_font_size(9.5)),
                             );
                         }
-                        (None, DeliveryState::Synced) => {}
+                        (None, DeliveryState::Delivered) => {}
                     }
                 },
             );
@@ -2082,6 +2152,17 @@ impl AppState {
             conversation_id: conversation_id.to_owned(),
             message_id: message_id.to_owned(),
             scope,
+        });
+    }
+
+    fn clear_chat_history(&mut self, conversation_id: &str) {
+        if let Some(timeline) = self.chat.timelines.get_mut(conversation_id) {
+            for message in timeline.drain(..) {
+                self.chat.delivery.remove(&message.message_id);
+            }
+        }
+        self.cmd(Command::ClearChatHistory {
+            conversation_id: conversation_id.to_owned(),
         });
     }
 
@@ -5192,6 +5273,9 @@ enum Command {
         conversation_id: String,
         message_id: String,
     },
+    ClearChatHistory {
+        conversation_id: String,
+    },
 }
 
 struct Worker {
@@ -5834,6 +5918,9 @@ impl Worker {
                 message_id,
             } => {
                 self.chat.restore_message(conversation_id, message_id).await;
+            }
+            Command::ClearChatHistory { conversation_id } => {
+                self.chat.clear_history(conversation_id).await;
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {

@@ -35,6 +35,9 @@ pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_BYTES: usize = 256 * 1024;
 const MESSAGE_PREFIX: &[u8] = b"message/";
 const DELETION_PREFIX: &[u8] = b"deletion/";
+const RECEIPT_PREFIX: &[u8] = b"receipt/";
+const RETRY_TICK: Duration = Duration::from_secs(1);
+const MAX_RETRY_SECONDS: u64 = 60;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +171,40 @@ impl ReplicatedDeletion {
     }
 }
 
+/// A recipient-authored durable acknowledgement.  The message data stays in
+/// Iroh Docs; this just lets the sender distinguish a local commit from an
+/// observed remote replica.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicatedReceipt {
+    version: u8,
+    message_id: String,
+    delivered_at: i64,
+}
+
+impl ReplicatedReceipt {
+    fn new(message_id: String) -> Self {
+        Self {
+            version: 1,
+            message_id,
+            delivered_at: now_millis(),
+        }
+    }
+
+    fn entry_key(&self) -> String {
+        format!("receipt/{}", self.message_id)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("unsupported receipt version {}", self.version);
+        }
+        if !is_message_id(&self.message_id) {
+            bail!("receipt has an invalid message id");
+        }
+        Ok(())
+    }
+}
+
 impl Ord for ChatMessage {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.sent_at, &self.author_id, self.nonce, &self.message_id).cmp(&(
@@ -198,6 +235,10 @@ pub struct ChatConversation {
     pub kind: ConversationKind,
     pub members: Vec<String>,
     pub document_id: String,
+    /// Bumped when history is hard-deleted and the conversation rotates onto a
+    /// fresh empty document. Higher epoch always wins on invite.
+    #[serde(default)]
+    pub history_epoch: u64,
 }
 
 impl ChatConversation {
@@ -212,7 +253,8 @@ impl ChatConversation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
     Pending,
-    Synced,
+    Retrying,
+    Delivered,
     Failed,
 }
 
@@ -256,10 +298,24 @@ struct ChatInvite {
     ticket: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ChatProtocolMessage {
+    Invite(ChatInvite),
+    SyncRequest(SyncRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncRequest {
+    kind: String,
+    version: u8,
+    conversation_id: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct IncomingInvite {
     remote: NodeId,
-    invite: ChatInvite,
+    message: ChatProtocolMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -290,9 +346,9 @@ impl ProtocolHandler for ChatInviteProtocol {
             }
             let mut bytes = vec![0; length];
             recv.read_exact(&mut bytes).await?;
-            let invite: ChatInvite =
-                serde_json::from_slice(&bytes).context("invalid Wire chat invitation")?;
-            tx.send(IncomingInvite { remote, invite }).await?;
+            let message: ChatProtocolMessage =
+                serde_json::from_slice(&bytes).context("invalid Wire chat protocol message")?;
+            tx.send(IncomingInvite { remote, message }).await?;
             send.write_all(b"ok").await?;
             send.finish()?;
             Ok(())
@@ -327,9 +383,18 @@ pub struct ChatService {
     doc_event_rx: async_channel::Receiver<DocumentSignal>,
     subscriptions: BTreeMap<String, String>,
     queued: VecDeque<ChatNotification>,
-    retry: tokio::time::Interval,
+    retry_tick: tokio::time::Interval,
+    retry_state: BTreeMap<String, ConversationRetry>,
+    pending_deliveries: BTreeMap<String, String>,
     #[cfg(test)]
     invite_attempts: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ConversationRetry {
+    attempts: u8,
+    next_attempt: tokio::time::Instant,
+    messages: BTreeSet<String>,
 }
 
 pub(crate) enum ChatInput {
@@ -383,10 +448,12 @@ impl ChatService {
             doc_event_rx,
             subscriptions: BTreeMap::new(),
             queued: VecDeque::new(),
-            retry: tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_secs(30),
-                Duration::from_secs(30),
+            retry_tick: tokio::time::interval_at(
+                tokio::time::Instant::now() + RETRY_TICK,
+                RETRY_TICK,
             ),
+            retry_state: BTreeMap::new(),
+            pending_deliveries: BTreeMap::new(),
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
         };
@@ -416,7 +483,33 @@ impl ChatService {
                 )));
             }
         }
+        self.restore_pending_delivery_retries().await;
         self.retry_invites();
+    }
+
+    async fn restore_pending_delivery_retries(&mut self) {
+        let conversations: Vec<_> = self
+            .index
+            .conversations
+            .iter()
+            .map(|(id, stored)| (id.clone(), stored.clone()))
+            .collect();
+        for (conversation_id, stored) in conversations {
+            let Ok(messages) = self.load_messages(&stored).await else {
+                continue;
+            };
+            let Ok(delivered) = self.load_delivered_message_ids(&stored).await else {
+                continue;
+            };
+            let our_node_id = self.our_node_id.to_string();
+            for message in messages.into_iter().filter(|message| {
+                message.author_id == our_node_id && !delivered.contains(&message.message_id)
+            }) {
+                self.pending_deliveries
+                    .insert(message.message_id.clone(), conversation_id.clone());
+                self.schedule_delivery_retry(&conversation_id, &message.message_id, true);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -444,19 +537,47 @@ impl ChatService {
             changed = self.doc_event_rx.recv() => ChatInput::Document(
                 changed.expect("chat document event channel closed")
             ),
-            _ = self.retry.tick() => ChatInput::Retry,
+            _ = self.retry_tick.tick() => ChatInput::Retry,
         }
     }
 
     pub(crate) async fn process_input(&mut self, input: ChatInput) -> Option<ChatNotification> {
         match input {
-            ChatInput::Invite(incoming) => {
-                if let Err(error) = self.accept_invite(incoming).await {
-                    return Some(ChatNotification::Error(format!(
-                        "Chat invitation failed: {error:#}"
-                    )));
+            ChatInput::Invite(incoming) => match incoming.message {
+                ChatProtocolMessage::Invite(invite) => {
+                    if let Err(error) = self.accept_invite(incoming.remote, invite).await {
+                        return Some(ChatNotification::Error(format!(
+                            "Chat invitation failed: {error:#}"
+                        )));
+                    }
                 }
-            }
+                ChatProtocolMessage::SyncRequest(request) => {
+                    if request.kind != "sync-request" || request.version != 1 {
+                        return Some(ChatNotification::Error(format!(
+                            "Unsupported chat sync request version {}",
+                            request.version
+                        )));
+                    }
+                    if self.is_conversation_member(&request.conversation_id, incoming.remote) {
+                        // Push the current ticket so peers that missed a history
+                        // rotation (or any invite) catch up when they come online.
+                        self.invite_members(&request.conversation_id);
+                        if let Err(error) = self.open_and_publish(&request.conversation_id).await {
+                            warn!(
+                                conversation = %log_id(&request.conversation_id),
+                                peer = %incoming.remote.fmt_short(),
+                                "failed to immediately sync requested chat: {error:#}"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            conversation = %log_id(&request.conversation_id),
+                            peer = %incoming.remote.fmt_short(),
+                            "ignored chat sync request from a non-member"
+                        );
+                    }
+                }
+            },
             ChatInput::Document(signal) => match signal {
                 DocumentSignal::Changed(id) => {
                     if let Err(error) = self.publish_timeline(&id).await {
@@ -484,13 +605,7 @@ impl ChatService {
                 }
             },
             ChatInput::Retry => {
-                self.retry_invites();
-                let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
-                for id in ids {
-                    if let Err(error) = self.open_and_publish(&id).await {
-                        warn!(conversation = %log_id(&id), "periodic chat reconciliation failed: {error:#}");
-                    }
-                }
+                self.retry_due_deliveries().await;
             }
         }
         self.pop_notification()
@@ -508,6 +623,7 @@ impl ChatService {
                         peer_id: peer.to_string(),
                     },
                     members,
+                    0,
                 )
                 .await?;
             self.index.conversations.insert(id.clone(), stored);
@@ -548,6 +664,7 @@ impl ChatService {
                 title.chars().take(128).collect(),
                 ConversationKind::Group,
                 sorted_members(all_members),
+                0,
             )
             .await?;
         self.index.conversations.insert(id.clone(), stored);
@@ -568,7 +685,7 @@ impl ChatService {
         let result = self
             .insert_message(&conversation_id, &message)
             .await
-            .map(|_| DeliveryState::Synced);
+            .map(|_| DeliveryState::Pending);
         match result {
             Ok(state) => {
                 info!(
@@ -578,10 +695,14 @@ impl ChatService {
                     "message committed to local chat replica"
                 );
                 self.queued.push_back(ChatNotification::Delivery {
-                    message_id,
+                    message_id: message_id.clone(),
                     state,
-                    detail: None,
+                    detail: Some("saved locally; delivering".to_owned()),
                 });
+                self.pending_deliveries
+                    .insert(message_id.clone(), conversation_id.clone());
+                self.schedule_delivery_retry(&conversation_id, &message_id, true);
+                self.sync_and_wake(&conversation_id).await;
             }
             Err(error) => {
                 warn!(
@@ -595,6 +716,115 @@ impl ChatService {
                     detail: Some(error.to_string()),
                 });
             }
+        }
+    }
+
+    fn is_conversation_member(&self, conversation_id: &str, node: NodeId) -> bool {
+        self.index
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|stored| {
+                stored
+                    .public
+                    .members
+                    .iter()
+                    .any(|member| member == &node.to_string())
+            })
+    }
+
+    fn schedule_delivery_retry(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+        immediate: bool,
+    ) {
+        let now = tokio::time::Instant::now();
+        let state = self
+            .retry_state
+            .entry(conversation_id.to_owned())
+            .or_insert_with(|| ConversationRetry {
+                attempts: 0,
+                next_attempt: now,
+                messages: BTreeSet::new(),
+            });
+        state.messages.insert(message_id.to_owned());
+        if immediate {
+            state.next_attempt = now;
+        }
+    }
+
+    async fn retry_due_deliveries(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .retry_state
+            .iter()
+            .filter_map(|(id, state)| (state.next_attempt <= now).then_some(id.clone()))
+            .collect();
+        for conversation_id in due {
+            let message_ids = self
+                .retry_state
+                .get(&conversation_id)
+                .map(|state| state.messages.clone())
+                .unwrap_or_default();
+            if message_ids.is_empty() {
+                self.retry_state.remove(&conversation_id);
+                continue;
+            }
+            self.sync_and_wake(&conversation_id).await;
+            let Some(state) = self.retry_state.get_mut(&conversation_id) else {
+                // A receipt can arrive while the immediate sync above is
+                // publishing its timeline, which removes this retry state.
+                continue;
+            };
+            if state.messages.is_empty() {
+                continue;
+            }
+            let attempts = {
+                state.attempts = state.attempts.saturating_add(1);
+                state.next_attempt = now + delivery_retry_delay(&conversation_id, state.attempts);
+                state.attempts
+            };
+            for message_id in message_ids {
+                if self.pending_deliveries.contains_key(&message_id) {
+                    self.queued.push_back(ChatNotification::Delivery {
+                        message_id,
+                        state: DeliveryState::Retrying,
+                        detail: Some(format!("delivery retry {attempts}")),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn sync_and_wake(&mut self, conversation_id: &str) {
+        if let Err(error) = self.open_and_publish(conversation_id).await {
+            warn!(conversation = %log_id(conversation_id), "immediate chat sync failed: {error:#}");
+        }
+        self.wake_members(conversation_id);
+    }
+
+    fn wake_members(&self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return;
+        };
+        for peer in stored
+            .public
+            .members
+            .iter()
+            .filter_map(|member| NodeId::from_str(member).ok())
+            .filter(|peer| *peer != self.our_node_id)
+        {
+            let endpoint = self.endpoint.clone();
+            let conversation_id = conversation_id.to_owned();
+            tokio::spawn(async move {
+                if let Err(error) = send_sync_request(endpoint, peer, &conversation_id).await {
+                    trace!(
+                        peer = %peer.fmt_short(),
+                        conversation = %log_id(&conversation_id),
+                        "chat delivery wake-up did not reach peer: {error:#}"
+                    );
+                }
+            });
         }
     }
 
@@ -678,12 +908,114 @@ impl ChatService {
         }
     }
 
+    pub async fn clear_history(&mut self, conversation_id: String) {
+        match self.rotate_conversation_document(&conversation_id).await {
+            Ok(epoch) => {
+                info!(
+                    conversation = %log_id(&conversation_id),
+                    history_epoch = epoch,
+                    "chat history deleted and conversation rotated onto a fresh document"
+                );
+                self.invite_members(&conversation_id);
+            }
+            Err(error) => {
+                warn!(
+                    conversation = %log_id(&conversation_id),
+                    "failed to clear chat history: {error:#}"
+                );
+                if let Err(refresh_error) = self.publish_timeline(&conversation_id).await {
+                    warn!(
+                        conversation = %log_id(&conversation_id),
+                        "failed to refresh timeline after history clear error: {refresh_error:#}"
+                    );
+                }
+                self.queued.push_back(ChatNotification::Error(format!(
+                    "Could not clear history: {error:#}"
+                )));
+            }
+        }
+    }
+
+    async fn rotate_conversation_document(&mut self, conversation_id: &str) -> Result<u64> {
+        let current = self
+            .index
+            .conversations
+            .get(conversation_id)
+            .cloned()
+            .context("unknown conversation")?;
+        let old_document_id = current.public.document_id.clone();
+        let next_epoch = current.public.history_epoch.saturating_add(1);
+        let fresh = self
+            .create_conversation(
+                current.public.id.clone(),
+                current.public.title.clone(),
+                current.public.kind.clone(),
+                current.public.members.clone(),
+                next_epoch,
+            )
+            .await?;
+        let epoch = fresh.public.history_epoch;
+        let new_document_id = fresh.public.document_id.clone();
+
+        self.forget_conversation_local_state(conversation_id);
+        self.subscriptions.remove(conversation_id);
+        self.index
+            .conversations
+            .insert(conversation_id.to_owned(), fresh);
+        self.persist_index()?;
+        self.drop_document(&old_document_id).await;
+        self.open_and_publish(conversation_id).await?;
+        info!(
+            conversation = %log_id(conversation_id),
+            old_document = %log_id(&old_document_id),
+            new_document = %log_id(&new_document_id),
+            history_epoch = epoch,
+            "rotated chat document after history delete"
+        );
+        Ok(epoch)
+    }
+
+    fn forget_conversation_local_state(&mut self, conversation_id: &str) {
+        self.pending_deliveries
+            .retain(|_, pending_conversation| pending_conversation != conversation_id);
+        self.retry_state.remove(conversation_id);
+        if self
+            .local_deletions
+            .conversations
+            .remove(conversation_id)
+            .is_some()
+        {
+            if let Err(error) = save_local_deletions(
+                &self.root.join("local-deletions.json"),
+                &self.local_deletions,
+            ) {
+                warn!(
+                    conversation = %log_id(conversation_id),
+                    "failed to drop local deletions after history clear: {error:#}"
+                );
+            }
+        }
+    }
+
+    async fn drop_document(&self, document_id: &str) {
+        let Ok(namespace) = NamespaceId::from_str(document_id) else {
+            return;
+        };
+        if let Err(error) = self.docs.drop_doc(namespace).await {
+            warn!(
+                document = %log_id(document_id),
+                "failed to drop chat document storage: {error:#}"
+            );
+        }
+    }
+
     async fn create_conversation(
         &self,
         id: String,
         title: String,
         kind: ConversationKind,
         members: Vec<String>,
+        history_epoch: u64,
     ) -> Result<StoredConversation> {
         let doc = self.docs.create().await?;
         let ticket = doc
@@ -696,14 +1028,14 @@ impl ChatService {
                 kind,
                 members,
                 document_id: doc.id().to_string(),
+                history_epoch,
             },
             ticket: ticket.to_string(),
         })
     }
 
-    async fn accept_invite(&mut self, incoming: IncomingInvite) -> Result<()> {
-        info!(peer = %incoming.remote.fmt_short(), conversation = %log_id(&incoming.invite.conversation.id), "accepting chat invitation");
-        let mut invite = incoming.invite;
+    async fn accept_invite(&mut self, remote: NodeId, mut invite: ChatInvite) -> Result<()> {
+        info!(peer = %remote.fmt_short(), conversation = %log_id(&invite.conversation.id), "accepting chat invitation");
         if invite.version != 1 {
             bail!("unsupported invitation version {}", invite.version);
         }
@@ -719,43 +1051,65 @@ impl ChatService {
                 .conversation
                 .members
                 .iter()
-                .any(|id| id == &incoming.remote.to_string())
+                .any(|id| id == &remote.to_string())
         {
             bail!("invitation membership does not match its sender and recipient");
         }
         if matches!(invite.conversation.kind, ConversationKind::Direct { .. }) {
-            let expected = direct_conversation_id(self.our_node_id, incoming.remote);
+            let expected = direct_conversation_id(self.our_node_id, remote);
             if invite.conversation.id != expected || invite.conversation.members.len() != 2 {
                 bail!("direct-message invitation has inconsistent members");
             }
             invite.conversation.kind = ConversationKind::Direct {
-                peer_id: incoming.remote.to_string(),
+                peer_id: remote.to_string(),
             };
         }
         let _: DocTicket =
             DocTicket::from_str(&invite.ticket).context("invalid document ticket")?;
 
         let id = invite.conversation.id.clone();
-        let replace = self
-            .index
-            .conversations
-            .get(&id)
-            .map(|current| invite.conversation.document_id < current.public.document_id)
-            .unwrap_or(true);
+        let current = self.index.conversations.get(&id).cloned();
+        let (replace, history_reset) = match current.as_ref() {
+            None => (true, false),
+            Some(current) => {
+                let invite_epoch = invite.conversation.history_epoch;
+                let current_epoch = current.public.history_epoch;
+                if invite_epoch > current_epoch {
+                    (true, true)
+                } else if invite_epoch < current_epoch {
+                    (false, false)
+                } else if invite.conversation.document_id == current.public.document_id {
+                    (false, false)
+                } else {
+                    (
+                        invite.conversation.document_id < current.public.document_id,
+                        false,
+                    )
+                }
+            }
+        };
         if !replace {
             debug!(
                 conversation = %log_id(&id),
-                peer = %incoming.remote.fmt_short(),
+                peer = %remote.fmt_short(),
                 "ignored chat invitation for a non-canonical replica"
             );
             return Ok(());
         }
 
-        let migrated = if let Some(current) = self.index.conversations.get(&id) {
+        // History resets intentionally discard prior messages. Concurrent DM
+        // creation still migrates into the canonical replica.
+        let migrated = if history_reset {
+            Vec::new()
+        } else if let Some(current) = current.as_ref() {
             self.load_messages(current).await.unwrap_or_default()
         } else {
             Vec::new()
         };
+        let old_document_id = current.as_ref().map(|stored| stored.public.document_id.clone());
+        if history_reset {
+            self.forget_conversation_local_state(&id);
+        }
         self.index.conversations.insert(
             id.clone(),
             StoredConversation {
@@ -765,8 +1119,18 @@ impl ChatService {
         );
         self.subscriptions.remove(&id);
         self.persist_index()?;
+        if let Some(old_document_id) = old_document_id {
+            let new_document_id = &self.index.conversations[&id].public.document_id;
+            if old_document_id != *new_document_id {
+                self.drop_document(&old_document_id).await;
+            }
+        }
         self.open_and_publish(&id).await?;
-        info!(conversation = %log_id(&id), "chat invitation imported");
+        info!(
+            conversation = %log_id(&id),
+            history_reset,
+            "chat invitation imported"
+        );
         for message in migrated {
             let migrate_deletion = message.deletion == Some(MessageDeletion::Everyone);
             if let Err(error) = self.insert_message(&id, &message).await {
@@ -791,7 +1155,12 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let ticket = DocTicket::from_str(&stored.ticket)?;
-        let mut peers = ticket.nodes.clone();
+        let mut peers: Vec<_> = ticket
+            .nodes
+            .iter()
+            .filter(|addr| addr.node_id != self.our_node_id)
+            .cloned()
+            .collect();
         let document_id = NamespaceId::from_str(&stored.public.document_id)?;
         let doc = match self.docs.open(document_id).await {
             Ok(Some(doc)) => doc,
@@ -871,6 +1240,45 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let messages = self.load_messages(&stored).await?;
+        self.acknowledge_received_messages(&stored, &messages)
+            .await?;
+        let delivered = self.load_delivered_message_ids(&stored).await?;
+        let visible: BTreeSet<_> = messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect();
+        let dropped_pending: Vec<_> = self
+            .pending_deliveries
+            .iter()
+            .filter(|(message_id, conversation_id)| {
+                *conversation_id == id && !visible.contains(*message_id)
+            })
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        for message_id in dropped_pending {
+            self.pending_deliveries.remove(&message_id);
+        }
+        for message in &messages {
+            if message.author_id == self.our_node_id.to_string()
+                && delivered.contains(&message.message_id)
+                && self
+                    .pending_deliveries
+                    .remove(&message.message_id)
+                    .is_some()
+            {
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message.message_id.clone(),
+                    state: DeliveryState::Delivered,
+                    detail: None,
+                });
+            }
+        }
+        self.retry_state.retain(|_, state| {
+            state
+                .messages
+                .retain(|message_id| self.pending_deliveries.contains_key(message_id));
+            !state.messages.is_empty()
+        });
         debug!(
             conversation = %log_id(id),
             messages = messages.len(),
@@ -881,6 +1289,87 @@ impl ChatService {
             messages,
         });
         Ok(())
+    }
+
+    async fn acknowledge_received_messages(
+        &self,
+        stored: &StoredConversation,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        let ticket = DocTicket::from_str(&stored.ticket)?;
+        let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+        let doc = match self.docs.open(document_id).await {
+            Ok(Some(doc)) => doc,
+            _ => self.docs.import(ticket).await?,
+        };
+        for message in messages
+            .iter()
+            .filter(|message| message.author_id != self.our_node_id.to_string())
+        {
+            let receipt = ReplicatedReceipt::new(message.message_id.clone());
+            let mut existing = doc
+                .get_many(
+                    Query::author(self.author)
+                        .key_exact(receipt.entry_key())
+                        .build(),
+                )
+                .await?;
+            if existing.next().await.transpose()?.is_none() {
+                doc.set_bytes(
+                    self.author,
+                    receipt.entry_key(),
+                    serde_json::to_vec(&receipt)?,
+                )
+                .await?;
+                debug!(
+                    conversation = %log_id(&stored.public.id),
+                    message = %log_id(&message.message_id),
+                    "acknowledged received chat message"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_delivered_message_ids(
+        &self,
+        stored: &StoredConversation,
+    ) -> Result<BTreeSet<String>> {
+        let ticket = DocTicket::from_str(&stored.ticket)?;
+        let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+        let doc = match self.docs.open(document_id).await {
+            Ok(Some(doc)) => doc,
+            _ => self.docs.import(ticket).await?,
+        };
+        let mut entries = doc
+            .get_many(Query::key_prefix(RECEIPT_PREFIX).build())
+            .await?;
+        let mut delivered = BTreeSet::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            if entry.author() == self.author {
+                continue;
+            }
+            let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
+            if len == 0 || len > 16 * 1024 {
+                continue;
+            }
+            let Some(blob) = self.blobs.get(&entry.content_hash()).await? else {
+                continue;
+            };
+            if !blob.is_complete() {
+                continue;
+            }
+            let mut reader = blob.data_reader();
+            let bytes = reader.read_at(0, len).await?;
+            let Ok(receipt) = serde_json::from_slice::<ReplicatedReceipt>(&bytes) else {
+                continue;
+            };
+            if receipt.validate().is_ok() {
+                delivered.insert(receipt.message_id);
+            }
+        }
+        Ok(delivered)
     }
 
     async fn load_messages(&self, stored: &StoredConversation) -> Result<Vec<ChatMessage>> {
@@ -1101,29 +1590,37 @@ impl ChatService {
     }
 
     fn retry_invites(&self) {
-        for stored in self.index.conversations.values() {
-            let invite = ChatInvite {
-                version: 1,
-                conversation: stored.public.clone(),
-                ticket: stored.ticket.clone(),
+        let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
+        for id in ids {
+            self.invite_members(&id);
+        }
+    }
+
+    fn invite_members(&self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return;
+        };
+        let invite = ChatInvite {
+            version: 1,
+            conversation: stored.public.clone(),
+            ticket: stored.ticket.clone(),
+        };
+        for member in &stored.public.members {
+            let Ok(peer) = NodeId::from_str(member) else {
+                continue;
             };
-            for member in &stored.public.members {
-                let Ok(peer) = NodeId::from_str(member) else {
-                    continue;
-                };
-                if peer == self.our_node_id {
-                    continue;
-                }
-                #[cfg(test)]
-                self.invite_attempts.fetch_add(1, Ordering::Relaxed);
-                let endpoint = self.endpoint.clone();
-                let invite = invite.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = send_invite(endpoint, peer, &invite).await {
-                        trace!(peer = %peer.fmt_short(), "chat peer not currently reachable: {error:#}");
-                    }
-                });
+            if peer == self.our_node_id {
+                continue;
             }
+            #[cfg(test)]
+            self.invite_attempts.fetch_add(1, Ordering::Relaxed);
+            let endpoint = self.endpoint.clone();
+            let invite = invite.clone();
+            tokio::spawn(async move {
+                if let Err(error) = send_invite(endpoint, peer, &invite).await {
+                    trace!(peer = %peer.fmt_short(), "chat peer not currently reachable: {error:#}");
+                }
+            });
         }
     }
 
@@ -1133,11 +1630,31 @@ impl ChatService {
 }
 
 async fn send_invite(endpoint: Endpoint, peer: NodeId, invite: &ChatInvite) -> Result<()> {
-    let payload = serde_json::to_vec(invite)?;
+    send_chat_packet(endpoint, peer, ChatProtocolMessage::Invite(invite.clone())).await
+}
+
+async fn send_sync_request(endpoint: Endpoint, peer: NodeId, conversation_id: &str) -> Result<()> {
+    send_chat_packet(
+        endpoint,
+        peer,
+        ChatProtocolMessage::SyncRequest(SyncRequest {
+            kind: "sync-request".to_owned(),
+            version: 1,
+            conversation_id: conversation_id.to_owned(),
+        }),
+    )
+    .await
+}
+
+async fn send_chat_packet(
+    endpoint: Endpoint,
+    peer: NodeId,
+    packet: ChatProtocolMessage,
+) -> Result<()> {
+    let payload = serde_json::to_vec(&packet)?;
     if payload.len() > MAX_INVITE_BYTES {
-        bail!("chat invitation exceeds safety cap");
+        bail!("chat protocol message exceeds safety cap");
     }
-    trace!(peer = %peer.fmt_short(), conversation = %log_id(&invite.conversation.id), "sending chat invitation");
     let connection: Connection = endpoint.connect(NodeAddr::from(peer), CHAT_ALPN).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&(payload.len() as u32).to_be_bytes())
@@ -1147,9 +1664,16 @@ async fn send_invite(endpoint: Endpoint, peer: NodeId, invite: &ChatInvite) -> R
     let mut ack = [0u8; 2];
     recv.read_exact(&mut ack).await?;
     if &ack != b"ok" {
-        bail!("chat peer returned an invalid invitation acknowledgement");
+        bail!("chat peer returned an invalid protocol acknowledgement");
     }
-    info!(peer = %peer.fmt_short(), conversation = %log_id(&invite.conversation.id), "chat invitation sent");
+    match packet {
+        ChatProtocolMessage::Invite(invite) => {
+            info!(peer = %peer.fmt_short(), conversation = %log_id(&invite.conversation.id), "chat invitation sent");
+        }
+        ChatProtocolMessage::SyncRequest(request) => {
+            debug!(peer = %peer.fmt_short(), conversation = %log_id(&request.conversation_id), "chat delivery wake-up sent");
+        }
+    }
     Ok(())
 }
 
@@ -1178,6 +1702,17 @@ fn next_nonce() -> u64 {
         .unwrap_or_default()
         .as_nanos() as u64;
     time.rotate_left(17) ^ counter
+}
+
+fn delivery_retry_delay(conversation_id: &str, attempts: u8) -> Duration {
+    let seconds = (1u64 << attempts.min(6)).min(MAX_RETRY_SECONDS);
+    let jitter_ms = conversation_id
+        .bytes()
+        .fold(u64::from(attempts), |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(u64::from(byte))
+        })
+        % 500;
+    Duration::from_secs(seconds) + Duration::from_millis(jitter_ms)
 }
 
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
@@ -1331,6 +1866,26 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_delivery(service: &mut ChatService, message_id: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Delivery {
+                    message_id: observed,
+                    state,
+                    ..
+                } = service.next_notification().await
+                {
+                    if observed == message_id && state == DeliveryState::Delivered {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for remote delivery receipt")?;
+        Ok(())
+    }
+
     async fn wait_for_deletion(
         service: &mut ChatService,
         message_id: &str,
@@ -1380,6 +1935,7 @@ mod tests {
         let outbound_id = outbound.message_id.clone();
         left.send_message(conversation_id.clone(), outbound).await;
         wait_for_body(&mut right, "offline from calls").await?;
+        wait_for_delivery(&mut left, &outbound_id).await?;
         assert_eq!(
             right.invite_attempts.load(Ordering::Relaxed),
             0,
@@ -1487,5 +2043,140 @@ mod tests {
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn delivery_retries_are_bounded_and_desynchronised() {
+        let first = delivery_retry_delay("dm/example-a", 1);
+        let second = delivery_retry_delay("dm/example-b", 1);
+        assert!(first >= Duration::from_secs(2));
+        assert!(first <= Duration::from_secs(2) + Duration::from_millis(499));
+        assert!(
+            delivery_retry_delay("dm/example", 99) <= Duration::from_secs(MAX_RETRY_SECONDS + 1)
+        );
+        assert_ne!(
+            first, second,
+            "conversation-specific jitter avoids retry herds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn history_clear_deletes_document_and_rotates_replicas() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("wire_app=debug,iroh_docs=info")
+            .with_test_writer()
+            .try_init();
+        let temp = tempfile::tempdir()?;
+        let left_root = temp.path().join("left");
+        let right_root = temp.path().join("right");
+        let left_secret = SecretKey::from_bytes(&[11; 32]);
+        let right_secret = SecretKey::from_bytes(&[22; 32]);
+
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&left_root, left_secret.clone()).await?;
+        let (right_endpoint, right_router, mut right) =
+            spawn_test_node(&right_root, right_secret.clone()).await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        let old_document_id = left.index.conversations[&conversation_id]
+            .public
+            .document_id
+            .clone();
+        left.send_message(
+            conversation_id.clone(),
+            ChatMessage::new(left_endpoint.node_id(), "wipe me".to_owned()),
+        )
+        .await;
+        wait_for_body(&mut right, "wipe me").await?;
+
+        left.clear_history(conversation_id.clone()).await;
+        wait_for_history_epoch(&mut left, &conversation_id, 1).await?;
+        wait_for_history_epoch(&mut right, &conversation_id, 1).await?;
+
+        let left_stored = left.index.conversations[&conversation_id].clone();
+        let right_stored = right.index.conversations[&conversation_id].clone();
+        assert_ne!(left_stored.public.document_id, old_document_id);
+        assert_eq!(
+            left_stored.public.document_id,
+            right_stored.public.document_id
+        );
+        assert_eq!(left_stored.public.history_epoch, 1);
+        assert_eq!(right_stored.public.history_epoch, 1);
+        assert!(
+            left.load_messages(&left_stored).await?.is_empty(),
+            "rotated document must start empty"
+        );
+        assert!(
+            right.load_messages(&right_stored).await?.is_empty(),
+            "peer must drop old history after rotation invite"
+        );
+        let old_namespace = NamespaceId::from_str(&old_document_id)?;
+        assert!(
+            !doc_is_present(&left.docs, old_namespace).await?,
+            "initiator must drop old document storage"
+        );
+        assert!(
+            !doc_is_present(&right.docs, old_namespace).await?,
+            "peer must drop old document storage"
+        );
+
+        left.send_message(
+            conversation_id.clone(),
+            ChatMessage::new(left_endpoint.node_id(), "after clear".to_owned()),
+        )
+        .await;
+        wait_for_body(&mut right, "after clear").await?;
+        wait_for_body(&mut left, "after clear").await?;
+
+        let left_messages = left
+            .load_messages(&left.index.conversations[&conversation_id].clone())
+            .await?;
+        assert_eq!(left_messages.len(), 1);
+        assert_eq!(left_messages[0].body, "after clear");
+
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    async fn wait_for_history_epoch(
+        service: &mut ChatService,
+        conversation_id: &str,
+        epoch: u64,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Conversation {
+                    conversation,
+                    messages,
+                } = service.next_notification().await
+                {
+                    if conversation.id == conversation_id
+                        && conversation.history_epoch >= epoch
+                        && messages.is_empty()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for chat history rotation")?;
+        Ok(())
+    }
+
+    async fn doc_is_present(docs: &MemClient, namespace: NamespaceId) -> Result<bool> {
+        let mut listed = docs.list().await?;
+        while let Some(item) = listed.next().await {
+            let (id, _) = item?;
+            if id == namespace {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
