@@ -45,10 +45,13 @@ const MAX_RETRY_SECONDS: u64 = 60;
 /// See `docs/chat-keepalive-sessions.md`.
 const CHAT_SESSION_IDLE: Duration = Duration::from_secs(60);
 const CHAT_SESSION_POOL_CAP: usize = 8;
-/// Bound stream/connect waits so a half-open pooled session cannot stall the
-/// chat worker (logs showed ~30s hangs → “queued” / stalled delivery).
+/// Half-open pooled sessions must fail fast — logs showed a hard ~3s floor on
+/// every send while waiting out a full stream timeout on a dead reuse.
+const CHAT_REUSE_TIMEOUT: Duration = Duration::from_millis(400);
 const CHAT_STREAM_TIMEOUT: Duration = Duration::from_secs(3);
-const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// First delivery re-probe after a successful wake (receipt may still be in flight).
+const CHAT_FIRST_RETRY: Duration = Duration::from_millis(750);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,6 +548,8 @@ pub struct ChatService {
     invite_rx: async_channel::Receiver<IncomingInvite>,
     doc_event_tx: async_channel::Sender<DocumentSignal>,
     doc_event_rx: async_channel::Receiver<DocumentSignal>,
+    wake_tx: async_channel::Sender<ChatInput>,
+    wake_rx: async_channel::Receiver<ChatInput>,
     subscriptions: BTreeMap<String, String>,
     queued: VecDeque<ChatNotification>,
     retry_tick: tokio::time::Interval,
@@ -564,6 +569,11 @@ struct ConversationRetry {
 pub(crate) enum ChatInput {
     Invite(IncomingInvite),
     Document(DocumentSignal),
+    /// Background wake finished (send path does not block on dial/reuse).
+    WakeFinished {
+        conversation_id: String,
+        reached: bool,
+    },
     Retry,
 }
 
@@ -602,6 +612,7 @@ impl ChatService {
         let client = docs.client().clone();
         let author = client.authors().default().await?;
         let (doc_event_tx, doc_event_rx) = async_channel::bounded(256);
+        let (wake_tx, wake_rx) = async_channel::bounded(64);
         let index = load_index(&root.join("index.json"));
         let local_deletions = load_local_deletions(&root.join("local-deletions.json"));
         let conversation_count = index.conversations.len();
@@ -618,6 +629,8 @@ impl ChatService {
             invite_rx,
             doc_event_tx,
             doc_event_rx,
+            wake_tx,
+            wake_rx,
             subscriptions: BTreeMap::new(),
             queued: VecDeque::new(),
             retry_tick: tokio::time::interval_at(
@@ -734,6 +747,7 @@ impl ChatService {
             changed = self.doc_event_rx.recv() => ChatInput::Document(
                 changed.expect("chat document event channel closed")
             ),
+            wake = self.wake_rx.recv() => wake.expect("chat wake channel closed"),
             _ = self.retry_tick.tick() => ChatInput::Retry,
         }
     }
@@ -810,6 +824,12 @@ impl ChatService {
                     }
                 }
             },
+            ChatInput::WakeFinished {
+                conversation_id,
+                reached,
+            } => {
+                self.apply_wake_finished(&conversation_id, reached).await;
+            }
             ChatInput::Retry => {
                 self.retry_due_deliveries().await;
             }
@@ -840,7 +860,9 @@ impl ChatService {
                 peer = %peer.fmt_short(),
                 "created direct-message replica"
             );
-            self.retry_invites();
+            // Await invite so an immediate first send's SyncRequest is not
+            // ignored as non-member on the peer.
+            self.invite_members_wait(&id).await;
         }
         Ok(id)
     }
@@ -881,7 +903,7 @@ impl ChatService {
             members = member_count,
             "created group-chat replica"
         );
-        self.retry_invites();
+        self.invite_members_wait(&id).await;
         Ok(id)
     }
 
@@ -898,29 +920,16 @@ impl ChatService {
                 );
                 self.pending_deliveries
                     .insert(message_id.clone(), conversation_id.clone());
-                // Wake before timeline work. When outbound docs Connect fails,
-                // SyncRequest is what makes peers pull — see
-                // docs/chat-delivery-asymmetry.md and docs/chat-offline-queue.md.
-                let reached = self.wake_members(&conversation_id).await;
-                if reached {
-                    self.schedule_delivery_retry(&conversation_id, &message_id, false);
-                    self.queued.push_back(ChatNotification::Delivery {
-                        message_id: message_id.clone(),
-                        state: DeliveryState::Pending,
-                        detail: Some("delivering".to_owned()),
-                    });
-                } else {
-                    info!(
-                        conversation = %log_id(&conversation_id),
-                        message = %log_id(&message_id),
-                        "no chat member reachable; message queued offline"
-                    );
-                    self.queued.push_back(ChatNotification::Delivery {
-                        message_id: message_id.clone(),
-                        state: DeliveryState::Queued,
-                        detail: Some("waiting for peer".to_owned()),
-                    });
-                }
+                // Optimistic pending — do not block the chat worker on dial/reuse.
+                // A background wake nudges peers; WakeFinished parks as Queued if
+                // nobody is reachable. See docs/chat-delivery-asymmetry.md.
+                self.schedule_delivery_retry(&conversation_id, &message_id, false);
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message_id.clone(),
+                    state: DeliveryState::Pending,
+                    detail: Some("delivering".to_owned()),
+                });
+                self.spawn_wake(&conversation_id);
                 if let Err(error) = self.publish_timeline(&conversation_id).await {
                     warn!(
                         conversation = %log_id(&conversation_id),
@@ -968,13 +977,78 @@ impl ChatService {
             .entry(conversation_id.to_owned())
             .or_insert_with(|| ConversationRetry {
                 attempts: 0,
-                // First automatic retry waits for a normal backoff window.
-                next_attempt: now + delivery_retry_delay(conversation_id, 1),
+                // Short first probe — long backoff only after real attempts.
+                next_attempt: now + CHAT_FIRST_RETRY,
                 messages: BTreeSet::new(),
             });
         state.messages.insert(message_id.to_owned());
         if immediate {
             state.next_attempt = now;
+        }
+    }
+
+    fn spawn_wake(&self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return;
+        };
+        let peers = self.other_members(stored);
+        if peers.is_empty() {
+            return;
+        }
+        let sessions = self.sessions.clone();
+        let wake_tx = self.wake_tx.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            let reached = wake_peers(sessions, peers, &conversation_id).await;
+            let _ = wake_tx
+                .send(ChatInput::WakeFinished {
+                    conversation_id,
+                    reached,
+                })
+                .await;
+        });
+    }
+
+    async fn apply_wake_finished(&mut self, conversation_id: &str, reached: bool) {
+        let pending: Vec<_> = self
+            .pending_deliveries
+            .iter()
+            .filter(|(_, cid)| *cid == conversation_id)
+            .map(|(mid, _)| mid.clone())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        if reached {
+            for message_id in pending {
+                if !self
+                    .retry_state
+                    .get(conversation_id)
+                    .is_some_and(|state| state.messages.contains(&message_id))
+                {
+                    self.schedule_delivery_retry(conversation_id, &message_id, false);
+                }
+            }
+            if let Err(error) = self.publish_timeline(conversation_id).await {
+                warn!(
+                    conversation = %log_id(conversation_id),
+                    "failed to refresh timeline after wake: {error:#}"
+                );
+            }
+            return;
+        }
+        info!(
+            conversation = %log_id(conversation_id),
+            messages = pending.len(),
+            "no chat member reachable; parking deliveries as queued"
+        );
+        self.retry_state.remove(conversation_id);
+        for message_id in pending {
+            self.queued.push_back(ChatNotification::Delivery {
+                message_id,
+                state: DeliveryState::Queued,
+                detail: Some("waiting for peer".to_owned()),
+            });
         }
     }
 
@@ -1119,39 +1193,12 @@ impl ChatService {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return false;
         };
-        let peers: Vec<_> = stored
-            .public
-            .members
-            .iter()
-            .filter_map(|member| NodeId::from_str(member).ok())
-            .filter(|peer| *peer != self.our_node_id)
-            .collect();
-        if peers.is_empty() {
-            return false;
-        }
-        let mut join_set = tokio::task::JoinSet::new();
-        for peer in peers {
-            let sessions = self.sessions.clone();
-            let conversation_id = conversation_id.to_owned();
-            join_set.spawn(async move {
-                match send_sync_request(sessions, peer, &conversation_id).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        trace!(
-                            peer = %peer.fmt_short(),
-                            conversation = %log_id(&conversation_id),
-                            "chat delivery wake-up did not reach peer: {error:#}"
-                        );
-                        false
-                    }
-                }
-            });
-        }
-        let mut reached = false;
-        while let Some(result) = join_set.join_next().await {
-            reached |= result.unwrap_or(false);
-        }
-        reached
+        wake_peers(
+            self.sessions.clone(),
+            self.other_members(stored),
+            conversation_id,
+        )
+        .await
     }
 
     pub async fn delete_message(
@@ -2055,6 +2102,39 @@ async fn send_sync_request(
     .await
 }
 
+async fn wake_peers(
+    sessions: ChatSessionPool,
+    peers: Vec<NodeId>,
+    conversation_id: &str,
+) -> bool {
+    if peers.is_empty() {
+        return false;
+    }
+    let mut join_set = tokio::task::JoinSet::new();
+    for peer in peers {
+        let sessions = sessions.clone();
+        let conversation_id = conversation_id.to_owned();
+        join_set.spawn(async move {
+            match send_sync_request(sessions, peer, &conversation_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    trace!(
+                        peer = %peer.fmt_short(),
+                        conversation = %log_id(&conversation_id),
+                        "chat delivery wake-up did not reach peer: {error:#}"
+                    );
+                    false
+                }
+            }
+        });
+    }
+    let mut reached = false;
+    while let Some(result) = join_set.join_next().await {
+        reached |= result.unwrap_or(false);
+    }
+    reached
+}
+
 async fn send_chat_packet(
     sessions: ChatSessionPool,
     peer: NodeId,
@@ -2064,63 +2144,58 @@ async fn send_chat_packet(
     if payload.len() > MAX_INVITE_BYTES {
         bail!("chat protocol message exceeds safety cap");
     }
-    // Prefer a warm session; on stream/connect failure drop it and dial once.
-    let mut reused = false;
-    for attempt in 0..2 {
-        let connection = if attempt == 0 {
-            if let Some(connection) = sessions.get(peer).await {
-                reused = true;
-                connection
-            } else {
-                reused = false;
-                sessions.dial(peer).await?
-            }
-        } else {
-            sessions.invalidate(peer).await;
-            reused = false;
-            sessions.dial(peer).await?
-        };
-        match tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
+    // Try warm session with a tight timeout, then fresh dial.
+    if let Some(connection) = sessions.get(peer).await {
+        match tokio::time::timeout(CHAT_REUSE_TIMEOUT, send_chat_packet_on(&connection, &payload))
             .await
         {
             Ok(Ok(())) => {
                 sessions.touch(peer).await;
-                match &packet {
-                    ChatProtocolMessage::Invite(invite) => {
-                        info!(
-                            peer = %peer.fmt_short(),
-                            conversation = %log_id(&invite.conversation.id),
-                            reused,
-                            "chat invitation sent"
-                        );
-                    }
-                    ChatProtocolMessage::SyncRequest(request) => {
-                        debug!(
-                            peer = %peer.fmt_short(),
-                            conversation = %log_id(&request.conversation_id),
-                            reused,
-                            "chat delivery wake-up sent"
-                        );
-                    }
-                }
+                log_chat_packet_sent(peer, &packet, true);
                 return Ok(());
             }
-            Ok(Err(error)) if attempt == 0 => {
+            Ok(Err(error)) => {
                 trace!(
                     peer = %peer.fmt_short(),
-                    "chat session send failed; redialing: {error:#}"
+                    "chat session reuse failed; redialing: {error:#}"
                 );
                 sessions.invalidate(peer).await;
             }
-            Err(_) if attempt == 0 => {
-                trace!(peer = %peer.fmt_short(), "chat session send timed out; redialing");
+            Err(_) => {
+                trace!(peer = %peer.fmt_short(), "chat session reuse timed out; redialing");
                 sessions.invalidate(peer).await;
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => bail!("chat session send timed out"),
         }
     }
-    unreachable!("chat send loop exits via return");
+    let connection = sessions.dial(peer).await?;
+    tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
+        .await
+        .context("chat session send timed out")?
+        .context("chat session send failed")?;
+    sessions.touch(peer).await;
+    log_chat_packet_sent(peer, &packet, false);
+    Ok(())
+}
+
+fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool) {
+    match packet {
+        ChatProtocolMessage::Invite(invite) => {
+            info!(
+                peer = %peer.fmt_short(),
+                conversation = %log_id(&invite.conversation.id),
+                reused,
+                "chat invitation sent"
+            );
+        }
+        ChatProtocolMessage::SyncRequest(request) => {
+            debug!(
+                peer = %peer.fmt_short(),
+                conversation = %log_id(&request.conversation_id),
+                reused,
+                "chat delivery wake-up sent"
+            );
+        }
+    }
 }
 
 async fn send_chat_packet_on(connection: &Connection, payload: &[u8]) -> Result<()> {

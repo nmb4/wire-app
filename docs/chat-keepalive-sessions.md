@@ -38,8 +38,9 @@ an unreachable peer.
 - Idle drop after **60s** without streams; connection is **explicitly closed**
 - Outbound `SyncRequest` / invite reuse pooled connections (`open_bi`)
 - Inbound accept loops on multiple bi-streams until idle or `connection.closed()`
-- **3s stream / 5s connect timeouts** so half-open pooled sessions cannot stall
-  the chat worker (observed ~30s hangs after the first warm seconds)
+- **400ms reuse timeout** then fresh dial (was a hard ~3s floor per send on
+  dead pooled sessions); **3s stream / 4s connect** on the fresh path
+- Send path **does not block** on wake — background probe + `WakeFinished`
 - Failed/timed-out streams invalidate + close the pool entry and redial once
 
 Still open: piggyback docs/blob traffic on the same session; measure burst RTT
