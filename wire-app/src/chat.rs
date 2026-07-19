@@ -604,6 +604,9 @@ pub struct ChatService {
     retry_tick: tokio::time::Interval,
     retry_state: BTreeMap<String, ConversationRetry>,
     pending_deliveries: BTreeMap<String, String>,
+    /// In-flight background wakes per conversation — prevents a losing race
+    /// from parking deliveries as Queued right after a successful wake.
+    wake_inflight: BTreeMap<String, u32>,
     #[cfg(test)]
     invite_attempts: AtomicU64,
 }
@@ -688,6 +691,7 @@ impl ChatService {
             ),
             retry_state: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
+            wake_inflight: BTreeMap::new(),
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
         };
@@ -1036,7 +1040,7 @@ impl ChatService {
         }
     }
 
-    fn spawn_wake(&self, conversation_id: &str) {
+    fn spawn_wake(&mut self, conversation_id: &str) {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return;
         };
@@ -1044,6 +1048,10 @@ impl ChatService {
         if peers.is_empty() {
             return;
         }
+        *self
+            .wake_inflight
+            .entry(conversation_id.to_owned())
+            .or_insert(0) += 1;
         let sessions = self.sessions.clone();
         let wake_tx = self.wake_tx.clone();
         let conversation_id = conversation_id.to_owned();
@@ -1075,6 +1083,13 @@ impl ChatService {
     }
 
     async fn apply_wake_finished(&mut self, conversation_id: &str, reached: bool) {
+        if let Some(count) = self.wake_inflight.get_mut(conversation_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.wake_inflight.remove(conversation_id);
+            }
+        }
+        let inflight = self.wake_inflight.get(conversation_id).copied().unwrap_or(0);
         let pending: Vec<_> = self
             .pending_deliveries
             .iter()
@@ -1085,15 +1100,17 @@ impl ChatService {
             return;
         }
         if reached {
-            for message_id in pending {
-                if !self
-                    .retry_state
-                    .get(conversation_id)
-                    .is_some_and(|state| state.messages.contains(&message_id))
-                {
-                    self.schedule_delivery_retry(conversation_id, &message_id, false);
-                }
+            // A success means the peer is up — never leave messages Queued.
+            for message_id in &pending {
+                self.schedule_delivery_retry(conversation_id, message_id, false);
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message_id.clone(),
+                    state: DeliveryState::Pending,
+                    detail: Some("delivering".to_owned()),
+                });
             }
+            // Peer acked SyncRequest; pull any receipts they may have just written.
+            self.spawn_doc_sync(conversation_id);
             if let Err(error) = self.publish_timeline(conversation_id).await {
                 warn!(
                     conversation = %log_id(conversation_id),
@@ -1102,12 +1119,15 @@ impl ChatService {
             }
             return;
         }
+        // Only park when every in-flight wake lost — a concurrent success must win.
+        if inflight > 0 || self.retry_state.contains_key(conversation_id) {
+            return;
+        }
         info!(
             conversation = %log_id(conversation_id),
             messages = pending.len(),
             "no chat member reachable; parking deliveries as queued"
         );
-        self.retry_state.remove(conversation_id);
         for message_id in pending {
             self.queued.push_back(ChatNotification::Delivery {
                 message_id,
@@ -1726,8 +1746,15 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let messages = self.load_messages(&stored).await?;
-        self.acknowledge_received_messages(&stored, &messages)
+        let wrote_receipts = self
+            .acknowledge_received_messages(&stored, &messages)
             .await?;
+        // Friend already sees their message on our side; their UI stays on
+        // "syncing" until they pull our receipt. Nudge them immediately.
+        if wrote_receipts {
+            self.spawn_doc_sync(id);
+            self.spawn_wake(id);
+        }
         let delivered = self.load_delivered_message_ids(&stored).await?;
         let visible: BTreeSet<_> = messages
             .iter()
@@ -1786,13 +1813,14 @@ impl ChatService {
         &self,
         stored: &StoredConversation,
         messages: &[ChatMessage],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ticket = DocTicket::from_str(&stored.ticket)?;
         let document_id = NamespaceId::from_str(&stored.public.document_id)?;
         let doc = match self.docs.open(document_id).await {
             Ok(Some(doc)) => doc,
             _ => self.docs.import(ticket).await?,
         };
+        let mut wrote_any = false;
         for message in messages
             .iter()
             .filter(|message| message.author_id != self.our_node_id.to_string())
@@ -1812,6 +1840,7 @@ impl ChatService {
                     serde_json::to_vec(&receipt)?,
                 )
                 .await?;
+                wrote_any = true;
                 debug!(
                     conversation = %log_id(&stored.public.id),
                     message = %log_id(&message.message_id),
@@ -1819,7 +1848,7 @@ impl ChatService {
                 );
             }
         }
-        Ok(())
+        Ok(wrote_any)
     }
 
     async fn load_delivered_message_ids(
