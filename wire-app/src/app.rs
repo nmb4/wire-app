@@ -5118,6 +5118,7 @@ mod layout_tests {
             sent_at,
             body: "hello".to_owned(),
             nonce: 0,
+            client_version: None,
             deletion: None,
         };
 

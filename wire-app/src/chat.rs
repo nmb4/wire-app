@@ -97,6 +97,10 @@ pub struct ChatMessage {
     pub sent_at: i64,
     pub body: String,
     pub nonce: u64,
+    /// Wire GUI build that authored this message (e.g. "0.4.7"). Absent on
+    /// older peers / historical entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
     #[serde(skip)]
     pub deletion: Option<MessageDeletion>,
 }
@@ -130,6 +134,7 @@ impl ChatMessage {
             sent_at,
             body,
             nonce,
+            client_version: Some(crate::APP_VERSION.to_owned()),
             deletion: None,
         }
     }
@@ -318,6 +323,8 @@ struct ChatInvite {
     version: u8,
     conversation: ChatConversation,
     ticket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +344,8 @@ struct SyncRequest {
     /// toward the sender even when their endpoint address book is stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -818,6 +827,7 @@ impl ChatService {
             ChatInput::Invite(incoming) => match incoming.message {
                 ChatProtocolMessage::Invite(invite) => {
                     let remote = incoming.remote;
+                    note_peer_client_version(remote, invite.client_version.as_deref(), "invite");
                     if let Err(error) = self.accept_invite(remote, invite).await {
                         return Some(ChatNotification::Error(format!(
                             "Chat invitation failed: {error:#}"
@@ -832,6 +842,11 @@ impl ChatService {
                             request.version
                         )));
                     }
+                    note_peer_client_version(
+                        incoming.remote,
+                        request.client_version.as_deref(),
+                        "sync-request",
+                    );
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
                         // Accept-side pull using any fresh ticket addrs the
                         // sender embedded (fixes Noah→David docs lag when chat
@@ -1777,6 +1792,15 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let messages = self.load_messages(&stored).await?;
+        for message in &messages {
+            if message.author_id != self.our_node_id.to_string() {
+                if let Some(version) = message.client_version.as_deref() {
+                    if let Ok(author) = NodeId::from_str(&message.author_id) {
+                        note_peer_client_version(author, Some(version), "message");
+                    }
+                }
+            }
+        }
         let wrote_receipts = self
             .acknowledge_received_messages(&stored, &messages)
             .await?;
@@ -2164,6 +2188,7 @@ impl ChatService {
             version: 1,
             conversation: stored.public.clone(),
             ticket: stored.ticket.clone(),
+            client_version: Some(crate::APP_VERSION.to_owned()),
         };
         for peer in self.other_members(stored) {
             #[cfg(test)]
@@ -2186,6 +2211,7 @@ impl ChatService {
             version: 1,
             conversation: stored.public.clone(),
             ticket: stored.ticket.clone(),
+            client_version: Some(crate::APP_VERSION.to_owned()),
         };
         let mut join_set = tokio::task::JoinSet::new();
         for peer in self.other_members(stored) {
@@ -2236,6 +2262,7 @@ async fn send_sync_request(
             version: 1,
             conversation_id: conversation_id.to_owned(),
             ticket: ticket.map(str::to_owned),
+            client_version: Some(crate::APP_VERSION.to_owned()),
         }),
     )
     .await
@@ -2470,6 +2497,49 @@ async fn accept_chat_stream(
 
 fn log_id(value: &str) -> &str {
     value.get(..24).unwrap_or(value)
+}
+
+fn note_peer_client_version(peer: NodeId, version: Option<&str>, via: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<BTreeMap<String, Option<String>>> = Mutex::new(BTreeMap::new());
+    let key = peer.to_string();
+    let next = version.map(str::to_owned);
+    let mut guard = match SEEN.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if guard.get(&key) == Some(&next) {
+        return;
+    }
+    guard.insert(key, next.clone());
+    match next.as_deref() {
+        Some(version) if version == crate::APP_VERSION => {
+            info!(
+                peer = %peer.fmt_short(),
+                peer_version = %version,
+                local_version = %crate::APP_VERSION,
+                via,
+                "peer client version matches local"
+            );
+        }
+        Some(version) => {
+            info!(
+                peer = %peer.fmt_short(),
+                peer_version = %version,
+                local_version = %crate::APP_VERSION,
+                via,
+                "peer client version differs from local"
+            );
+        }
+        None => {
+            info!(
+                peer = %peer.fmt_short(),
+                local_version = %crate::APP_VERSION,
+                via,
+                "peer did not advertise client_version (older build or stripped field)"
+            );
+        }
+    }
 }
 
 pub fn direct_conversation_id(a: NodeId, b: NodeId) -> String {
