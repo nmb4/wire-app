@@ -2,7 +2,7 @@
 --[[
   kanbn.lua — thin CLI for the Kan REST API (https://kan.bn/api/v1)
 
-  Auth:  export KANBN_API_KEY=...   (Bearer token from https://kan.bn/settings)
+  Auth:  KANBN_API_KEY=... in the environment or a nearby .env file
   HTTP:  prefers curl, falls back to wget
   Deps:  none (pure Lua JSON codec; no third-party libs)
 
@@ -30,8 +30,8 @@
     --connect-timeout SEC
                    TCP connect timeout in seconds (default 15; 0 = none)
 
-  Env (overridden by flags):
-    KANBN_TIMEOUT, KANBN_CONNECT_TIMEOUT
+  Env (environment variables take precedence over .env values):
+    KANBN_API_KEY, KANBN_TIMEOUT, KANBN_CONNECT_TIMEOUT
 
   backup-board flags:
     --no-attachments   skip downloading attachment files (metadata only)
@@ -65,15 +65,36 @@ local function trim(s)
   return (tostring(s):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+-- Platform detection: Windows uses cmd.exe for os.execute/io.popen,
+-- which needs different quoting, redirection, and shell builtins.
+local IS_WINDOWS = (package.config:sub(1, 1) == "\\")
+  or (os.getenv("OS") or ""):match("Windows") ~= nil
+
+-- Redirect-to-null target for the current shell.
+local NULL_DEVICE = IS_WINDOWS and "NUL" or "/dev/null"
+
 local function shell_quote(s)
   s = tostring(s)
+  if IS_WINDOWS then
+    -- cmd.exe: wrap in double quotes; escape embedded quotes by doubling.
+    -- Do NOT escape "%": on the cmd command line (unlike inside a .bat
+    -- file) "%%" stays literal, which would break curl's -w "%{http_code}".
+    s = s:gsub('"', '""')
+    return '"' .. s .. '"'
+  end
   if s == "" then return "''" end
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
 local function command_exists(name)
-  -- `command -v` works in sh; suppress output
-  local ok = os.execute("command -v " .. shell_quote(name) .. " >/dev/null 2>&1")
+  local ok
+  if IS_WINDOWS then
+    -- `where` returns 0 if the executable is found on PATH.
+    ok = os.execute("where " .. shell_quote(name) .. " >NUL 2>&1")
+  else
+    -- `command -v` works in sh; suppress output
+    ok = os.execute("command -v " .. shell_quote(name) .. " >/dev/null 2>&1")
+  end
   -- Lua 5.1: true/nil; 5.2+/LuaJIT: true or exit status integer
   if ok == true or ok == 0 then return true end
   return false
@@ -81,6 +102,15 @@ end
 
 local function tmpname()
   local t = os.tmpname()
+  if IS_WINDOWS then
+    -- Some Lua builds return a bare root path (e.g. "\s3a.") that is not
+    -- writable. If there is no drive/dir component, relocate into TEMP.
+    if not t:match("^%a:[\\/]") then
+      local tmp = os.getenv("TEMP") or os.getenv("TMP") or "."
+      t = t:gsub("^[\\/]+", "")
+      t = tmp:gsub("[\\/]+$", "") .. "\\" .. t
+    end
+  end
   return t
 end
 
@@ -90,6 +120,46 @@ local function read_file(path)
   local data = f:read("*a")
   f:close()
   return data
+end
+
+-- Load simple KEY=VALUE entries from .env without changing the process
+-- environment. Prefer the current directory, then the repository root next
+-- to this script so `lua scripts/kanbn.lua ...` works from either location.
+local function load_dotenv()
+  local paths = { ".env" }
+  local script = rawget(_G, "arg") and arg[0] or nil
+  local script_dir = script and script:match("^(.*)[/\\][^/\\]+$")
+  if script_dir and script_dir ~= "" then
+    paths[#paths + 1] = script_dir .. "/../.env"
+  end
+
+  for _, path in ipairs(paths) do
+    local contents = read_file(path)
+    if contents then
+      local values = {}
+      for line in contents:gmatch("[^\r\n]+") do
+        line = line:gsub("^%s*export%s+", "")
+        local key, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+        if key and value and value:sub(1, 1) ~= "#" then
+          if (value:sub(1, 1) == '"' and value:sub(-1) == '"')
+              or (value:sub(1, 1) == "'" and value:sub(-1) == "'") then
+            value = value:sub(2, -2)
+          end
+          values[key] = value
+        end
+      end
+      return values
+    end
+  end
+  return {}
+end
+
+local DOTENV = load_dotenv()
+
+local function env_or_dotenv(name)
+  local value = os.getenv(name)
+  if value and trim(value) ~= "" then return value end
+  return DOTENV[name]
 end
 
 local function write_file(path, data)
@@ -382,8 +452,8 @@ local function parse_timeout_seconds(v, flag_name)
 end
 
 local function apply_timeout_defaults_from_env()
-  local t = parse_timeout_seconds(os.getenv("KANBN_TIMEOUT"), "KANBN_TIMEOUT")
-  local c = parse_timeout_seconds(os.getenv("KANBN_CONNECT_TIMEOUT"), "KANBN_CONNECT_TIMEOUT")
+  local t = parse_timeout_seconds(env_or_dotenv("KANBN_TIMEOUT"), "KANBN_TIMEOUT")
+  local c = parse_timeout_seconds(env_or_dotenv("KANBN_CONNECT_TIMEOUT"), "KANBN_CONNECT_TIMEOUT")
   if t ~= nil then HTTP.timeout = t end
   if c ~= nil then HTTP.connect_timeout = c end
 end
@@ -634,7 +704,7 @@ function HTTP.upload_file(method, url, headers, file_path, timeout_override)
     local parts = {
       "curl", "-sS",
       "-X", shell_quote(method),
-      "-o", "/dev/null",
+      "-o", NULL_DEVICE,
       "-w", shell_quote("%{http_code}"),
       "-T", shell_quote(file_path),
     }
@@ -650,7 +720,7 @@ function HTTP.upload_file(method, url, headers, file_path, timeout_override)
   else
     local parts = {
       "wget", "-q",
-      "-O", "/dev/null",
+      "-O", NULL_DEVICE,
       "--method=" .. shell_quote(method),
       "--body-file=" .. shell_quote(file_path),
       "--server-response",
@@ -709,7 +779,7 @@ local opts = {
   raw = false,
   quiet = false,
   base = BASE_DEFAULT,
-  api_key = os.getenv("KANBN_API_KEY"),
+  api_key = env_or_dotenv("KANBN_API_KEY"),
   timeout = HTTP.timeout,
   connect_timeout = HTTP.connect_timeout,
   -- command flags
@@ -721,6 +791,7 @@ local opts = {
   skip_comments = false,
   skip_activities = false,
   limit = nil,
+  body_file = nil,
 }
 
 local function log(msg)
@@ -730,6 +801,11 @@ local function log(msg)
 end
 
 local function require_key()
+  -- Strip surrounding single/double quotes so keys stored as "kan_..." in
+  -- .env still authenticate (naive $(split '=')[1] parsing keeps the quotes).
+  if opts.api_key then
+    opts.api_key = opts.api_key:gsub('^["\']', ''):gsub('["\']$', '')
+  end
   if not opts.api_key or opts.api_key == "" then
     die("KANBN_API_KEY is not set. Create a key at https://kan.bn/settings")
   end
@@ -824,24 +900,55 @@ end
 --------------------------------------------------------------------
 
 local function path_join(a, b)
-  if a:sub(-1) == "/" then return a .. b end
+  local last = a:sub(-1)
+  if last == "/" or last == "\\" then return a .. b end
   return a .. "/" .. b
 end
 
+-- Stored/backup paths use "/" (portable, accepted by io.open and curl on
+-- Windows). cmd.exe builtins (mkdir, if exist) need native separators.
+local function native_path(p)
+  if IS_WINDOWS then return (tostring(p):gsub("/", "\\")) end
+  return p
+end
+
 local function mkdir_p(path)
-  local ok = os.execute("mkdir -p " .. shell_quote(path))
+  local ok
+  if IS_WINDOWS then
+    local win = native_path(path)
+    -- `mkdir` in cmd.exe creates intermediate dirs; it errors if the dir
+    -- already exists, so treat an existing directory as success.
+    ok = os.execute("if not exist " .. shell_quote(win)
+      .. " mkdir " .. shell_quote(win))
+  else
+    ok = os.execute("mkdir -p " .. shell_quote(path))
+  end
   if not (ok == true or ok == 0) then
     die("failed to create directory: " .. path)
   end
 end
 
 local function is_dir(path)
-  local ok = os.execute("test -d " .. shell_quote(path))
+  local ok
+  if IS_WINDOWS then
+    ok = os.execute("if exist " .. shell_quote(native_path(path) .. "\\*") .. " (exit 0) else (exit 1)")
+  else
+    ok = os.execute("test -d " .. shell_quote(path))
+  end
   return ok == true or ok == 0
 end
 
 local function is_file(path)
-  local ok = os.execute("test -f " .. shell_quote(path))
+  local ok
+  if IS_WINDOWS then
+    local win = native_path(path)
+    -- `if exist path\` (trailing sep) is true only for directories, so a
+    -- plain-existing path that is not a directory must be a file.
+    ok = os.execute("if exist " .. shell_quote(win)
+      .. " if not exist " .. shell_quote(win .. "\\") .. " (exit 0) else (exit 1)")
+  else
+    ok = os.execute("test -f " .. shell_quote(path))
+  end
   return ok == true or ok == 0
 end
 
@@ -1137,7 +1244,8 @@ local function load_backup(path)
       tostring(data.version), BACKUP_VERSION
     ))
   end
-  local root = is_dir(path) and path or (json_path:match("^(.*)/[^/]+$") or ".")
+  -- strip the trailing filename, tolerating both / and \ separators
+  local root = is_dir(path) and path or (json_path:match("^(.*)[/\\][^/\\]+$") or ".")
   return data, root, json_path
 end
 
@@ -1531,7 +1639,7 @@ local function usage()
   io.write([[kanbn.lua v]] .. VERSION .. [[ — Kan REST API CLI
 
 Env:
-  KANBN_API_KEY            required Bearer token
+  KANBN_API_KEY            required Bearer token (environment or .env)
   KANBN_TIMEOUT            default total timeout seconds (default ]] .. tostring(TIMEOUT_DEFAULT) .. [[)
   KANBN_CONNECT_TIMEOUT    default connect timeout seconds (default ]] .. tostring(CONNECT_TIMEOUT_DEFAULT) .. [[)
 
@@ -1541,15 +1649,20 @@ Commands:
   workspace <id-or-slug>
   boards <workspacePublicId>
   board <boardPublicId>
-  card <cardPublicId>
+  card <cardPublicId | GEN-N>
+  card update <cardPublicId | GEN-N> <key=value ...>   # e.g. description=<html>
+  card move <cardPublicId | GEN-N> <list name>
+  card-by-number <workspacePublicId> <GEN-N | N>   # -> publicId
   search <workspacePublicId> <query> [--limit N]
   find-workspace <name>
   find-board <workspacePublicId> <name>
   explore-board <boardPublicId>
   backup-board <boardPublicId> [out-dir]
   restore-board <backup-path>
+  checklist add <cardPublicId | GEN-N> [--ws WS] <name>   # -> checklist publicId
+  checklist-item add <checklistPublicId> <title>          # -> item publicId
   get <path> [key=value ...]
-  request <METHOD> <path> [json-body]
+  request <METHOD> <path> [json-body | --body-file PATH]
 
 Flags:
   --raw                 raw JSON body
@@ -1561,6 +1674,7 @@ Flags:
   --skip-activities     backup: omit activity history
   --workspace ID        restore: target workspace public id
   --name NAME           restore: board name override
+  --body-file PATH      request: read JSON body from file (Windows-safe)
   --dry-run             restore: plan only
   --skip-attachments    restore: do not upload files
   --skip-comments       restore: do not recreate comments
@@ -1589,6 +1703,7 @@ local VALUE_FLAGS = {
   ["--base"] = function(v) opts.base = v end,
   ["--workspace"] = function(v) opts.workspace = v end,
   ["--name"] = function(v) opts.name = v end,
+  ["--body-file"] = function(v) opts.body_file = v end,
   ["--limit"] = function(v) opts.limit = tonumber(v) end,
   ["--timeout"] = function(v)
     local n = parse_timeout_seconds(v, "--timeout")
@@ -1643,6 +1758,77 @@ local function need(n, msg)
 end
 
 --------------------------------------------------------------------
+-- card number resolution: "GEN-19" / "19" -> card publicId
+--------------------------------------------------------------------
+
+-- Resolve a card "number" to its publicId within a workspace. Accepts either
+-- a bare number ("19") or a prefixed string ("GEN-19"); the prefix is ignored
+-- (card numbers are unique per workspace). Returns publicId, or dies.
+local function resolve_card_in_workspace(ws_id, card_ref)
+  local num = tostring(card_ref):match("^(%d+)$")
+    or tostring(card_ref):match("%-(%d+)$")
+  if not num then
+    die("card reference must look like '19' or 'GEN-19', got: " .. tostring(card_ref))
+  end
+  -- Search the workspace; the API matches card number via the query.
+  local data, status, raw, err = api("GET", "/workspaces/" .. ws_id .. "/search", {
+    query = num,
+    limit = opts.limit or 50,
+  })
+  if err or status < 200 or status >= 300 then
+    print_result(data, status, raw, err)
+  end
+  -- Search may return cards and/or boards; pull the matching card number.
+  local results = data.cards or data or {}
+  for _, c in ipairs(results) do
+    local cnum = c.cardNumber and tostring(c.cardNumber) or nil
+    if cnum == num and c.publicId then
+      return c.publicId, tonumber(num)
+    end
+  end
+  -- Fallback: scan every board in the workspace for the exact card number.
+  local boards = api_ok("GET", "/workspaces/" .. ws_id .. "/boards")
+  for _, b in ipairs(boards or {}) do
+    local board = api_ok("GET", "/boards/" .. b.publicId)
+    for _, list in ipairs(board.lists or {}) do
+      for _, c in ipairs(list.cards or {}) do
+        local cnum = c.cardNumber and tostring(c.cardNumber) or nil
+        if cnum == num and c.publicId then
+          return c.publicId, tonumber(num)
+        end
+      end
+    end
+  end
+  die("no card with number " .. num .. " found in workspace " .. ws_id)
+end
+
+local DEFAULT_WORKSPACE = "0w1w9dpim929"
+
+local function is_public_id(value)
+  return tostring(value):match("^%w+$") ~= nil and #tostring(value) >= 12
+end
+
+local function resolve_card_reference(card_ref)
+  if is_public_id(card_ref) then return card_ref end
+  return resolve_card_in_workspace(opts.workspace or DEFAULT_WORKSPACE, card_ref)
+end
+
+local function resolve_list_in_card(card, list_ref)
+  local lists = card.list and card.list.board and card.list.board.lists or {}
+  local wanted = trim(list_ref):lower()
+  for _, list in ipairs(lists) do
+    if list.publicId == list_ref or trim(list.name):lower() == wanted then
+      return list.publicId
+    end
+  end
+  local available = {}
+  for _, list in ipairs(lists) do
+    available[#available + 1] = list.name
+  end
+  die("unknown list '" .. tostring(list_ref) .. "'; available lists: " .. table.concat(available, ", "))
+end
+
+--------------------------------------------------------------------
 -- commands
 --------------------------------------------------------------------
 
@@ -1669,8 +1855,40 @@ elseif cmd == "board" then
   local data, status, raw, err = api("GET", "/boards/" .. id)
   print_result(data, status, raw, err)
 
+elseif cmd == "card" and positional[2] == "move" then
+  local ref = need(3, "usage: card move <cardPublicId | GEN-N> <list name>")
+  local list_parts = {}
+  for ai = 4, #positional do
+    list_parts[#list_parts + 1] = positional[ai]
+  end
+  if #list_parts == 0 then
+    die("usage: card move <cardPublicId | GEN-N> <list name>")
+  end
+  local list_ref = table.concat(list_parts, " ")
+  local card_id = resolve_card_reference(ref)
+  local card = api_ok("GET", "/cards/" .. card_id)
+  local list_id = resolve_list_in_card(card, list_ref)
+  local data, status, raw, err = api("PUT", "/cards/" .. card_id, nil, {
+    listPublicId = list_id,
+  })
+  print_result(data, status, raw, err)
+
+elseif cmd == "card" and positional[2] == "update" then
+  -- card update <cardPublicId | GEN-N> <key=value ...>   (e.g. description=...)
+  local ref = need(3, "usage: card update <cardPublicId | GEN-N> <key=value ...>")
+  local id = resolve_card_reference(ref)
+  local body = {}
+  for ai = 4, #positional do
+    local k, v = positional[ai]:match("^([^=]+)=(.*)$")
+    if not k then die("args must be key=value, got: " .. positional[ai]) end
+    body[k] = v
+  end
+  if not next(body) then die("card update needs at least one key=value field") end
+  local data, status, raw, err = api("PUT", "/cards/" .. id, nil, body)
+  print_result(data, status, raw, err)
+
 elseif cmd == "card" then
-  local id = need(2, "usage: card <cardPublicId>")
+  local id = resolve_card_reference(need(2, "usage: card <cardPublicId | GEN-N>"))
   local data, status, raw, err = api("GET", "/cards/" .. id)
   print_result(data, status, raw, err)
 
@@ -1773,16 +1991,59 @@ elseif cmd == "get" then
   print_result(data, status, raw, err)
 
 elseif cmd == "request" then
-  local method = need(2, "usage: request <METHOD> <path> [json-body]")
-  local path = need(3, "usage: request <METHOD> <path> [json-body]")
+  local method = need(2, "usage: request <METHOD> <path> [json-body | --body-file PATH]")
+  local path = need(3, "usage: request <METHOD> <path> [json-body | --body-file PATH]")
   local body_tbl
-  if positional[4] then
-    local ok, decoded = pcall(json.decode, positional[4])
+  -- Prefer --body-file: passing raw JSON as a CLI arg is unreliable on
+  -- Windows (cmd.exe strips embedded double quotes).
+  local body_str = positional[4]
+  if opts.body_file then
+    local data, ferr = read_file(opts.body_file)
+    if not data then die("cannot read --body-file " .. opts.body_file .. ": " .. tostring(ferr)) end
+    body_str = data
+  end
+  if body_str then
+    local ok, decoded = pcall(json.decode, body_str)
     if not ok then die("body is not valid JSON: " .. tostring(decoded)) end
     body_tbl = decoded
   end
   local data, status, raw, err = api(method:upper(), path, nil, body_tbl)
   print_result(data, status, raw, err)
+
+elseif cmd == "card-by-number" then
+  local ws = need(2, "usage: card-by-number <workspacePublicId> <GEN-N | N>")
+  local ref = need(3, "usage: card-by-number <workspacePublicId> <GEN-N | N>")
+  local public_id, num = resolve_card_in_workspace(ws, ref)
+  if opts.raw then
+    io.write(public_id .. "\n")
+  else
+    io.write(json.encode({ cardNumber = num, publicId = public_id }, true) .. "\n")
+  end
+
+elseif cmd == "checklist" then
+  -- checklist add <cardPublicId | GEN-N> [--ws workspacePublicId] <name>
+  local sub = need(2, "usage: checklist add <cardPublicId | GEN-N> [--ws WS] <name>")
+  if sub ~= "add" then die("unknown checklist subcommand: " .. sub) end
+  local card_arg = need(3, "usage: checklist add <cardPublicId | GEN-N> [--ws WS] <name>")
+  local name = need(4, "usage: checklist add <cardPublicId | GEN-N> [--ws WS] <name>")
+  -- Resolve card reference: a bare publicId is used directly; a "GEN-N" style
+  -- string is resolved via the workspace (default: --ws flag, else 0w1w9dpim929).
+  local card_id = resolve_card_reference(card_arg)
+  local created = api_ok("POST", "/cards/" .. card_id .. "/checklists", nil, {
+    name = name,
+  })
+  io.write(json.encode(created, true) .. "\n")
+
+elseif cmd == "checklist-item" then
+  -- checklist-item add <checklistPublicId> <title>
+  local sub = need(2, "usage: checklist-item add <checklistPublicId> <title>")
+  if sub ~= "add" then die("unknown checklist-item subcommand: " .. sub) end
+  local cl_id = need(3, "usage: checklist-item add <checklistPublicId> <title>")
+  local title = need(4, "usage: checklist-item add <checklistPublicId> <title>")
+  local created = api_ok("POST", "/checklists/" .. cl_id .. "/items", nil, {
+    title = title,
+  })
+  io.write(json.encode(created, true) .. "\n")
 
 else
   die("unknown command: " .. cmd .. " (try --help)")
