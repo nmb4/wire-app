@@ -307,6 +307,7 @@ fn main() -> Result<(), eframe::Error> {
             .as_deref()
             .map(|session| (session, launch.dev_peer_index)),
     );
+    info!(version = wire_app::APP_VERSION, "starting Wire");
     if let Some(session) = launch.dev_pair_session.as_deref() {
         info!(
             "starting isolated dev-call instance '{}' (participant={})",

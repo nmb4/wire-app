@@ -108,12 +108,13 @@ pub struct VideoDecodeWorker {
 struct EncodedPacket {
     data: Vec<u8>,
     keyframe: bool,
+    generation: u64,
 }
 
 impl VideoDecodeWorker {
     pub fn spawn<F>(on_frame: F) -> Result<Self>
     where
-        F: Fn(DecodedFrame) + Send + 'static,
+        F: Fn(DecodedFrame, u64) + Send + 'static,
     {
         let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_QUEUE_DEPTH);
         let submitted = Arc::new(AtomicU64::new(0));
@@ -144,12 +145,16 @@ impl VideoDecodeWorker {
     /// sequence of H.264 pictures. If the decoder is slower than the network,
     /// this blocks the caller (the QUIC receive task), which backpressures the
     /// sender through QUIC flow control instead of dropping frames.
-    pub fn submit(&self, data: Vec<u8>, keyframe: bool) {
+    pub fn submit(&self, data: Vec<u8>, keyframe: bool, generation: u64) {
         let Some(packet_tx) = &self.packet_tx else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        match packet_tx.send(EncodedPacket { data, keyframe }) {
+        match packet_tx.send(EncodedPacket {
+            data,
+            keyframe,
+            generation,
+        }) {
             Ok(()) => {
                 self.submitted.fetch_add(1, Ordering::Relaxed);
             }
@@ -178,7 +183,7 @@ mod tests {
 
     #[test]
     fn decode_worker_shutdown_does_not_wait_for_another_packet() {
-        let worker = VideoDecodeWorker::spawn(|_| {}).unwrap();
+        let worker = VideoDecodeWorker::spawn(|_, _| {}).unwrap();
         let started = Instant::now();
         drop(worker);
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -192,7 +197,7 @@ fn run_decode_loop<F>(
     on_frame: F,
 ) -> Result<()>
 where
-    F: Fn(DecodedFrame),
+    F: Fn(DecodedFrame, u64),
 {
     #[cfg(windows)]
     let (mut decoder, mut hardware_decoder) = make_decoder()?;
@@ -243,7 +248,7 @@ where
                             frame.width, frame.height
                         );
                     }
-                    on_frame(frame);
+                    on_frame(frame, packet.generation);
                 }
             }
             Err(e) => {

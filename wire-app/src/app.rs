@@ -157,6 +157,8 @@ struct AppState {
     volumes: BTreeMap<NodeId, VolumeHandle>,
     rtts: BTreeMap<NodeId, Duration>,
     video_frames: BTreeMap<NodeId, VideoFrameState>,
+    video_stream_generations: BTreeMap<NodeId, u64>,
+    ended_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
     sharing_active: bool,
     capture_error: Option<String>,
@@ -245,6 +247,7 @@ struct PreviewState {
 struct VideoFrameState {
     width: u32,
     height: u32,
+    stream_generation: u64,
     generation: u64,
     data: DecodedFrameData,
     texture: Option<egui::TextureHandle>,
@@ -427,6 +430,8 @@ impl App {
             volumes: Default::default(),
             rtts: Default::default(),
             video_frames: Default::default(),
+            video_stream_generations: Default::default(),
+            ended_video_stream_generations: Default::default(),
             focused_stream: None,
             sharing_active: false,
             capture_error: None,
@@ -766,6 +771,8 @@ impl AppState {
                         self.volumes.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
+                        self.video_stream_generations.remove(&node_id);
+                        self.ended_video_stream_generations.remove(&node_id);
                         if self.focused_stream == Some(StreamSource::Remote(node_id)) {
                             self.focused_stream = None;
                         }
@@ -829,10 +836,43 @@ impl AppState {
                 Event::SetRtt(node_id, rtt) => {
                     self.rtts.insert(node_id, rtt);
                 }
-                Event::VideoFrame { node_id, frame } => {
+                Event::VideoStreamAccepted {
+                    node_id,
+                    generation,
+                } => {
                     if !matches!(self.calls.get(&node_id), Some(CallState::Active)) {
                         continue;
                     }
+                    if self
+                        .video_stream_generations
+                        .get(&node_id)
+                        .is_some_and(|current| generation < *current)
+                    {
+                        continue;
+                    }
+                    self.video_stream_generations.insert(node_id, generation);
+                    self.ended_video_stream_generations.remove(&node_id);
+                }
+                Event::VideoFrame {
+                    node_id,
+                    generation,
+                    frame,
+                } => {
+                    if !matches!(self.calls.get(&node_id), Some(CallState::Active)) {
+                        continue;
+                    }
+                    if self
+                        .video_stream_generations
+                        .get(&node_id)
+                        .is_some_and(|current| generation < *current)
+                        || self
+                            .ended_video_stream_generations
+                            .get(&node_id)
+                            .is_some_and(|ended| generation <= *ended)
+                    {
+                        continue;
+                    }
+                    self.video_stream_generations.insert(node_id, generation);
                     if !self.video_frames.contains_key(&node_id) {
                         self.reset_home_scroll = true;
                     }
@@ -842,6 +882,7 @@ impl AppState {
                             .or_insert_with(|| VideoFrameState {
                                 width: 0,
                                 height: 0,
+                                stream_generation: generation,
                                 generation: 0,
                                 data: DecodedFrameData::Rgba(Arc::new(Vec::new())),
                                 texture: None,
@@ -852,6 +893,7 @@ impl AppState {
                                 #[cfg(windows)]
                                 native_present_failed: false,
                             });
+                    state.stream_generation = generation;
                     state.width = frame.width;
                     state.height = frame.height;
                     state.data = frame.data;
@@ -861,10 +903,35 @@ impl AppState {
                     }
                     state.generation += 1;
                 }
-                Event::VideoStreamEnded(node_id) => {
-                    self.video_frames.remove(&node_id);
-                    if self.focused_stream == Some(StreamSource::Remote(node_id)) {
-                        self.focused_stream = None;
+                Event::VideoStreamEnded {
+                    node_id,
+                    generation,
+                    reason,
+                } => {
+                    let is_current = self
+                        .video_stream_generations
+                        .get(&node_id)
+                        .is_some_and(|current| *current == generation);
+                    if is_current {
+                        self.ended_video_stream_generations
+                            .insert(node_id, generation);
+                        self.video_frames.remove(&node_id);
+                        if self.focused_stream == Some(StreamSource::Remote(node_id)) {
+                            self.focused_stream = None;
+                        }
+                        info!(
+                            node = %node_id.fmt_short(),
+                            generation,
+                            reason = ?reason,
+                            "cleared ended video stream"
+                        );
+                    } else {
+                        info!(
+                            node = %node_id.fmt_short(),
+                            generation,
+                            reason = ?reason,
+                            "ignored stale video stream end"
+                        );
                     }
                 }
                 Event::SharingToggled(active) => {
@@ -5009,11 +5076,20 @@ enum Event {
     SetCallState(NodeId, CallState),
     VolumeHandle(NodeId, VolumeHandle),
     SetRtt(NodeId, Duration),
+    VideoStreamAccepted {
+        node_id: NodeId,
+        generation: u64,
+    },
     VideoFrame {
         node_id: NodeId,
+        generation: u64,
         frame: DecodedFrame,
     },
-    VideoStreamEnded(NodeId),
+    VideoStreamEnded {
+        node_id: NodeId,
+        generation: u64,
+        reason: VideoStreamEndReason,
+    },
     SharingToggled(bool),
     SharingFailed(String),
     PreviewFrame {
@@ -5023,6 +5099,14 @@ enum Event {
         actual_fps: f64,
         encode_time_ms: f64,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VideoStreamEndReason {
+    CleanEof,
+    ReceiveError,
+    ReplacementIdle,
+    ConnectionClosed,
 }
 
 #[derive(strum::Display, Clone, Copy)]
@@ -5042,23 +5126,16 @@ enum CallInfo {
 
 struct VideoPeerTasks {
     send: Option<tokio::task::JoinHandle<()>>,
+    send_stop: Option<tokio::sync::watch::Sender<bool>>,
     recv: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl VideoPeerTasks {
-    fn abort_all(&mut self) {
-        if let Some(h) = self.send.take() {
-            h.abort();
-        }
-        if let Some(h) = self.recv.take() {
-            h.abort();
-        }
-    }
-
-    #[allow(dead_code)]
-    fn abort_send(&mut self) {
-        if let Some(h) = self.send.take() {
-            h.abort();
+    fn new() -> Self {
+        Self {
+            send: None,
+            send_stop: None,
+            recv: None,
         }
     }
 }
@@ -5296,7 +5373,7 @@ impl Worker {
                     }
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
-                    self.remove_video_peer(node_id);
+                    self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
@@ -5378,7 +5455,7 @@ impl Worker {
                     "failed to receive audio track from {}: {err:?}",
                     node_id.fmt_short()
                 );
-                self.remove_video_peer(node_id);
+                self.remove_video_peer(node_id).await;
                 self.cleanup_after_call_end().await;
                 conn.transport().close(0u32.into(), b"bye");
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
@@ -5478,12 +5555,16 @@ impl Worker {
             return;
         }
 
-        let entry = self.video_peers.entry(node_id).or_insert(VideoPeerTasks {
-            send: None,
-            recv: None,
-        });
+        self.video_peers
+            .entry(node_id)
+            .or_insert_with(VideoPeerTasks::new);
 
-        let recv_dead = entry.recv.as_ref().map(|h| h.is_finished()).unwrap_or(true);
+        let recv_dead = self
+            .video_peers
+            .get(&node_id)
+            .and_then(|tasks| tasks.recv.as_ref())
+            .map(|h| h.is_finished())
+            .unwrap_or(true);
         if recv_dead {
             let recv_conn = conn.clone();
             let event_tx = self.event_tx.clone();
@@ -5492,32 +5573,47 @@ impl Worker {
             let handle = tokio::spawn(async move {
                 run_video_recv(recv_conn, nid, event_tx, callback).await;
             });
-            entry.recv = Some(handle);
+            self.video_peers
+                .get_mut(&node_id)
+                .expect("video peer was initialized")
+                .recv = Some(handle);
         }
 
         if self.sharing_active {
-            if let Some(h) = entry.send.take() {
-                h.abort();
-                let _ = h.await;
-            }
+            let (old_stop, old_send) = {
+                let entry = self
+                    .video_peers
+                    .get_mut(&node_id)
+                    .expect("video peer was initialized");
+                (entry.send_stop.take(), entry.send.take())
+            };
+            stop_video_send(node_id, old_stop, old_send).await;
             let send_conn = conn.clone();
             let frame_tx = self.video_frame_tx.clone();
             let keyframe_tx = self.keyframe_tx.clone();
             let nid = node_id;
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
             info!("starting video send task for {}", node_id.fmt_short());
             let handle = tokio::spawn(async move {
-                run_video_send(send_conn, frame_tx, keyframe_tx, nid).await;
+                run_video_send(send_conn, frame_tx, keyframe_tx, nid, stop_rx).await;
             });
+            let entry = self
+                .video_peers
+                .get_mut(&node_id)
+                .expect("video peer was initialized");
             entry.send = Some(handle);
+            entry.send_stop = Some(stop_tx);
         }
     }
 
     async fn finish_all_video_send(&mut self) {
-        for tasks in self.video_peers.values_mut() {
-            if let Some(h) = tasks.send.take() {
-                h.abort();
-                let _ = h.await;
-            }
+        let tasks: Vec<_> = self
+            .video_peers
+            .iter_mut()
+            .map(|(node_id, tasks)| (*node_id, tasks.send_stop.take(), tasks.send.take()))
+            .collect();
+        for (node_id, stop, send) in tasks {
+            stop_video_send(node_id, stop, send).await;
         }
     }
 
@@ -5535,9 +5631,13 @@ impl Worker {
         }
     }
 
-    fn remove_video_peer(&mut self, node_id: NodeId) {
+    async fn remove_video_peer(&mut self, node_id: NodeId) {
         if let Some(mut tasks) = self.video_peers.remove(&node_id) {
-            tasks.abort_all();
+            stop_video_send(node_id, tasks.send_stop.take(), tasks.send.take()).await;
+            if let Some(recv) = tasks.recv.take() {
+                recv.abort();
+                let _ = recv.await;
+            }
         }
     }
 
@@ -5754,7 +5854,7 @@ impl Worker {
                 if accept {
                     self.accept_from_accept(conn).await?;
                 } else {
-                    self.remove_video_peer(node_id);
+                    self.remove_video_peer(node_id).await;
                     conn.transport().close(0u32.into(), b"bye");
                     self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
@@ -5764,7 +5864,7 @@ impl Worker {
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     self.volumes.remove(&node_id);
-                    self.remove_video_peer(node_id);
+                    self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     match state {
                         CallInfo::Calling => {}
@@ -5787,6 +5887,40 @@ impl Worker {
     }
 }
 
+const VIDEO_SEND_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn stop_video_send(
+    node_id: NodeId,
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+    mut handle: Option<tokio::task::JoinHandle<()>>,
+) {
+    let Some(mut handle) = handle.take() else {
+        return;
+    };
+    if let Some(stop) = stop {
+        let _ = stop.send(true);
+        info!(
+            node = %node_id.fmt_short(),
+            "requested cooperative video sender stop"
+        );
+    }
+    // `timeout` polls `&mut handle` to completion on success. A second
+    // `handle.await` after that panics ("JoinHandle polled after completion"),
+    // so only await again on the abort fallback path.
+    match tokio::time::timeout(VIDEO_SEND_STOP_TIMEOUT, &mut handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            warn!(
+                node = %node_id.fmt_short(),
+                timeout = ?VIDEO_SEND_STOP_TIMEOUT,
+                "video sender did not stop cooperatively; falling back to abort"
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn open_screen_recording_settings() {
     if let Err(error) = std::process::Command::new("open")
@@ -5802,12 +5936,13 @@ async fn run_video_send(
     frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
     keyframe_tx: tokio::sync::broadcast::Sender<()>,
     node_id: NodeId,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let result: Result<()> = async {
         info!("opening video stream to {}", node_id.fmt_short());
         let (mut send, recv) = conn.transport().open_bi().await?;
         let _ = send.set_priority(10);
-        tokio::spawn(drain_quic_recv(recv));
+        let drain_task = tokio::spawn(drain_quic_recv(recv, stop_rx.clone()));
         let mut rx = frame_tx.subscribe();
         let _ = keyframe_tx.send(());
         let mut sent = 0u64;
@@ -5818,25 +5953,34 @@ async fn run_video_send(
         let mut window_bytes = 0u64;
         let mut window_send_ms = Vec::with_capacity(300);
         let mut last_stats_log = std::time::Instant::now();
+        let mut stop_requested = false;
         loop {
-            let frame = match rx.recv().await {
-                Ok(frame) => frame,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    skipped += count;
-                    // A broadcast lag means this sender missed encoded pictures, not
-                    // that the QUIC stream itself is broken. Keep the existing stream
-                    // and resume at an IDR: an IDR resets the receiver's H.264 reference
-                    // chain without forcing it to recreate its decoder and GPU surfaces.
-                    keyframe_gate.require_keyframe();
-                    let _ = keyframe_tx.send(());
-                    warn!(
-                        "video send to {} lagged by {} frame(s); recovering on the existing stream at the next IDR",
-                        node_id.fmt_short(),
-                        count
-                    );
-                    continue;
+            let frame = tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_ok() {
+                        stop_requested = true;
+                    }
+                    break;
                 }
-                Err(_) => break,
+                frame = rx.recv() => match frame {
+                    Ok(frame) => frame,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        skipped += count;
+                        // A broadcast lag means this sender missed encoded pictures, not
+                        // that the QUIC stream itself is broken. Keep the existing stream
+                        // and resume at an IDR: an IDR resets the receiver's H.264 reference
+                        // chain without forcing it to recreate its decoder and GPU surfaces.
+                        keyframe_gate.require_keyframe();
+                        let _ = keyframe_tx.send(());
+                        warn!(
+                            "video send to {} lagged by {} frame(s); recovering on the existing stream at the next IDR",
+                            node_id.fmt_short(),
+                            count
+                        );
+                        continue;
+                    }
+                    Err(_) => break,
+                }
             };
             let was_waiting = keyframe_gate.is_waiting();
             if !keyframe_gate.accept(&frame) {
@@ -5847,7 +5991,16 @@ async fn run_video_send(
                 resyncs += 1;
             }
             let send_start = std::time::Instant::now();
-            if let Err(e) = transport::send_frame(&mut send, frame.as_ref()).await {
+            let send_result = tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_ok() {
+                        stop_requested = true;
+                    }
+                    break;
+                }
+                result = transport::send_frame(&mut send, frame.as_ref()) => result,
+            };
+            if let Err(e) = send_result {
                 info!("video send to {} failed: {e:?}", node_id.fmt_short());
                 break;
             }
@@ -5910,7 +6063,21 @@ async fn run_video_send(
                 last_stats_log = std::time::Instant::now();
             }
         }
-        let _ = send.reset(VIDEO_STREAM_RESET_CODE);
+        let reset_result = send.reset(VIDEO_STREAM_RESET_CODE);
+        info!(
+            node = %node_id.fmt_short(),
+            reset_code = "0x51",
+            cooperative = stop_requested,
+            "resetting video send stream"
+        );
+        if reset_result.is_err() {
+            warn!(
+                "video send reset for {} failed: {reset_result:?}",
+                node_id.fmt_short()
+            );
+        }
+        drain_task.abort();
+        let _ = drain_task.await;
         Ok(())
     }
     .await;
@@ -5921,12 +6088,18 @@ async fn run_video_send(
     }
 }
 
-async fn drain_quic_recv(mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static) {
+async fn drain_quic_recv(
+    mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let mut buf = [0u8; 256];
     loop {
-        match tokio::io::AsyncReadExt::read(&mut recv, &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        tokio::select! {
+            _ = stop_rx.changed() => break,
+            result = tokio::io::AsyncReadExt::read(&mut recv, &mut buf) => match result {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
         }
     }
 }
@@ -5951,12 +6124,14 @@ async fn run_video_recv(
     // Keep one decoder across brief share restarts. Media Foundation and the GPU
     // driver retain sizeable allocator caches when a decoder is destroyed and
     // immediately recreated, which makes repeated button presses look like a
-    // leak even though every COM object is eventually released. The UI is told
-    // about the stream end immediately; only the decoder itself gets a short
-    // idle grace before it is released. It remains lazy so a voice-only call
-    // does not allocate any video resources.
+    // leak even though every COM object is eventually released. The UI retains
+    // the last frame during this grace period; a genuinely idle stream is
+    // cleared when the decoder is released.
     let mut worker = None;
     let mut decoder_idle_deadline: Option<tokio::time::Instant> = None;
+    let mut next_generation = 0u64;
+    let mut active_generation = None;
+    let mut pending_end: Option<(u64, VideoStreamEndReason)> = None;
     loop {
         let accept = conn.transport().accept_bi();
         tokio::select! {
@@ -5971,6 +6146,20 @@ async fn run_video_recv(
                 break;
             }
             _ = wait_until_optional(decoder_idle_deadline) => {
+                if let Some((generation, reason)) = pending_end.take() {
+                    notify_video_stream_ended(
+                        &event_tx,
+                        callback.as_ref(),
+                        node_id,
+                        generation,
+                        reason,
+                    );
+                    // Avoid a duplicate ConnectionClosed end for the same gen
+                    // if the recv task later exits without a newer stream.
+                    if active_generation == Some(generation) {
+                        active_generation = None;
+                    }
+                }
                 worker = None;
                 decoder_idle_deadline = None;
                 info!(
@@ -5993,7 +6182,24 @@ async fn run_video_recv(
             stream = accept => {
                 match stream {
                     Ok((_send, mut recv)) => {
-                        info!("receiving video from {}", node_id.fmt_short());
+                        next_generation = next_generation
+                            .checked_add(1)
+                            .expect("video stream generation exhausted");
+                        let generation = next_generation;
+                        active_generation = Some(generation);
+                        pending_end = None;
+                        info!(
+                            node = %node_id.fmt_short(),
+                            generation,
+                            "accepted video receive stream"
+                        );
+                        notify_video_stream_accepted(
+                            &event_tx,
+                            callback.as_ref(),
+                            node_id,
+                            generation,
+                        )
+                        .await;
                         if worker.is_none() {
                             match spawn_video_decode_worker(
                                 node_id,
@@ -6013,33 +6219,39 @@ async fn run_video_recv(
                         let stream_result = recv_video_on_stream(
                             &mut recv,
                             node_id,
+                            generation,
                             worker.as_ref().expect("video decoder was initialized"),
                         )
                         .await;
                         match stream_result {
                             Ok(()) => {
                                 info!(
-                                    "video stream from {} ended cleanly; retaining decoder for {:?}",
+                                    "video stream from {} generation {} ended cleanly; retaining decoder for {:?}",
                                     node_id.fmt_short(),
+                                    generation,
                                     DECODER_IDLE_GRACE
                                 );
+                                pending_end = Some((generation, VideoStreamEndReason::CleanEof));
                                 decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
-                                notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                             Err(error) if is_video_stream_replacement_error(&error) => {
                                 info!(
-                                    "video stream from {} was replaced at a frame boundary; waiting for the resync stream",
-                                    node_id.fmt_short()
+                                    "video stream from {} generation {} was replaced at a frame boundary; waiting for the resync stream",
+                                    node_id.fmt_short(),
+                                    generation
                                 );
+                                pending_end =
+                                    Some((generation, VideoStreamEndReason::ReplacementIdle));
                                 decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                             }
                             Err(error) => {
                                 warn!(
-                                    "video stream from {} failed: {error:?}; waiting for a replacement stream",
-                                    node_id.fmt_short()
+                                    "video stream from {} generation {} failed: {error:?}; waiting for a replacement stream",
+                                    node_id.fmt_short(),
+                                    generation
                                 );
+                                pending_end = Some((generation, VideoStreamEndReason::ReceiveError));
                                 decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
-                                notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
                             }
                         }
                     }
@@ -6051,7 +6263,17 @@ async fn run_video_recv(
             }
         }
     }
-    notify_video_stream_ended(&event_tx, callback.as_ref(), node_id);
+    if let Some((generation, reason)) = pending_end {
+        notify_video_stream_ended(&event_tx, callback.as_ref(), node_id, generation, reason);
+    } else if let Some(generation) = active_generation {
+        notify_video_stream_ended(
+            &event_tx,
+            callback.as_ref(),
+            node_id,
+            generation,
+            VideoStreamEndReason::ConnectionClosed,
+        );
+    }
 }
 
 async fn wait_until_optional(deadline: Option<tokio::time::Instant>) {
@@ -6066,9 +6288,13 @@ fn spawn_video_decode_worker(
     event_tx: async_channel::Sender<Event>,
     callback: Option<UpdateCallback>,
 ) -> Result<VideoDecodeWorker> {
-    VideoDecodeWorker::spawn(move |frame| {
+    VideoDecodeWorker::spawn(move |frame, generation| {
         if event_tx
-            .try_send(Event::VideoFrame { node_id, frame })
+            .try_send(Event::VideoFrame {
+                node_id,
+                generation,
+                frame,
+            })
             .is_ok()
         {
             if let Some(callback) = &callback {
@@ -6078,12 +6304,41 @@ fn spawn_video_decode_worker(
     })
 }
 
+async fn notify_video_stream_accepted(
+    event_tx: &async_channel::Sender<Event>,
+    callback: Option<&UpdateCallback>,
+    node_id: NodeId,
+    generation: u64,
+) {
+    let _ = event_tx
+        .send(Event::VideoStreamAccepted {
+            node_id,
+            generation,
+        })
+        .await;
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 fn notify_video_stream_ended(
     event_tx: &async_channel::Sender<Event>,
     callback: Option<&UpdateCallback>,
     node_id: NodeId,
+    generation: u64,
+    reason: VideoStreamEndReason,
 ) {
-    let _ = event_tx.try_send(Event::VideoStreamEnded(node_id));
+    info!(
+        node = %node_id.fmt_short(),
+        generation,
+        reason = ?reason,
+        "video receive stream ended"
+    );
+    let _ = event_tx.try_send(Event::VideoStreamEnded {
+        node_id,
+        generation,
+        reason,
+    });
     if let Some(callback) = callback {
         callback();
     }
@@ -6098,6 +6353,7 @@ fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {
 async fn recv_video_on_stream(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     node_id: NodeId,
+    generation: u64,
     worker: &VideoDecodeWorker,
 ) -> Result<()> {
     let mut received = 0u64;
@@ -6125,6 +6381,13 @@ async fn recv_video_on_stream(
                 }
                 last_sequence = Some(frame.sequence);
                 received += 1;
+                if received == 1 {
+                    info!(
+                        node = %node_id.fmt_short(),
+                        generation,
+                        "received first encoded video frame"
+                    );
+                }
                 received_bytes += frame.data.len() as u64;
                 if let Some(age_ms) = transport::frame_age_ms(frame.sent_at_micros) {
                     received_age_ms += age_ms;
@@ -6170,7 +6433,7 @@ async fn recv_video_on_stream(
                     max_age_ms = 0.0;
                     age_samples.clear();
                 }
-                worker.submit(frame.data, frame.keyframe);
+                worker.submit(frame.data, frame.keyframe, generation);
             }
             Ok(None) => break,
             Err(e) => {
