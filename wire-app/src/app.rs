@@ -2095,7 +2095,7 @@ impl AppState {
                         (Some(_), _) => {}
                         (None, DeliveryState::Pending) => {
                             ui.label(
-                                RichText::new("syncingâ€¦")
+                                RichText::new("syncing…")
                                     .color(pal.dim2)
                                     .size(ui_font_size(9.5)),
                             );

@@ -559,9 +559,9 @@ impl ChatService {
                         )));
                     }
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
-                        // Push the current ticket so peers that missed a history
-                        // rotation (or any invite) catch up when they come online.
-                        self.invite_members(&request.conversation_id);
+                        // Accept-side pull only. Re-inviting here caused a
+                        // connect storm (ignored non-canonical invites) without
+                        // helping delivery when we already share the doc.
                         if let Err(error) = self.open_and_publish(&request.conversation_id).await {
                             warn!(
                                 conversation = %log_id(&request.conversation_id),
@@ -701,8 +701,21 @@ impl ChatService {
                 });
                 self.pending_deliveries
                     .insert(message_id.clone(), conversation_id.clone());
-                self.schedule_delivery_retry(&conversation_id, &message_id, true);
-                self.sync_and_wake(&conversation_id).await;
+                // Initial sync/wake already runs below. Schedule the first
+                // retry after backoff so the UI does not flash "delivery retry
+                // 1" while the peer receipt is still in flight.
+                self.schedule_delivery_retry(&conversation_id, &message_id, false);
+                // Wake peers before any local timeline work. When outbound
+                // docs Connect fails, SyncRequest is what makes them pull;
+                // delaying it behind publish_timeline adds real delivery lag.
+                // See docs/chat-delivery-asymmetry.md.
+                self.wake_members(&conversation_id);
+                if let Err(error) = self.publish_timeline(&conversation_id).await {
+                    warn!(
+                        conversation = %log_id(&conversation_id),
+                        "failed to refresh timeline after send: {error:#}"
+                    );
+                }
             }
             Err(error) => {
                 warn!(
@@ -744,7 +757,8 @@ impl ChatService {
             .entry(conversation_id.to_owned())
             .or_insert_with(|| ConversationRetry {
                 attempts: 0,
-                next_attempt: now,
+                // First automatic retry waits for a normal backoff window.
+                next_attempt: now + delivery_retry_delay(conversation_id, 1),
                 messages: BTreeSet::new(),
             });
         state.messages.insert(message_id.to_owned());
@@ -797,12 +811,15 @@ impl ChatService {
     }
 
     async fn sync_and_wake(&mut self, conversation_id: &str) {
-        if let Err(error) = self.open_and_publish(conversation_id).await {
-            warn!(conversation = %log_id(conversation_id), "immediate chat sync failed: {error:#}");
-        }
+        // Nudge first; local publish is secondary for cross-peer latency.
         self.wake_members(conversation_id);
+        if let Err(error) = self.publish_timeline(conversation_id).await {
+            warn!(conversation = %log_id(conversation_id), "chat delivery refresh failed: {error:#}");
+        }
     }
 
+    /// Ask members to pull the current doc. Does **not** re-send invites —
+    /// those are reserved for create / clear / initialize (see `invite_members`).
     fn wake_members(&self, conversation_id: &str) {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return;
@@ -916,7 +933,9 @@ impl ChatService {
                     history_epoch = epoch,
                     "chat history deleted and conversation rotated onto a fresh document"
                 );
+                // Peers on a stale document need a new ticket, not only a pull nudge.
                 self.invite_members(&conversation_id);
+                self.wake_members(&conversation_id);
             }
             Err(error) => {
                 warn!(
@@ -1266,6 +1285,11 @@ impl ChatService {
                     .remove(&message.message_id)
                     .is_some()
             {
+                info!(
+                    conversation = %log_id(id),
+                    message = %log_id(&message.message_id),
+                    "chat message marked delivered after remote receipt"
+                );
                 self.queued.push_back(ChatNotification::Delivery {
                     message_id: message.message_id.clone(),
                     state: DeliveryState::Delivered,
@@ -1348,6 +1372,14 @@ impl ChatService {
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             if entry.author() == self.author {
+                continue;
+            }
+            // The key is `receipt/{message_id}`. Trust a remote receipt entry as
+            // soon as it exists — waiting for the blob body caused the UI to
+            // keep showing delivery retries after the peer already had the
+            // message (and had already written the receipt).
+            if let Some(message_id) = receipt_message_id_from_key(entry.key()) {
+                delivered.insert(message_id);
                 continue;
             }
             let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
@@ -1737,6 +1769,12 @@ fn is_message_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn receipt_message_id_from_key(key: &[u8]) -> Option<String> {
+    let key = std::str::from_utf8(key).ok()?;
+    let message_id = key.strip_prefix("receipt/")?;
+    is_message_id(message_id).then(|| message_id.to_owned())
 }
 
 fn load_index(path: &Path) -> ChatIndex {
