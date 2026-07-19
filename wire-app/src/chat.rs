@@ -52,6 +52,10 @@ const CHAT_STREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// First delivery re-probe after send (receipt / docs pull may still be in flight).
 const CHAT_FIRST_RETRY: Duration = Duration::from_millis(400);
+/// Min gap between receipt-driven wakes (avoids connect storms that block sends).
+const CHAT_RECEIPT_WAKE_COOLDOWN: Duration = Duration::from_secs(2);
+/// After this many consecutive failed probes, show Queued but keep slow retries.
+const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,6 +611,10 @@ pub struct ChatService {
     /// In-flight background wakes per conversation — prevents a losing race
     /// from parking deliveries as Queued right after a successful wake.
     wake_inflight: BTreeMap<String, u32>,
+    /// Last time we spawned a receipt-driven wake for a conversation.
+    last_receipt_wake: BTreeMap<String, tokio::time::Instant>,
+    /// Consecutive failed wake probes per conversation.
+    wake_failures: BTreeMap<String, u8>,
     #[cfg(test)]
     invite_attempts: AtomicU64,
 }
@@ -692,6 +700,8 @@ impl ChatService {
             retry_state: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
             wake_inflight: BTreeMap::new(),
+            last_receipt_wake: BTreeMap::new(),
+            wake_failures: BTreeMap::new(),
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
         };
@@ -1082,6 +1092,20 @@ impl ChatService {
         });
     }
 
+    fn spawn_receipt_wake(&mut self, conversation_id: &str) {
+        let now = tokio::time::Instant::now();
+        if self
+            .last_receipt_wake
+            .get(conversation_id)
+            .is_some_and(|at| now.duration_since(*at) < CHAT_RECEIPT_WAKE_COOLDOWN)
+        {
+            return;
+        }
+        self.last_receipt_wake
+            .insert(conversation_id.to_owned(), now);
+        self.spawn_wake(conversation_id);
+    }
+
     async fn apply_wake_finished(&mut self, conversation_id: &str, reached: bool) {
         if let Some(count) = self.wake_inflight.get_mut(conversation_id) {
             *count = count.saturating_sub(1);
@@ -1100,7 +1124,7 @@ impl ChatService {
             return;
         }
         if reached {
-            // A success means the peer is up — never leave messages Queued.
+            self.wake_failures.remove(conversation_id);
             for message_id in &pending {
                 self.schedule_delivery_retry(conversation_id, message_id, false);
                 self.queued.push_back(ChatNotification::Delivery {
@@ -1109,8 +1133,7 @@ impl ChatService {
                     detail: Some("delivering".to_owned()),
                 });
             }
-            // Peer acked SyncRequest; pull any receipts they may have just written.
-            self.spawn_doc_sync(conversation_id);
+            // Peer acked the wake — refresh timeline (receipts may already be local).
             if let Err(error) = self.publish_timeline(conversation_id).await {
                 warn!(
                     conversation = %log_id(conversation_id),
@@ -1119,21 +1142,38 @@ impl ChatService {
             }
             return;
         }
-        // Only park when every in-flight wake lost — a concurrent success must win.
-        if inflight > 0 || self.retry_state.contains_key(conversation_id) {
+        // Another wake still running — wait for it.
+        if inflight > 0 {
             return;
         }
-        info!(
-            conversation = %log_id(conversation_id),
-            messages = pending.len(),
-            "no chat member reachable; parking deliveries as queued"
-        );
-        for message_id in pending {
-            self.queued.push_back(ChatNotification::Delivery {
-                message_id,
-                state: DeliveryState::Queued,
-                detail: Some("waiting for peer".to_owned()),
-            });
+        let failures = {
+            let entry = self
+                .wake_failures
+                .entry(conversation_id.to_owned())
+                .or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        // Keep probing. Only flip the UI to Queued after several misses — never
+        // drop retry_state on a single failed dial (that permanently stuck sends
+        // while the peer was merely briefly unreachable).
+        for message_id in &pending {
+            self.schedule_delivery_retry(conversation_id, message_id, false);
+            if failures >= CHAT_QUEUE_AFTER_FAILURES {
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message_id.clone(),
+                    state: DeliveryState::Queued,
+                    detail: Some("waiting for peer".to_owned()),
+                });
+            }
+        }
+        if failures >= CHAT_QUEUE_AFTER_FAILURES {
+            info!(
+                conversation = %log_id(conversation_id),
+                messages = pending.len(),
+                failures,
+                "peer unreachable; showing queued while slow retries continue"
+            );
         }
     }
 
@@ -1154,29 +1194,11 @@ impl ChatService {
                 self.retry_state.remove(&conversation_id);
                 continue;
             }
-            let reached = self.wake_members(&conversation_id).await;
-            if !reached {
-                self.retry_state.remove(&conversation_id);
-                for message_id in message_ids {
-                    if self.pending_deliveries.contains_key(&message_id) {
-                        self.queued.push_back(ChatNotification::Delivery {
-                            message_id,
-                            state: DeliveryState::Queued,
-                            detail: Some("waiting for peer".to_owned()),
-                        });
-                    }
-                }
-                continue;
-            }
-            if let Err(error) = self.publish_timeline(&conversation_id).await {
-                warn!(
-                    conversation = %log_id(&conversation_id),
-                    "chat delivery refresh failed: {error:#}"
-                );
-            }
+            // Never await dials on the service loop — that blocked all chat
+            // processing for multi-second connect timeouts and starved sends.
+            self.spawn_wake(&conversation_id);
+            self.spawn_doc_sync(&conversation_id);
             let Some(state) = self.retry_state.get_mut(&conversation_id) else {
-                // A receipt can arrive while the immediate sync above is
-                // publishing its timeline, which removes this retry state.
                 continue;
             };
             if state.messages.is_empty() {
@@ -1234,10 +1256,7 @@ impl ChatService {
         if message_ids.is_empty() {
             return;
         }
-        // Already actively retrying this conversation — leave the timer alone.
-        if self.retry_state.contains_key(conversation_id) {
-            return;
-        }
+        self.wake_failures.remove(conversation_id);
         info!(
             conversation = %log_id(conversation_id),
             messages = message_ids.len(),
@@ -1251,18 +1270,9 @@ impl ChatService {
                 detail: Some("peer online; delivering".to_owned()),
             });
         }
-        let reached = self.wake_members(conversation_id).await;
-        if !reached {
-            self.retry_state.remove(conversation_id);
-            for message_id in message_ids {
-                self.queued.push_back(ChatNotification::Delivery {
-                    message_id,
-                    state: DeliveryState::Queued,
-                    detail: Some("waiting for peer".to_owned()),
-                });
-            }
-            return;
-        }
+        // Non-blocking: peer already contacted us (invite/sync/doc activity).
+        self.spawn_wake(conversation_id);
+        self.spawn_doc_sync(conversation_id);
         if let Err(error) = self.publish_timeline(conversation_id).await {
             warn!(
                 conversation = %log_id(conversation_id),
@@ -1750,10 +1760,11 @@ impl ChatService {
             .acknowledge_received_messages(&stored, &messages)
             .await?;
         // Friend already sees their message on our side; their UI stays on
-        // "syncing" until they pull our receipt. Nudge them immediately.
+        // "syncing" until they pull our receipt. Debounce wakes — firing one
+        // per timeline publish caused dial storms that blocked real sends.
         if wrote_receipts {
             self.spawn_doc_sync(id);
-            self.spawn_wake(id);
+            self.spawn_receipt_wake(id);
         }
         let delivered = self.load_delivered_message_ids(&stored).await?;
         let visible: BTreeSet<_> = messages
