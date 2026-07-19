@@ -3,3 +3,5 @@ SANDBOX
 /mcps/
 /terminals/
 /dist/
+.env
+wire-app/apple_sounds_wav.zip
