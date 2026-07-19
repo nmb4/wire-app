@@ -50,8 +50,8 @@ const CHAT_SESSION_POOL_CAP: usize = 8;
 const CHAT_REUSE_TIMEOUT: Duration = Duration::from_millis(400);
 const CHAT_STREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-/// First delivery re-probe after a successful wake (receipt may still be in flight).
-const CHAT_FIRST_RETRY: Duration = Duration::from_millis(750);
+/// First delivery re-probe after send (receipt / docs pull may still be in flight).
+const CHAT_FIRST_RETRY: Duration = Duration::from_millis(400);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,7 +435,14 @@ impl ProtocolHandler for ChatInviteProtocol {
 #[derive(Clone)]
 struct ChatSessionPool {
     endpoint: Endpoint,
-    inner: Arc<tokio::sync::Mutex<BTreeMap<NodeId, HotSession>>>,
+    inner: Arc<tokio::sync::Mutex<SessionPoolState>>,
+}
+
+struct SessionPoolState {
+    sessions: BTreeMap<NodeId, HotSession>,
+    /// Serialize dial/send per peer so concurrent wakes don't kill each other's
+    /// fresh connections (seen as rapid reused=false + multi-second gaps).
+    peer_gates: BTreeMap<NodeId, Arc<tokio::sync::Mutex<()>>>,
 }
 
 struct HotSession {
@@ -447,40 +454,61 @@ impl ChatSessionPool {
     fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
-            inner: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            inner: Arc::new(tokio::sync::Mutex::new(SessionPoolState {
+                sessions: BTreeMap::new(),
+                peer_gates: BTreeMap::new(),
+            })),
         }
+    }
+
+    async fn peer_gate(&self, peer: NodeId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut guard = self.inner.lock().await;
+        guard
+            .peer_gates
+            .entry(peer)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     async fn insert(&self, peer: NodeId, connection: Connection) {
         let mut guard = self.inner.lock().await;
-        Self::sweep_locked(&mut guard);
-        if let Some(previous) = guard.insert(
+        Self::sweep_locked(&mut guard.sessions);
+        // Keep an existing warm session; concurrent dials must not close it.
+        if guard.sessions.contains_key(&peer) {
+            connection.close(0u32.into(), b"chat-dup-dial");
+            if let Some(session) = guard.sessions.get_mut(&peer) {
+                session.last_used = tokio::time::Instant::now();
+            }
+            return;
+        }
+        guard.sessions.insert(
             peer,
             HotSession {
                 connection,
                 last_used: tokio::time::Instant::now(),
             },
-        ) {
-            previous.connection.close(0u32.into(), b"chat-replaced");
-        }
-        Self::evict_locked(&mut guard);
+        );
+        Self::evict_locked(&mut guard.sessions);
     }
 
     async fn touch(&self, peer: NodeId) {
         let mut guard = self.inner.lock().await;
-        if let Some(session) = guard.get_mut(&peer) {
+        if let Some(session) = guard.sessions.get_mut(&peer) {
             session.last_used = tokio::time::Instant::now();
         }
     }
 
     async fn get(&self, peer: NodeId) -> Option<Connection> {
         let mut guard = self.inner.lock().await;
-        Self::sweep_locked(&mut guard);
-        guard.get(&peer).map(|session| session.connection.clone())
+        Self::sweep_locked(&mut guard.sessions);
+        guard
+            .sessions
+            .get(&peer)
+            .map(|session| session.connection.clone())
     }
 
     async fn invalidate(&self, peer: NodeId) {
-        if let Some(session) = self.inner.lock().await.remove(&peer) {
+        if let Some(session) = self.inner.lock().await.sessions.remove(&peer) {
             session.connection.close(0u32.into(), b"chat-invalid");
         }
     }
@@ -515,6 +543,9 @@ impl ChatSessionPool {
     }
 
     async fn dial(&self, peer: NodeId) -> Result<Connection> {
+        if let Some(existing) = self.get(peer).await {
+            return Ok(existing);
+        }
         let connection = tokio::time::timeout(
             CHAT_CONNECT_TIMEOUT,
             self.endpoint.connect(NodeAddr::from(peer), CHAT_ALPN),
@@ -523,7 +554,8 @@ impl ChatSessionPool {
         .context("chat connect timed out")?
         .context("chat connect failed")?;
         self.insert(peer, connection.clone()).await;
-        Ok(connection)
+        // Another task may have won the insert race — prefer pooled session.
+        Ok(self.get(peer).await.unwrap_or(connection))
     }
 }
 
@@ -772,10 +804,9 @@ impl ChatService {
                         )));
                     }
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
-                        // Accept-side pull only. Re-inviting here caused a
-                        // connect storm (ignored non-canonical invites) without
-                        // helping delivery when we already share the doc.
-                        if let Err(error) = self.open_and_publish(&request.conversation_id).await {
+                        // Accept-side pull. Prefer a cheap start_sync + timeline
+                        // refresh over full re-subscribe on every wake.
+                        if let Err(error) = self.pull_conversation(&request.conversation_id).await {
                             warn!(
                                 conversation = %log_id(&request.conversation_id),
                                 peer = %incoming.remote.fmt_short(),
@@ -929,6 +960,7 @@ impl ChatService {
                     state: DeliveryState::Pending,
                     detail: Some("delivering".to_owned()),
                 });
+                self.spawn_doc_sync(&conversation_id);
                 self.spawn_wake(&conversation_id);
                 if let Err(error) = self.publish_timeline(&conversation_id).await {
                     warn!(
@@ -1006,6 +1038,22 @@ impl ChatService {
                     reached,
                 })
                 .await;
+        });
+    }
+
+    fn spawn_doc_sync(&self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id).cloned() else {
+            return;
+        };
+        let docs = self.docs.clone();
+        let our_node_id = self.our_node_id;
+        tokio::spawn(async move {
+            if let Err(error) = nudge_doc_sync(&docs, &stored, our_node_id).await {
+                trace!(
+                    conversation = %log_id(&stored.public.id),
+                    "doc sync nudge failed: {error:#}"
+                );
+            }
         });
     }
 
@@ -1522,6 +1570,17 @@ impl ChatService {
             }
         }
         Ok(())
+    }
+
+    async fn pull_conversation(&mut self, id: &str) -> Result<()> {
+        let stored = self
+            .index
+            .conversations
+            .get(id)
+            .cloned()
+            .context("unknown conversation")?;
+        nudge_doc_sync(&self.docs, &stored, self.our_node_id).await?;
+        self.publish_timeline(id).await
     }
 
     async fn open_and_publish(&mut self, id: &str) -> Result<()> {
@@ -2135,6 +2194,38 @@ async fn wake_peers(
     reached
 }
 
+async fn nudge_doc_sync(
+    docs: &MemClient,
+    stored: &StoredConversation,
+    our_node_id: NodeId,
+) -> Result<()> {
+    let ticket = DocTicket::from_str(&stored.ticket)?;
+    let mut peers: Vec<_> = ticket
+        .nodes
+        .iter()
+        .filter(|addr| addr.node_id != our_node_id)
+        .cloned()
+        .collect();
+    let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+    let doc = match docs.open(document_id).await {
+        Ok(Some(doc)) => doc,
+        _ => docs.import(ticket).await?,
+    };
+    for node in stored
+        .public
+        .members
+        .iter()
+        .filter_map(|value| NodeId::from_str(value).ok())
+        .filter(|node| *node != our_node_id)
+    {
+        if !peers.iter().any(|addr| addr.node_id == node) {
+            peers.push(NodeAddr::from(node));
+        }
+    }
+    doc.start_sync(peers).await?;
+    Ok(())
+}
+
 async fn send_chat_packet(
     sessions: ChatSessionPool,
     peer: NodeId,
@@ -2144,6 +2235,11 @@ async fn send_chat_packet(
     if payload.len() > MAX_INVITE_BYTES {
         bail!("chat protocol message exceeds safety cap");
     }
+    // One send/dial at a time per peer — concurrent wakes were closing each
+    // other's fresh connections and forcing multi-second redial storms.
+    let gate = sessions.peer_gate(peer).await;
+    let _guard = gate.lock().await;
+
     // Try warm session with a tight timeout, then fresh dial.
     if let Some(connection) = sessions.get(peer).await {
         match tokio::time::timeout(CHAT_REUSE_TIMEOUT, send_chat_packet_on(&connection, &payload))
@@ -2259,14 +2355,23 @@ fn next_nonce() -> u64 {
 }
 
 fn delivery_retry_delay(conversation_id: &str, attempts: u8) -> Duration {
-    let seconds = (1u64 << attempts.min(6)).min(MAX_RETRY_SECONDS);
+    // Fast, flat probes while waiting on receipt. The old 2/4/8/16s exponential
+    // schedule left continuous chats idle for many seconds after a wake already
+    // succeeded at the chat-ALPN layer (docs pull / receipt still in flight).
+    let base_ms = match attempts {
+        0 | 1 => 400,
+        2 => 700,
+        3 => 1_000,
+        4..=10 => 1_500,
+        _ => 3_000.min(MAX_RETRY_SECONDS.saturating_mul(1000)),
+    };
     let jitter_ms = conversation_id
         .bytes()
         .fold(u64::from(attempts), |acc, byte| {
             acc.wrapping_mul(31).wrapping_add(u64::from(byte))
         })
-        % 500;
-    Duration::from_secs(seconds) + Duration::from_millis(jitter_ms)
+        % 200;
+    Duration::from_millis(base_ms + jitter_ms)
 }
 
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
@@ -2609,11 +2714,9 @@ mod tests {
     fn delivery_retries_are_bounded_and_desynchronised() {
         let first = delivery_retry_delay("dm/example-a", 1);
         let second = delivery_retry_delay("dm/example-b", 1);
-        assert!(first >= Duration::from_secs(2));
-        assert!(first <= Duration::from_secs(2) + Duration::from_millis(499));
-        assert!(
-            delivery_retry_delay("dm/example", 99) <= Duration::from_secs(MAX_RETRY_SECONDS + 1)
-        );
+        assert!(first >= Duration::from_millis(400));
+        assert!(first < Duration::from_millis(700));
+        assert!(delivery_retry_delay("dm/example", 99) <= Duration::from_secs(4));
         assert_ne!(
             first, second,
             "conversation-specific jitter avoids retry herds"
