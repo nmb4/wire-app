@@ -56,6 +56,8 @@ const CHAT_FIRST_RETRY: Duration = Duration::from_millis(400);
 const CHAT_RECEIPT_WAKE_COOLDOWN: Duration = Duration::from_secs(2);
 /// After this many consecutive failed probes, show Queued but keep slow retries.
 const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
+/// Leave headroom under MAX_INVITE_BYTES for ticket + framing on chat ALPN.
+const CHAT_WAKE_PAYLOAD_BUDGET: usize = 200 * 1024;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +348,21 @@ struct SyncRequest {
     ticket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_version: Option<String>,
+    /// Optional message bodies for chat-ALPN fast path. Older peers ignore this
+    /// field and still pull via docs; new peers insert immediately so delivery
+    /// does not wait on outbound docs `Connect(DirectJoin)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    messages: Vec<ChatMessage>,
+    /// Optional receipts so the sender can mark Delivered without waiting for
+    /// a docs pull of the recipient's receipt entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receipts: Vec<ReplicatedReceipt>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WakePayload {
+    messages: Vec<ChatMessage>,
+    receipts: Vec<ReplicatedReceipt>,
 }
 
 #[derive(Debug)]
@@ -622,6 +639,13 @@ pub struct ChatService {
     retry_tick: tokio::time::Interval,
     retry_state: BTreeMap<String, ConversationRetry>,
     pending_deliveries: BTreeMap<String, String>,
+    /// Full outbound bodies for pending deliveries (chat-ALPN fast path).
+    pending_outbound: BTreeMap<String, ChatMessage>,
+    /// Inbound bodies received over chat ALPN before docs sync lands them.
+    /// Keyed conversation_id → message_id → message. Never written under our
+    /// docs author (that would forge peer entries); merged into the timeline
+    /// until `load_messages` sees the real replica.
+    staged_inbound: BTreeMap<String, BTreeMap<String, ChatMessage>>,
     /// In-flight background wakes per conversation — prevents a losing race
     /// from parking deliveries as Queued right after a successful wake.
     wake_inflight: BTreeMap<String, u32>,
@@ -713,6 +737,8 @@ impl ChatService {
             ),
             retry_state: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
+            pending_outbound: BTreeMap::new(),
+            staged_inbound: BTreeMap::new(),
             wake_inflight: BTreeMap::new(),
             last_receipt_wake: BTreeMap::new(),
             wake_failures: BTreeMap::new(),
@@ -770,6 +796,8 @@ impl ChatService {
             }) {
                 self.pending_deliveries
                     .insert(message.message_id.clone(), conversation_id.clone());
+                self.pending_outbound
+                    .insert(message.message_id.clone(), message.clone());
                 pending_by_conversation
                     .entry(conversation_id.clone())
                     .or_default()
@@ -848,17 +876,14 @@ impl ChatService {
                         "sync-request",
                     );
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
-                        // Accept-side pull using any fresh ticket addrs the
-                        // sender embedded (fixes Noah→David docs lag when chat
-                        // ALPN works but local address books are stale).
                         if let Err(error) = self
-                            .pull_conversation(&request.conversation_id, request.ticket.as_deref())
+                            .apply_sync_request(incoming.remote, &request)
                             .await
                         {
                             warn!(
                                 conversation = %log_id(&request.conversation_id),
                                 peer = %incoming.remote.fmt_short(),
-                                "failed to immediately sync requested chat: {error:#}"
+                                "failed to apply chat sync request: {error:#}"
                             );
                         }
                         self.resume_deliveries_for_peer(incoming.remote).await;
@@ -1001,6 +1026,8 @@ impl ChatService {
                 );
                 self.pending_deliveries
                     .insert(message_id.clone(), conversation_id.clone());
+                self.pending_outbound
+                    .insert(message_id.clone(), message.clone());
                 // Optimistic pending — do not block the chat worker on dial/reuse.
                 // A background wake nudges peers; WakeFinished parks as Queued if
                 // nobody is reachable. See docs/chat-delivery-asymmetry.md.
@@ -1072,7 +1099,38 @@ impl ChatService {
         }
     }
 
+    fn wake_payload_for(&self, conversation_id: &str) -> WakePayload {
+        let mut messages = Vec::new();
+        let mut used = 0usize;
+        for (message_id, pending_conversation) in &self.pending_deliveries {
+            if pending_conversation != conversation_id {
+                continue;
+            }
+            let Some(message) = self.pending_outbound.get(message_id) else {
+                continue;
+            };
+            let size = message.body.len().saturating_add(256);
+            if !messages.is_empty() && used.saturating_add(size) > CHAT_WAKE_PAYLOAD_BUDGET {
+                break;
+            }
+            if size > CHAT_WAKE_PAYLOAD_BUDGET {
+                continue;
+            }
+            used = used.saturating_add(size);
+            messages.push(message.clone());
+        }
+        WakePayload {
+            messages,
+            receipts: Vec::new(),
+        }
+    }
+
     fn spawn_wake(&mut self, conversation_id: &str) {
+        let payload = self.wake_payload_for(conversation_id);
+        self.spawn_wake_with(conversation_id, payload);
+    }
+
+    fn spawn_wake_with(&mut self, conversation_id: &str, payload: WakePayload) {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return;
         };
@@ -1095,8 +1153,14 @@ impl ChatService {
                 .await
                 .ok()
                 .or_else(|| Some(stored.ticket.clone()));
-            let reached =
-                wake_peers(sessions, peers, &conversation_id, ticket.as_deref()).await;
+            let reached = wake_peers(
+                sessions,
+                peers,
+                &conversation_id,
+                ticket.as_deref(),
+                payload,
+            )
+            .await;
             let _ = wake_tx
                 .send(ChatInput::WakeFinished {
                     conversation_id,
@@ -1123,7 +1187,7 @@ impl ChatService {
         });
     }
 
-    fn spawn_receipt_wake(&mut self, conversation_id: &str) {
+    fn spawn_receipt_wake(&mut self, conversation_id: &str, receipts: Vec<ReplicatedReceipt>) {
         let now = tokio::time::Instant::now();
         if self
             .last_receipt_wake
@@ -1134,7 +1198,9 @@ impl ChatService {
         }
         self.last_receipt_wake
             .insert(conversation_id.to_owned(), now);
-        self.spawn_wake(conversation_id);
+        let mut payload = self.wake_payload_for(conversation_id);
+        payload.receipts = receipts;
+        self.spawn_wake_with(conversation_id, payload);
     }
 
     async fn apply_wake_finished(&mut self, conversation_id: &str, reached: bool) {
@@ -1320,8 +1386,118 @@ impl ChatService {
             self.other_members(stored),
             conversation_id,
             ticket.as_deref(),
+            self.wake_payload_for(conversation_id),
         )
         .await
+    }
+
+    async fn apply_sync_request(&mut self, remote: NodeId, request: &SyncRequest) -> Result<()> {
+        let remote_s = remote.to_string();
+        let mut accepted_messages = 0u32;
+        for message in &request.messages {
+            if message.author_id != remote_s {
+                warn!(
+                    conversation = %log_id(&request.conversation_id),
+                    peer = %remote.fmt_short(),
+                    message = %log_id(&message.message_id),
+                    "ignored chat ALPN message with mismatched author"
+                );
+                continue;
+            }
+            if let Err(error) = message.validate() {
+                warn!(
+                    conversation = %log_id(&request.conversation_id),
+                    peer = %remote.fmt_short(),
+                    message = %log_id(&message.message_id),
+                    "ignored invalid chat ALPN message: {error:#}"
+                );
+                continue;
+            }
+            let staged = self
+                .staged_inbound
+                .entry(request.conversation_id.clone())
+                .or_default()
+                .insert(message.message_id.clone(), message.clone())
+                .is_none();
+            if staged {
+                accepted_messages += 1;
+                info!(
+                    conversation = %log_id(&request.conversation_id),
+                    peer = %remote.fmt_short(),
+                    message = %log_id(&message.message_id),
+                    "accepted chat message over ALPN fast path"
+                );
+            }
+        }
+        if !request.receipts.is_empty() {
+            self.apply_direct_receipts(&request.conversation_id, remote, &request.receipts);
+        }
+        // Publish first so staged bodies + receipts hit the UI immediately,
+        // then nudge docs for durable multi-device sync.
+        if accepted_messages > 0 || !request.receipts.is_empty() {
+            if let Err(error) = self.publish_timeline(&request.conversation_id).await {
+                warn!(
+                    conversation = %log_id(&request.conversation_id),
+                    "failed to publish timeline after ALPN wake: {error:#}"
+                );
+            }
+        }
+        if let Err(error) = self
+            .pull_conversation(&request.conversation_id, request.ticket.as_deref())
+            .await
+        {
+            if accepted_messages == 0 && request.receipts.is_empty() {
+                return Err(error);
+            }
+            warn!(
+                conversation = %log_id(&request.conversation_id),
+                peer = %remote.fmt_short(),
+                "docs pull after chat ALPN wake failed: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_direct_receipts(
+        &mut self,
+        conversation_id: &str,
+        remote: NodeId,
+        receipts: &[ReplicatedReceipt],
+    ) {
+        if !self.is_conversation_member(conversation_id, remote) {
+            return;
+        }
+        for receipt in receipts {
+            if receipt.validate().is_err() {
+                continue;
+            }
+            let Some(pending_conversation) = self.pending_deliveries.get(&receipt.message_id)
+            else {
+                continue;
+            };
+            if pending_conversation != conversation_id {
+                continue;
+            }
+            self.pending_deliveries.remove(&receipt.message_id);
+            self.pending_outbound.remove(&receipt.message_id);
+            info!(
+                conversation = %log_id(conversation_id),
+                message = %log_id(&receipt.message_id),
+                peer = %remote.fmt_short(),
+                "chat message marked delivered after ALPN receipt"
+            );
+            self.queued.push_back(ChatNotification::Delivery {
+                message_id: receipt.message_id.clone(),
+                state: DeliveryState::Delivered,
+                detail: None,
+            });
+        }
+        self.retry_state.retain(|_, state| {
+            state
+                .messages
+                .retain(|message_id| self.pending_deliveries.contains_key(message_id));
+            !state.messages.is_empty()
+        });
     }
 
     pub async fn delete_message(
@@ -1475,9 +1651,36 @@ impl ChatService {
         Ok(epoch)
     }
 
+    fn merge_staged_inbound(&mut self, conversation_id: &str, messages: &mut Vec<ChatMessage>) {
+        let Some(staged) = self.staged_inbound.get_mut(conversation_id) else {
+            return;
+        };
+        let present: BTreeSet<_> = messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect();
+        staged.retain(|message_id, _| !present.contains(message_id));
+        for message in staged.values() {
+            messages.push(message.clone());
+        }
+        messages.sort();
+        if staged.is_empty() {
+            self.staged_inbound.remove(conversation_id);
+        }
+    }
+
     fn forget_conversation_local_state(&mut self, conversation_id: &str) {
-        self.pending_deliveries
-            .retain(|_, pending_conversation| pending_conversation != conversation_id);
+        let dropped: Vec<_> = self
+            .pending_deliveries
+            .iter()
+            .filter(|(_, pending_conversation)| *pending_conversation == conversation_id)
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        for message_id in dropped {
+            self.pending_deliveries.remove(&message_id);
+            self.pending_outbound.remove(&message_id);
+        }
+        self.staged_inbound.remove(conversation_id);
         self.retry_state.remove(conversation_id);
         if self
             .local_deletions
@@ -1791,7 +1994,8 @@ impl ChatService {
             .get(id)
             .cloned()
             .context("unknown conversation")?;
-        let messages = self.load_messages(&stored).await?;
+        let mut messages = self.load_messages(&stored).await?;
+        self.merge_staged_inbound(id, &mut messages);
         for message in &messages {
             if message.author_id != self.our_node_id.to_string() {
                 if let Some(version) = message.client_version.as_deref() {
@@ -1801,15 +2005,16 @@ impl ChatService {
                 }
             }
         }
-        let wrote_receipts = self
+        let new_receipts = self
             .acknowledge_received_messages(&stored, &messages)
             .await?;
         // Friend already sees their message on our side; their UI stays on
         // "syncing" until they pull our receipt. Debounce wakes — firing one
         // per timeline publish caused dial storms that blocked real sends.
-        if wrote_receipts {
+        // Receipts ride the chat ALPN wake so the sender need not wait on docs.
+        if !new_receipts.is_empty() {
             self.spawn_doc_sync(id);
-            self.spawn_receipt_wake(id);
+            self.spawn_receipt_wake(id, new_receipts);
         }
         let delivered = self.load_delivered_message_ids(&stored).await?;
         let visible: BTreeSet<_> = messages
@@ -1826,6 +2031,7 @@ impl ChatService {
             .collect();
         for message_id in dropped_pending {
             self.pending_deliveries.remove(&message_id);
+            self.pending_outbound.remove(&message_id);
         }
         for message in &messages {
             if message.author_id == self.our_node_id.to_string()
@@ -1835,6 +2041,7 @@ impl ChatService {
                     .remove(&message.message_id)
                     .is_some()
             {
+                self.pending_outbound.remove(&message.message_id);
                 info!(
                     conversation = %log_id(id),
                     message = %log_id(&message.message_id),
@@ -1869,14 +2076,14 @@ impl ChatService {
         &self,
         stored: &StoredConversation,
         messages: &[ChatMessage],
-    ) -> Result<bool> {
+    ) -> Result<Vec<ReplicatedReceipt>> {
         let ticket = DocTicket::from_str(&stored.ticket)?;
         let document_id = NamespaceId::from_str(&stored.public.document_id)?;
         let doc = match self.docs.open(document_id).await {
             Ok(Some(doc)) => doc,
             _ => self.docs.import(ticket).await?,
         };
-        let mut wrote_any = false;
+        let mut wrote = Vec::new();
         for message in messages
             .iter()
             .filter(|message| message.author_id != self.our_node_id.to_string())
@@ -1896,15 +2103,15 @@ impl ChatService {
                     serde_json::to_vec(&receipt)?,
                 )
                 .await?;
-                wrote_any = true;
                 debug!(
                     conversation = %log_id(&stored.public.id),
                     message = %log_id(&message.message_id),
                     "acknowledged received chat message"
                 );
+                wrote.push(receipt);
             }
         }
-        Ok(wrote_any)
+        Ok(wrote)
     }
 
     async fn load_delivered_message_ids(
@@ -2253,6 +2460,7 @@ async fn send_sync_request(
     peer: NodeId,
     conversation_id: &str,
     ticket: Option<&str>,
+    payload: WakePayload,
 ) -> Result<()> {
     send_chat_packet(
         sessions,
@@ -2263,6 +2471,8 @@ async fn send_sync_request(
             conversation_id: conversation_id.to_owned(),
             ticket: ticket.map(str::to_owned),
             client_version: Some(crate::APP_VERSION.to_owned()),
+            messages: payload.messages,
+            receipts: payload.receipts,
         }),
     )
     .await
@@ -2273,6 +2483,7 @@ async fn wake_peers(
     peers: Vec<NodeId>,
     conversation_id: &str,
     ticket: Option<&str>,
+    payload: WakePayload,
 ) -> bool {
     if peers.is_empty() {
         return false;
@@ -2282,8 +2493,17 @@ async fn wake_peers(
         let sessions = sessions.clone();
         let conversation_id = conversation_id.to_owned();
         let ticket = ticket.map(str::to_owned);
+        let payload = payload.clone();
         join_set.spawn(async move {
-            match send_sync_request(sessions, peer, &conversation_id, ticket.as_deref()).await {
+            match send_sync_request(
+                sessions,
+                peer,
+                &conversation_id,
+                ticket.as_deref(),
+                payload,
+            )
+            .await
+            {
                 Ok(()) => true,
                 Err(error) => {
                     trace!(
@@ -2456,6 +2676,8 @@ fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool
                 peer = %peer.fmt_short(),
                 conversation = %log_id(&request.conversation_id),
                 reused,
+                messages = request.messages.len(),
+                receipts = request.receipts.len(),
                 "chat delivery wake-up sent"
             );
         }
@@ -2932,6 +3154,34 @@ mod tests {
             first, second,
             "conversation-specific jitter avoids retry herds"
         );
+    }
+
+    #[test]
+    fn sync_request_keeps_legacy_shape_and_carries_fast_path() {
+        let legacy = r#"{"kind":"sync-request","version":1,"conversation_id":"dm/a/b"}"#;
+        let parsed: SyncRequest = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.receipts.is_empty());
+        assert!(parsed.ticket.is_none());
+
+        let author = SecretKey::from_bytes(&[7; 32]).public();
+        let message = ChatMessage::new(author, "fast".to_owned());
+        let receipt = ReplicatedReceipt::new(message.message_id.clone());
+        let full = SyncRequest {
+            kind: "sync-request".to_owned(),
+            version: 1,
+            conversation_id: "dm/a/b".to_owned(),
+            ticket: Some("ticket".to_owned()),
+            client_version: Some("0.4.15".to_owned()),
+            messages: vec![message.clone()],
+            receipts: vec![receipt],
+        };
+        let encoded = serde_json::to_value(&full).unwrap();
+        assert_eq!(encoded["messages"][0]["body"], "fast");
+        assert_eq!(encoded["receipts"][0]["message_id"], message.message_id);
+        let roundtrip: SyncRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(roundtrip.messages.len(), 1);
+        assert_eq!(roundtrip.receipts.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

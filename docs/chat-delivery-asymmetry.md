@@ -131,12 +131,29 @@ Mitigations in code:
   connection’s `remote_address()` so docs/gossip can dial the same path.
 - Pool forget on idle/failure without force-close.
 
+## Chat-ALPN fast path (2026-07-19)
+
+`SyncRequest` may carry:
+
+- `messages`: full `ChatMessage` bodies the sender just committed
+- `receipts`: recipient acks the sender can apply immediately
+
+Older peers ignore unknown JSON fields and keep the docs-only path. New peers:
+
+1. Stage inbound ALPN bodies locally (no forged docs author) and publish timeline
+2. Write receipts immediately and return them on the next wake
+3. Sender marks Delivered from the ALPN receipt without a docs pull
+4. Docs/gossip still lands the durable replica and drops the staged copy
+
+Docs/gossip remains source of truth for multi-device and history; the ALPN
+payload only removes the NAT-bound wait when chat connect already works.
+
 ## What still needs a real networking fix
 
 - Reliable docs/gossip when even addressed Connect fails (relay preference,
-  reuse RTC path).
+  reuse RTC path) for peers that do not speak the fast path.
 - Windows UDP 10040 / 1452-byte sends (PMTU, IPv6 vs IPv4, relay).
-- True multipath: piggyback docs on an open chat/RTC QUIC connection.
+- True multipath: piggyback full docs sync on an open chat/RTC QUIC connection.
 
-Until then, expect some NAT asymmetry even when calls look perfect — but chat
-should no longer *kill* its own working sessions.
+Until then, expect some NAT asymmetry with older peers even when calls look
+perfect — but chat should no longer *kill* its own working sessions.
