@@ -332,6 +332,11 @@ struct SyncRequest {
     kind: String,
     version: u8,
     conversation_id: String,
+    /// Fresh write ticket (includes current relay/direct addrs). Optional for
+    /// backward compatibility with older peers. Lets the receiver start_sync
+    /// toward the sender even when their endpoint address book is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ticket: Option<String>,
 }
 
 #[derive(Debug)]
@@ -828,9 +833,13 @@ impl ChatService {
                         )));
                     }
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
-                        // Accept-side pull. Prefer a cheap start_sync + timeline
-                        // refresh over full re-subscribe on every wake.
-                        if let Err(error) = self.pull_conversation(&request.conversation_id).await {
+                        // Accept-side pull using any fresh ticket addrs the
+                        // sender embedded (fixes Noah→David docs lag when chat
+                        // ALPN works but local address books are stale).
+                        if let Err(error) = self
+                            .pull_conversation(&request.conversation_id, request.ticket.as_deref())
+                            .await
+                        {
                             warn!(
                                 conversation = %log_id(&request.conversation_id),
                                 peer = %incoming.remote.fmt_short(),
@@ -1061,10 +1070,18 @@ impl ChatService {
             .entry(conversation_id.to_owned())
             .or_insert(0) += 1;
         let sessions = self.sessions.clone();
+        let docs = self.docs.clone();
+        let stored = stored.clone();
+        let endpoint = self.endpoint.clone();
         let wake_tx = self.wake_tx.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
-            let reached = wake_peers(sessions, peers, &conversation_id).await;
+            let ticket = refresh_share_ticket(&docs, &stored, &endpoint)
+                .await
+                .ok()
+                .or_else(|| Some(stored.ticket.clone()));
+            let reached =
+                wake_peers(sessions, peers, &conversation_id, ticket.as_deref()).await;
             let _ = wake_tx
                 .send(ChatInput::WakeFinished {
                     conversation_id,
@@ -1080,8 +1097,9 @@ impl ChatService {
         };
         let docs = self.docs.clone();
         let our_node_id = self.our_node_id;
+        let endpoint = self.endpoint.clone();
         tokio::spawn(async move {
-            if let Err(error) = nudge_doc_sync(&docs, &stored, our_node_id).await {
+            if let Err(error) = nudge_doc_sync(&docs, &stored, our_node_id, &endpoint, None).await {
                 trace!(
                     conversation = %log_id(&stored.public.id),
                     "doc sync nudge failed: {error:#}"
@@ -1278,10 +1296,15 @@ impl ChatService {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return false;
         };
+        let ticket = refresh_share_ticket(&self.docs, stored, &self.endpoint)
+            .await
+            .ok()
+            .or_else(|| Some(stored.ticket.clone()));
         wake_peers(
             self.sessions.clone(),
             self.other_members(stored),
             conversation_id,
+            ticket.as_deref(),
         )
         .await
     }
@@ -1609,14 +1632,21 @@ impl ChatService {
         Ok(())
     }
 
-    async fn pull_conversation(&mut self, id: &str) -> Result<()> {
+    async fn pull_conversation(&mut self, id: &str, remote_ticket: Option<&str>) -> Result<()> {
         let stored = self
             .index
             .conversations
             .get(id)
             .cloned()
             .context("unknown conversation")?;
-        nudge_doc_sync(&self.docs, &stored, self.our_node_id).await?;
+        nudge_doc_sync(
+            &self.docs,
+            &stored,
+            self.our_node_id,
+            &self.endpoint,
+            remote_ticket,
+        )
+        .await?;
         self.publish_timeline(id).await
     }
 
@@ -2196,6 +2226,7 @@ async fn send_sync_request(
     sessions: ChatSessionPool,
     peer: NodeId,
     conversation_id: &str,
+    ticket: Option<&str>,
 ) -> Result<()> {
     send_chat_packet(
         sessions,
@@ -2204,6 +2235,7 @@ async fn send_sync_request(
             kind: "sync-request".to_owned(),
             version: 1,
             conversation_id: conversation_id.to_owned(),
+            ticket: ticket.map(str::to_owned),
         }),
     )
     .await
@@ -2213,6 +2245,7 @@ async fn wake_peers(
     sessions: ChatSessionPool,
     peers: Vec<NodeId>,
     conversation_id: &str,
+    ticket: Option<&str>,
 ) -> bool {
     if peers.is_empty() {
         return false;
@@ -2221,8 +2254,9 @@ async fn wake_peers(
     for peer in peers {
         let sessions = sessions.clone();
         let conversation_id = conversation_id.to_owned();
+        let ticket = ticket.map(str::to_owned);
         join_set.spawn(async move {
-            match send_sync_request(sessions, peer, &conversation_id).await {
+            match send_sync_request(sessions, peer, &conversation_id, ticket.as_deref()).await {
                 Ok(()) => true,
                 Err(error) => {
                     trace!(
@@ -2242,23 +2276,58 @@ async fn wake_peers(
     reached
 }
 
-async fn nudge_doc_sync(
+async fn refresh_share_ticket(
     docs: &MemClient,
     stored: &StoredConversation,
-    our_node_id: NodeId,
-) -> Result<()> {
+    endpoint: &Endpoint,
+) -> Result<String> {
     let ticket = DocTicket::from_str(&stored.ticket)?;
-    let mut peers: Vec<_> = ticket
-        .nodes
-        .iter()
-        .filter(|addr| addr.node_id != our_node_id)
-        .cloned()
-        .collect();
     let document_id = NamespaceId::from_str(&stored.public.document_id)?;
     let doc = match docs.open(document_id).await {
         Ok(Some(doc)) => doc,
         _ => docs.import(ticket).await?,
     };
+    // Ensure our own endpoint addresses are current before sharing.
+    let _ = endpoint.node_id();
+    let fresh = doc
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    Ok(fresh.to_string())
+}
+
+async fn nudge_doc_sync(
+    docs: &MemClient,
+    stored: &StoredConversation,
+    our_node_id: NodeId,
+    endpoint: &Endpoint,
+    remote_ticket: Option<&str>,
+) -> Result<()> {
+    let local_ticket = DocTicket::from_str(&stored.ticket)?;
+    let mut peers: Vec<_> = local_ticket
+        .nodes
+        .iter()
+        .filter(|addr| addr.node_id != our_node_id)
+        .cloned()
+        .collect();
+    // Prefer addresses from the sender's fresh ticket when present.
+    if let Some(remote) = remote_ticket {
+        if let Ok(ticket) = DocTicket::from_str(remote) {
+            let remote_doc = ticket.capability.id().to_string();
+            if remote_doc == stored.public.document_id {
+                for node in ticket.nodes {
+                    if node.node_id == our_node_id {
+                        continue;
+                    }
+                    if let Some(existing) = peers.iter_mut().find(|p| p.node_id == node.node_id) {
+                        *existing = node;
+                    } else {
+                        peers.push(node);
+                    }
+                }
+            }
+        }
+    }
+    // Enrich with whatever magicsock already learned (chat ALPN path, etc.).
     for node in stored
         .public
         .members
@@ -2266,10 +2335,22 @@ async fn nudge_doc_sync(
         .filter_map(|value| NodeId::from_str(value).ok())
         .filter(|node| *node != our_node_id)
     {
-        if !peers.iter().any(|addr| addr.node_id == node) {
+        if let Some(info) = endpoint.remote_info(node) {
+            let addr: NodeAddr = info.into();
+            if let Some(existing) = peers.iter_mut().find(|p| p.node_id == node) {
+                *existing = addr;
+            } else {
+                peers.push(addr);
+            }
+        } else if !peers.iter().any(|addr| addr.node_id == node) {
             peers.push(NodeAddr::from(node));
         }
     }
+    let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+    let doc = match docs.open(document_id).await {
+        Ok(Some(doc)) => doc,
+        _ => docs.import(local_ticket).await?,
+    };
     doc.start_sync(peers).await?;
     Ok(())
 }
