@@ -763,25 +763,18 @@ impl ChatService {
             }
         }
         for (conversation_id, message_ids) in pending_by_conversation {
-            let reached = self.wake_members(&conversation_id).await;
-            if reached {
-                for message_id in message_ids {
-                    self.schedule_delivery_retry(&conversation_id, &message_id, true);
-                    self.queued.push_back(ChatNotification::Delivery {
-                        message_id,
-                        state: DeliveryState::Pending,
-                        detail: Some("delivering".to_owned()),
-                    });
-                }
-            } else {
-                for message_id in message_ids {
-                    self.queued.push_back(ChatNotification::Delivery {
-                        message_id,
-                        state: DeliveryState::Queued,
-                        detail: Some("waiting for peer".to_owned()),
-                    });
-                }
+            // Do not dial during startup — that blocked the worker for seconds
+            // per conversation when peers were offline.
+            for message_id in &message_ids {
+                self.schedule_delivery_retry(&conversation_id, message_id, true);
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message_id.clone(),
+                    state: DeliveryState::Pending,
+                    detail: Some("delivering".to_owned()),
+                });
             }
+            self.spawn_wake(&conversation_id);
+            self.spawn_doc_sync(&conversation_id);
         }
     }
 
@@ -1388,7 +1381,7 @@ impl ChatService {
                 // nudge — keep-alive made SyncRequest often win the race and
                 // get ignored as non-member.
                 self.invite_members_wait(&conversation_id).await;
-                let _ = self.wake_members(&conversation_id).await;
+                self.spawn_wake(&conversation_id);
             }
             Err(error) => {
                 warn!(
