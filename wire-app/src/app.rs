@@ -1883,14 +1883,7 @@ impl AppState {
                 .map(|node| self.peer_display_name(node))
                 .unwrap_or_else(|| "Unknown peer".to_owned())
         };
-        let opacity = if matches!(
-            state,
-            DeliveryState::Pending | DeliveryState::Queued | DeliveryState::Retrying
-        ) {
-            0.58
-        } else {
-            1.0
-        };
+        let opacity = chat_delivery_opacity(state);
         let time = format_chat_time(message.sent_at);
         let mut requested_deletion = None;
         let mut requested_restore = false;
@@ -1911,6 +1904,15 @@ impl AppState {
                                     .color(pal.dim.gamma_multiply(opacity))
                                     .size(ui_font_size(10.5)),
                             );
+                            if own && message.deletion.is_none() {
+                                chat_delivery_status_icon(
+                                    ui,
+                                    pal,
+                                    state,
+                                    detail.as_deref(),
+                                    opacity,
+                                );
+                            }
                         });
                         let bubble = Frame::new()
                             .fill(if own {
@@ -1926,75 +1928,31 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_max_width(640.0);
-                                let body = RichText::new(match message.deletion {
-                                    Some(MessageDeletion::Local) => "You deleted this message",
-                                    Some(MessageDeletion::Everyone) => "This message was deleted",
-                                    None => &message.body,
-                                })
-                                .color(pal.text.gamma_multiply(opacity))
-                                .size(ui_font_size(13.0));
-                                ui.label(if message.deletion.is_some() {
-                                    body.italics()
-                                } else {
-                                    body
+                                let body_response = ui.add(
+                                    egui::Label::new(chat_message_body_text(
+                                        message, pal, opacity,
+                                    ))
+                                    .wrap(),
+                                );
+                                body_response.context_menu(|ui| {
+                                    chat_message_context_menu(
+                                        ui,
+                                        message,
+                                        own,
+                                        &mut requested_restore,
+                                        &mut requested_deletion,
+                                    );
                                 });
                             });
                         bubble.response.context_menu(|ui| {
-                            if message.deletion == Some(MessageDeletion::Local) {
-                                if ui.button("Restore message").clicked() {
-                                    requested_restore = true;
-                                    ui.close_menu();
-                                }
-                            } else if message.deletion.is_none() {
-                                let (label, scope) = if own {
-                                    ("Delete for everyone", DeleteScope::Everyone)
-                                } else {
-                                    ("Delete for me", DeleteScope::Local)
-                                };
-                                if ui.button(label).clicked() {
-                                    requested_deletion = Some(scope);
-                                    ui.close_menu();
-                                }
-                            }
+                            chat_message_context_menu(
+                                ui,
+                                message,
+                                own,
+                                &mut requested_restore,
+                                &mut requested_deletion,
+                            );
                         });
-                        match (message.deletion, state) {
-                            (Some(_), _) => {}
-                            (None, DeliveryState::Pending) => {
-                                ui.label(
-                                    RichText::new("syncing…")
-                                        .color(pal.dim2)
-                                        .size(ui_font_size(9.5)),
-                                );
-                            }
-                            (None, DeliveryState::Queued) => {
-                                ui.label(
-                                    RichText::new(
-                                        detail.unwrap_or_else(|| "queued".to_owned()),
-                                    )
-                                    .color(pal.dim2)
-                                    .size(ui_font_size(9.5)),
-                                );
-                            }
-                            (None, DeliveryState::Retrying) => {
-                                ui.label(
-                                    RichText::new(
-                                        detail.unwrap_or_else(|| "retrying delivery…".to_owned()),
-                                    )
-                                    .color(pal.dim2)
-                                    .size(ui_font_size(9.5)),
-                                );
-                            }
-                            (None, DeliveryState::Failed) => {
-                                ui.label(
-                                    RichText::new(
-                                        detail.unwrap_or_else(|| "failed to send".to_owned()),
-                                    )
-                                    .color(pal.err)
-                                    .size(ui_font_size(9.5)),
-                                );
-                            }
-                            (None, DeliveryState::Delivered) => {}
-                        }
                     },
                 );
             },
@@ -2037,14 +1995,7 @@ impl AppState {
             .unwrap_or('?')
             .to_uppercase()
             .to_string();
-        let opacity = if matches!(
-            state,
-            DeliveryState::Pending | DeliveryState::Queued | DeliveryState::Retrying
-        ) {
-            0.58
-        } else {
-            1.0
-        };
+        let opacity = chat_delivery_opacity(state);
         let mut requested_deletion = None;
         let mut requested_restore = false;
 
@@ -2054,10 +2005,12 @@ impl AppState {
             } else {
                 ui.add_space(40.0);
             }
+            let content_width = (ui.available_width() - 4.0).max(80.0);
             ui.allocate_ui_with_layout(
-                Vec2::new((ui.available_width() - 4.0).max(80.0), 0.0),
+                Vec2::new(content_width, 0.0),
                 Layout::top_down(Align::Min),
                 |ui| {
+                    ui.set_max_width(content_width);
                     if starts_group {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -2071,78 +2024,63 @@ impl AppState {
                                     .color(pal.dim.gamma_multiply(opacity))
                                     .size(ui_font_size(10.5)),
                             );
-                        });
-                    }
-
-                    ui.horizontal_top(|ui| {
-                        let body = RichText::new(match message.deletion {
-                            Some(MessageDeletion::Local) => "You deleted this message",
-                            Some(MessageDeletion::Everyone) => "This message was deleted",
-                            None => &message.body,
-                        })
-                        .color(pal.text.gamma_multiply(opacity))
-                        .size(ui_font_size(13.0));
-                        let body_response = ui.label(if message.deletion.is_some() {
-                            body.italics()
-                        } else {
-                            body
-                        });
-                        body_response.context_menu(|ui| {
-                            if message.deletion == Some(MessageDeletion::Local) {
-                                if ui.button("Restore message").clicked() {
-                                    requested_restore = true;
-                                    ui.close_menu();
-                                }
-                            } else if message.deletion.is_none() {
-                                let (label, scope) = if own {
-                                    ("Delete for everyone", DeleteScope::Everyone)
-                                } else {
-                                    ("Delete for me", DeleteScope::Local)
-                                };
-                                if ui.button(label).clicked() {
-                                    requested_deletion = Some(scope);
-                                    ui.close_menu();
-                                }
+                            if own && message.deletion.is_none() {
+                                chat_delivery_status_icon(
+                                    ui,
+                                    pal,
+                                    state,
+                                    detail.as_deref(),
+                                    opacity,
+                                );
                             }
                         });
-                    });
-
-                    match (message.deletion, state) {
-                        (Some(_), _) => {}
-                        (None, DeliveryState::Pending) => {
-                            ui.label(
-                                RichText::new("syncing…")
-                                    .color(pal.dim2)
-                                    .size(ui_font_size(9.5)),
-                            );
-                        }
-                        (None, DeliveryState::Queued) => {
-                            ui.label(
-                                RichText::new(detail.unwrap_or_else(|| "queued".to_owned()))
-                                    .color(pal.dim2)
-                                    .size(ui_font_size(9.5)),
-                            );
-                        }
-                        (None, DeliveryState::Retrying) => {
-                            ui.label(
-                                RichText::new(
-                                    detail.unwrap_or_else(|| "retrying delivery…".to_owned()),
-                                )
-                                .color(pal.dim2)
-                                .size(ui_font_size(9.5)),
-                            );
-                        }
-                        (None, DeliveryState::Failed) => {
-                            ui.label(
-                                RichText::new(
-                                    detail.unwrap_or_else(|| "failed to send".to_owned()),
-                                )
-                                .color(pal.err)
-                                .size(ui_font_size(9.5)),
-                            );
-                        }
-                        (None, DeliveryState::Delivered) => {}
                     }
+
+                    // Constrain width so the label wraps (horizontal layouts
+                    // otherwise give infinite width and never break lines).
+                    let status_slot = if own
+                        && message.deletion.is_none()
+                        && !starts_group
+                        && !matches!(state, DeliveryState::Delivered)
+                    {
+                        18.0
+                    } else {
+                        0.0
+                    };
+                    let body_width = (ui.available_width() - status_slot).max(40.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(body_width, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_max_width(body_width);
+                                let body_response = ui.add(
+                                    egui::Label::new(chat_message_body_text(
+                                        message, pal, opacity,
+                                    ))
+                                    .wrap(),
+                                );
+                                body_response.context_menu(|ui| {
+                                    chat_message_context_menu(
+                                        ui,
+                                        message,
+                                        own,
+                                        &mut requested_restore,
+                                        &mut requested_deletion,
+                                    );
+                                });
+                            },
+                        );
+                        if status_slot > 0.0 {
+                            chat_delivery_status_icon(
+                                ui,
+                                pal,
+                                state,
+                                detail.as_deref(),
+                                opacity,
+                            );
+                        }
+                    });
                 },
             );
         });
@@ -5042,6 +4980,92 @@ fn chat_send_button(ui: &mut Ui, pal: &Palette) -> egui::Response {
         pal.text,
     );
     response
+}
+
+fn chat_delivery_opacity(state: DeliveryState) -> f32 {
+    if matches!(
+        state,
+        DeliveryState::Pending | DeliveryState::Queued | DeliveryState::Retrying
+    ) {
+        0.58
+    } else {
+        1.0
+    }
+}
+
+fn chat_message_body_text(message: &ChatMessage, pal: &Palette, opacity: f32) -> RichText {
+    let body = RichText::new(match message.deletion {
+        Some(MessageDeletion::Local) => "You deleted this message",
+        Some(MessageDeletion::Everyone) => "This message was deleted",
+        None => message.body.as_str(),
+    })
+    .color(pal.text.gamma_multiply(opacity))
+    .size(ui_font_size(13.0));
+    if message.deletion.is_some() {
+        body.italics()
+    } else {
+        body
+    }
+}
+
+fn chat_message_context_menu(
+    ui: &mut Ui,
+    message: &ChatMessage,
+    own: bool,
+    requested_restore: &mut bool,
+    requested_deletion: &mut Option<DeleteScope>,
+) {
+    if message.deletion == Some(MessageDeletion::Local) {
+        if ui.button("Restore message").clicked() {
+            *requested_restore = true;
+            ui.close();
+        }
+    } else if message.deletion.is_none() {
+        let (label, scope) = if own {
+            ("Delete for everyone", DeleteScope::Everyone)
+        } else {
+            ("Delete for me", DeleteScope::Local)
+        };
+        if ui.button(label).clicked() {
+            *requested_deletion = Some(scope);
+            ui.close();
+        }
+    }
+}
+
+/// Compact delivery affordance next to a message. Hover shows the detail string.
+fn chat_delivery_status_icon(
+    ui: &mut Ui,
+    pal: &Palette,
+    state: DeliveryState,
+    detail: Option<&str>,
+    opacity: f32,
+) {
+    let (icon, color, tip) = match state {
+        DeliveryState::Delivered => return,
+        DeliveryState::Pending => (Icon::Loader, pal.dim2, "Sending…"),
+        DeliveryState::Retrying => (
+            Icon::RefreshCw,
+            pal.dim2,
+            detail.unwrap_or("Retrying delivery…"),
+        ),
+        DeliveryState::Queued => (
+            Icon::CloudOff,
+            pal.dim2,
+            detail.unwrap_or("Queued — waiting for peer"),
+        ),
+        DeliveryState::Failed => (
+            Icon::CircleX,
+            pal.err,
+            detail.unwrap_or("Failed to send"),
+        ),
+    };
+    let response = ui.label(
+        RichText::new(char::from(icon))
+            .font(lucide(12.0))
+            .color(color.gamma_multiply(opacity)),
+    );
+    response.on_hover_text(tip);
 }
 
 fn format_chat_time(sent_at: i64) -> String {
