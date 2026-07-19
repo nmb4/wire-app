@@ -852,6 +852,8 @@ impl ChatService {
                     conversation_id,
                     from_remote,
                 } => {
+                    // Only resume parked sends on real remote inserts — not on
+                    // every SyncFinished (that caused a wake/resume storm).
                     if from_remote {
                         self.resume_queued_deliveries(&conversation_id).await;
                     }
@@ -1028,6 +1030,7 @@ impl ChatService {
         immediate: bool,
     ) {
         let now = tokio::time::Instant::now();
+        let existed = self.retry_state.contains_key(conversation_id);
         let state = self
             .retry_state
             .entry(conversation_id.to_owned())
@@ -1038,7 +1041,9 @@ impl ChatService {
                 messages: BTreeSet::new(),
             });
         state.messages.insert(message_id.to_owned());
-        if immediate {
+        // Only pull the timer forward for a brand-new conversation schedule.
+        // Re-arming to `now` on every resume caused a wake every retry tick.
+        if immediate && !existed {
             state.next_attempt = now;
         }
     }
@@ -1120,19 +1125,10 @@ impl ChatService {
             self.wake_failures.remove(conversation_id);
             for message_id in &pending {
                 self.schedule_delivery_retry(conversation_id, message_id, false);
-                self.queued.push_back(ChatNotification::Delivery {
-                    message_id: message_id.clone(),
-                    state: DeliveryState::Pending,
-                    detail: Some("delivering".to_owned()),
-                });
             }
-            // Peer acked the wake — refresh timeline (receipts may already be local).
-            if let Err(error) = self.publish_timeline(conversation_id).await {
-                warn!(
-                    conversation = %log_id(conversation_id),
-                    "failed to refresh timeline after wake: {error:#}"
-                );
-            }
+            // Do not publish_timeline here — that re-entered doc events and
+            // spawned more wakes. Receipts arrive via InsertRemote naturally.
+            self.spawn_doc_sync(conversation_id);
             return;
         }
         // Another wake still running — wait for it.
@@ -1249,6 +1245,14 @@ impl ChatService {
         if message_ids.is_empty() {
             return;
         }
+        // Already probing or waking — a remote insert just means pull docs;
+        // publish_timeline in the caller handles that. Extra resume/wake here
+        // was flooding the peer (~20 wakes/sec in logs) and delaying receipts.
+        if self.retry_state.contains_key(conversation_id)
+            || self.wake_inflight.get(conversation_id).copied().unwrap_or(0) > 0
+        {
+            return;
+        }
         self.wake_failures.remove(conversation_id);
         info!(
             conversation = %log_id(conversation_id),
@@ -1263,15 +1267,8 @@ impl ChatService {
                 detail: Some("peer online; delivering".to_owned()),
             });
         }
-        // Non-blocking: peer already contacted us (invite/sync/doc activity).
         self.spawn_wake(conversation_id);
         self.spawn_doc_sync(conversation_id);
-        if let Err(error) = self.publish_timeline(conversation_id).await {
-            warn!(
-                conversation = %log_id(conversation_id),
-                "failed to refresh timeline while resuming queued deliveries: {error:#}"
-            );
-        }
     }
 
     /// Ask members to pull the current doc. Returns true if at least one other
@@ -1709,12 +1706,13 @@ impl ChatService {
                         }
                         Ok(LiveEvent::SyncFinished(_)) => {
                             debug!(conversation = %log_id(&id), source = "sync-finished", "chat document changed");
-                            // A finished sync with a peer is a strong signal
-                            // they are online — resume any parked sends.
+                            // Refresh timeline only. Do NOT mark from_remote —
+                            // that re-entered resume/wake on every sync finish
+                            // and delayed real receipt handling by seconds.
                             if tx
                                 .send(DocumentSignal::Changed {
                                     conversation_id: id.clone(),
-                                    from_remote: true,
+                                    from_remote: false,
                                 })
                                 .await
                                 .is_err()
