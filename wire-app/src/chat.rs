@@ -54,7 +54,8 @@ const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CHAT_FIRST_RETRY: Duration = Duration::from_millis(400);
 /// Min gap between receipt-driven wakes (avoids connect storms that block sends).
 const CHAT_RECEIPT_WAKE_COOLDOWN: Duration = Duration::from_secs(2);
-/// After this many consecutive failed probes, show Queued but keep slow retries.
+/// After this many consecutive failed probes, show Queued and switch to slow
+/// offline probes (see `delivery_retry_delay(..., offline=true)`).
 const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
 /// Leave headroom under MAX_INVITE_BYTES for ticket + framing on chat ALPN.
 const CHAT_WAKE_PAYLOAD_BUDGET: usize = 200 * 1024;
@@ -1203,6 +1204,12 @@ impl ChatService {
         self.spawn_wake_with(conversation_id, payload);
     }
 
+    fn conversation_is_queued(&self, conversation_id: &str) -> bool {
+        self.wake_failures
+            .get(conversation_id)
+            .is_some_and(|failures| *failures >= CHAT_QUEUE_AFTER_FAILURES)
+    }
+
     async fn apply_wake_finished(&mut self, conversation_id: &str, reached: bool) {
         if let Some(count) = self.wake_inflight.get_mut(conversation_id) {
             *count = count.saturating_sub(1);
@@ -1226,14 +1233,13 @@ impl ChatService {
                 self.schedule_delivery_retry(conversation_id, message_id, false);
             }
             // Do not publish_timeline here — that re-entered doc events and
-            // spawned more wakes. Receipts arrive via InsertRemote naturally.
+            // spawned more wakes. Receipts arrive via InsertRemote / ALPN.
             self.spawn_doc_sync(conversation_id);
             return;
         }
-        // Another wake still running — wait for it.
-        if inflight > 0 {
-            return;
-        }
+        // Always count this failed probe (even if another wake is still in
+        // flight). Skipping the count while stacked let offline peers never
+        // reach Queued and stay on "delivery retry N" forever.
         let failures = {
             let entry = self
                 .wake_failures
@@ -1242,26 +1248,37 @@ impl ChatService {
             *entry = entry.saturating_add(1);
             *entry
         };
-        // Keep probing. Only flip the UI to Queued after several misses — never
-        // drop retry_state on a single failed dial (that permanently stuck sends
-        // while the peer was merely briefly unreachable).
-        for message_id in &pending {
-            self.schedule_delivery_retry(conversation_id, message_id, false);
-            if failures >= CHAT_QUEUE_AFTER_FAILURES {
+        let offline = failures >= CHAT_QUEUE_AFTER_FAILURES;
+        if offline {
+            for message_id in &pending {
                 self.queued.push_back(ChatNotification::Delivery {
                     message_id: message_id.clone(),
                     state: DeliveryState::Queued,
                     detail: Some("waiting for peer".to_owned()),
                 });
             }
+            if failures == CHAT_QUEUE_AFTER_FAILURES || failures.is_multiple_of(10) {
+                info!(
+                    conversation = %log_id(conversation_id),
+                    messages = pending.len(),
+                    failures,
+                    "peer unreachable; queued until they come online"
+                );
+            }
         }
-        if failures >= CHAT_QUEUE_AFTER_FAILURES {
-            info!(
-                conversation = %log_id(conversation_id),
-                messages = pending.len(),
-                failures,
-                "peer unreachable; showing queued while slow retries continue"
-            );
+        // Another wake still running — let it finish before arming the next.
+        if inflight > 0 {
+            return;
+        }
+        for message_id in &pending {
+            self.schedule_delivery_retry(conversation_id, message_id, false);
+        }
+        // Stretch the timer when offline so we do not hammer Connect every few
+        // seconds (online receipt wait still uses the fast schedule).
+        if let Some(state) = self.retry_state.get_mut(conversation_id) {
+            let now = tokio::time::Instant::now();
+            state.next_attempt =
+                now + delivery_retry_delay(conversation_id, state.attempts, offline);
         }
     }
 
@@ -1282,10 +1299,30 @@ impl ChatService {
                 self.retry_state.remove(&conversation_id);
                 continue;
             }
+            // Never stack dials: retry interval used to be shorter than the
+            // connect timeout, so offline peers accumulated parallel wakes and
+            // never settled into Queued.
+            if self
+                .wake_inflight
+                .get(&conversation_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                if let Some(state) = self.retry_state.get_mut(&conversation_id) {
+                    state.next_attempt = now + CHAT_FIRST_RETRY;
+                }
+                continue;
+            }
+            let offline = self.conversation_is_queued(&conversation_id);
             // Never await dials on the service loop — that blocked all chat
             // processing for multi-second connect timeouts and starved sends.
             self.spawn_wake(&conversation_id);
-            self.spawn_doc_sync(&conversation_id);
+            // Docs DirectJoin is useless while the peer is offline and only
+            // adds noise; resume path will nudge when they return.
+            if !offline {
+                self.spawn_doc_sync(&conversation_id);
+            }
             let Some(state) = self.retry_state.get_mut(&conversation_id) else {
                 continue;
             };
@@ -1294,9 +1331,15 @@ impl ChatService {
             }
             let attempts = {
                 state.attempts = state.attempts.saturating_add(1);
-                state.next_attempt = now + delivery_retry_delay(&conversation_id, state.attempts);
+                state.next_attempt =
+                    now + delivery_retry_delay(&conversation_id, state.attempts, offline);
                 state.attempts
             };
+            // Keep Queued in the UI while offline — do not overwrite with
+            // "delivery retry 34" every few seconds.
+            if offline {
+                continue;
+            }
             for message_id in message_ids {
                 if self.pending_deliveries.contains_key(&message_id) {
                     self.queued.push_back(ChatNotification::Delivery {
@@ -2787,24 +2830,35 @@ fn next_nonce() -> u64 {
     time.rotate_left(17) ^ counter
 }
 
-fn delivery_retry_delay(conversation_id: &str, attempts: u8) -> Duration {
-    // Fast, flat probes while waiting on receipt. The old 2/4/8/16s exponential
-    // schedule left continuous chats idle for many seconds after a wake already
-    // succeeded at the chat-ALPN layer (docs pull / receipt still in flight).
-    let base_ms = match attempts {
-        0 | 1 => 400,
-        2 => 700,
-        3 => 1_000,
-        4..=10 => 1_500,
-        _ => 3_000.min(MAX_RETRY_SECONDS.saturating_mul(1000)),
+fn delivery_retry_delay(conversation_id: &str, attempts: u8, offline: bool) -> Duration {
+    let base_ms = if offline {
+        // Peer unreachable: rare background probes only. Aggressive 3s loops
+        // made offline DMs show "delivery retry 30+" forever.
+        match attempts {
+            0..=5 => 5_000,
+            6..=10 => 15_000,
+            11..=20 => 30_000,
+            _ => MAX_RETRY_SECONDS.saturating_mul(1000),
+        }
+    } else {
+        // Fast, flat probes while a reachable peer's receipt is still in flight.
+        // Continuous chat must not idle for many seconds after a successful wake.
+        match attempts {
+            0 | 1 => 400,
+            2 => 700,
+            3 => 1_000,
+            4..=10 => 1_500,
+            _ => 3_000,
+        }
     };
+    let jitter_span = if offline { 1_000 } else { 200 };
     let jitter_ms = conversation_id
         .bytes()
         .fold(u64::from(attempts), |acc, byte| {
             acc.wrapping_mul(31).wrapping_add(u64::from(byte))
         })
-        % 200;
-    Duration::from_millis(base_ms + jitter_ms)
+        % jitter_span;
+    Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
 
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
@@ -3145,14 +3199,21 @@ mod tests {
 
     #[test]
     fn delivery_retries_are_bounded_and_desynchronised() {
-        let first = delivery_retry_delay("dm/example-a", 1);
-        let second = delivery_retry_delay("dm/example-b", 1);
+        let first = delivery_retry_delay("dm/example-a", 1, false);
+        let second = delivery_retry_delay("dm/example-b", 1, false);
         assert!(first >= Duration::from_millis(400));
         assert!(first < Duration::from_millis(700));
-        assert!(delivery_retry_delay("dm/example", 99) <= Duration::from_secs(4));
+        assert!(delivery_retry_delay("dm/example", 99, false) <= Duration::from_secs(4));
         assert_ne!(
             first, second,
             "conversation-specific jitter avoids retry herds"
+        );
+        let offline = delivery_retry_delay("dm/offline", 30, true);
+        assert!(offline >= Duration::from_secs(60));
+        assert!(offline <= Duration::from_secs(61));
+        assert!(
+            delivery_retry_delay("dm/offline", 3, true) >= Duration::from_secs(5),
+            "offline probes must not use the online sub-second schedule"
         );
     }
 

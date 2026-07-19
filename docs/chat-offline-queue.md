@@ -37,9 +37,13 @@ Do **not** treat local `InsertLocal` alone as “peer online.”
 |-------|----|---------|
 | `Pending` | syncing… | normal backoff after a successful wake |
 | `Retrying` | retrying… | peer was reachable; still waiting on receipt |
-| `Queued` | queued | no aggressive wake loop |
+| `Queued` | queued | slow background probes only (15–60s); UI stays queued |
 | `Delivered` | (none) | — |
 | `Failed` | failed | local commit error only |
+
+Online receipt waits keep a fast sub-second→3s schedule. Offline (after several
+failed wakes) switches to long backoff, does not stack concurrent dials, and
+does not overwrite the UI with “delivery retry N”.
 
 ## Edge cases
 
