@@ -1084,6 +1084,7 @@ impl AppState {
                                 Some((
                                     DeliveryState::Pending
                                         | DeliveryState::Retrying
+                                        | DeliveryState::Queued
                                         | DeliveryState::Failed,
                                     _,
                                 ))
@@ -1882,7 +1883,10 @@ impl AppState {
                 .map(|node| self.peer_display_name(node))
                 .unwrap_or_else(|| "Unknown peer".to_owned())
         };
-        let opacity = if state == DeliveryState::Pending {
+        let opacity = if matches!(
+            state,
+            DeliveryState::Pending | DeliveryState::Queued | DeliveryState::Retrying
+        ) {
             0.58
         } else {
             1.0
@@ -1962,6 +1966,15 @@ impl AppState {
                                         .size(ui_font_size(9.5)),
                                 );
                             }
+                            (None, DeliveryState::Queued) => {
+                                ui.label(
+                                    RichText::new(
+                                        detail.unwrap_or_else(|| "queued".to_owned()),
+                                    )
+                                    .color(pal.dim2)
+                                    .size(ui_font_size(9.5)),
+                                );
+                            }
                             (None, DeliveryState::Retrying) => {
                                 ui.label(
                                     RichText::new(
@@ -2024,7 +2037,10 @@ impl AppState {
             .unwrap_or('?')
             .to_uppercase()
             .to_string();
-        let opacity = if state == DeliveryState::Pending {
+        let opacity = if matches!(
+            state,
+            DeliveryState::Pending | DeliveryState::Queued | DeliveryState::Retrying
+        ) {
             0.58
         } else {
             1.0
@@ -2096,6 +2112,13 @@ impl AppState {
                         (None, DeliveryState::Pending) => {
                             ui.label(
                                 RichText::new("syncing…")
+                                    .color(pal.dim2)
+                                    .size(ui_font_size(9.5)),
+                            );
+                        }
+                        (None, DeliveryState::Queued) => {
+                            ui.label(
+                                RichText::new(detail.unwrap_or_else(|| "queued".to_owned()))
                                     .color(pal.dim2)
                                     .size(ui_font_size(9.5)),
                             );

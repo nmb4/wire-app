@@ -252,8 +252,12 @@ impl ChatConversation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
+    /// Peer was reachable; waiting on remote receipt.
     Pending,
+    /// Active delivery attempts still running.
     Retrying,
+    /// Saved locally; no member reachable right now — not aggressively retried.
+    Queued,
     Delivered,
     Failed,
 }
@@ -405,7 +409,13 @@ pub(crate) enum ChatInput {
 
 #[derive(Debug)]
 pub(crate) enum DocumentSignal {
-    Changed(String),
+    Changed {
+        conversation_id: String,
+        /// True when the live event came from a remote peer (or a sync finish).
+        /// Used to resume queued offline deliveries without treating local
+        /// inserts as “peer is online”.
+        from_remote: bool,
+    },
     SubscriptionEnded {
         conversation_id: String,
         document_id: String,
@@ -494,6 +504,7 @@ impl ChatService {
             .iter()
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect();
+        let mut pending_by_conversation: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (conversation_id, stored) in conversations {
             let Ok(messages) = self.load_messages(&stored).await else {
                 continue;
@@ -507,7 +518,31 @@ impl ChatService {
             }) {
                 self.pending_deliveries
                     .insert(message.message_id.clone(), conversation_id.clone());
-                self.schedule_delivery_retry(&conversation_id, &message.message_id, true);
+                pending_by_conversation
+                    .entry(conversation_id.clone())
+                    .or_default()
+                    .push(message.message_id);
+            }
+        }
+        for (conversation_id, message_ids) in pending_by_conversation {
+            let reached = self.wake_members(&conversation_id).await;
+            if reached {
+                for message_id in message_ids {
+                    self.schedule_delivery_retry(&conversation_id, &message_id, true);
+                    self.queued.push_back(ChatNotification::Delivery {
+                        message_id,
+                        state: DeliveryState::Pending,
+                        detail: Some("delivering".to_owned()),
+                    });
+                }
+            } else {
+                for message_id in message_ids {
+                    self.queued.push_back(ChatNotification::Delivery {
+                        message_id,
+                        state: DeliveryState::Queued,
+                        detail: Some("waiting for peer".to_owned()),
+                    });
+                }
             }
         }
     }
@@ -545,11 +580,13 @@ impl ChatService {
         match input {
             ChatInput::Invite(incoming) => match incoming.message {
                 ChatProtocolMessage::Invite(invite) => {
-                    if let Err(error) = self.accept_invite(incoming.remote, invite).await {
+                    let remote = incoming.remote;
+                    if let Err(error) = self.accept_invite(remote, invite).await {
                         return Some(ChatNotification::Error(format!(
                             "Chat invitation failed: {error:#}"
                         )));
                     }
+                    self.resume_deliveries_for_peer(remote).await;
                 }
                 ChatProtocolMessage::SyncRequest(request) => {
                     if request.kind != "sync-request" || request.version != 1 {
@@ -569,6 +606,7 @@ impl ChatService {
                                 "failed to immediately sync requested chat: {error:#}"
                             );
                         }
+                        self.resume_deliveries_for_peer(incoming.remote).await;
                     } else {
                         warn!(
                             conversation = %log_id(&request.conversation_id),
@@ -579,8 +617,14 @@ impl ChatService {
                 }
             },
             ChatInput::Document(signal) => match signal {
-                DocumentSignal::Changed(id) => {
-                    if let Err(error) = self.publish_timeline(&id).await {
+                DocumentSignal::Changed {
+                    conversation_id,
+                    from_remote,
+                } => {
+                    if from_remote {
+                        self.resume_queued_deliveries(&conversation_id).await;
+                    }
+                    if let Err(error) = self.publish_timeline(&conversation_id).await {
                         return Some(ChatNotification::Error(format!(
                             "Could not refresh chat: {error:#}"
                         )));
@@ -682,34 +726,39 @@ impl ChatService {
     pub async fn send_message(&mut self, conversation_id: String, message: ChatMessage) {
         let message_id = message.message_id.clone();
         let body_bytes = message.body.len();
-        let result = self
-            .insert_message(&conversation_id, &message)
-            .await
-            .map(|_| DeliveryState::Pending);
-        match result {
-            Ok(state) => {
+        match self.insert_message(&conversation_id, &message).await {
+            Ok(()) => {
                 info!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
                     bytes = body_bytes,
                     "message committed to local chat replica"
                 );
-                self.queued.push_back(ChatNotification::Delivery {
-                    message_id: message_id.clone(),
-                    state,
-                    detail: Some("saved locally; delivering".to_owned()),
-                });
                 self.pending_deliveries
                     .insert(message_id.clone(), conversation_id.clone());
-                // Initial sync/wake already runs below. Schedule the first
-                // retry after backoff so the UI does not flash "delivery retry
-                // 1" while the peer receipt is still in flight.
-                self.schedule_delivery_retry(&conversation_id, &message_id, false);
-                // Wake peers before any local timeline work. When outbound
-                // docs Connect fails, SyncRequest is what makes them pull;
-                // delaying it behind publish_timeline adds real delivery lag.
-                // See docs/chat-delivery-asymmetry.md.
-                self.wake_members(&conversation_id);
+                // Wake before timeline work. When outbound docs Connect fails,
+                // SyncRequest is what makes peers pull — see
+                // docs/chat-delivery-asymmetry.md and docs/chat-offline-queue.md.
+                let reached = self.wake_members(&conversation_id).await;
+                if reached {
+                    self.schedule_delivery_retry(&conversation_id, &message_id, false);
+                    self.queued.push_back(ChatNotification::Delivery {
+                        message_id: message_id.clone(),
+                        state: DeliveryState::Pending,
+                        detail: Some("delivering".to_owned()),
+                    });
+                } else {
+                    info!(
+                        conversation = %log_id(&conversation_id),
+                        message = %log_id(&message_id),
+                        "no chat member reachable; message queued offline"
+                    );
+                    self.queued.push_back(ChatNotification::Delivery {
+                        message_id: message_id.clone(),
+                        state: DeliveryState::Queued,
+                        detail: Some("waiting for peer".to_owned()),
+                    });
+                }
                 if let Err(error) = self.publish_timeline(&conversation_id).await {
                     warn!(
                         conversation = %log_id(&conversation_id),
@@ -784,7 +833,26 @@ impl ChatService {
                 self.retry_state.remove(&conversation_id);
                 continue;
             }
-            self.sync_and_wake(&conversation_id).await;
+            let reached = self.wake_members(&conversation_id).await;
+            if !reached {
+                self.retry_state.remove(&conversation_id);
+                for message_id in message_ids {
+                    if self.pending_deliveries.contains_key(&message_id) {
+                        self.queued.push_back(ChatNotification::Delivery {
+                            message_id,
+                            state: DeliveryState::Queued,
+                            detail: Some("waiting for peer".to_owned()),
+                        });
+                    }
+                }
+                continue;
+            }
+            if let Err(error) = self.publish_timeline(&conversation_id).await {
+                warn!(
+                    conversation = %log_id(&conversation_id),
+                    "chat delivery refresh failed: {error:#}"
+                );
+            }
             let Some(state) = self.retry_state.get_mut(&conversation_id) else {
                 // A receipt can arrive while the immediate sync above is
                 // publishing its timeline, which removes this retry state.
@@ -810,39 +878,118 @@ impl ChatService {
         }
     }
 
-    async fn sync_and_wake(&mut self, conversation_id: &str) {
-        // Nudge first; local publish is secondary for cross-peer latency.
-        self.wake_members(conversation_id);
-        if let Err(error) = self.publish_timeline(conversation_id).await {
-            warn!(conversation = %log_id(conversation_id), "chat delivery refresh failed: {error:#}");
+    async fn resume_deliveries_for_peer(&mut self, peer: NodeId) {
+        let peer_s = peer.to_string();
+        let conversation_ids: Vec<_> = self
+            .index
+            .conversations
+            .iter()
+            .filter(|(_, stored)| {
+                stored
+                    .public
+                    .members
+                    .iter()
+                    .any(|member| member == &peer_s)
+            })
+            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                self.pending_deliveries
+                    .values()
+                    .any(|conversation_id| conversation_id == id)
+            })
+            .collect();
+        for conversation_id in conversation_ids {
+            self.resume_queued_deliveries(&conversation_id).await;
         }
     }
 
-    /// Ask members to pull the current doc. Does **not** re-send invites —
-    /// those are reserved for create / clear / initialize (see `invite_members`).
-    fn wake_members(&self, conversation_id: &str) {
-        let Some(stored) = self.index.conversations.get(conversation_id) else {
+    async fn resume_queued_deliveries(&mut self, conversation_id: &str) {
+        let message_ids: Vec<_> = self
+            .pending_deliveries
+            .iter()
+            .filter(|(_, pending_conversation)| *pending_conversation == conversation_id)
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        if message_ids.is_empty() {
             return;
+        }
+        // Already actively retrying this conversation — leave the timer alone.
+        if self.retry_state.contains_key(conversation_id) {
+            return;
+        }
+        info!(
+            conversation = %log_id(conversation_id),
+            messages = message_ids.len(),
+            "resuming queued chat deliveries"
+        );
+        for message_id in &message_ids {
+            self.schedule_delivery_retry(conversation_id, message_id, true);
+            self.queued.push_back(ChatNotification::Delivery {
+                message_id: message_id.clone(),
+                state: DeliveryState::Pending,
+                detail: Some("peer online; delivering".to_owned()),
+            });
+        }
+        let reached = self.wake_members(conversation_id).await;
+        if !reached {
+            self.retry_state.remove(conversation_id);
+            for message_id in message_ids {
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id,
+                    state: DeliveryState::Queued,
+                    detail: Some("waiting for peer".to_owned()),
+                });
+            }
+            return;
+        }
+        if let Err(error) = self.publish_timeline(conversation_id).await {
+            warn!(
+                conversation = %log_id(conversation_id),
+                "failed to refresh timeline while resuming queued deliveries: {error:#}"
+            );
+        }
+    }
+
+    /// Ask members to pull the current doc. Returns true if at least one other
+    /// member accepted the wake. Does **not** re-send invites — those are
+    /// reserved for create / clear / initialize (see `invite_members`).
+    async fn wake_members(&self, conversation_id: &str) -> bool {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return false;
         };
-        for peer in stored
+        let peers: Vec<_> = stored
             .public
             .members
             .iter()
             .filter_map(|member| NodeId::from_str(member).ok())
             .filter(|peer| *peer != self.our_node_id)
-        {
+            .collect();
+        if peers.is_empty() {
+            return false;
+        }
+        let mut join_set = tokio::task::JoinSet::new();
+        for peer in peers {
             let endpoint = self.endpoint.clone();
             let conversation_id = conversation_id.to_owned();
-            tokio::spawn(async move {
-                if let Err(error) = send_sync_request(endpoint, peer, &conversation_id).await {
-                    trace!(
-                        peer = %peer.fmt_short(),
-                        conversation = %log_id(&conversation_id),
-                        "chat delivery wake-up did not reach peer: {error:#}"
-                    );
+            join_set.spawn(async move {
+                match send_sync_request(endpoint, peer, &conversation_id).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        trace!(
+                            peer = %peer.fmt_short(),
+                            conversation = %log_id(&conversation_id),
+                            "chat delivery wake-up did not reach peer: {error:#}"
+                        );
+                        false
+                    }
                 }
             });
         }
+        let mut reached = false;
+        while let Some(result) = join_set.join_next().await {
+            reached |= result.unwrap_or(false);
+        }
+        reached
     }
 
     pub async fn delete_message(
@@ -935,7 +1082,7 @@ impl ChatService {
                 );
                 // Peers on a stale document need a new ticket, not only a pull nudge.
                 self.invite_members(&conversation_id);
-                self.wake_members(&conversation_id);
+                let _ = self.wake_members(&conversation_id).await;
             }
             Err(error) => {
                 warn!(
@@ -1210,25 +1357,58 @@ impl ChatService {
                     match event {
                         Ok(LiveEvent::InsertLocal { .. }) => {
                             debug!(conversation = %log_id(&id), source = "local", "chat document changed");
-                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
+                            if tx
+                                .send(DocumentSignal::Changed {
+                                    conversation_id: id.clone(),
+                                    from_remote: false,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Ok(LiveEvent::InsertRemote { .. }) => {
                             debug!(conversation = %log_id(&id), source = "remote", "chat document changed");
-                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
+                            if tx
+                                .send(DocumentSignal::Changed {
+                                    conversation_id: id.clone(),
+                                    from_remote: true,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Ok(LiveEvent::ContentReady { .. }) | Ok(LiveEvent::PendingContentReady) => {
                             debug!(conversation = %log_id(&id), source = "content-ready", "chat document changed");
-                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
+                            // May be local or remote content; do not use this
+                            // alone to resume offline queues (InsertRemote /
+                            // inbound protocol cover peer-online).
+                            if tx
+                                .send(DocumentSignal::Changed {
+                                    conversation_id: id.clone(),
+                                    from_remote: false,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Ok(LiveEvent::SyncFinished(_)) => {
                             debug!(conversation = %log_id(&id), source = "sync-finished", "chat document changed");
-                            if tx.send(DocumentSignal::Changed(id.clone())).await.is_err() {
+                            // A finished sync with a peer is a strong signal
+                            // they are online — resume any parked sends.
+                            if tx
+                                .send(DocumentSignal::Changed {
+                                    conversation_id: id.clone(),
+                                    from_remote: true,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
