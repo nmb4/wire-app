@@ -65,6 +65,14 @@ Do not query or modify the board proactively.
 
 ### Model restrictions
 
+**Grok models are restricted to UI-related work only.** A Grok model may work on
+frontend presentation and interaction, including UI components, styling, layout,
+responsive behavior, and visual polish. It must not perform or assist with any
+non-UI work in this project, including backend code, APIs, data models, business
+logic, infrastructure, configuration, tests, documentation, project management,
+or general codebase changes. If a task is not clearly UI-related, route it to a
+non-Grok model.
+
 **Grok models are banned from touching the board.** Do not let any Grok model
 (xAI) read, modify, or otherwise interact with the Wire Kanban board via the
 `kanbn.lua` CLI or the Kan API. The user finds Grok's wording/communication
