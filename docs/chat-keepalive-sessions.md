@@ -32,6 +32,13 @@ an unreachable peer.
 
 ## Status
 
-**Not implemented.** Do after offline/queued delivery (`chat-offline-queue.md`).
-Suggested order: queue UX → measure → keep-alive pool on chat ALPN → explore
-docs session reuse.
+**Implemented** (chat ALPN session pool):
+
+- `ChatSessionPool` holds up to 8 peer QUIC connections
+- Idle drop after **90s** without streams
+- Outbound `SyncRequest` / invite reuse pooled connections (`open_bi`)
+- Inbound accept loops on multiple bi-streams until idle or `connection.closed()`
+- Failed streams invalidate the pool entry and redial once
+
+Still open: piggyback docs/blob traffic on the same session; measure burst RTT
+in the wild after the offline-queue work.

@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +41,10 @@ const DELETION_PREFIX: &[u8] = b"deletion/";
 const RECEIPT_PREFIX: &[u8] = b"receipt/";
 const RETRY_TICK: Duration = Duration::from_secs(1);
 const MAX_RETRY_SECONDS: u64 = 60;
+/// Keep chat-plane QUIC sessions warm for bursty back-and-forth.
+/// See `docs/chat-keepalive-sessions.md`.
+const CHAT_SESSION_IDLE: Duration = Duration::from_secs(90);
+const CHAT_SESSION_POOL_CAP: usize = 8;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,39 +329,76 @@ pub(crate) struct IncomingInvite {
     message: ChatProtocolMessage,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatInviteProtocol {
     tx: async_channel::Sender<IncomingInvite>,
+    sessions: ChatSessionPool,
+}
+
+impl std::fmt::Debug for ChatInviteProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatInviteProtocol").finish_non_exhaustive()
+    }
 }
 
 impl ChatInviteProtocol {
-    fn new() -> (Self, async_channel::Receiver<IncomingInvite>) {
+    fn new(sessions: ChatSessionPool) -> (Self, async_channel::Receiver<IncomingInvite>) {
         let (tx, rx) = async_channel::bounded(64);
-        (Self { tx }, rx)
+        (Self { tx, sessions }, rx)
     }
 }
 
 impl ProtocolHandler for ChatInviteProtocol {
     fn accept(&self, connecting: iroh::endpoint::Connecting) -> BoxFuture<Result<()>> {
         let tx = self.tx.clone();
+        let sessions = self.sessions.clone();
         async move {
             let connection = connecting.await?;
             let remote = connection.remote_node_id()?;
             info!(peer = %remote.fmt_short(), "received chat protocol connection");
-            let (mut send, mut recv) = connection.accept_bi().await?;
-            let mut length = [0u8; 4];
-            recv.read_exact(&mut length).await?;
-            let length = u32::from_be_bytes(length) as usize;
-            if length > MAX_INVITE_BYTES {
-                bail!("chat invitation exceeds safety cap");
+            sessions.insert(remote, connection.clone()).await;
+            // Keep accepting bi-streams until idle so rapid chatter reuses this
+            // session instead of dialing again (see docs/chat-keepalive-sessions.md).
+            let mut idle = Box::pin(tokio::time::sleep(CHAT_SESSION_IDLE));
+            loop {
+                tokio::select! {
+                    bi = connection.accept_bi() => {
+                        match bi {
+                            Ok((mut send, mut recv)) => {
+                                sessions.touch(remote).await;
+                                idle.as_mut().reset(
+                                    tokio::time::Instant::now() + CHAT_SESSION_IDLE,
+                                );
+                                match accept_chat_stream(&mut send, &mut recv).await {
+                                    Ok(message) => {
+                                        if tx
+                                            .send(IncomingInvite { remote, message })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            peer = %remote.fmt_short(),
+                                            "chat session stream failed: {error:#}"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    _ = &mut idle => {
+                        debug!(peer = %remote.fmt_short(), "chat session idle timeout");
+                        break;
+                    }
+                    _ = connection.closed() => break,
+                }
             }
-            let mut bytes = vec![0; length];
-            recv.read_exact(&mut bytes).await?;
-            let message: ChatProtocolMessage =
-                serde_json::from_slice(&bytes).context("invalid Wire chat protocol message")?;
-            tx.send(IncomingInvite { remote, message }).await?;
-            send.write_all(b"ok").await?;
-            send.finish()?;
+            sessions.remove(remote).await;
             Ok(())
         }
         .boxed()
@@ -362,6 +406,93 @@ impl ProtocolHandler for ChatInviteProtocol {
 
     fn shutdown(&self) -> BoxFuture<()> {
         async move {}.boxed()
+    }
+}
+
+/// Shared outbound/inbound chat QUIC sessions kept warm for bursty messaging.
+#[derive(Clone)]
+struct ChatSessionPool {
+    endpoint: Endpoint,
+    inner: Arc<tokio::sync::Mutex<BTreeMap<NodeId, HotSession>>>,
+}
+
+struct HotSession {
+    connection: Connection,
+    last_used: tokio::time::Instant,
+}
+
+impl ChatSessionPool {
+    fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            inner: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    async fn insert(&self, peer: NodeId, connection: Connection) {
+        let mut guard = self.inner.lock().await;
+        Self::sweep_locked(&mut guard);
+        guard.insert(
+            peer,
+            HotSession {
+                connection,
+                last_used: tokio::time::Instant::now(),
+            },
+        );
+        Self::evict_locked(&mut guard);
+    }
+
+    async fn touch(&self, peer: NodeId) {
+        let mut guard = self.inner.lock().await;
+        if let Some(session) = guard.get_mut(&peer) {
+            session.last_used = tokio::time::Instant::now();
+        }
+    }
+
+    async fn remove(&self, peer: NodeId) {
+        self.inner.lock().await.remove(&peer);
+    }
+
+    async fn get(&self, peer: NodeId) -> Option<Connection> {
+        let mut guard = self.inner.lock().await;
+        Self::sweep_locked(&mut guard);
+        let session = guard.get_mut(&peer)?;
+        session.last_used = tokio::time::Instant::now();
+        Some(session.connection.clone())
+    }
+
+    async fn invalidate(&self, peer: NodeId) {
+        self.inner.lock().await.remove(&peer);
+    }
+
+    fn sweep_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
+        let now = tokio::time::Instant::now();
+        sessions.retain(|_, session| now.duration_since(session.last_used) < CHAT_SESSION_IDLE);
+    }
+
+    fn evict_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
+        while sessions.len() > CHAT_SESSION_POOL_CAP {
+            let oldest = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_used)
+                .map(|(peer, _)| *peer);
+            let Some(peer) = oldest else {
+                break;
+            };
+            sessions.remove(&peer);
+        }
+    }
+
+    async fn connect(&self, peer: NodeId) -> Result<Connection> {
+        if let Some(connection) = self.get(peer).await {
+            return Ok(connection);
+        }
+        let connection = self
+            .endpoint
+            .connect(NodeAddr::from(peer), CHAT_ALPN)
+            .await?;
+        self.insert(peer, connection.clone()).await;
+        Ok(connection)
     }
 }
 
@@ -375,6 +506,7 @@ pub struct ChatProtocols {
 
 pub struct ChatService {
     endpoint: Endpoint,
+    sessions: ChatSessionPool,
     docs: MemClient,
     blobs: BlobStore,
     author: AuthorId,
@@ -437,7 +569,8 @@ impl ChatService {
         let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
         let docs = Docs::persistent(docs_path).spawn(&blobs, &gossip).await?;
         debug!("persistent Iroh Docs engine opened");
-        let (invites, invite_rx) = ChatInviteProtocol::new();
+        let sessions = ChatSessionPool::new(endpoint.clone());
+        let (invites, invite_rx) = ChatInviteProtocol::new(sessions.clone());
         let client = docs.client().clone();
         let author = client.authors().default().await?;
         let (doc_event_tx, doc_event_rx) = async_channel::bounded(256);
@@ -446,6 +579,7 @@ impl ChatService {
         let conversation_count = index.conversations.len();
         let mut service = Self {
             endpoint: endpoint.clone(),
+            sessions,
             docs: client,
             blobs: blob_store,
             author,
@@ -969,10 +1103,10 @@ impl ChatService {
         }
         let mut join_set = tokio::task::JoinSet::new();
         for peer in peers {
-            let endpoint = self.endpoint.clone();
+            let sessions = self.sessions.clone();
             let conversation_id = conversation_id.to_owned();
             join_set.spawn(async move {
-                match send_sync_request(endpoint, peer, &conversation_id).await {
+                match send_sync_request(sessions, peer, &conversation_id).await {
                     Ok(()) => true,
                     Err(error) => {
                         trace!(
@@ -1826,10 +1960,10 @@ impl ChatService {
             }
             #[cfg(test)]
             self.invite_attempts.fetch_add(1, Ordering::Relaxed);
-            let endpoint = self.endpoint.clone();
+            let sessions = self.sessions.clone();
             let invite = invite.clone();
             tokio::spawn(async move {
-                if let Err(error) = send_invite(endpoint, peer, &invite).await {
+                if let Err(error) = send_invite(sessions, peer, &invite).await {
                     trace!(peer = %peer.fmt_short(), "chat peer not currently reachable: {error:#}");
                 }
             });
@@ -1841,13 +1975,22 @@ impl ChatService {
     }
 }
 
-async fn send_invite(endpoint: Endpoint, peer: NodeId, invite: &ChatInvite) -> Result<()> {
-    send_chat_packet(endpoint, peer, ChatProtocolMessage::Invite(invite.clone())).await
+async fn send_invite(sessions: ChatSessionPool, peer: NodeId, invite: &ChatInvite) -> Result<()> {
+    send_chat_packet(
+        sessions,
+        peer,
+        ChatProtocolMessage::Invite(invite.clone()),
+    )
+    .await
 }
 
-async fn send_sync_request(endpoint: Endpoint, peer: NodeId, conversation_id: &str) -> Result<()> {
+async fn send_sync_request(
+    sessions: ChatSessionPool,
+    peer: NodeId,
+    conversation_id: &str,
+) -> Result<()> {
     send_chat_packet(
-        endpoint,
+        sessions,
         peer,
         ChatProtocolMessage::SyncRequest(SyncRequest {
             kind: "sync-request".to_owned(),
@@ -1859,7 +2002,7 @@ async fn send_sync_request(endpoint: Endpoint, peer: NodeId, conversation_id: &s
 }
 
 async fn send_chat_packet(
-    endpoint: Endpoint,
+    sessions: ChatSessionPool,
     peer: NodeId,
     packet: ChatProtocolMessage,
 ) -> Result<()> {
@@ -1867,26 +2010,88 @@ async fn send_chat_packet(
     if payload.len() > MAX_INVITE_BYTES {
         bail!("chat protocol message exceeds safety cap");
     }
-    let connection: Connection = endpoint.connect(NodeAddr::from(peer), CHAT_ALPN).await?;
+    // Prefer a warm session; on stream failure drop it and dial once more.
+    for attempt in 0..2 {
+        let connection = if attempt == 0 {
+            sessions.connect(peer).await?
+        } else {
+            sessions.invalidate(peer).await;
+            sessions
+                .endpoint
+                .connect(NodeAddr::from(peer), CHAT_ALPN)
+                .await?
+        };
+        match send_chat_packet_on(&connection, &payload).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    sessions.insert(peer, connection).await;
+                } else {
+                    sessions.touch(peer).await;
+                }
+                match &packet {
+                    ChatProtocolMessage::Invite(invite) => {
+                        info!(
+                            peer = %peer.fmt_short(),
+                            conversation = %log_id(&invite.conversation.id),
+                            reused = attempt == 0,
+                            "chat invitation sent"
+                        );
+                    }
+                    ChatProtocolMessage::SyncRequest(request) => {
+                        debug!(
+                            peer = %peer.fmt_short(),
+                            conversation = %log_id(&request.conversation_id),
+                            reused = attempt == 0,
+                            "chat delivery wake-up sent"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Err(error) if attempt == 0 => {
+                trace!(
+                    peer = %peer.fmt_short(),
+                    "chat session send failed; redialing: {error:#}"
+                );
+                sessions.invalidate(peer).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("chat send loop exits via return");
+}
+
+async fn send_chat_packet_on(connection: &Connection, payload: &[u8]) -> Result<()> {
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&(payload.len() as u32).to_be_bytes())
         .await?;
-    send.write_all(&payload).await?;
+    send.write_all(payload).await?;
     send.finish()?;
     let mut ack = [0u8; 2];
     recv.read_exact(&mut ack).await?;
     if &ack != b"ok" {
         bail!("chat peer returned an invalid protocol acknowledgement");
     }
-    match packet {
-        ChatProtocolMessage::Invite(invite) => {
-            info!(peer = %peer.fmt_short(), conversation = %log_id(&invite.conversation.id), "chat invitation sent");
-        }
-        ChatProtocolMessage::SyncRequest(request) => {
-            debug!(peer = %peer.fmt_short(), conversation = %log_id(&request.conversation_id), "chat delivery wake-up sent");
-        }
-    }
     Ok(())
+}
+
+async fn accept_chat_stream(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<ChatProtocolMessage> {
+    let mut length = [0u8; 4];
+    recv.read_exact(&mut length).await?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_INVITE_BYTES {
+        bail!("chat invitation exceeds safety cap");
+    }
+    let mut bytes = vec![0; length];
+    recv.read_exact(&mut bytes).await?;
+    let message: ChatProtocolMessage =
+        serde_json::from_slice(&bytes).context("invalid Wire chat protocol message")?;
+    send.write_all(b"ok").await?;
+    send.finish()?;
+    Ok(message)
 }
 
 fn log_id(value: &str) -> &str {
