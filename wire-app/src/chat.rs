@@ -43,8 +43,12 @@ const RETRY_TICK: Duration = Duration::from_secs(1);
 const MAX_RETRY_SECONDS: u64 = 60;
 /// Keep chat-plane QUIC sessions warm for bursty back-and-forth.
 /// See `docs/chat-keepalive-sessions.md`.
-const CHAT_SESSION_IDLE: Duration = Duration::from_secs(90);
+const CHAT_SESSION_IDLE: Duration = Duration::from_secs(60);
 const CHAT_SESSION_POOL_CAP: usize = 8;
+/// Bound stream/connect waits so a half-open pooled session cannot stall the
+/// chat worker (logs showed ~30s hangs → “queued” / stalled delivery).
+const CHAT_STREAM_TIMEOUT: Duration = Duration::from_secs(3);
+const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,8 +373,13 @@ impl ProtocolHandler for ChatInviteProtocol {
                                 idle.as_mut().reset(
                                     tokio::time::Instant::now() + CHAT_SESSION_IDLE,
                                 );
-                                match accept_chat_stream(&mut send, &mut recv).await {
-                                    Ok(message) => {
+                                match tokio::time::timeout(
+                                    CHAT_STREAM_TIMEOUT,
+                                    accept_chat_stream(&mut send, &mut recv),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(message)) => {
                                         if tx
                                             .send(IncomingInvite { remote, message })
                                             .await
@@ -379,10 +388,17 @@ impl ProtocolHandler for ChatInviteProtocol {
                                             break;
                                         }
                                     }
-                                    Err(error) => {
+                                    Ok(Err(error)) => {
                                         warn!(
                                             peer = %remote.fmt_short(),
                                             "chat session stream failed: {error:#}"
+                                        );
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            peer = %remote.fmt_short(),
+                                            "chat session stream timed out"
                                         );
                                         break;
                                     }
@@ -398,7 +414,10 @@ impl ProtocolHandler for ChatInviteProtocol {
                     _ = connection.closed() => break,
                 }
             }
-            sessions.remove(remote).await;
+            // Drop both pool entry and the QUIC session so the peer does not
+            // keep a half-open pooled handle that hangs on open_bi.
+            sessions.invalidate(remote).await;
+            connection.close(0u32.into(), b"chat-idle");
             Ok(())
         }
         .boxed()
@@ -432,13 +451,15 @@ impl ChatSessionPool {
     async fn insert(&self, peer: NodeId, connection: Connection) {
         let mut guard = self.inner.lock().await;
         Self::sweep_locked(&mut guard);
-        guard.insert(
+        if let Some(previous) = guard.insert(
             peer,
             HotSession {
                 connection,
                 last_used: tokio::time::Instant::now(),
             },
-        );
+        ) {
+            previous.connection.close(0u32.into(), b"chat-replaced");
+        }
         Self::evict_locked(&mut guard);
     }
 
@@ -449,25 +470,30 @@ impl ChatSessionPool {
         }
     }
 
-    async fn remove(&self, peer: NodeId) {
-        self.inner.lock().await.remove(&peer);
-    }
-
     async fn get(&self, peer: NodeId) -> Option<Connection> {
         let mut guard = self.inner.lock().await;
         Self::sweep_locked(&mut guard);
-        let session = guard.get_mut(&peer)?;
-        session.last_used = tokio::time::Instant::now();
-        Some(session.connection.clone())
+        guard.get(&peer).map(|session| session.connection.clone())
     }
 
     async fn invalidate(&self, peer: NodeId) {
-        self.inner.lock().await.remove(&peer);
+        if let Some(session) = self.inner.lock().await.remove(&peer) {
+            session.connection.close(0u32.into(), b"chat-invalid");
+        }
     }
 
     fn sweep_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
         let now = tokio::time::Instant::now();
-        sessions.retain(|_, session| now.duration_since(session.last_used) < CHAT_SESSION_IDLE);
+        let stale: Vec<_> = sessions
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_used) >= CHAT_SESSION_IDLE)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in stale {
+            if let Some(session) = sessions.remove(&peer) {
+                session.connection.close(0u32.into(), b"chat-idle");
+            }
+        }
     }
 
     fn evict_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
@@ -479,18 +505,20 @@ impl ChatSessionPool {
             let Some(peer) = oldest else {
                 break;
             };
-            sessions.remove(&peer);
+            if let Some(session) = sessions.remove(&peer) {
+                session.connection.close(0u32.into(), b"chat-evicted");
+            }
         }
     }
 
-    async fn connect(&self, peer: NodeId) -> Result<Connection> {
-        if let Some(connection) = self.get(peer).await {
-            return Ok(connection);
-        }
-        let connection = self
-            .endpoint
-            .connect(NodeAddr::from(peer), CHAT_ALPN)
-            .await?;
+    async fn dial(&self, peer: NodeId) -> Result<Connection> {
+        let connection = tokio::time::timeout(
+            CHAT_CONNECT_TIMEOUT,
+            self.endpoint.connect(NodeAddr::from(peer), CHAT_ALPN),
+        )
+        .await
+        .context("chat connect timed out")?
+        .context("chat connect failed")?;
         self.insert(peer, connection.clone()).await;
         Ok(connection)
     }
@@ -1214,8 +1242,10 @@ impl ChatService {
                     history_epoch = epoch,
                     "chat history deleted and conversation rotated onto a fresh document"
                 );
-                // Peers on a stale document need a new ticket, not only a pull nudge.
-                self.invite_members(&conversation_id);
+                // Peers on a stale document need the new ticket before a pull
+                // nudge — keep-alive made SyncRequest often win the race and
+                // get ignored as non-member.
+                self.invite_members_wait(&conversation_id).await;
                 let _ = self.wake_members(&conversation_id).await;
             }
             Err(error) => {
@@ -1951,13 +1981,7 @@ impl ChatService {
             conversation: stored.public.clone(),
             ticket: stored.ticket.clone(),
         };
-        for member in &stored.public.members {
-            let Ok(peer) = NodeId::from_str(member) else {
-                continue;
-            };
-            if peer == self.our_node_id {
-                continue;
-            }
+        for peer in self.other_members(stored) {
             #[cfg(test)]
             self.invite_attempts.fetch_add(1, Ordering::Relaxed);
             let sessions = self.sessions.clone();
@@ -1968,6 +1992,36 @@ impl ChatService {
                 }
             });
         }
+    }
+
+    async fn invite_members_wait(&self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return;
+        };
+        let invite = ChatInvite {
+            version: 1,
+            conversation: stored.public.clone(),
+            ticket: stored.ticket.clone(),
+        };
+        let mut join_set = tokio::task::JoinSet::new();
+        for peer in self.other_members(stored) {
+            #[cfg(test)]
+            self.invite_attempts.fetch_add(1, Ordering::Relaxed);
+            let sessions = self.sessions.clone();
+            let invite = invite.clone();
+            join_set.spawn(async move { send_invite(sessions, peer, &invite).await.is_ok() });
+        }
+        while join_set.join_next().await.is_some() {}
+    }
+
+    fn other_members(&self, stored: &StoredConversation) -> Vec<NodeId> {
+        stored
+            .public
+            .members
+            .iter()
+            .filter_map(|member| NodeId::from_str(member).ok())
+            .filter(|peer| *peer != self.our_node_id)
+            .collect()
     }
 
     fn persist_index(&self) -> Result<()> {
@@ -2010,30 +2064,33 @@ async fn send_chat_packet(
     if payload.len() > MAX_INVITE_BYTES {
         bail!("chat protocol message exceeds safety cap");
     }
-    // Prefer a warm session; on stream failure drop it and dial once more.
+    // Prefer a warm session; on stream/connect failure drop it and dial once.
+    let mut reused = false;
     for attempt in 0..2 {
         let connection = if attempt == 0 {
-            sessions.connect(peer).await?
+            if let Some(connection) = sessions.get(peer).await {
+                reused = true;
+                connection
+            } else {
+                reused = false;
+                sessions.dial(peer).await?
+            }
         } else {
             sessions.invalidate(peer).await;
-            sessions
-                .endpoint
-                .connect(NodeAddr::from(peer), CHAT_ALPN)
-                .await?
+            reused = false;
+            sessions.dial(peer).await?
         };
-        match send_chat_packet_on(&connection, &payload).await {
-            Ok(()) => {
-                if attempt > 0 {
-                    sessions.insert(peer, connection).await;
-                } else {
-                    sessions.touch(peer).await;
-                }
+        match tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
+            .await
+        {
+            Ok(Ok(())) => {
+                sessions.touch(peer).await;
                 match &packet {
                     ChatProtocolMessage::Invite(invite) => {
                         info!(
                             peer = %peer.fmt_short(),
                             conversation = %log_id(&invite.conversation.id),
-                            reused = attempt == 0,
+                            reused,
                             "chat invitation sent"
                         );
                     }
@@ -2041,21 +2098,26 @@ async fn send_chat_packet(
                         debug!(
                             peer = %peer.fmt_short(),
                             conversation = %log_id(&request.conversation_id),
-                            reused = attempt == 0,
+                            reused,
                             "chat delivery wake-up sent"
                         );
                     }
                 }
                 return Ok(());
             }
-            Err(error) if attempt == 0 => {
+            Ok(Err(error)) if attempt == 0 => {
                 trace!(
                     peer = %peer.fmt_short(),
                     "chat session send failed; redialing: {error:#}"
                 );
                 sessions.invalidate(peer).await;
             }
-            Err(error) => return Err(error),
+            Err(_) if attempt == 0 => {
+                trace!(peer = %peer.fmt_short(), "chat session send timed out; redialing");
+                sessions.invalidate(peer).await;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => bail!("chat session send timed out"),
         }
     }
     unreachable!("chat send loop exits via return");

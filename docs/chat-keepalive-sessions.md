@@ -35,10 +35,12 @@ an unreachable peer.
 **Implemented** (chat ALPN session pool):
 
 - `ChatSessionPool` holds up to 8 peer QUIC connections
-- Idle drop after **90s** without streams
+- Idle drop after **60s** without streams; connection is **explicitly closed**
 - Outbound `SyncRequest` / invite reuse pooled connections (`open_bi`)
 - Inbound accept loops on multiple bi-streams until idle or `connection.closed()`
-- Failed streams invalidate the pool entry and redial once
+- **3s stream / 5s connect timeouts** so half-open pooled sessions cannot stall
+  the chat worker (observed ~30s hangs after the first warm seconds)
+- Failed/timed-out streams invalidate + close the pool entry and redial once
 
 Still open: piggyback docs/blob traffic on the same session; measure burst RTT
 in the wild after the offline-queue work.
