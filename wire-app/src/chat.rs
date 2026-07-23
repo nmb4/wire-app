@@ -13,8 +13,10 @@ use anyhow::{bail, Context, Result};
 use futures_lite::StreamExt;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint, NodeAddr, NodeId};
 use iroh_blobs::{
+    downloader::DownloadRequest,
     net_protocol::Blobs,
-    store::{fs::Store as BlobStore, Map},
+    store::{fs::Store as BlobStore, Map, Store},
+    BlobFormat, Hash, HashAndFormat,
 };
 use iroh_docs::{
     engine::LiveEvent,
@@ -104,8 +106,25 @@ pub struct ChatMessage {
     /// older peers / historical entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChatAttachment>,
     #[serde(skip)]
     pub deletion: Option<MessageDeletion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatAttachment {
+    pub id: String,
+    pub name: String,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub hash: String,
+    /// Present only on the local UI side or after the referenced blob was
+    /// downloaded. The original bytes are never embedded in message metadata.
+    #[serde(skip)]
+    pub data: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +141,14 @@ pub enum DeleteScope {
 
 impl ChatMessage {
     pub fn new(author_id: NodeId, body: String) -> Self {
+        Self::new_with_attachments(author_id, body, Vec::new())
+    }
+
+    pub fn new_with_attachments(
+        author_id: NodeId,
+        body: String,
+        attachments: Vec<ChatAttachment>,
+    ) -> Self {
         let sent_at = now_millis();
         let nonce = next_nonce();
         let mut hasher = Sha256::new();
@@ -129,6 +156,10 @@ impl ChatMessage {
         hasher.update(sent_at.to_be_bytes());
         hasher.update(nonce.to_be_bytes());
         hasher.update(body.as_bytes());
+        for attachment in &attachments {
+            hasher.update(attachment.hash.as_bytes());
+            hasher.update(attachment.byte_len.to_be_bytes());
+        }
         let message_id = hex_bytes(&hasher.finalize());
         Self {
             version: 1,
@@ -138,6 +169,7 @@ impl ChatMessage {
             body,
             nonce,
             client_version: Some(crate::APP_VERSION.to_owned()),
+            attachments,
             deletion: None,
         }
     }
@@ -153,7 +185,7 @@ impl ChatMessage {
         if self.version != 1 {
             bail!("unsupported message version {}", self.version);
         }
-        if self.body.trim().is_empty() {
+        if self.body.trim().is_empty() && self.attachments.is_empty() {
             bail!("message is empty");
         }
         if self.body.len() > MAX_MESSAGE_BYTES {
@@ -161,6 +193,22 @@ impl ChatMessage {
         }
         if !is_message_id(&self.message_id) || self.author_id.is_empty() {
             bail!("message identity is incomplete");
+        }
+        if self.attachments.len() > 128 {
+            bail!("message has more than 128 attachments");
+        }
+        for attachment in &self.attachments {
+            if attachment.id.is_empty()
+                || attachment.name.is_empty()
+                || attachment.name.len() > 1024
+                || attachment.media_type.len() > 128
+                || attachment.byte_len == 0
+                || attachment.width == 0
+                || attachment.height == 0
+                || Hash::from_str(&attachment.hash).is_err()
+            {
+                bail!("image attachment metadata is incomplete");
+            }
         }
         Ok(())
     }
@@ -654,6 +702,9 @@ pub struct ChatService {
     last_receipt_wake: BTreeMap<String, tokio::time::Instant>,
     /// Consecutive failed wake probes per conversation.
     wake_failures: BTreeMap<String, u8>,
+    max_image_bytes: Option<u64>,
+    attachment_downloads: BTreeSet<Hash>,
+    blob_downloader: iroh_blobs::downloader::Downloader,
     #[cfg(test)]
     invite_attempts: AtomicU64,
 }
@@ -672,6 +723,11 @@ pub(crate) enum ChatInput {
     WakeFinished {
         conversation_id: String,
         reached: bool,
+    },
+    AttachmentDownloadFinished {
+        conversation_id: String,
+        hash: Hash,
+        succeeded: bool,
     },
     Retry,
 }
@@ -703,6 +759,7 @@ impl ChatService {
         let blob_store = BlobStore::load(&blobs_path).await?;
         debug!("chat blob store opened");
         let blobs = Blobs::builder(blob_store.clone()).build(&endpoint);
+        let blob_downloader = blobs.downloader().clone();
         let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
         let docs = Docs::persistent(docs_path).spawn(&blobs, &gossip).await?;
         debug!("persistent Iroh Docs engine opened");
@@ -743,6 +800,9 @@ impl ChatService {
             wake_inflight: BTreeMap::new(),
             last_receipt_wake: BTreeMap::new(),
             wake_failures: BTreeMap::new(),
+            max_image_bytes: None,
+            attachment_downloads: BTreeSet::new(),
+            blob_downloader,
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
         };
@@ -877,9 +937,7 @@ impl ChatService {
                         "sync-request",
                     );
                     if self.is_conversation_member(&request.conversation_id, incoming.remote) {
-                        if let Err(error) = self
-                            .apply_sync_request(incoming.remote, &request)
-                            .await
+                        if let Err(error) = self.apply_sync_request(incoming.remote, &request).await
                         {
                             warn!(
                                 conversation = %log_id(&request.conversation_id),
@@ -936,6 +994,20 @@ impl ChatService {
                 reached,
             } => {
                 self.apply_wake_finished(&conversation_id, reached).await;
+            }
+            ChatInput::AttachmentDownloadFinished {
+                conversation_id,
+                hash,
+                succeeded,
+            } => {
+                self.attachment_downloads.remove(&hash);
+                if succeeded {
+                    if let Err(error) = self.publish_timeline(&conversation_id).await {
+                        return Some(ChatNotification::Error(format!(
+                            "Could not refresh downloaded image: {error:#}"
+                        )));
+                    }
+                }
             }
             ChatInput::Retry => {
                 self.retry_due_deliveries().await;
@@ -1015,6 +1087,14 @@ impl ChatService {
     }
 
     pub async fn send_message(&mut self, conversation_id: String, message: ChatMessage) {
+        if let Err(error) = self.import_attachment_bytes(&message).await {
+            self.queued.push_back(ChatNotification::Delivery {
+                message_id: message.message_id.clone(),
+                state: DeliveryState::Failed,
+                detail: Some(error.to_string()),
+            });
+            return;
+        }
         let message_id = message.message_id.clone();
         let body_bytes = message.body.len();
         match self.insert_message(&conversation_id, &message).await {
@@ -1060,6 +1140,47 @@ impl ChatService {
                 });
             }
         }
+    }
+
+    pub fn set_max_image_bytes(&mut self, max_image_bytes: Option<u64>) {
+        self.max_image_bytes = max_image_bytes;
+        let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
+        for id in ids {
+            if let Err(error) = self.doc_event_tx.try_send(DocumentSignal::Changed {
+                conversation_id: id,
+                from_remote: false,
+            }) {
+                trace!("could not queue image-limit refresh: {error}");
+            }
+        }
+    }
+
+    async fn import_attachment_bytes(&self, message: &ChatMessage) -> Result<()> {
+        for attachment in &message.attachments {
+            let expected = Hash::from_str(&attachment.hash)?;
+            if let Some(data) = &attachment.data {
+                if data.len() as u64 != attachment.byte_len
+                    || Hash::new(data.as_slice()) != expected
+                {
+                    bail!("image attachment changed before it was sent");
+                }
+                let tag = self
+                    .blobs
+                    .import_bytes(data.as_slice().to_vec().into(), BlobFormat::Raw)
+                    .await?;
+                if *tag.hash() != expected {
+                    bail!("image attachment hash mismatch");
+                }
+            } else if !self
+                .blobs
+                .get(&expected)
+                .await?
+                .is_some_and(|blob| blob.is_complete())
+            {
+                bail!("image attachment bytes are unavailable");
+            }
+        }
+        Ok(())
     }
 
     fn is_conversation_member(&self, conversation_id: &str, node: NodeId) -> bool {
@@ -1217,7 +1338,11 @@ impl ChatService {
                 self.wake_inflight.remove(conversation_id);
             }
         }
-        let inflight = self.wake_inflight.get(conversation_id).copied().unwrap_or(0);
+        let inflight = self
+            .wake_inflight
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(0);
         let pending: Vec<_> = self
             .pending_deliveries
             .iter()
@@ -1358,13 +1483,7 @@ impl ChatService {
             .index
             .conversations
             .iter()
-            .filter(|(_, stored)| {
-                stored
-                    .public
-                    .members
-                    .iter()
-                    .any(|member| member == &peer_s)
-            })
+            .filter(|(_, stored)| stored.public.members.iter().any(|member| member == &peer_s))
             .map(|(id, _)| id.clone())
             .filter(|id| {
                 self.pending_deliveries
@@ -1391,7 +1510,12 @@ impl ChatService {
         // publish_timeline in the caller handles that. Extra resume/wake here
         // was flooding the peer (~20 wakes/sec in logs) and delaying receipts.
         if self.retry_state.contains_key(conversation_id)
-            || self.wake_inflight.get(conversation_id).copied().unwrap_or(0) > 0
+            || self
+                .wake_inflight
+                .get(conversation_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
         {
             return;
         }
@@ -1852,7 +1976,9 @@ impl ChatService {
         } else {
             Vec::new()
         };
-        let old_document_id = current.as_ref().map(|stored| stored.public.document_id.clone());
+        let old_document_id = current
+            .as_ref()
+            .map(|stored| stored.public.document_id.clone());
         if history_reset {
             self.forget_conversation_local_state(&id);
         }
@@ -2039,6 +2165,7 @@ impl ChatService {
             .context("unknown conversation")?;
         let mut messages = self.load_messages(&stored).await?;
         self.merge_staged_inbound(id, &mut messages);
+        self.request_missing_attachments(id, &messages).await;
         for message in &messages {
             if message.author_id != self.our_node_id.to_string() {
                 if let Some(version) = message.client_version.as_deref() {
@@ -2113,6 +2240,73 @@ impl ChatService {
             messages,
         });
         Ok(())
+    }
+
+    async fn request_missing_attachments(
+        &mut self,
+        conversation_id: &str,
+        messages: &[ChatMessage],
+    ) {
+        let providers = self
+            .index
+            .conversations
+            .get(conversation_id)
+            .map(|stored| {
+                stored
+                    .public
+                    .members
+                    .iter()
+                    .filter_map(|member| NodeId::from_str(member).ok())
+                    .filter(|member| *member != self.our_node_id)
+                    .map(NodeAddr::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for message in messages {
+            if message.author_id == self.our_node_id.to_string() {
+                continue;
+            }
+            for attachment in &message.attachments {
+                if self
+                    .max_image_bytes
+                    .is_some_and(|limit| attachment.byte_len > limit)
+                {
+                    continue;
+                }
+                let Ok(hash) = Hash::from_str(&attachment.hash) else {
+                    continue;
+                };
+                if attachment.data.is_some() || !self.attachment_downloads.insert(hash) {
+                    continue;
+                }
+                let downloader = self.blob_downloader.clone();
+                let tx = self.wake_tx.clone();
+                let conversation_id = conversation_id.to_owned();
+                let providers = providers.clone();
+                if providers.is_empty() {
+                    self.attachment_downloads.remove(&hash);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let request = DownloadRequest::new(HashAndFormat::raw(hash), providers);
+                    let handle = downloader.queue(request).await;
+                    let succeeded = match handle.await {
+                        Ok(_) => true,
+                        Err(error) => {
+                            trace!(image = %hash.fmt_short(), "image download failed: {error}");
+                            false
+                        }
+                    };
+                    let _ = tx
+                        .send(ChatInput::AttachmentDownloadFinished {
+                            conversation_id,
+                            hash,
+                            succeeded,
+                        })
+                        .await;
+                });
+            }
+        }
     }
 
     async fn acknowledge_received_messages(
@@ -2235,6 +2429,23 @@ impl ChatService {
                 continue;
             };
             if message.validate().is_ok() {
+                let mut message = message;
+                for attachment in &mut message.attachments {
+                    let Ok(hash) = Hash::from_str(&attachment.hash) else {
+                        continue;
+                    };
+                    let Some(blob) = self.blobs.get(&hash).await? else {
+                        continue;
+                    };
+                    if !blob.is_complete() {
+                        continue;
+                    }
+                    let len = usize::try_from(attachment.byte_len).unwrap_or(usize::MAX);
+                    let mut reader = blob.data_reader();
+                    if let Ok(bytes) = reader.read_at(0, len).await {
+                        attachment.data = Some(Arc::new(bytes.to_vec()));
+                    }
+                }
                 messages
                     .entry(message.message_id.clone())
                     .or_insert((message, entry.author()));
@@ -2490,12 +2701,7 @@ impl ChatService {
 }
 
 async fn send_invite(sessions: ChatSessionPool, peer: NodeId, invite: &ChatInvite) -> Result<()> {
-    send_chat_packet(
-        sessions,
-        peer,
-        ChatProtocolMessage::Invite(invite.clone()),
-    )
-    .await
+    send_chat_packet(sessions, peer, ChatProtocolMessage::Invite(invite.clone())).await
 }
 
 async fn send_sync_request(
@@ -2538,14 +2744,8 @@ async fn wake_peers(
         let ticket = ticket.map(str::to_owned);
         let payload = payload.clone();
         join_set.spawn(async move {
-            match send_sync_request(
-                sessions,
-                peer,
-                &conversation_id,
-                ticket.as_deref(),
-                payload,
-            )
-            .await
+            match send_sync_request(sessions, peer, &conversation_id, ticket.as_deref(), payload)
+                .await
             {
                 Ok(()) => true,
                 Err(error) => {
@@ -2661,8 +2861,11 @@ async fn send_chat_packet(
 
     // Try warm session with a tight timeout, then fresh dial.
     if let Some(connection) = sessions.get(peer).await {
-        match tokio::time::timeout(CHAT_REUSE_TIMEOUT, send_chat_packet_on(&connection, &payload))
-            .await
+        match tokio::time::timeout(
+            CHAT_REUSE_TIMEOUT,
+            send_chat_packet_on(&connection, &payload),
+        )
+        .await
         {
             Ok(Ok(())) => {
                 sessions.touch(peer).await;
@@ -2684,8 +2887,11 @@ async fn send_chat_packet(
         }
     }
     let connection = sessions.dial(peer).await?;
-    match tokio::time::timeout(CHAT_STREAM_TIMEOUT, send_chat_packet_on(&connection, &payload))
-        .await
+    match tokio::time::timeout(
+        CHAT_STREAM_TIMEOUT,
+        send_chat_packet_on(&connection, &payload),
+    )
+    .await
     {
         Ok(Ok(())) => {
             sessions.touch(peer).await;
@@ -2957,6 +3163,38 @@ mod tests {
         let decoded: ChatMessage = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.deletion, None);
         assert!(!String::from_utf8(encoded).unwrap().contains("deletion"));
+    }
+
+    #[test]
+    fn legacy_messages_default_to_no_attachments() {
+        let message = ChatMessage::new(node(1), "legacy".to_owned());
+        let mut value = serde_json::to_value(message).unwrap();
+        value.as_object_mut().unwrap().remove("attachments");
+        let decoded: ChatMessage = serde_json::from_value(value).unwrap();
+        assert!(decoded.attachments.is_empty());
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn image_only_messages_carry_metadata_not_bytes() {
+        let bytes = Arc::new(vec![1, 2, 3, 4]);
+        let hash = Hash::new(bytes.as_slice()).to_string();
+        let attachment = ChatAttachment {
+            id: hash.clone(),
+            name: "pixel.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            byte_len: bytes.len() as u64,
+            width: 1,
+            height: 1,
+            hash,
+            data: Some(bytes),
+        };
+        let message = ChatMessage::new_with_attachments(node(1), String::new(), vec![attachment]);
+        assert!(message.validate().is_ok());
+        let encoded = serde_json::to_vec(&message).unwrap();
+        assert!(!encoded.windows(9).any(|window| window == b"1,2,3,4"));
+        let decoded: ChatMessage = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.attachments[0].data.is_none());
     }
 
     #[test]

@@ -27,8 +27,8 @@ use wire::{
 
 use crate::{
     chat::{
-        self, ChatConversation, ChatMessage, ChatNotification, ConversationKind, DeleteScope,
-        DeliveryState, MessageDeletion, RetentionPolicy,
+        self, ChatAttachment, ChatConversation, ChatMessage, ChatNotification, ConversationKind,
+        DeleteScope, DeliveryState, MessageDeletion, RetentionPolicy,
     },
     dev_pair::DevPairState,
     notifications::{NotificationAction, NotificationService},
@@ -186,6 +186,7 @@ struct AppState {
     chat_notifications_ready: bool,
     chat_retention: RetentionPolicy,
     chat_style: ChatStyle,
+    max_image_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -209,11 +210,36 @@ struct ChatUiState {
     delivery: BTreeMap<String, (DeliveryState, Option<String>)>,
     selected: Option<String>,
     composer: String,
+    draft_attachments: Vec<ChatAttachment>,
+    attachment_textures: BTreeMap<String, egui::TextureHandle>,
+    image_preview: Option<ImagePreview>,
     error: Option<String>,
     service_error: Option<String>,
     show_group_editor: bool,
     group_name: String,
     group_members: BTreeSet<NodeId>,
+}
+
+#[derive(Clone)]
+struct ImagePreview {
+    attachment: ChatAttachment,
+    draft: bool,
+    mode: ImagePreviewMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ImagePreviewMode {
+    #[default]
+    Floating,
+    FillWindow,
+    Fullscreen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImagePreviewAction {
+    Close,
+    Delete,
+    SetMode(ImagePreviewMode),
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -302,6 +328,8 @@ struct Settings {
     chat_retention: RetentionPolicy,
     #[serde(default)]
     chat_style: ChatStyle,
+    #[serde(default)]
+    max_image_bytes: Option<u64>,
 }
 
 impl Default for Settings {
@@ -314,6 +342,7 @@ impl Default for Settings {
             configured: false,
             chat_retention: RetentionPolicy::Unlimited,
             chat_style: ChatStyle::default(),
+            max_image_bytes: None,
         }
     }
 }
@@ -459,6 +488,7 @@ impl App {
             chat_notifications_ready: false,
             chat_retention: settings.chat_retention,
             chat_style: settings.chat_style,
+            max_image_bytes: settings.max_image_bytes,
         };
 
         if has_saved_settings {
@@ -469,6 +499,9 @@ impl App {
                 video_config: state.video_config,
             });
         }
+        state.cmd(Command::SetMaxImageBytes {
+            max_image_bytes: state.max_image_bytes,
+        });
 
         let rounded = window_frame::style_wants_rounded(state.window_frame_style);
         let app = App {
@@ -523,6 +556,17 @@ impl AppState {
         self.handle_view_mode_input(ctx);
         if self.app_mode == AppMode::Text && self.stream_view_mode != StreamViewMode::Normal {
             self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+        }
+        if self.app_mode != AppMode::Text {
+            if self
+                .chat
+                .image_preview
+                .as_ref()
+                .is_some_and(|preview| preview.mode == ImagePreviewMode::Fullscreen)
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            self.chat.image_preview = None;
         }
 
         if !self.stream_view_mode.is_fullscreen() {
@@ -1114,7 +1158,14 @@ impl AppState {
                             id.clone(),
                             conversation_title.clone(),
                             author,
-                            ellipsize(message.body.trim(), 180),
+                            if message.body.trim().is_empty() {
+                                match message.attachments.len() {
+                                    1 => "Image".to_owned(),
+                                    count => format!("{count} images"),
+                                }
+                            } else {
+                                ellipsize(message.body.trim(), 180)
+                            },
                         );
                     }
                 }
@@ -1136,7 +1187,16 @@ impl AppState {
 
     fn handle_view_mode_input(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.focused_stream.is_some() {
+            if let Some(mode) = self.chat.image_preview.as_ref().map(|preview| preview.mode) {
+                if mode == ImagePreviewMode::Fullscreen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+                if mode == ImagePreviewMode::Floating {
+                    self.chat.image_preview = None;
+                } else if let Some(preview) = &mut self.chat.image_preview {
+                    preview.mode = ImagePreviewMode::Floating;
+                }
+            } else if self.focused_stream.is_some() {
                 self.focused_stream = None;
             } else {
                 self.set_stream_view_mode(ctx, StreamViewMode::Normal);
@@ -1235,6 +1295,7 @@ impl AppState {
             configured: true,
             chat_retention: self.chat_retention,
             chat_style: self.chat_style,
+            max_image_bytes: self.max_image_bytes,
         });
     }
 
@@ -1661,8 +1722,19 @@ impl AppState {
             .unwrap_or_else(|| conversation.title.clone());
 
         const HEADER: f32 = 72.0;
-        const COMPOSER: f32 = 92.0;
         const GAP: f32 = 10.0;
+        self.collect_chat_image_input(ui.ctx());
+        let composer_rows = composer_visual_rows(
+            &self.chat.composer,
+            (ui.available_width() - 80.0).max(120.0),
+        );
+        let editor_height = 10.0 + composer_rows as f32 * 20.0;
+        let composer_height = editor_height + 64.0;
+        let preview_height = if self.chat.draft_attachments.is_empty() {
+            0.0
+        } else {
+            62.0
+        };
         let rect = ui.max_rect();
         let surface_rect = egui::Rect::from_min_max(
             rect.min + Vec2::new(0.0, 10.0),
@@ -1671,12 +1743,24 @@ impl AppState {
         let header =
             egui::Rect::from_min_size(surface_rect.min, Vec2::new(surface_rect.width(), HEADER));
         let composer = egui::Rect::from_min_max(
-            egui::pos2(surface_rect.min.x, surface_rect.max.y - COMPOSER),
+            egui::pos2(surface_rect.min.x, surface_rect.max.y - composer_height),
             surface_rect.max,
         );
+        let previews = egui::Rect::from_min_max(
+            egui::pos2(
+                surface_rect.min.x,
+                composer.min.y - preview_height - if preview_height > 0.0 { GAP } else { 0.0 },
+            ),
+            egui::pos2(surface_rect.max.x, composer.min.y - GAP),
+        );
+        let message_bottom = if preview_height > 0.0 {
+            previews.min.y - GAP
+        } else {
+            composer.min.y - GAP
+        };
         let messages = egui::Rect::from_min_max(
             egui::pos2(surface_rect.min.x, header.max.y + GAP),
-            egui::pos2(surface_rect.max.x, composer.min.y - GAP),
+            egui::pos2(surface_rect.max.x, message_bottom),
         );
 
         paint_chat_card(ui, header, pal, 18);
@@ -1812,27 +1896,68 @@ impl AppState {
                 });
         });
 
-        paint_chat_card(ui, composer, pal, 18);
+        if !self.chat.draft_attachments.is_empty() {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(previews), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(previews));
+                egui::ScrollArea::horizontal()
+                    .id_salt("chat-draft-images")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for attachment in self.chat.draft_attachments.clone() {
+                                if let Some(texture) = attachment_texture(
+                                    ui.ctx(),
+                                    &mut self.chat.attachment_textures,
+                                    &attachment,
+                                ) {
+                                    let response = square_attachment_preview(
+                                        ui,
+                                        pal,
+                                        texture,
+                                        attachment.width,
+                                        attachment.height,
+                                        56.0,
+                                    );
+                                    if response.clicked() {
+                                        self.chat.image_preview = Some(ImagePreview {
+                                            attachment,
+                                            draft: true,
+                                            mode: ImagePreviewMode::Floating,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+        }
+
+        paint_chat_card(ui, composer, pal, 22);
         let composer_inner = composer.shrink2(Vec2::new(14.0, 10.0));
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(composer_inner), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(composer_inner));
-            ui.horizontal(|ui| {
-                let editor_width = (ui.available_width() - 68.0).max(80.0);
-                let edit = ui.add_sized(
-                    [editor_width, 42.0],
-                    egui::TextEdit::multiline(&mut self.chat.composer)
-                        .hint_text(format!("Message {display_title}"))
-                        .desired_rows(2)
-                        .frame(false),
-                );
-                let keyboard_send = edit.has_focus()
-                    && ui.input(|input| {
-                        !input.modifiers.shift && input.key_pressed(egui::Key::Enter)
+            let edit = ui.add_sized(
+                [ui.available_width(), editor_height],
+                egui::TextEdit::multiline(&mut self.chat.composer)
+                    .hint_text(format!("Message {display_title}"))
+                    .desired_rows(composer_rows)
+                    .desired_width(f32::INFINITY)
+                    .frame(false),
+            );
+            let keyboard_send = edit.has_focus()
+                && ui.input(|input| !input.modifiers.shift && input.key_pressed(egui::Key::Enter));
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach images").clicked() {
+                        self.pick_chat_images();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let button_send = chat_send_button(ui, pal).clicked();
+                        if keyboard_send || button_send {
+                            self.send_chat_composer(&conversation.id);
+                        }
                     });
-                let button_send = chat_send_button(ui, pal).clicked();
-                if keyboard_send || button_send {
-                    self.send_chat_composer(&conversation.id);
-                }
+                });
             });
             if let Some(error) = self.chat.error.take() {
                 ui.add(
@@ -1841,6 +1966,7 @@ impl AppState {
                 );
             }
         });
+        self.ui_image_preview(ui.ctx(), pal);
     }
 
     fn ui_chat_message(
@@ -1928,21 +2054,34 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_max_width(640.0);
-                                let body_response = ui.add(
-                                    egui::Label::new(chat_message_body_text(
-                                        message, pal, opacity,
-                                    ))
-                                    .wrap(),
-                                );
-                                body_response.context_menu(|ui| {
-                                    chat_message_context_menu(
+                                if message.deletion.is_some() || !message.body.trim().is_empty() {
+                                    let body_response = ui.add(
+                                        egui::Label::new(chat_message_body_text(
+                                            message, pal, opacity,
+                                        ))
+                                        .wrap(),
+                                    );
+                                    body_response.context_menu(|ui| {
+                                        chat_message_context_menu(
+                                            ui,
+                                            message,
+                                            own,
+                                            &mut requested_restore,
+                                            &mut requested_deletion,
+                                        );
+                                    });
+                                }
+                                if message.deletion.is_none() {
+                                    self.ui_message_attachments(
                                         ui,
+                                        pal,
                                         message,
                                         own,
+                                        opacity,
                                         &mut requested_restore,
                                         &mut requested_deletion,
                                     );
-                                });
+                                }
                             });
                         bubble.response.context_menu(|ui| {
                             chat_message_context_menu(
@@ -2054,31 +2193,38 @@ impl AppState {
                             Layout::top_down(Align::Min),
                             |ui| {
                                 ui.set_max_width(body_width);
-                                let body_response = ui.add(
-                                    egui::Label::new(chat_message_body_text(
-                                        message, pal, opacity,
-                                    ))
-                                    .wrap(),
-                                );
-                                body_response.context_menu(|ui| {
-                                    chat_message_context_menu(
+                                if message.deletion.is_some() || !message.body.trim().is_empty() {
+                                    let body_response = ui.add(
+                                        egui::Label::new(chat_message_body_text(
+                                            message, pal, opacity,
+                                        ))
+                                        .wrap(),
+                                    );
+                                    body_response.context_menu(|ui| {
+                                        chat_message_context_menu(
+                                            ui,
+                                            message,
+                                            own,
+                                            &mut requested_restore,
+                                            &mut requested_deletion,
+                                        );
+                                    });
+                                }
+                                if message.deletion.is_none() {
+                                    self.ui_message_attachments(
                                         ui,
+                                        pal,
                                         message,
                                         own,
+                                        opacity,
                                         &mut requested_restore,
                                         &mut requested_deletion,
                                     );
-                                });
+                                }
                             },
                         );
                         if status_slot > 0.0 {
-                            chat_delivery_status_icon(
-                                ui,
-                                pal,
-                                state,
-                                detail.as_deref(),
-                                opacity,
-                            );
+                            chat_delivery_status_icon(ui, pal, state, detail.as_deref(), opacity);
                         }
                     });
                 },
@@ -2148,7 +2294,7 @@ impl AppState {
 
     fn send_chat_composer(&mut self, conversation_id: &str) {
         let body = self.chat.composer.trim().to_owned();
-        if body.is_empty() {
+        if body.is_empty() && self.chat.draft_attachments.is_empty() {
             self.chat.composer.clear();
             return;
         }
@@ -2157,7 +2303,8 @@ impl AppState {
             return;
         };
         self.chat.composer.clear();
-        let message = ChatMessage::new(author, body);
+        let attachments = std::mem::take(&mut self.chat.draft_attachments);
+        let message = ChatMessage::new_with_attachments(author, body, attachments);
         self.chat
             .delivery
             .insert(message.message_id.clone(), (DeliveryState::Pending, None));
@@ -2170,6 +2317,391 @@ impl AppState {
             conversation_id: conversation_id.to_owned(),
             message,
         });
+    }
+
+    fn collect_chat_image_input(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        for file in dropped {
+            if let Some(path) = file.path {
+                self.add_chat_image_path(&path);
+            } else if let Some(bytes) = file.bytes {
+                self.add_chat_image_bytes(
+                    if file.name.is_empty() {
+                        "dropped-image".to_owned()
+                    } else {
+                        file.name
+                    },
+                    bytes.to_vec(),
+                );
+            }
+        }
+
+        let paste_image =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::V));
+        if paste_image {
+            let before = self.chat.draft_attachments.len();
+            #[cfg(windows)]
+            {
+                use clipboard_win::Getter;
+                let mut paths = Vec::<PathBuf>::new();
+                if let Ok(_clipboard) = clipboard_win::Clipboard::new_attempts(5) {
+                    let _ = clipboard_win::formats::FileList.read_clipboard(&mut paths);
+                }
+                for path in paths {
+                    self.add_chat_image_path(&path);
+                }
+            }
+
+            #[cfg(not(target_os = "android"))]
+            if self.chat.draft_attachments.len() == before {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(image) = clipboard.get_image() {
+                        let width = image.width as u32;
+                        let height = image.height as u32;
+                        if let Some(rgba) =
+                            image::RgbaImage::from_raw(width, height, image.bytes.into_owned())
+                        {
+                            let mut bytes = std::io::Cursor::new(Vec::new());
+                            if image::DynamicImage::ImageRgba8(rgba)
+                                .write_to(&mut bytes, image::ImageFormat::Png)
+                                .is_ok()
+                            {
+                                self.add_chat_image_bytes(
+                                    format!("pasted-{}.png", chat::now_millis()),
+                                    bytes.into_inner(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if self.chat.draft_attachments.len() > before {
+                ctx.input_mut(|input| {
+                    input
+                        .events
+                        .retain(|event| !matches!(event, egui::Event::Paste(_)));
+                });
+            }
+        }
+    }
+
+    fn pick_chat_images(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "Images",
+                &[
+                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico", "pnm", "qoi",
+                    "tga", "avif", "dds", "ff", "hdr", "exr",
+                ],
+            )
+            .pick_files()
+        {
+            for path in paths {
+                self.add_chat_image_path(&path);
+            }
+        }
+    }
+
+    fn add_chat_image_path(&mut self, path: &Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => self.add_chat_image_bytes(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image")
+                    .to_owned(),
+                bytes,
+            ),
+            Err(error) => {
+                self.chat.error = Some(format!("Could not read {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn add_chat_image_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.chat.error = Some(format!("{name} is not a supported image: {error}"));
+                return;
+            }
+        };
+        let hash = iroh_blobs::Hash::new(&bytes);
+        let hash_string = hash.to_string();
+        if self
+            .chat
+            .draft_attachments
+            .iter()
+            .any(|attachment| attachment.hash == hash_string)
+        {
+            return;
+        }
+        let media_type = image::guess_format(&bytes)
+            .ok()
+            .map(image_media_type)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        self.chat.draft_attachments.push(ChatAttachment {
+            id: hash_string.clone(),
+            name,
+            media_type,
+            byte_len: bytes.len() as u64,
+            width: decoded.width(),
+            height: decoded.height(),
+            hash: hash_string,
+            data: Some(Arc::new(bytes)),
+        });
+    }
+
+    fn ui_message_attachments(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        message: &ChatMessage,
+        own: bool,
+        opacity: f32,
+        requested_restore: &mut bool,
+        requested_deletion: &mut Option<DeleteScope>,
+    ) {
+        for (index, attachment) in message.attachments.iter().enumerate() {
+            if index > 0 || !message.body.trim().is_empty() {
+                ui.add_space(6.0);
+            }
+            if self
+                .max_image_bytes
+                .is_some_and(|limit| attachment.byte_len > limit)
+            {
+                let response = Frame::new()
+                    .fill(pal.panel2.gamma_multiply(opacity))
+                    .stroke(Stroke::new(1.0_f32, pal.line.gamma_multiply(opacity)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Image is too big ({})",
+                                format_bytes(attachment.byte_len)
+                            ))
+                            .color(pal.dim.gamma_multiply(opacity))
+                            .size(ui_font_size(11.5)),
+                        );
+                    })
+                    .response;
+                response.context_menu(|ui| {
+                    chat_message_context_menu(
+                        ui,
+                        message,
+                        own,
+                        requested_restore,
+                        requested_deletion,
+                    );
+                });
+                continue;
+            }
+            let Some(texture) =
+                attachment_texture(ui.ctx(), &mut self.chat.attachment_textures, attachment)
+            else {
+                let response = ui.label(
+                    RichText::new(format!(
+                        "Loading image… ({})",
+                        format_bytes(attachment.byte_len)
+                    ))
+                    .color(pal.dim.gamma_multiply(opacity)),
+                );
+                response.context_menu(|ui| {
+                    chat_message_context_menu(
+                        ui,
+                        message,
+                        own,
+                        requested_restore,
+                        requested_deletion,
+                    );
+                });
+                continue;
+            };
+            let scale = (ui.available_width().min(620.0) / attachment.width as f32)
+                .min(180.0 / attachment.height as f32);
+            let size = Vec2::new(
+                attachment.width as f32 * scale,
+                attachment.height as f32 * scale,
+            );
+            let response = ui.add(
+                egui::Image::new((texture.id(), size))
+                    .fit_to_exact_size(size)
+                    .sense(egui::Sense::click())
+                    .corner_radius(8.0),
+            );
+            if response.clicked() {
+                self.chat.image_preview = Some(ImagePreview {
+                    attachment: attachment.clone(),
+                    draft: false,
+                    mode: ImagePreviewMode::Floating,
+                });
+            }
+            response.context_menu(|ui| {
+                if ui.button("Download image").clicked() {
+                    save_chat_attachment(attachment);
+                    ui.close();
+                }
+                ui.separator();
+                chat_message_context_menu(ui, message, own, requested_restore, requested_deletion);
+            });
+        }
+    }
+
+    fn ui_image_preview(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(preview) = self.chat.image_preview.clone() else {
+            return;
+        };
+        let mut action = None;
+        match preview.mode {
+            ImagePreviewMode::Floating => {
+                let mut open = true;
+                egui::Window::new("Image preview")
+                    .id(egui::Id::new("chat-image-preview"))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size(Vec2::new(720.0, 560.0))
+                    .show(ctx, |ui| {
+                        action = image_preview_panel(
+                            ui,
+                            pal,
+                            &preview,
+                            &mut self.chat.attachment_textures,
+                        );
+                    });
+                if !open {
+                    action = Some(ImagePreviewAction::Close);
+                }
+            }
+            ImagePreviewMode::FillWindow | ImagePreviewMode::Fullscreen => {
+                let rect = if preview.mode == ImagePreviewMode::Fullscreen {
+                    ctx.viewport_rect()
+                } else {
+                    ctx.content_rect()
+                };
+                egui::Area::new(egui::Id::new("chat-image-preview-immersive"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(rect.min)
+                    .show(ctx, |ui| {
+                        ui.set_min_size(rect.size());
+                        Frame::new()
+                            .fill(pal.bg)
+                            .inner_margin(egui::Margin::symmetric(18, 14))
+                            .show(ui, |ui| {
+                                ui.set_min_size(rect.size() - Vec2::new(36.0, 28.0));
+                                action = image_preview_panel(
+                                    ui,
+                                    pal,
+                                    &preview,
+                                    &mut self.chat.attachment_textures,
+                                );
+                            });
+                    });
+            }
+        }
+
+        match action {
+            Some(ImagePreviewAction::Close) => {
+                if preview.mode == ImagePreviewMode::Fullscreen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+                self.chat.image_preview = None;
+            }
+            Some(ImagePreviewAction::Delete) => {
+                if preview.mode == ImagePreviewMode::Fullscreen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+                self.chat
+                    .draft_attachments
+                    .retain(|attachment| attachment.id != preview.attachment.id);
+                self.chat.image_preview = None;
+            }
+            Some(ImagePreviewAction::SetMode(mode)) => {
+                if preview.mode == ImagePreviewMode::Fullscreen
+                    && mode != ImagePreviewMode::Fullscreen
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                } else if mode == ImagePreviewMode::Fullscreen
+                    && preview.mode != ImagePreviewMode::Fullscreen
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                if let Some(current) = &mut self.chat.image_preview {
+                    current.mode = mode;
+                }
+            }
+            None => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn ui_image_preview_legacy(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(preview) = self.chat.image_preview.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut delete = false;
+        egui::Window::new("Image preview")
+            .id(egui::Id::new("chat-image-preview"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(720.0, 560.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} × {} · {}",
+                            preview.attachment.width,
+                            preview.attachment.height,
+                            format_bytes(preview.attachment.byte_len)
+                        ))
+                        .color(pal.dim),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                        if preview.draft && ui.button("Delete").clicked() {
+                            delete = true;
+                        }
+                        if ui.button("Download").clicked() {
+                            save_chat_attachment(&preview.attachment);
+                        }
+                    });
+                });
+                ui.separator();
+                if let Some(texture) = attachment_texture(
+                    ui.ctx(),
+                    &mut self.chat.attachment_textures,
+                    &preview.attachment,
+                ) {
+                    let available = ui.available_size().max(Vec2::splat(1.0));
+                    let scale = (available.x / preview.attachment.width as f32)
+                        .min(available.y / preview.attachment.height as f32);
+                    let size = Vec2::new(
+                        preview.attachment.width as f32 * scale,
+                        preview.attachment.height as f32 * scale,
+                    );
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Image::new((texture.id(), size)).fit_to_exact_size(size));
+                    });
+                }
+            });
+        if delete {
+            self.chat
+                .draft_attachments
+                .retain(|attachment| attachment.id != preview.attachment.id);
+            open = false;
+        }
+        if close {
+            open = false;
+        }
+        if !open {
+            self.chat.image_preview = None;
+        }
     }
 
     fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -2325,7 +2857,12 @@ impl AppState {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    circle_avatar(ui, pal, &self.peer_initial(node_id), PARTICIPANT_AVATAR_SIZE);
+                    circle_avatar(
+                        ui,
+                        pal,
+                        &self.peer_initial(node_id),
+                        PARTICIPANT_AVATAR_SIZE,
+                    );
 
                     ui.label(
                         RichText::new(self.peer_display_name(node_id))
@@ -2345,16 +2882,14 @@ impl AppState {
 
                     match state {
                         CallState::Incoming => {
-                            if compact_chip_button(ui, pal, "Accept", ButtonTone::Primary)
-                                .clicked()
+                            if compact_chip_button(ui, pal, "Accept", ButtonTone::Primary).clicked()
                             {
                                 self.cmd(Command::HandleIncoming {
                                     node_id,
                                     accept: true,
                                 });
                             }
-                            if compact_chip_button(ui, pal, "Decline", ButtonTone::Danger)
-                                .clicked()
+                            if compact_chip_button(ui, pal, "Decline", ButtonTone::Danger).clicked()
                             {
                                 self.cmd(Command::HandleIncoming {
                                     node_id,
@@ -2583,8 +3118,10 @@ impl AppState {
         let controls_left = if show_status {
             (rect.right() - controls_width).max(rect.left())
         } else {
-            (rect.center().x - controls_width / 2.0)
-                .clamp(rect.left(), (rect.right() - controls_width).max(rect.left()))
+            (rect.center().x - controls_width / 2.0).clamp(
+                rect.left(),
+                (rect.right() - controls_width).max(rect.left()),
+            )
         };
         let controls_rect = egui::Rect::from_min_max(
             egui::pos2(controls_left, rect.top()),
@@ -2999,8 +3536,7 @@ impl AppState {
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.label(fmt_node_id(&node_id.fmt_short()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if action_button(ui, &pal, "Copy ID", ButtonTone::Secondary).clicked()
-                            {
+                            if action_button(ui, &pal, "Copy ID", ButtonTone::Secondary).clicked() {
                                 copy_to_clipboard(&node_id.to_string());
                             }
                         });
@@ -3201,11 +3737,7 @@ impl AppState {
                                             short_id
                                         })
                                         .monospace()
-                                        .color(if parsed.is_err() {
-                                            pal.err
-                                        } else {
-                                            pal.dim
-                                        })
+                                        .color(if parsed.is_err() { pal.err } else { pal.dim })
                                         .size(ui_font_size(10.5)),
                                     );
                                 });
@@ -4100,6 +4632,40 @@ impl AppState {
                                             }
                                         }
                                     });
+                                ui.add_space(8.0);
+                                settings_field_label(
+                                    ui,
+                                    &pal,
+                                    "Maximum received image size",
+                                    Some("Larger images stay remote and appear as placeholders."),
+                                );
+                                egui::ComboBox::from_id_salt("settings-max-image-bytes")
+                                    .width(ui.available_width())
+                                    .selected_text(image_limit_label(self.max_image_bytes))
+                                    .show_ui(ui, |ui| {
+                                        for limit in [
+                                            Some(1 * 1024 * 1024),
+                                            Some(5 * 1024 * 1024),
+                                            Some(10 * 1024 * 1024),
+                                            Some(25 * 1024 * 1024),
+                                            Some(50 * 1024 * 1024),
+                                            Some(100 * 1024 * 1024),
+                                            Some(250 * 1024 * 1024),
+                                            Some(500 * 1024 * 1024),
+                                            Some(1024 * 1024 * 1024),
+                                            None,
+                                        ] {
+                                            if ui
+                                                .selectable_label(
+                                                    self.max_image_bytes == limit,
+                                                    image_limit_label(limit),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.max_image_bytes = limit;
+                                            }
+                                        }
+                                    });
 
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -4418,6 +4984,9 @@ impl AppState {
                                         let video_config = self.video_config;
                                         self.cmd(Command::SetAudioConfig { audio_config });
                                         self.cmd(Command::SetVideoConfig { video_config });
+                                        self.cmd(Command::SetMaxImageBytes {
+                                            max_image_bytes: self.max_image_bytes,
+                                        });
                                         self.persist_settings();
                                         self.configured = true;
                                         self.show_settings = false;
@@ -4518,6 +5087,205 @@ fn settings_divider(ui: &mut Ui) {
     ui.add_space(8.0);
 }
 
+fn image_limit_label(limit: Option<u64>) -> String {
+    limit
+        .map(|bytes| format!("{} per image", format_bytes(bytes)))
+        .unwrap_or_else(|| "Unlimited".to_owned())
+}
+
+fn composer_visual_rows(text: &str, width: f32) -> usize {
+    let columns = (width / 7.2).floor().max(12.0) as usize;
+    text.split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(columns))
+        .sum::<usize>()
+        .clamp(1, 8)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / GIB)
+    } else if bytes >= 1024 * 1024 {
+        let value = bytes as f64 / MIB;
+        if value.fract() < 0.05 {
+            format!("{value:.0} MB")
+        } else {
+            format!("{value:.1} MB")
+        }
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn image_media_type(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Bmp => "image/bmp",
+        image::ImageFormat::Tiff => "image/tiff",
+        image::ImageFormat::Ico => "image/x-icon",
+        image::ImageFormat::Pnm => "image/x-portable-anymap",
+        image::ImageFormat::Qoi => "image/qoi",
+        image::ImageFormat::Tga => "image/x-tga",
+        _ => "application/octet-stream",
+    }
+}
+
+fn attachment_texture<'a>(
+    ctx: &egui::Context,
+    textures: &'a mut BTreeMap<String, egui::TextureHandle>,
+    attachment: &ChatAttachment,
+) -> Option<&'a egui::TextureHandle> {
+    if !textures.contains_key(&attachment.id) {
+        let data = attachment.data.as_ref()?;
+        let decoded = image::load_from_memory(data).ok()?.to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let pixels = decoded.into_raw();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+        let texture = ctx.load_texture(
+            format!("chat-image-{}", attachment.id),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        textures.insert(attachment.id.clone(), texture);
+    }
+    textures.get(&attachment.id)
+}
+
+fn square_attachment_preview(
+    ui: &mut Ui,
+    pal: &Palette,
+    texture: &egui::TextureHandle,
+    width: u32,
+    height: u32,
+    side: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::click());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(7), pal.panel2);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(7),
+        Stroke::new(1.0_f32, pal.line),
+        egui::StrokeKind::Inside,
+    );
+    let scale = (side / width.max(1) as f32).min(side / height.max(1) as f32);
+    let image_size = Vec2::new(width as f32 * scale, height as f32 * scale);
+    let image_rect = egui::Rect::from_center_size(rect.center(), image_size);
+    ui.put(
+        image_rect,
+        egui::Image::new((texture.id(), image_size))
+            .fit_to_exact_size(image_size)
+            .corner_radius(5.0),
+    );
+    response
+}
+
+fn image_preview_panel(
+    ui: &mut Ui,
+    pal: &Palette,
+    preview: &ImagePreview,
+    textures: &mut BTreeMap<String, egui::TextureHandle>,
+) -> Option<ImagePreviewAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "{} × {} · {}",
+                preview.attachment.width,
+                preview.attachment.height,
+                format_bytes(preview.attachment.byte_len)
+            ))
+            .color(pal.dim),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if toolbar_button(ui, pal, Icon::X, "Close", false).clicked() {
+                action = Some(ImagePreviewAction::Close);
+            }
+            if preview.draft && toolbar_button(ui, pal, Icon::Trash2, "Delete", false).clicked() {
+                action = Some(ImagePreviewAction::Delete);
+            }
+            if toolbar_button(ui, pal, Icon::Download, "Download", false).clicked() {
+                save_chat_attachment(&preview.attachment);
+            }
+            if toolbar_button(
+                ui,
+                pal,
+                Icon::Fullscreen,
+                "Fullscreen",
+                preview.mode == ImagePreviewMode::Fullscreen,
+            )
+            .clicked()
+            {
+                action = Some(ImagePreviewAction::SetMode(
+                    if preview.mode == ImagePreviewMode::Fullscreen {
+                        ImagePreviewMode::Floating
+                    } else {
+                        ImagePreviewMode::Fullscreen
+                    },
+                ));
+            }
+            if toolbar_button(
+                ui,
+                pal,
+                Icon::Expand,
+                "Fill window",
+                preview.mode == ImagePreviewMode::FillWindow,
+            )
+            .clicked()
+            {
+                action = Some(ImagePreviewAction::SetMode(
+                    if preview.mode == ImagePreviewMode::FillWindow {
+                        ImagePreviewMode::Floating
+                    } else {
+                        ImagePreviewMode::FillWindow
+                    },
+                ));
+            }
+            if preview.mode != ImagePreviewMode::Floating
+                && toolbar_button(ui, pal, Icon::Minimize2, "Floating", false).clicked()
+            {
+                action = Some(ImagePreviewAction::SetMode(ImagePreviewMode::Floating));
+            }
+        });
+    });
+    ui.separator();
+    if let Some(texture) = attachment_texture(ui.ctx(), textures, &preview.attachment) {
+        let available = ui.available_size().max(Vec2::splat(1.0));
+        let scale = (available.x / preview.attachment.width.max(1) as f32)
+            .min(available.y / preview.attachment.height.max(1) as f32);
+        let size = Vec2::new(
+            preview.attachment.width as f32 * scale,
+            preview.attachment.height as f32 * scale,
+        );
+        ui.centered_and_justified(|ui| {
+            ui.add(egui::Image::new((texture.id(), size)).fit_to_exact_size(size));
+        });
+    }
+    action
+}
+
+fn save_chat_attachment(attachment: &ChatAttachment) {
+    let Some(data) = &attachment.data else {
+        return;
+    };
+    let mut dialog = rfd::FileDialog::new().set_file_name(&attachment.name);
+    if let Some(extension) = Path::new(&attachment.name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        dialog = dialog.add_filter("Image", &[extension]);
+    }
+    if let Some(path) = dialog.save_file() {
+        if let Err(error) = std::fs::write(&path, data.as_slice()) {
+            warn!("failed to save image to {}: {error}", path.display());
+        }
+    }
+}
+
 fn section_card<R>(
     ui: &mut Ui,
     pal: &Palette,
@@ -4567,11 +5335,7 @@ fn compact_chip_button(
             Stroke::new(1.0_f32, chat_hairline(pal)),
             pal.text2,
         ),
-        ButtonTone::Danger => (
-            Color32::TRANSPARENT,
-            Stroke::new(1.0_f32, pal.err),
-            pal.err,
-        ),
+        ButtonTone::Danger => (Color32::TRANSPARENT, Stroke::new(1.0_f32, pal.err), pal.err),
     };
     ui.add(
         egui::Button::new(RichText::new(label).color(text).size(ui_font_size(11.0)))
@@ -4901,8 +5665,10 @@ fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Resp
 }
 
 fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(100.0, CHROME_CONTROL_HEIGHT), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(100.0, CHROME_CONTROL_HEIGHT),
+        egui::Sense::click(),
+    );
     let fill = if selected {
         chat_selected_surface(pal)
     } else if response.hovered() {
@@ -4959,27 +5725,42 @@ fn chat_navigation_button(
 }
 
 fn chat_send_button(ui: &mut Ui, pal: &Palette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 42.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::click());
     let fill = if response.hovered() {
-        mix_color(pal.bg, pal.panel2, 0.9)
+        pal.text2
     } else {
-        chat_selected_surface(pal)
+        pal.text
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(11), fill);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(11),
-        Stroke::new(1.0_f32, chat_hairline(pal)),
-        egui::StrokeKind::Inside,
-    );
+    ui.painter().circle_filled(rect.center(), 19.0, fill);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
-        "Send",
-        egui::FontId::new(ui_font_size(12.0), egui::FontFamily::Proportional),
-        pal.text,
+        char::from(Icon::ArrowUp),
+        lucide(19.0),
+        pal.bg,
     );
-    response
+    response.on_hover_text("Send message")
+}
+
+fn composer_ghost_icon_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(36.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(9), pal.panel2);
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(20.0),
+        pal.text2,
+    );
+    response.on_hover_text(label)
 }
 
 fn chat_delivery_opacity(state: DeliveryState) -> f32 {
@@ -5054,11 +5835,7 @@ fn chat_delivery_status_icon(
             pal.dim2,
             detail.unwrap_or("Queued — waiting for peer"),
         ),
-        DeliveryState::Failed => (
-            Icon::CircleX,
-            pal.err,
-            detail.unwrap_or("Failed to send"),
-        ),
+        DeliveryState::Failed => (Icon::CircleX, pal.err, detail.unwrap_or("Failed to send")),
     };
     let response = ui.label(
         RichText::new(char::from(icon))
@@ -5143,6 +5920,7 @@ mod layout_tests {
             body: "hello".to_owned(),
             nonce: 0,
             client_version: None,
+            attachments: Vec::new(),
             deletion: None,
         };
 
@@ -5158,6 +5936,14 @@ mod layout_tests {
             &message("alice", 60_001),
             &message("bob", 60_002),
         ));
+    }
+
+    #[test]
+    fn composer_grows_for_newlines_and_wrapped_text() {
+        assert_eq!(composer_visual_rows("one line", 500.0), 1);
+        assert_eq!(composer_visual_rows("one\ntwo\nthree\nfour", 500.0), 4);
+        assert!(composer_visual_rows(&"x".repeat(200), 140.0) > 3);
+        assert_eq!(composer_visual_rows(&"x".repeat(10_000), 140.0), 8);
     }
 
     #[test]
@@ -5311,6 +6097,9 @@ enum Command {
     SendChatMessage {
         conversation_id: String,
         message: ChatMessage,
+    },
+    SetMaxImageBytes {
+        max_image_bytes: Option<u64>,
     },
     DeleteChatMessage {
         conversation_id: String,
@@ -5954,6 +6743,9 @@ impl Worker {
                 message,
             } => {
                 self.chat.send_message(conversation_id, message).await;
+            }
+            Command::SetMaxImageBytes { max_image_bytes } => {
+                self.chat.set_max_image_bytes(max_image_bytes);
             }
             Command::DeleteChatMessage {
                 conversation_id,

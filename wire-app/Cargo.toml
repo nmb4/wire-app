@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.4.19"
+version = "0.5.0"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -50,9 +50,11 @@ eframe = { version = "0.33.3", default-features = false, features = [
     "wgpu",
 ] }
 arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
+rfd = "0.15"
 sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
 raw-window-handle = "0.6"
 # `eframe` has default features disabled above, so select the Vulkan backend
 # explicitly. This also keeps Windows and Linux on the same presentation path.
