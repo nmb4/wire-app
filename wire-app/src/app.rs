@@ -26,10 +26,12 @@ use wire::{
 };
 
 use crate::{
+    autostart,
     chat::{
         self, ChatAttachment, ChatConversation, ChatMessage, ChatNotification, ConversationKind,
         DeleteScope, DeliveryState, MessageDeletion, RetentionPolicy,
     },
+    client_status::{Availability, ClientStatusProtocol, StatusUpdate, CLIENT_STATUS_ALPN},
     dev_pair::DevPairState,
     notifications::{NotificationAction, NotificationService},
     resource_monitor::ResourceMonitor,
@@ -121,6 +123,12 @@ fn save_settings(settings: &Settings) {
     }
 }
 
+fn save_start_with_system(enabled: bool) {
+    let mut settings = load_settings().unwrap_or_default();
+    settings.start_with_system = enabled;
+    save_settings(&settings);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamViewMode {
     Normal,
@@ -164,6 +172,7 @@ struct AppState {
     capture_error: Option<String>,
     preview: Option<PreviewState>,
     friends: Vec<Friend>,
+    friend_status: BTreeMap<NodeId, StatusUpdate>,
     new_friend_name: String,
     new_friend_id: String,
     theme: Theme,
@@ -175,6 +184,8 @@ struct AppState {
     voluntary_hangups: AtomicU32,
     update_tx: mpsc::Sender<UpdateMessage>,
     update_rx: mpsc::Receiver<UpdateMessage>,
+    autostart_tx: mpsc::Sender<AutostartMessage>,
+    autostart_rx: mpsc::Receiver<AutostartMessage>,
     update_status: UpdateStatus,
     show_update_prompt: bool,
     reset_home_scroll: bool,
@@ -187,6 +198,8 @@ struct AppState {
     chat_retention: RetentionPolicy,
     chat_style: ChatStyle,
     max_image_bytes: Option<u64>,
+    start_with_system: bool,
+    saved_start_with_system: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,6 +269,11 @@ enum UpdateStatus {
 enum UpdateMessage {
     CheckFinished(anyhow::Result<Option<ReleaseInfo>>),
     DownloadFinished(anyhow::Result<PathBuf>),
+}
+
+struct AutostartMessage {
+    enabled: bool,
+    result: std::result::Result<(), String>,
 }
 
 struct PreviewState {
@@ -330,6 +348,8 @@ struct Settings {
     chat_style: ChatStyle,
     #[serde(default)]
     max_image_bytes: Option<u64>,
+    #[serde(default)]
+    start_with_system: bool,
 }
 
 impl Default for Settings {
@@ -343,6 +363,7 @@ impl Default for Settings {
             chat_retention: RetentionPolicy::Unlimited,
             chat_style: ChatStyle::default(),
             max_image_bytes: None,
+            start_with_system: false,
         }
     }
 }
@@ -440,6 +461,7 @@ impl App {
             || dev_fixture;
         let settings = saved_settings.unwrap_or_default();
         let (update_tx, update_rx) = mpsc::channel();
+        let (autostart_tx, autostart_rx) = mpsc::channel();
         let sounds = Sounds::try_new();
         if let Some(sounds) = &sounds {
             sounds.play(Sound::Whoosh2);
@@ -466,6 +488,7 @@ impl App {
             capture_error: None,
             preview: None,
             friends: load_friends(),
+            friend_status: BTreeMap::new(),
             new_friend_name: String::new(),
             new_friend_id: String::new(),
             theme: settings.theme,
@@ -477,6 +500,8 @@ impl App {
             voluntary_hangups: AtomicU32::new(0),
             update_tx,
             update_rx,
+            autostart_tx,
+            autostart_rx,
             update_status: UpdateStatus::Idle,
             show_update_prompt: false,
             reset_home_scroll: false,
@@ -489,6 +514,8 @@ impl App {
             chat_retention: settings.chat_retention,
             chat_style: settings.chat_style,
             max_image_bytes: settings.max_image_bytes,
+            start_with_system: settings.start_with_system,
+            saved_start_with_system: settings.start_with_system,
         };
 
         if has_saved_settings {
@@ -502,6 +529,7 @@ impl App {
         state.cmd(Command::SetMaxImageBytes {
             max_image_bytes: state.max_image_bytes,
         });
+        state.sync_friends_with_worker();
 
         let rounded = window_frame::style_wants_rounded(state.window_frame_style);
         let app = App {
@@ -539,6 +567,7 @@ impl AppState {
         // Keep the process resource readout current even while the rest of the UI is idle.
         ctx.request_repaint_after(Duration::from_secs(1));
         self.process_update_events(ctx);
+        self.process_autostart_events();
         let pal = Palette::for_theme(self.theme);
         ctx.set_visuals(visuals_for(&pal));
 
@@ -681,6 +710,26 @@ impl AppState {
         }
     }
 
+    fn process_autostart_events(&mut self) {
+        while let Ok(message) = self.autostart_rx.try_recv() {
+            match message.result {
+                Ok(()) => {
+                    self.saved_start_with_system = message.enabled;
+                    self.start_with_system = message.enabled;
+                    save_start_with_system(message.enabled);
+                }
+                Err(error) => {
+                    self.start_with_system = self.saved_start_with_system;
+                    self.notifications.error(
+                        "start-with-system-error",
+                        "Could not update startup behavior",
+                        error,
+                    );
+                }
+            }
+        }
+    }
+
     fn process_notification_actions(&mut self, ctx: &egui::Context) {
         while let Some(action) = self.notifications.try_action() {
             match action {
@@ -761,11 +810,26 @@ impl AppState {
                         self.friends
                             .sort_by(|left, right| left.name.cmp(&right.name));
                         save_friends(&self.friends);
+                        self.sync_friends_with_worker();
                         info!("added dev fixture peers as local chat contacts");
                     }
                     for peer in dev_call_peers {
                         info!("dev call initiating automatic call to {}", peer.fmt_short());
                         self.cmd(Command::Call { node_id: peer });
+                    }
+                }
+                Event::ClientStatus(update) => {
+                    let peer = update.peer;
+                    let peer_is_newer = update.client_version.as_deref().is_some_and(|version| {
+                        update::is_version_newer(version, crate::APP_VERSION)
+                    });
+                    self.friend_status.insert(peer, update);
+                    if peer_is_newer {
+                        info!(
+                            peer = %peer.fmt_short(),
+                            "friend advertised a newer Wire version; checking for updates"
+                        );
+                        self.start_update_check(ctx);
                     }
                 }
                 Event::InitialChatLoaded => self.chat_notifications_ready = true,
@@ -1296,6 +1360,31 @@ impl AppState {
             chat_retention: self.chat_retention,
             chat_style: self.chat_style,
             max_image_bytes: self.max_image_bytes,
+            start_with_system: self.saved_start_with_system,
+        });
+    }
+
+    fn update_autostart_in_background(&self, ctx: &egui::Context) {
+        let enabled = self.start_with_system;
+        let tx = self.autostart_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = autostart::set_enabled(enabled).map_err(|error| error.to_string());
+            let _ = tx.send(AutostartMessage { enabled, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn friend_node_ids(&self) -> BTreeSet<NodeId> {
+        self.friends
+            .iter()
+            .filter_map(|friend| NodeId::from_str(friend.node_id.trim()).ok())
+            .collect()
+    }
+
+    fn sync_friends_with_worker(&self) {
+        self.cmd(Command::SetFriends {
+            friends: self.friend_node_ids(),
         });
     }
 
@@ -3711,6 +3800,11 @@ impl AppState {
                                 raw.to_owned()
                             }
                         });
+                    let availability = parsed.as_ref().ok().and_then(|node_id| {
+                        self.friend_status
+                            .get(node_id)
+                            .map(|status| status.availability)
+                    });
 
                     Frame::new()
                         .fill(chat_surface(&pal))
@@ -3730,16 +3824,30 @@ impl AppState {
                                             .color(pal.text)
                                             .size(ui_font_size(13.0)),
                                     );
-                                    ui.label(
-                                        RichText::new(if parsed.is_err() {
-                                            "invalid id".to_owned()
-                                        } else {
-                                            short_id
-                                        })
-                                        .monospace()
-                                        .color(if parsed.is_err() { pal.err } else { pal.dim })
-                                        .size(ui_font_size(10.5)),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 5.0;
+                                        ui.label(
+                                            RichText::new(if parsed.is_err() {
+                                                "invalid id".to_owned()
+                                            } else {
+                                                short_id
+                                            })
+                                            .monospace()
+                                            .color(if parsed.is_err() { pal.err } else { pal.dim })
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                        if let Some(availability) = availability {
+                                            let (label, color) = match availability {
+                                                Availability::Online => ("Online", pal.ok),
+                                                Availability::Offline => ("Offline", pal.dim2),
+                                            };
+                                            ui.label(
+                                                RichText::new(format!("• {label}"))
+                                                    .color(color)
+                                                    .size(ui_font_size(10.5)),
+                                            );
+                                        }
+                                    });
                                 });
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3801,8 +3909,12 @@ impl AppState {
                     self.cmd(Command::Call { node_id: id });
                 }
                 if let Some(idx) = remove_idx {
+                    if let Ok(node_id) = NodeId::from_str(self.friends[idx].node_id.trim()) {
+                        self.friend_status.remove(&node_id);
+                    }
                     self.friends.remove(idx);
                     save_friends(&self.friends);
+                    self.sync_friends_with_worker();
                 }
                 if let Some(node_id) = copy_id {
                     copy_to_clipboard(&node_id);
@@ -3830,6 +3942,7 @@ impl AppState {
                 node_id: node_id.clone(),
             });
             save_friends(&self.friends);
+            self.sync_friends_with_worker();
         }
         self.new_friend_name.clear();
         self.new_friend_id.clear();
@@ -4445,7 +4558,9 @@ impl AppState {
         let pal = Palette::for_theme(self.theme);
         let screen_rect = ctx.screen_rect();
         let dialog_width = (screen_rect.width() - 40.0).clamp(420.0, 500.0);
-        let body_height = (screen_rect.height() - 130.0).clamp(360.0, 840.0);
+        // Reserve enough vertical space for the dialog chrome plus a visible
+        // inset above and below the centered window.
+        let scroll_height = (screen_rect.height() - 230.0).clamp(220.0, 700.0);
         egui::Window::new("settings-dialog")
             .title_bar(false)
             .collapsible(false)
@@ -4488,9 +4603,29 @@ impl AppState {
                         ui.set_width(ui.available_width());
                         egui::ScrollArea::vertical()
                             .id_salt("settings-scroll")
-                            .max_height(body_height)
+                            .max_height(scroll_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
+                                    "General",
+                                    "Choose how Wire starts.",
+                                );
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0_f32, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        ui.checkbox(
+                                            &mut self.start_with_system,
+                                            RichText::new("Start with system")
+                                                .color(pal.text2)
+                                                .size(ui_font_size(12.0)),
+                                        );
+                                    });
+                                settings_divider(ui);
                                 settings_section_heading(
                                     ui,
                                     &pal,
@@ -4974,31 +5109,34 @@ impl AppState {
                                     }
                                 }
 
-                                settings_divider(ui);
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if action_button(ui, &pal, "Save changes", ButtonTone::Primary)
-                                        .clicked()
-                                    {
-                                        self.play_sound(Sound::Button2);
-                                        let audio_config = self.audio_config();
-                                        let video_config = self.video_config;
-                                        self.cmd(Command::SetAudioConfig { audio_config });
-                                        self.cmd(Command::SetVideoConfig { video_config });
-                                        self.cmd(Command::SetMaxImageBytes {
-                                            max_image_bytes: self.max_image_bytes,
-                                        });
-                                        self.persist_settings();
-                                        self.configured = true;
-                                        self.show_settings = false;
-                                    }
-                                    if can_close
-                                        && action_button(ui, &pal, "Cancel", ButtonTone::Secondary)
-                                            .clicked()
-                                    {
-                                        self.show_settings = false;
-                                    }
-                                });
                             });
+                        settings_divider(ui);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if action_button(ui, &pal, "Save changes", ButtonTone::Primary)
+                                .clicked()
+                            {
+                                self.play_sound(Sound::Button2);
+                                let audio_config = self.audio_config();
+                                let video_config = self.video_config;
+                                self.cmd(Command::SetAudioConfig { audio_config });
+                                self.cmd(Command::SetVideoConfig { video_config });
+                                self.cmd(Command::SetMaxImageBytes {
+                                    max_image_bytes: self.max_image_bytes,
+                                });
+                                // Persist all regular settings immediately. The
+                                // startup preference is committed after the OS
+                                // integration succeeds on a background thread.
+                                self.persist_settings();
+                                self.update_autostart_in_background(ctx);
+                                self.configured = true;
+                                self.show_settings = false;
+                            }
+                            if can_close
+                                && action_button(ui, &pal, "Close", ButtonTone::Secondary).clicked()
+                            {
+                                self.show_settings = false;
+                            }
+                        });
                     });
             });
     }
@@ -5950,6 +6088,7 @@ mod layout_tests {
     fn old_settings_default_to_bubble_chat() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
+        assert!(!settings.start_with_system);
     }
 
     #[test]
@@ -5985,6 +6124,7 @@ mod layout_tests {
 
 enum Event {
     EndpointBound(NodeId),
+    ClientStatus(StatusUpdate),
     InitialChatLoaded,
     Chat(ChatNotification),
     WorkerFailed(String),
@@ -6101,6 +6241,9 @@ enum Command {
     SetMaxImageBytes {
         max_image_bytes: Option<u64>,
     },
+    SetFriends {
+        friends: BTreeSet<NodeId>,
+    },
     DeleteChatMessage {
         conversation_id: String,
         message_id: String,
@@ -6141,22 +6284,29 @@ struct Worker {
     muted: bool,
     deafened: bool,
     chat: chat::ChatService,
+    client_status: ClientStatusProtocol,
 }
 
 struct WorkerHandle {
     command_tx: Sender<Command>,
     event_rx: Receiver<Event>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.command_tx.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Worker {
     pub fn spawn() -> WorkerHandle {
         let (command_tx, command_rx) = async_channel::bounded(16);
         let (event_tx, event_rx) = async_channel::bounded(64);
-        let handle = WorkerHandle {
-            event_rx,
-            command_tx,
-        };
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             info!("Wire worker thread starting");
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -6187,7 +6337,11 @@ impl Worker {
                 }
             });
         });
-        handle
+        WorkerHandle {
+            event_rx,
+            command_tx,
+            thread: Some(thread),
+        }
     }
 
     async fn emit(&self, event: Event) -> Result<()> {
@@ -6208,12 +6362,14 @@ impl Worker {
             iroh_docs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
             chat::CHAT_ALPN.to_vec(),
+            CLIENT_STATUS_ALPN.to_vec(),
             wire::remote_logs::LOGS_ALPN.to_vec(),
         ])
         .await?;
         info!(node = %endpoint.node_id().fmt_short(), "Wire endpoint bound; opening chat storage");
         let handler = RtcProtocol::new(endpoint.clone());
         let logs_protocol = wire::remote_logs::LogsProtocol::new(endpoint.node_id());
+        let client_status = ClientStatusProtocol::new(endpoint.clone());
         let config_dir = wire::net::config_dir().context("missing Wire config directory")?;
         let chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
         info!("chat storage opened; starting protocol router");
@@ -6223,6 +6379,7 @@ impl Worker {
             .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
             .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
             .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
+            .accept(CLIENT_STATUS_ALPN, client_status.clone())
             .accept(wire::remote_logs::LOGS_ALPN, logs_protocol)
             .spawn()
             .await?;
@@ -6255,6 +6412,7 @@ impl Worker {
             muted: false,
             deafened: false,
             chat: chat_protocols.service,
+            client_status,
         })
     }
 
@@ -6276,6 +6434,7 @@ impl Worker {
                 command = self.command_rx.recv() => {
                     let Ok(command) = command else {
                         info!("app command channel closed; stopping worker");
+                        self.client_status.broadcast_offline().await;
                         break;
                     };
                     if let Err(err) = self.handle_command(command).await {
@@ -6317,6 +6476,9 @@ impl Worker {
                     if let Some(notification) = self.chat.process_input(input).await {
                         self.emit(Event::Chat(notification)).await?;
                     }
+                }
+                status = self.client_status.next_update() => {
+                    self.emit(Event::ClientStatus(status?)).await?;
                 }
             }
         }
@@ -6746,6 +6908,10 @@ impl Worker {
             }
             Command::SetMaxImageBytes { max_image_bytes } => {
                 self.chat.set_max_image_bytes(max_image_bytes);
+            }
+            Command::SetFriends { friends } => {
+                self.client_status.replace_peers(friends.clone());
+                self.client_status.announce_online(friends);
             }
             Command::DeleteChatMessage {
                 conversation_id,

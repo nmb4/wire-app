@@ -9473,7 +9473,7 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.5.0"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "arboard",

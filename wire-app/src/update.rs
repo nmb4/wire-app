@@ -46,6 +46,13 @@ fn parse_version(value: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(version)
 }
 
+pub(crate) fn is_version_newer(candidate: &str, current: &str) -> bool {
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
 fn release_from_file(file: FileEntry) -> Option<([u64; 3], ReleaseInfo)> {
     let version = file
         .original_name
@@ -196,5 +203,12 @@ mod tests {
         .unwrap();
         assert_eq!(release.version, "0.2.0");
         assert!(latest_newer_release(vec![file("wire-app-v0.1.2.zip")], [0, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn compares_client_versions_for_peer_update_hints() {
+        assert!(is_version_newer("1.2.0", "1.1.9"));
+        assert!(!is_version_newer("1.1.9", "1.2.0"));
+        assert!(!is_version_newer("development", "1.2.0"));
     }
 }
