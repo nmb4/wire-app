@@ -5,8 +5,6 @@
 // intentionally NOT ported -- they don't map onto this real wire app.
 
 use eframe::egui;
-#[cfg(any(wire_has_font_fraktion_sans, wire_has_font_fraktion_mono))]
-use egui::FontTweak;
 use egui::{
     text::{LayoutJob, TextFormat},
     Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
@@ -235,6 +233,8 @@ pub fn setup_fonts(ctx: &egui::Context) {
 
     #[cfg(wire_has_font_fraktion_sans)]
     {
+        // Keep Fraktion's raster offset untouched. A FontTweak y-offset is
+        // pixel-snapped per glyph by egui and makes its baseline wobble.
         fonts.font_data.insert(
             "FraktionSans".into(),
             FontData::from_owned(
@@ -244,10 +244,6 @@ pub fn setup_fonts(ctx: &egui::Context) {
                 ))
                 .to_vec(),
             )
-            .tweak(FontTweak {
-                y_offset: 1.0,
-                ..Default::default()
-            })
             .into(),
         );
         fonts
@@ -259,6 +255,8 @@ pub fn setup_fonts(ctx: &egui::Context) {
 
     #[cfg(wire_has_font_fraktion_mono)]
     {
+        // Match the sans face so mixed proportional/monospace labels share a
+        // stable baseline.
         fonts.font_data.insert(
             "FraktionMono".into(),
             FontData::from_owned(
@@ -268,10 +266,6 @@ pub fn setup_fonts(ctx: &egui::Context) {
                 ))
                 .to_vec(),
             )
-            .tweak(FontTweak {
-                y_offset: 1.0,
-                ..Default::default()
-            })
             .into(),
         );
         fonts
