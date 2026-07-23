@@ -381,6 +381,12 @@ pub fn v_sep(ui: &mut egui::Ui, color: Color32) {
         .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, color));
 }
 
+pub fn compact_v_sep(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 16.0), egui::Sense::hover());
+    ui.painter()
+        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, color));
+}
+
 pub fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), size / 2.0, color);
@@ -526,6 +532,37 @@ pub fn toolbar_button(
             .min_size(Vec2::new(0.0, 32.0)),
     )
 }
+
+pub fn toolbar_ghost_icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
+    if selected || response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(9),
+            if selected { pal.accent_dim } else { pal.panel2 },
+        );
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(16.0),
+        if selected {
+            pal.accent
+        } else if response.hovered() || response.has_focus() {
+            pal.text
+        } else {
+            pal.dim
+        },
+    );
+    response
+}
+
 pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
     if response.hovered() || response.has_focus() {
@@ -545,53 +582,53 @@ pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui:
     );
     response
 }
-pub fn dock_icon_btn(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    glyph: &str,
-    active: bool,
-) -> egui::Response {
+pub fn dock_icon_btn(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) -> egui::Response {
     let size = Vec2::splat(42.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let fill = if active { pal.panel2 } else { pal.panel };
-    let border = if active { pal.line_br } else { pal.line };
-    let text_color = if active { pal.text } else { pal.text2 };
+    let enabled = ui.is_enabled();
+    let fill = if !enabled {
+        pal.panel.gamma_multiply(0.55)
+    } else if response.hovered() {
+        pal.panel2
+    } else if active {
+        pal.panel2
+    } else {
+        pal.panel
+    };
+    let border = if !enabled {
+        pal.line.gamma_multiply(0.55)
+    } else if response.hovered() {
+        pal.accent
+    } else if active {
+        pal.line_br
+    } else {
+        pal.line
+    };
+    let text_color = if !enabled {
+        pal.dim2
+    } else if active || response.hovered() {
+        pal.text
+    } else {
+        pal.text2
+    };
 
-    ui.painter().circle_filled(rect.center(), 21.0, fill);
+    // Leave a pixel of breathing room so the circle stroke is not clipped by
+    // the control's allocation at the top edge.
+    ui.painter().circle_filled(rect.center(), 20.0, fill);
     ui.painter()
-        .circle_stroke(rect.center(), 21.0, Stroke::new(1.0_f32, border));
+        .circle_stroke(rect.center(), 20.0, Stroke::new(1.0_f32, border));
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        glyph,
-        sans(18.0),
+        char::from(icon),
+        lucide(18.0),
         text_color,
     );
     response
 }
 
-pub fn dock_control(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    glyph: &str,
-    label: &str,
-    active: bool,
-) -> egui::Response {
-    ui.allocate_ui_with_layout(
-        Vec2::new(66.0, 66.0),
-        egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            let response = dock_icon_btn(ui, pal, glyph, active);
-            ui.label(
-                RichText::new(label)
-                    .color(pal.text2)
-                    .size(ui_font_size(12.0)),
-            );
-            response
-        },
-    )
-    .inner
+pub fn dock_control(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) -> egui::Response {
+    dock_icon_btn(ui, pal, icon, active)
 }
 
 pub fn leave_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {

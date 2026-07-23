@@ -583,7 +583,9 @@ impl AppState {
             }
         }
         self.handle_view_mode_input(ctx);
-        if self.app_mode == AppMode::Text && self.stream_view_mode != StreamViewMode::Normal {
+        if (self.app_mode == AppMode::Text || !self.has_active_call())
+            && self.stream_view_mode != StreamViewMode::Normal
+        {
             self.set_stream_view_mode(ctx, StreamViewMode::Normal);
         }
         if self.app_mode != AppMode::Text {
@@ -886,6 +888,9 @@ impl AppState {
                         }
                     } else {
                         self.calls.insert(node_id, call_state);
+                    }
+                    if self.sharing_active && !self.has_active_call() {
+                        self.cmd(Command::ToggleSharing { enabled: false });
                     }
 
                     let has_incoming = self.dev_pair.is_none()
@@ -1276,6 +1281,21 @@ impl AppState {
                 .is_some_and(|p| p.width > 0 && p.height > 0 && !p.data.is_empty())
     }
 
+    fn has_active_call(&self) -> bool {
+        self.calls
+            .values()
+            .any(|state| matches!(state, CallState::Active))
+    }
+
+    fn has_visible_call(&self) -> bool {
+        self.calls.values().any(|state| {
+            matches!(
+                state,
+                CallState::Incoming | CallState::Calling | CallState::Active
+            )
+        })
+    }
+
     fn active_stream_sources(&self) -> Vec<StreamSource> {
         let mut sources = Vec::new();
         if self.local_stream_ready() {
@@ -1301,6 +1321,23 @@ impl AppState {
             StreamSource::Local => "You".to_string(),
             StreamSource::Remote(node_id) => self.peer_display_name(node_id),
         }
+    }
+
+    fn stream_aspect_ratio(&self, source: StreamSource) -> f32 {
+        let dimensions = match source {
+            StreamSource::Local => self
+                .preview
+                .as_ref()
+                .map(|preview| (preview.width, preview.height)),
+            StreamSource::Remote(node_id) => self
+                .video_frames
+                .get(&node_id)
+                .map(|frame| (frame.width, frame.height)),
+        };
+        dimensions
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .map(|(width, height)| width as f32 / height as f32)
+            .unwrap_or(16.0 / 9.0)
     }
 
     fn friend_name(&self, node_id: NodeId) -> Option<&str> {
@@ -1485,18 +1522,21 @@ impl AppState {
             return;
         }
         const TOP_BAR_HEIGHT: f32 = 54.0;
-        const DOCK_HEIGHT: f32 = 86.0;
-        const PARTICIPANT_BAR_HEIGHT: f32 = 68.0;
+        const DOCK_HEIGHT: f32 = 66.0;
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
+        let show_participants = self.has_visible_call();
+        let top_height = TOP_BAR_HEIGHT.min(body.height());
+        let dock_top = (body.max.y - DOCK_HEIGHT).max(body.min.y + top_height);
+        let participant_space = (dock_top - (body.min.y + top_height)).max(0.0);
+        let participant_bar_height = show_participants
+            .then(|| participant_bar_height(body.width(), self.calls.len() + 1, participant_space))
+            .unwrap_or(0.0);
 
-        let top_rect = egui::Rect::from_min_max(
-            body.min,
-            egui::pos2(body.max.x, body.min.y + TOP_BAR_HEIGHT),
-        );
-        let dock_rect =
-            egui::Rect::from_min_max(egui::pos2(body.min.x, body.max.y - DOCK_HEIGHT), body.max);
+        let top_rect =
+            egui::Rect::from_min_max(body.min, egui::pos2(body.max.x, body.min.y + top_height));
+        let dock_rect = egui::Rect::from_min_max(egui::pos2(body.min.x, dock_top), body.max);
         let participant_rect = egui::Rect::from_min_max(
-            egui::pos2(body.min.x, dock_rect.min.y - PARTICIPANT_BAR_HEIGHT),
+            egui::pos2(body.min.x, dock_rect.min.y - participant_bar_height),
             egui::pos2(body.max.x, dock_rect.min.y),
         );
         let stage_rect = egui::Rect::from_min_max(
@@ -1504,49 +1544,11 @@ impl AppState {
             egui::pos2(body.max.x, participant_rect.min.y),
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
-            Frame::new()
-                .fill(pal.bg)
-                .inner_margin(egui::Margin::symmetric(14, 6))
-                .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
-        });
-
-        // Keep the call dock inset with the same side margins as the participants
-        // strip so controls never sit under the window edge / rounded corner.
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
-            Frame::new()
-                .fill(pal.bg)
-                .outer_margin(egui::Margin {
-                    left: CHROME_SIDE_INSET,
-                    right: CHROME_SIDE_INSET,
-                    top: 0,
-                    bottom: 8,
-                })
-                .inner_margin(egui::Margin::symmetric(12, 6))
-                .show(ui, |ui| self.ui_dock_content(ui, pal));
-        });
-
-        // Rounded strip matching window bg — no hard separators / panel band.
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
-            Frame::new()
-                .fill(pal.bg)
-                .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
-                .corner_radius(CornerRadius::same(CHROME_RADIUS))
-                .outer_margin(egui::Margin {
-                    left: CHROME_SIDE_INSET,
-                    right: CHROME_SIDE_INSET,
-                    top: 4,
-                    bottom: 6,
-                })
-                .inner_margin(egui::Margin::symmetric(14, 8))
-                .show(ui, |ui| self.ui_call_participant_bar(ui, pal));
-        });
-
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(stage_rect), |ui| {
             let frame = if immersive {
                 Frame::NONE
             } else {
-                Frame::new().inner_margin(egui::Margin::symmetric(20, 14))
+                Frame::new().inner_margin(egui::Margin::symmetric(14, 10))
             };
             frame.show(ui, |ui| {
                 self.ui_stage(
@@ -1557,6 +1559,48 @@ impl AppState {
                     parent_hwnd,
                 )
             });
+        });
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+            Frame::new()
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::symmetric(14, 6))
+                .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
+        });
+
+        if show_participants {
+            // Rounded strip matching window bg — no hard separators / panel band.
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
+                Frame::new()
+                    .fill(pal.bg)
+                    .outer_margin(egui::Margin {
+                        left: CHROME_SIDE_INSET,
+                        right: CHROME_SIDE_INSET,
+                        top: 0,
+                        bottom: 2,
+                    })
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 10,
+                        top: 2,
+                        bottom: 6,
+                    })
+                    .show(ui, |ui| self.ui_call_participant_bar(ui, pal));
+            });
+        }
+
+        // Paint the fixed call controls last so scrollable content never covers them.
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+            Frame::new()
+                .fill(pal.bg)
+                .outer_margin(egui::Margin {
+                    left: CHROME_SIDE_INSET,
+                    right: CHROME_SIDE_INSET,
+                    top: 0,
+                    bottom: 2,
+                })
+                .inner_margin(egui::Margin::symmetric(12, 4))
+                .show(ui, |ui| self.ui_dock_content(ui, pal));
         });
     }
 
@@ -2847,47 +2891,59 @@ impl AppState {
 
     fn ui_call_participant_bar(&mut self, ui: &mut Ui, pal: &Palette) {
         let bar_height = ui.available_height();
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_height(bar_height);
-            ui.spacing_mut().item_spacing.x = 10.0;
-
-            ui.label(
-                RichText::new("PARTICIPANTS")
-                    .family(kh_family())
-                    .color(pal.dim)
-                    .size(10.5),
-            );
-
-            if self.calls.is_empty() {
-                ui.label(
-                    RichText::new("No active call")
-                        .color(pal.dim2)
-                        .size(ui_font_size(11.5)),
-                );
-                return;
-            }
-
-            let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
-            egui::ScrollArea::horizontal()
-                .id_salt("participant-bar-scroll")
-                .auto_shrink([true, false])
-                .max_height(bar_height)
-                .show(ui, |ui| {
-                    // Match bar height so chips center against the PARTICIPANTS label.
-                    ui.set_min_height(bar_height);
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.set_min_height(bar_height);
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        for (node_id, state) in calls {
-                            self.ui_participant_chip(ui, pal, node_id, state);
+        let bar_width = ui.available_width();
+        let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
+        egui::ScrollArea::vertical()
+            .id_salt("participant-bar-scroll")
+            .auto_shrink([false, false])
+            .max_height(bar_height)
+            .show(ui, |ui| {
+                ui.set_min_width(bar_width);
+                ui.vertical_centered(|ui| {
+                    let columns = participant_bar_columns(bar_width);
+                    let item_count = calls.len() + 1;
+                    for row_start in (0..item_count).step_by(columns) {
+                        let row_end = (row_start + columns).min(item_count);
+                        let width_id = ui.id().with(("participant-row-width", row_start));
+                        let cached_width = ui
+                            .ctx()
+                            .data_mut(|data| data.get_temp::<f32>(width_id))
+                            .unwrap_or(0.0);
+                        let lead = ((bar_width - cached_width) * 0.5).max(0.0);
+                        let mut content_rect = egui::Rect::NOTHING;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
+                            if lead > 0.0 {
+                                ui.add_space(lead);
+                            }
+                            for index in row_start..row_end {
+                                let response =
+                                    if let Some((node_id, state)) = calls.get(index).copied() {
+                                        self.ui_participant_chip(ui, pal, node_id, state)
+                                    } else {
+                                        self.ui_self_participant_chip(ui, pal)
+                                    };
+                                content_rect = content_rect.union(response.rect);
+                            }
+                        });
+                        let measured_width = content_rect.width();
+                        if measured_width.is_finite() && measured_width > 0.0 {
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(width_id, measured_width);
+                            });
+                            if (measured_width - cached_width).abs() > 0.5 {
+                                ui.ctx().request_repaint();
+                            }
                         }
-                        self.ui_self_participant_chip(ui, pal);
-                    });
+                        if row_end < item_count {
+                            ui.add_space(PARTICIPANT_GAP);
+                        }
+                    }
                 });
-        });
+            });
     }
 
-    fn ui_self_participant_chip(&self, ui: &mut Ui, pal: &Palette) {
+    fn ui_self_participant_chip(&self, ui: &mut Ui, pal: &Palette) -> egui::Response {
         Frame::new()
             .fill(chat_surface(pal))
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
@@ -2908,7 +2964,8 @@ impl AppState {
                         dot(ui, pal.ok, 6.0);
                     }
                 });
-            });
+            })
+            .response
     }
 
     fn ui_participant_chip(
@@ -2917,7 +2974,7 @@ impl AppState {
         pal: &Palette,
         node_id: NodeId,
         state: CallState,
-    ) {
+    ) -> egui::Response {
         let is_active = matches!(state, CallState::Active);
         let is_streaming = self
             .video_frames
@@ -3010,7 +3067,8 @@ impl AppState {
                         CallState::Aborted => {}
                     }
                 });
-            });
+            })
+            .response
     }
 
     fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
@@ -3199,19 +3257,15 @@ impl AppState {
             .values()
             .filter(|state| matches!(state, CallState::Active))
             .count();
+        let in_call = active_calls > 0;
 
-        // Fit controls inside the inset dock rect — never past the right edge.
-        let desired_controls_width: f32 = if active_calls > 0 { 320.0 } else { 210.0 };
+        // Keep the control cluster centered at every window width.
+        let desired_controls_width: f32 = if in_call { 245.0 } else { 142.0 };
         let controls_width = desired_controls_width.min(rect.width().max(0.0));
-        let show_status = rect.width() >= controls_width + 180.0;
-        let controls_left = if show_status {
-            (rect.right() - controls_width).max(rect.left())
-        } else {
-            (rect.center().x - controls_width / 2.0).clamp(
-                rect.left(),
-                (rect.right() - controls_width).max(rect.left()),
-            )
-        };
+        let controls_left = (rect.center().x - controls_width / 2.0).clamp(
+            rect.left(),
+            (rect.right() - controls_width).max(rect.left()),
+        );
         let controls_rect = egui::Rect::from_min_max(
             egui::pos2(controls_left, rect.top()),
             egui::pos2(
@@ -3219,61 +3273,15 @@ impl AppState {
                 rect.bottom(),
             ),
         );
-        let status_rect = egui::Rect::from_min_max(
-            rect.left_top(),
-            egui::pos2(
-                (controls_rect.left() - 12.0).max(rect.left()),
-                rect.bottom(),
-            ),
-        );
-
-        if show_status {
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(status_rect), |ui| {
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(if active_calls == 1 {
-                            "1 peer in session".to_owned()
-                        } else {
-                            format!("{active_calls} peers in session")
-                        })
-                        .color(pal.text2)
-                        .size(ui_font_size(13.0)),
-                    );
-                    ui.horizontal(|ui| {
-                        dot(ui, if active_calls > 0 { pal.ok } else { pal.dim2 }, 5.0);
-                        ui.label(
-                            RichText::new(if active_calls > 0 {
-                                "direct connection"
-                            } else {
-                                "ready to connect"
-                            })
-                            .color(pal.dim)
-                            .size(ui_font_size(12.0)),
-                        );
-                    });
-                });
-            });
-        }
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(controls_rect));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                // Center the control cluster inside the allocated dock slot.
-                let cluster_width = if active_calls > 0 { 300.0 } else { 204.0 };
-                let lead = ((ui.available_width() - cluster_width) * 0.5).max(0.0);
-                if lead > 0.0 {
-                    ui.add_space(lead);
-                }
+                ui.spacing_mut().item_spacing.x = 0.0;
                 if dock_control(
                     ui,
                     pal,
-                    if self.muted {
-                        ph::MICROPHONE_SLASH
-                    } else {
-                        ph::MICROPHONE
-                    },
-                    if self.muted { "Muted" } else { "Mute" },
+                    if self.muted { Icon::MicOff } else { Icon::Mic },
                     self.muted,
                 )
                 .on_hover_text("Mute or unmute your microphone")
@@ -3283,12 +3291,15 @@ impl AppState {
                     self.play_control_sound(self.muted);
                     self.cmd(Command::SetMuted { muted: self.muted });
                 }
-                ui.add_space(2.0);
+                ui.add_space(8.0);
                 if dock_control(
                     ui,
                     pal,
-                    ph::HEADPHONES,
-                    if self.deafened { "Deafened" } else { "Deafen" },
+                    if self.deafened {
+                        Icon::EarOff
+                    } else {
+                        Icon::Headphones
+                    },
                     self.deafened,
                 )
                 .on_hover_text("Silence or restore all incoming call audio")
@@ -3300,29 +3311,39 @@ impl AppState {
                         deafened: self.deafened,
                     });
                 }
-                ui.add_space(2.0);
-                if dock_control(
-                    ui,
-                    pal,
-                    ph::MONITOR,
-                    if self.sharing_active { "Stop" } else { "Share" },
-                    self.sharing_active,
-                )
-                .on_hover_text(if self.sharing_active {
-                    "Stop sharing"
-                } else {
-                    "Share your screen"
-                })
-                .clicked()
+                ui.add_space(8.0);
+                let share_response = ui
+                    .add_enabled_ui(in_call, |ui| {
+                        dock_control(
+                            ui,
+                            pal,
+                            if self.sharing_active {
+                                Icon::ScreenShareOff
+                            } else {
+                                Icon::ScreenShare
+                            },
+                            self.sharing_active,
+                        )
+                    })
+                    .inner;
+                if share_response
+                    .on_hover_text(if self.sharing_active {
+                        "Stop sharing"
+                    } else if !in_call {
+                        "Join a call before sharing your screen"
+                    } else {
+                        "Share your screen"
+                    })
+                    .clicked()
                 {
                     let enabled = !self.sharing_active;
                     self.play_control_sound(enabled);
                     self.cmd(Command::ToggleSharing { enabled });
                 }
-                if active_calls > 0 {
-                    ui.add_space(8.0);
+                if in_call {
+                    ui.add_space(12.0);
                     v_sep(ui, pal.line);
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     if leave_button(ui, pal).clicked() {
                         let peers: Vec<_> = self.calls.keys().copied().collect();
                         if !peers.is_empty() {
@@ -3342,7 +3363,7 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
-        _pal: &Palette,
+        pal: &Palette,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         if self.stream_view_mode != StreamViewMode::Normal {
@@ -3355,31 +3376,28 @@ impl AppState {
             return;
         }
 
-        let has_live_visual = !self.active_stream_sources().is_empty() || self.sharing_active;
-        let available_height = ui.available_height();
-        let stage_height = if has_live_visual {
-            (available_height * 0.62)
-                .clamp(220.0, 720.0)
-                .min(available_height.max(120.0))
-        } else {
-            (available_height * 0.32)
-                .clamp(150.0, 220.0)
-                .min(available_height.max(110.0))
-        };
-        let stage_width = ui.available_width();
-        ui.allocate_ui_with_layout(
-            Vec2::new(stage_width, stage_height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                self.ui_stream_panel(
-                    ui,
-                    ctx,
-                    #[cfg(windows)]
-                    parent_hwnd,
-                )
-            },
-        );
-        ui.add_space(8.0);
+        if self.has_active_call() {
+            let stage_width = ui.available_width();
+            let stage_height = call_stage_height(stage_width, ui.available_height());
+            ui.allocate_ui_with_layout(
+                Vec2::new(stage_width, stage_height),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    Frame::new()
+                        .fill(pal.bg)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            self.ui_stream_panel(
+                                ui,
+                                ctx,
+                                #[cfg(windows)]
+                                parent_hwnd,
+                            )
+                        });
+                },
+            );
+            ui.add_space(10.0);
+        }
 
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("home-cards-scroll")
@@ -4096,11 +4114,25 @@ impl AppState {
 
         if immersive {
             ui.horizontal(|ui| {
-                self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, true);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if has_stream {
+                    ui.label(
+                        RichText::new(if streams.len() == 1 {
+                            "1 stream".to_owned()
+                        } else {
+                            format!("{} streams", streams.len())
+                        })
+                        .color(pal.dim)
+                        .size(ui_font_size(13.0)),
+                    );
+                    compact_v_sep(ui, pal.line);
+                }
+                self.ui_stream_toolbar(ui, ctx, has_stream, true);
             });
             ui.add_space(4.0);
         } else {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(
                     RichText::new("STAGE")
                         .family(kh_family())
@@ -4108,9 +4140,7 @@ impl AppState {
                         .size(16.0),
                 );
                 let stage_detail = if has_stream {
-                    Some(if self.focused_stream.is_some() {
-                        "focused stream".to_string()
-                    } else if streams.len() == 1 {
+                    Some(if streams.len() == 1 {
                         "1 stream".to_string()
                     } else {
                         format!("{} streams", streams.len())
@@ -4127,15 +4157,20 @@ impl AppState {
                             .size(ui_font_size(13.0)),
                     );
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    self.ui_stream_toolbar(ui, ctx, streams.len(), has_stream, false);
-                });
+                if has_stream {
+                    compact_v_sep(ui, pal.line);
+                }
+                self.ui_stream_toolbar(ui, ctx, has_stream, false);
             });
             ui.add_space(4.0);
         }
 
         let available = ui.available_size();
         let (area, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        if !immersive {
+            ui.painter()
+                .rect_filled(area, CornerRadius::same(10), pal.bg);
+        }
 
         if !has_stream {
             self.ui_empty_stream_state(ui, &pal, area, immersive);
@@ -4146,7 +4181,8 @@ impl AppState {
             .focused_stream
             .filter(|source| streams.contains(source))
         {
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area), |ui| {
+            let tile_rect = aspect_fit_rect(area, self.stream_aspect_ratio(focused));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
                 self.ui_stream_tile(
                     ui,
                     &pal,
@@ -4178,7 +4214,8 @@ impl AppState {
                 ),
                 Vec2::new(cell_w, cell_h),
             );
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_rect), |ui| {
+            let tile_rect = aspect_fit_rect(cell_rect, self.stream_aspect_ratio(*source));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
                 self.ui_stream_tile(
                     ui,
                     &pal,
@@ -4204,12 +4241,12 @@ impl AppState {
         } else {
             CornerRadius::same(10)
         };
-        ui.painter().rect_filled(area, corner_radius, pal.panel);
+        ui.painter().rect_filled(area, corner_radius, pal.bg);
         if !immersive {
             ui.painter().rect_stroke(
                 area,
                 corner_radius,
-                Stroke::new(1.0_f32, pal.line),
+                Stroke::new(1.0_f32, chat_hairline(pal)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4326,72 +4363,14 @@ impl AppState {
         let corner_radius = if immersive {
             CornerRadius::ZERO
         } else {
-            CornerRadius::same(10)
+            CornerRadius::same(12)
         };
         ui.painter()
-            .rect_filled(tile_rect, corner_radius, Color32::from_rgb(12, 12, 14));
-        if !immersive {
-            ui.painter().rect_stroke(
-                tile_rect,
-                corner_radius,
-                Stroke::new(1.0_f32, pal.line),
-                egui::StrokeKind::Inside,
-            );
-        }
-
-        // Native child windows necessarily sit above the parent's OpenGL
-        // surface. Keep controls in a small egui-owned header and limit the
-        // child to the image rectangle so it never obscures interaction.
-        let header_height = if tile_rect.height() >= 80.0 {
-            34.0
-        } else {
-            0.0
-        };
-        let header_rect = egui::Rect::from_min_max(
-            tile_rect.min,
-            egui::pos2(tile_rect.max.x, tile_rect.min.y + header_height),
-        );
-        let label = ellipsize(&self.stream_label(source), 30);
-        if header_height > 0.0 {
-            ui.painter().text(
-                header_rect.left_center() + egui::vec2(10.0, 0.0),
-                Align2::LEFT_CENTER,
-                &label,
-                sans(11.0),
-                pal.text,
-            );
-            let button_rect = egui::Rect::from_min_size(
-                header_rect.right_top() + egui::vec2(-34.0, 2.0),
-                Vec2::splat(30.0),
-            );
-            let icon = if expanded {
-                ph::SQUARES_FOUR
-            } else {
-                ph::ARROWS_OUT_SIMPLE
-            };
-            let tooltip = if expanded {
-                "Show all streams"
-            } else {
-                "Focus this stream"
-            };
-            if ui
-                .put(
-                    button_rect,
-                    egui::Button::new(RichText::new(icon).size(ui_font_size(15.0)))
-                        .fill(Color32::from_rgb(20, 20, 23))
-                        .stroke(Stroke::new(1.0_f32, pal.line_br)),
-                )
-                .on_hover_text(tooltip)
-                .clicked()
-            {
-                self.focused_stream = if expanded { None } else { Some(source) };
-            }
-        }
-
-        let content_rect = egui::Rect::from_min_max(
-            egui::pos2(tile_rect.min.x + 4.0, tile_rect.min.y + header_height + 2.0),
-            tile_rect.max - egui::vec2(4.0, 4.0),
-        );
+            .rect_filled(tile_rect, corner_radius, pal.panel);
+        let show_overlays = tile_rect.width() >= 90.0 && tile_rect.height() >= 44.0;
+        let max_label_chars = ((tile_rect.width() / 8.0) as usize).saturating_sub(12);
+        let label = ellipsize(&self.stream_label(source), max_label_chars.clamp(8, 30));
+        let content_rect = tile_rect;
         let (width, height) = match source {
             StreamSource::Local => self
                 .preview
@@ -4406,11 +4385,7 @@ impl AppState {
         if width == 0 || height == 0 {
             return;
         }
-        let aspect = width as f32 / height as f32;
-        let image_rect = egui::Rect::from_center_size(
-            content_rect.center(),
-            video_display_size(content_rect.size(), aspect, expanded),
-        );
+        let image_rect = content_rect;
 
         let mut texture_id = None;
         #[cfg(windows)]
@@ -4435,14 +4410,36 @@ impl AppState {
                 }
             }
             StreamSource::Remote(node_id) => {
-                #[cfg(windows)]
-                let allow_native =
-                    self.configured && !self.show_settings && !self.show_update_prompt;
                 let Some(frame) = self.video_frames.get_mut(&node_id) else {
                     return;
                 };
                 #[cfg(windows)]
-                if allow_native && matches!(&frame.data, DecodedFrameData::D3d11(_)) {
+                let use_native = !show_overlays
+                    && self.configured
+                    && !self.show_settings
+                    && !self.show_update_prompt;
+                #[cfg(windows)]
+                if !use_native {
+                    let rgba = match &frame.data {
+                        DecodedFrameData::D3d11(gpu_frame) => Some(gpu_frame.to_rgba()),
+                        DecodedFrameData::Rgba(_) => None,
+                    };
+                    if let Some(presenter) = &mut frame.presenter {
+                        presenter.hide();
+                    }
+                    if let Some(rgba) = rgba {
+                        match rgba {
+                            Ok(rgba) => {
+                                frame.data = DecodedFrameData::Rgba(Arc::new(rgba));
+                                frame.texture = None;
+                                frame.uploaded_generation = 0;
+                            }
+                            Err(error) => {
+                                warn!("video overlay composition fallback failed: {error:#}");
+                            }
+                        }
+                    }
+                } else if matches!(&frame.data, DecodedFrameData::D3d11(_)) {
                     let rect = physical_video_rect(image_rect, ui.ctx().pixels_per_point());
                     match present_native_video(frame, parent_hwnd, rect) {
                         Ok(presented) => native_presented = presented,
@@ -4471,11 +4468,9 @@ impl AppState {
         }
 
         if let Some(texture_id) = texture_id {
-            ui.painter().image(
-                texture_id,
+            ui.put(
                 image_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
+                egui::Image::new((texture_id, image_rect.size())).corner_radius(corner_radius),
             );
         } else if !native_presented {
             ui.painter().text(
@@ -4486,36 +4481,89 @@ impl AppState {
                 pal.dim,
             );
         }
+
+        if !immersive {
+            let border_color = if expanded {
+                pal.accent.gamma_multiply(0.72)
+            } else {
+                pal.line_br
+            };
+            ui.painter().rect_stroke(
+                tile_rect,
+                corner_radius,
+                Stroke::new(1.25_f32, border_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        if show_overlays {
+            let overlay_fill =
+                Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), 190);
+            let galley = ui
+                .painter()
+                .layout_no_wrap(label, sans(12.0), Color32::WHITE);
+            let badge_size = Vec2::new(galley.size().x + 20.0, 26.0);
+            let badge_rect = egui::Rect::from_min_size(
+                tile_rect.left_bottom() + egui::vec2(8.0, -badge_size.y - 8.0),
+                badge_size,
+            );
+            ui.painter()
+                .rect_filled(badge_rect, CornerRadius::same(8), overlay_fill);
+            ui.painter().galley(
+                badge_rect.left_center() + egui::vec2(10.0, -galley.size().y * 0.5),
+                galley,
+                Color32::WHITE,
+            );
+
+            if ui.rect_contains_pointer(tile_rect) {
+                let button_rect = egui::Rect::from_min_size(
+                    tile_rect.right_top() + egui::vec2(-40.0, 10.0),
+                    Vec2::splat(28.0),
+                );
+                let icon = if expanded {
+                    Icon::LayoutGrid
+                } else {
+                    Icon::Maximize2
+                };
+                let tooltip = if expanded {
+                    "Show all streams"
+                } else {
+                    "Focus this stream"
+                };
+                if ui
+                    .put(
+                        button_rect,
+                        egui::Button::new(
+                            RichText::new(char::from(icon))
+                                .font(lucide(15.0))
+                                .color(pal.text),
+                        )
+                        .fill(pal.panel)
+                        .stroke(Stroke::new(1.0_f32, pal.line_br))
+                        .corner_radius(CornerRadius::same(8)),
+                    )
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    self.focused_stream = if expanded { None } else { Some(source) };
+                }
+            }
+        }
     }
 
     fn ui_stream_toolbar(
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
-        stream_count: usize,
         has_stream: bool,
         compact: bool,
     ) {
         let pal = Palette::for_theme(self.theme);
-        if stream_count > 1 {
-            ui.label(
-                RichText::new(format!("{stream_count} streams"))
-                    .color(Color32::from_rgb(0x91, 0x8e, 0x8a))
-                    .size(ui_font_size(12.0)),
-            );
-        }
-
         if has_stream {
             let fill_selected = self.stream_view_mode == StreamViewMode::FillWindow;
-            if toolbar_button(
-                ui,
-                &pal,
-                Icon::Expand,
-                if compact { "Fill" } else { "Fill window" },
-                fill_selected,
-            )
-            .on_hover_text("Expand stream to fill the client window")
-            .clicked()
+            if toolbar_ghost_icon_button(ui, &pal, Icon::Expand, fill_selected)
+                .on_hover_text("Expand stream to fill the client window")
+                .clicked()
             {
                 self.set_stream_view_mode(
                     ctx,
@@ -4528,7 +4576,7 @@ impl AppState {
             }
 
             let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
-            if toolbar_button(ui, &pal, Icon::Fullscreen, "Fullscreen", fs_selected)
+            if toolbar_ghost_icon_button(ui, &pal, Icon::Fullscreen, fs_selected)
                 .on_hover_text("Enter native fullscreen (Esc to exit)")
                 .clicked()
             {
@@ -5459,6 +5507,29 @@ const CHROME_SIDE_INSET: i8 = 14;
 const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
 const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
 const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
+const PARTICIPANT_CARD_SLOT_WIDTH: f32 = 250.0;
+const PARTICIPANT_GAP: f32 = 8.0;
+
+fn participant_bar_columns(width: f32) -> usize {
+    let chrome_width = 2.0 * (f32::from(CHROME_SIDE_INSET) + 10.0);
+    let inner_width = (width - chrome_width).max(1.0);
+    ((inner_width + PARTICIPANT_GAP) / (PARTICIPANT_CARD_SLOT_WIDTH + PARTICIPANT_GAP))
+        .floor()
+        .max(1.0) as usize
+}
+
+fn participant_bar_height(width: f32, participant_count: usize, max_height: f32) -> f32 {
+    if participant_count == 0 || max_height <= 0.0 {
+        return 0.0;
+    }
+
+    let columns = participant_bar_columns(width);
+    let rows = participant_count.div_ceil(columns);
+    let content_height =
+        rows as f32 * PARTICIPANT_CHIP_HEIGHT + rows.saturating_sub(1) as f32 * PARTICIPANT_GAP;
+    // Participant frame: 4/6 outer margin plus 8/8 inner margin.
+    (content_height + 26.0).min(max_height)
+}
 
 fn compact_chip_button(
     ui: &mut Ui,
@@ -5528,6 +5599,22 @@ fn participant_grid_columns(available_width: f32, participant_count: usize) -> u
 fn participant_tile_width(available_width: f32, columns: usize, gap: f32) -> f32 {
     let columns = columns.max(1);
     ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
+}
+
+fn call_stage_height(available_width: f32, available_height: f32) -> f32 {
+    if available_width <= 0.0 || available_height <= 0.0 {
+        return 0.0;
+    }
+
+    const MIN_STAGE_HEIGHT: f32 = 280.0;
+    const MAX_STAGE_HEIGHT: f32 = 720.0;
+    const STAGE_HEIGHT_SHARE: f32 = 0.74;
+
+    let aspect_ratio_cap = available_width * 9.0 / 16.0;
+    let upper_bound = available_height.min(MAX_STAGE_HEIGHT).min(aspect_ratio_cap);
+    (available_height * STAGE_HEIGHT_SHARE)
+        .max(MIN_STAGE_HEIGHT)
+        .min(upper_bound)
 }
 
 fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
@@ -5653,6 +5740,13 @@ fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 
     } else {
         Vec2::new(available.x, available.x / aspect)
     }
+}
+
+fn aspect_fit_rect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
+    egui::Rect::from_center_size(
+        bounds.center(),
+        video_display_size(bounds.size(), aspect, false),
+    )
 }
 
 fn sync_rgba_texture(
@@ -6017,6 +6111,22 @@ mod layout_tests {
     }
 
     #[test]
+    fn call_stage_uses_most_space_without_exceeding_widescreen_height() {
+        assert_eq!(call_stage_height(1600.0, 1000.0), 720.0);
+        assert_eq!(call_stage_height(800.0, 1000.0), 450.0);
+        assert_eq!(call_stage_height(1200.0, 300.0), 280.0);
+        assert_eq!(call_stage_height(0.0, 500.0), 0.0);
+    }
+
+    #[test]
+    fn participant_bar_adds_rows_as_the_window_narrows() {
+        assert_eq!(participant_bar_height(900.0, 3, 500.0), 66.0);
+        assert_eq!(participant_bar_height(560.0, 3, 500.0), 114.0);
+        assert_eq!(participant_bar_height(320.0, 3, 500.0), 162.0);
+        assert_eq!(participant_bar_height(320.0, 3, 100.0), 100.0);
+    }
+
+    #[test]
     fn participant_grid_keeps_every_peer_on_screen() {
         assert_eq!(participant_grid_columns(1570.0, 2), 2);
         assert_eq!(participant_grid_columns(1570.0, 3), 3);
@@ -6040,6 +6150,11 @@ mod layout_tests {
         let narrow = video_display_size(Vec2::new(400.0, 1000.0), 16.0 / 9.0, false);
         assert_eq!(narrow.x, 400.0);
         assert!((narrow.y - 225.0).abs() < 0.01);
+
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(500.0, 500.0));
+        let fitted = aspect_fit_rect(bounds, 16.0 / 9.0);
+        assert!((fitted.width() / fitted.height() - 16.0 / 9.0).abs() < 0.001);
+        assert_eq!(fitted.center(), bounds.center());
     }
 
     #[test]
