@@ -155,6 +155,7 @@ const STREAM_GRID_GAP: f32 = 6.0;
 struct AppState {
     configured: bool,
     show_settings: bool,
+    show_contacts: bool,
     stream_view_mode: StreamViewMode,
     remote_node_id: Option<Result<NodeId, KeyParsingError>>,
     remote_node_input: String,
@@ -190,7 +191,6 @@ struct AppState {
     autostart_rx: mpsc::Receiver<AutostartMessage>,
     update_status: UpdateStatus,
     show_update_prompt: bool,
-    reset_home_scroll: bool,
     resource_monitor: ResourceMonitor,
     dev_pair: Option<DevPairState>,
     dev_auto_share: bool,
@@ -202,6 +202,7 @@ struct AppState {
     max_image_bytes: Option<u64>,
     start_with_system: bool,
     saved_start_with_system: bool,
+    show_system_usage: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -352,6 +353,8 @@ struct Settings {
     max_image_bytes: Option<u64>,
     #[serde(default)]
     start_with_system: bool,
+    #[serde(default)]
+    show_system_usage: bool,
 }
 
 impl Default for Settings {
@@ -366,6 +369,7 @@ impl Default for Settings {
             chat_style: ChatStyle::default(),
             max_image_bytes: None,
             start_with_system: false,
+            show_system_usage: false,
         }
     }
 }
@@ -482,6 +486,7 @@ impl App {
         let state = AppState {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
+            show_contacts: false,
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
             remote_node_input: String::new(),
@@ -517,7 +522,6 @@ impl App {
             autostart_rx,
             update_status: UpdateStatus::Idle,
             show_update_prompt: false,
-            reset_home_scroll: false,
             resource_monitor: ResourceMonitor::start(),
             dev_pair: DevPairState::from_env(),
             dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
@@ -529,6 +533,7 @@ impl App {
             max_image_bytes: settings.max_image_bytes,
             start_with_system: settings.start_with_system,
             saved_start_with_system: settings.start_with_system,
+            show_system_usage: settings.show_system_usage,
         };
 
         if has_saved_settings {
@@ -587,8 +592,10 @@ impl AppState {
         viewport_transparent: &mut Option<bool>,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
-        // Keep the process resource readout current even while the rest of the UI is idle.
-        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.show_system_usage {
+            // Keep the optional process resource readout current while the rest of the UI is idle.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         self.process_update_events(ctx);
         self.process_autostart_events();
         let pal = Palette::for_theme(self.theme);
@@ -655,8 +662,24 @@ impl AppState {
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(12.0, 12.0))
                 .show(ctx, |ui| self.ui_mode_switcher(ui, &pal));
+            egui::Area::new(egui::Id::new("fullscreen-contacts"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .show(ctx, |ui| {
+                    if ghost_icon_button(ui, &pal, ph::ADDRESS_BOOK)
+                        .on_hover_text("Contacts and calling")
+                        .clicked()
+                    {
+                        self.show_contacts = true;
+                    }
+                });
         }
 
+        let contacts_visible =
+            self.app_mode == AppMode::Calls && (self.show_contacts || !self.has_active_call());
+        if contacts_visible && !self.show_settings && self.configured {
+            self.ui_contacts_window(ctx);
+        }
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
         }
@@ -666,7 +689,10 @@ impl AppState {
         self.notifications.show(ctx, self.theme);
         #[cfg(windows)]
         {
-            let force_hide = self.show_settings || !self.configured || self.show_update_prompt;
+            let force_hide = self.show_settings
+                || !self.configured
+                || self.show_update_prompt
+                || contacts_visible;
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
                     presenter.hide_if_unused(force_hide);
@@ -1009,9 +1035,6 @@ impl AppState {
                         continue;
                     }
                     self.video_stream_generations.insert(node_id, generation);
-                    if !self.video_frames.contains_key(&node_id) {
-                        self.reset_home_scroll = true;
-                    }
                     let state =
                         self.video_frames
                             .entry(node_id)
@@ -1086,7 +1109,6 @@ impl AppState {
                             "Your screen is no longer being shared.",
                         );
                     }
-                    self.reset_home_scroll = true;
                     if !active {
                         self.preview = None;
                         if self.focused_stream == Some(StreamSource::Local) {
@@ -1103,7 +1125,6 @@ impl AppState {
                         message.clone(),
                     );
                     self.capture_error = Some(message);
-                    self.reset_home_scroll = true;
                 }
                 Event::PreviewFrame {
                     width,
@@ -1421,6 +1442,7 @@ impl AppState {
             chat_style: self.chat_style,
             max_image_bytes: self.max_image_bytes,
             start_with_system: self.saved_start_with_system,
+            show_system_usage: self.show_system_usage,
         });
     }
 
@@ -1541,6 +1563,7 @@ impl AppState {
                         pal,
                         &title,
                         self.resource_monitor.snapshot(),
+                        self.show_system_usage,
                         always_on_top,
                         rounded,
                     );
@@ -3206,6 +3229,13 @@ impl AppState {
                 {
                     self.show_settings = true;
                 }
+                if ghost_icon_button(ui, pal, ph::ADDRESS_BOOK)
+                    .on_hover_text("Contacts and calling")
+                    .clicked()
+                {
+                    self.app_mode = AppMode::Calls;
+                    self.show_contacts = true;
+                }
                 if let Some(release) = available_update {
                     if action_button(
                         ui,
@@ -3421,42 +3451,17 @@ impl AppState {
             return;
         }
 
-        if self.has_active_call() {
-            let stage_width = ui.available_width();
-            let stage_height = call_stage_height(stage_width, ui.available_height());
-            ui.allocate_ui_with_layout(
-                Vec2::new(stage_width, stage_height),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    Frame::new()
-                        .fill(pal.bg)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            self.ui_stream_panel(
-                                ui,
-                                ctx,
-                                #[cfg(windows)]
-                                parent_hwnd,
-                            )
-                        });
-                },
-            );
-            ui.add_space(10.0);
-        }
-
-        let mut scroll_area = egui::ScrollArea::vertical()
-            .id_salt("home-cards-scroll")
-            .auto_shrink([false, false]);
-        if self.reset_home_scroll {
-            scroll_area = scroll_area.vertical_scroll_offset(0.0);
-            self.reset_home_scroll = false;
-        }
-        scroll_area.show(ui, |ui| {
-            // Friends-first home: contacts are primary; dial / ID / add-friend sit behind More.
-            self.ui_friends_card(ui);
-            ui.add_space(12.0);
-            self.ui_call_more_options(ui);
-        });
+        Frame::new()
+            .fill(pal.bg)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                self.ui_stream_panel(
+                    ui,
+                    ctx,
+                    #[cfg(windows)]
+                    parent_hwnd,
+                )
+            });
     }
 
     #[allow(dead_code)]
@@ -3677,6 +3682,76 @@ impl AppState {
                     ui.add_space(10.0);
                     self.ui_add_friend_card(ui);
                 });
+            });
+    }
+
+    fn ui_contacts_window(&mut self, ctx: &egui::Context) {
+        let pal = Palette::for_theme(self.theme);
+        let screen_rect = ctx.content_rect();
+        let dialog_width = (screen_rect.width() - 32.0).clamp(340.0, 560.0);
+        let scroll_height = (screen_rect.height() - 190.0).clamp(220.0, 720.0);
+        let can_close = self.has_active_call();
+
+        egui::Window::new("contacts-dialog")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(dialog_width)
+            .min_width(dialog_width)
+            .max_width(dialog_width)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                Frame::new()
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0_f32, pal.line_br))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(0.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(dialog_width);
+                Frame::new()
+                    .fill(pal.panel)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("CONTACTS")
+                                    .family(kh_family())
+                                    .color(pal.text)
+                                    .size(16.0),
+                            );
+                            ui.label(
+                                RichText::new("friends and calling")
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.5)),
+                            );
+                            if can_close {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ghost_icon_button(ui, &pal, ph::X)
+                                        .on_hover_text("Close contacts")
+                                        .clicked()
+                                    {
+                                        self.show_contacts = false;
+                                    }
+                                });
+                            }
+                        });
+                    });
+                Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("contacts-scroll")
+                            .max_height(scroll_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                self.ui_friends_card(ui);
+                                ui.add_space(12.0);
+                                self.ui_call_more_options(ui);
+                            });
+                    });
             });
     }
 
@@ -4717,6 +4792,12 @@ impl AppState {
                                                 .color(pal.text2)
                                                 .size(ui_font_size(12.0)),
                                         );
+                                        ui.checkbox(
+                                            &mut self.show_system_usage,
+                                            RichText::new("Show system usage in title bar")
+                                                .color(pal.text2)
+                                                .size(ui_font_size(12.0)),
+                                        );
                                     });
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -5646,22 +5727,6 @@ fn participant_tile_width(available_width: f32, columns: usize, gap: f32) -> f32
     ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
 }
 
-fn call_stage_height(available_width: f32, available_height: f32) -> f32 {
-    if available_width <= 0.0 || available_height <= 0.0 {
-        return 0.0;
-    }
-
-    const MIN_STAGE_HEIGHT: f32 = 280.0;
-    const MAX_STAGE_HEIGHT: f32 = 720.0;
-    const STAGE_HEIGHT_SHARE: f32 = 0.74;
-
-    let aspect_ratio_cap = available_width * 9.0 / 16.0;
-    let upper_bound = available_height.min(MAX_STAGE_HEIGHT).min(aspect_ratio_cap);
-    (available_height * STAGE_HEIGHT_SHARE)
-        .max(MIN_STAGE_HEIGHT)
-        .min(upper_bound)
-}
-
 fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
     if count <= 1 || available.x <= 0.0 || available.y <= 0.0 {
         return (1, 1);
@@ -6161,14 +6226,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn call_stage_uses_most_space_without_exceeding_widescreen_height() {
-        assert_eq!(call_stage_height(1600.0, 1000.0), 720.0);
-        assert_eq!(call_stage_height(800.0, 1000.0), 450.0);
-        assert_eq!(call_stage_height(1200.0, 300.0), 280.0);
-        assert_eq!(call_stage_height(0.0, 500.0), 0.0);
-    }
-
-    #[test]
     fn participant_bar_adds_rows_as_the_window_narrows() {
         assert_eq!(participant_bar_height(900.0, 3, 500.0), 66.0);
         assert_eq!(participant_bar_height(560.0, 3, 500.0), 114.0);
@@ -6254,6 +6311,7 @@ mod layout_tests {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
         assert!(!settings.start_with_system);
+        assert!(!settings.show_system_usage);
     }
 
     #[test]

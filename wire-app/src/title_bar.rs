@@ -21,6 +21,7 @@ pub fn ui(
     pal: &Palette,
     title: &str,
     resources: ResourceUsage,
+    show_system_usage: bool,
     always_on_top: &mut bool,
     rounded: bool,
 ) {
@@ -40,7 +41,7 @@ pub fn ui(
         pal.text,
     );
 
-    if title_bar_rect.width() >= 500.0 {
+    if show_system_usage && title_bar_rect.width() >= 500.0 {
         let gpu = resources
             .gpu_percent
             .map(|value| format!("{value:.0}%"))
