@@ -1476,12 +1476,24 @@ impl AppState {
     }
 
     fn toggle_deafened(&mut self) {
-        self.deafened = !self.deafened;
-        info!(deafened = self.deafened, "deafen toggled");
+        let (deafened, muted) = next_deafen_audio_state(self.deafened);
+        self.deafened = deafened;
+        self.muted = muted;
+        info!(
+            deafened = self.deafened,
+            muted = self.muted,
+            "deafen toggled"
+        );
         self.play_control_sound(self.deafened);
-        self.cmd(Command::SetDeafened {
-            deafened: self.deafened,
-        });
+        if self.deafened {
+            // Stop capture before silencing playback when deafening.
+            self.cmd(Command::SetMuted { muted: true });
+            self.cmd(Command::SetDeafened { deafened: true });
+        } else {
+            // Restore playback before capture when undeafening.
+            self.cmd(Command::SetDeafened { deafened: false });
+            self.cmd(Command::SetMuted { muted: false });
+        }
     }
 
     fn hang_up_call(&self, node_id: NodeId) {
@@ -6122,6 +6134,11 @@ fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -
         && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
 }
 
+fn next_deafen_audio_state(currently_deafened: bool) -> (bool, bool) {
+    let enabled = !currently_deafened;
+    (enabled, enabled)
+}
+
 fn ellipsize(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
@@ -6254,6 +6271,12 @@ mod layout_tests {
         .unwrap();
 
         assert!(settings.audio.noise_suppression_enabled);
+    }
+
+    #[test]
+    fn deafen_and_mute_toggle_together() {
+        assert_eq!(next_deafen_audio_state(false), (true, true));
+        assert_eq!(next_deafen_audio_state(true), (false, false));
     }
 
     #[test]
