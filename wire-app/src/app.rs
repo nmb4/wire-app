@@ -51,6 +51,8 @@ pub struct App {
     always_on_top: bool,
     viewport_transparent: Option<bool>,
     state: AppState,
+    #[cfg(windows)]
+    global_hotkeys: Option<crate::global_hotkeys::GlobalHotkeys>,
 }
 
 /// A locally stored contact, identified by their stable wire node id.
@@ -410,6 +412,17 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        while let Some(action) = self
+            .global_hotkeys
+            .as_ref()
+            .and_then(crate::global_hotkeys::GlobalHotkeys::try_recv)
+        {
+            match action {
+                crate::global_hotkeys::Action::ToggleMute => self.state.toggle_muted(),
+                crate::global_hotkeys::Action::ToggleDeafen => self.state.toggle_deafened(),
+            }
+        }
         if ctx.input(|input| input.viewport().close_requested()) {
             info!("Wire root viewport close requested");
         }
@@ -537,11 +550,13 @@ impl App {
             is_first_update: true,
             always_on_top: false,
             viewport_transparent: Some(rounded),
+            #[cfg(windows)]
+            global_hotkeys: None,
         };
         eframe::run_native(
             "wire",
             options,
-            Box::new(|cc| {
+            Box::new(move |cc| {
                 if let Some(render_state) = &cc.wgpu_render_state {
                     let adapter = render_state.adapter.get_info();
                     tracing::info!(
@@ -551,6 +566,14 @@ impl App {
                     );
                 }
                 setup_fonts(&cc.egui_ctx);
+                #[allow(unused_mut)]
+                let mut app = app;
+                #[cfg(windows)]
+                if !dev_fixture {
+                    app.global_hotkeys = Some(crate::global_hotkeys::GlobalHotkeys::start(
+                        cc.egui_ctx.clone(),
+                    ));
+                }
                 Ok(Box::new(app))
             }),
         )
@@ -1442,6 +1465,22 @@ impl AppState {
             Sound::Button1
         } else {
             Sound::Button2
+        });
+    }
+
+    fn toggle_muted(&mut self) {
+        self.muted = !self.muted;
+        info!(muted = self.muted, "mute toggled");
+        self.play_control_sound(self.muted);
+        self.cmd(Command::SetMuted { muted: self.muted });
+    }
+
+    fn toggle_deafened(&mut self) {
+        self.deafened = !self.deafened;
+        info!(deafened = self.deafened, "deafen toggled");
+        self.play_control_sound(self.deafened);
+        self.cmd(Command::SetDeafened {
+            deafened: self.deafened,
         });
     }
 
@@ -3284,12 +3323,10 @@ impl AppState {
                     if self.muted { Icon::MicOff } else { Icon::Mic },
                     self.muted,
                 )
-                .on_hover_text("Mute or unmute your microphone")
+                .on_hover_text("Mute or unmute your microphone (Right Shift)")
                 .clicked()
                 {
-                    self.muted = !self.muted;
-                    self.play_control_sound(self.muted);
-                    self.cmd(Command::SetMuted { muted: self.muted });
+                    self.toggle_muted();
                 }
                 ui.add_space(8.0);
                 if dock_control(
@@ -3302,14 +3339,10 @@ impl AppState {
                     },
                     self.deafened,
                 )
-                .on_hover_text("Silence or restore all incoming call audio")
+                .on_hover_text("Silence or restore all incoming call audio (Right Control)")
                 .clicked()
                 {
-                    self.deafened = !self.deafened;
-                    self.play_control_sound(self.deafened);
-                    self.cmd(Command::SetDeafened {
-                        deafened: self.deafened,
-                    });
+                    self.toggle_deafened();
                 }
                 ui.add_space(8.0);
                 let share_response = ui

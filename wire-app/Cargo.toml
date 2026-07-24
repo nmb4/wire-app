@@ -76,6 +76,7 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Wdk_System_SystemServices",
 ] }
 scopeguard = "1.2"

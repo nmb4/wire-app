@@ -3,6 +3,8 @@ mod autostart;
 mod chat;
 mod client_status;
 mod dev_pair;
+#[cfg(windows)]
+mod global_hotkeys;
 mod notifications;
 mod resource_monitor;
 mod sounds;
