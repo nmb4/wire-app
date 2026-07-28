@@ -94,9 +94,13 @@ wgpu = { version = "27.0.1", default-features = false, features = ["metal"] }
 default = ["audio-processing"]
 audio-processing = ["wire/audio-processing"]
 
+[build-dependencies]
+winres = "0.1"
+
 [package.metadata.bundle]
 name = "Wire"
 identifier = "live.stardive.wire"
+icon = ["assets/icon.png", "assets/icon.ico"]
 osx_minimum_system_version = "12.3"
 osx_info_plist_exts = ["Info.plist"]
 

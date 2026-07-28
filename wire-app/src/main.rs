@@ -340,6 +340,7 @@ fn main() -> Result<(), eframe::Error> {
     options.viewport = options
         .viewport
         .with_title("Wire")
+        .with_icon(load_app_icon())
         .with_decorations(false)
         .with_transparent(rounded)
         .with_resizable(true)
@@ -359,4 +360,16 @@ fn main() -> Result<(), eframe::Error> {
         let _ = child.wait();
     }
     result
+}
+
+fn load_app_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .expect("app icon asset")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }

@@ -1,6 +1,22 @@
+use std::env;
 use std::path::Path;
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/icon.png");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+
+    // Embed the .ico into the PE resources on Windows so Explorer / taskbar /
+    // shortcuts show the branded file icon (separate from the eframe window icon).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winres::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        if let Err(err) = res.compile() {
+            // Don't hard-fail the whole crate if the resource compiler is missing
+            // in an unusual toolchain; the runtime window icon still works.
+            println!("cargo:warning=failed to embed Windows app icon: {err}");
+        }
+    }
+
     // These are polish assets, not application requirements. Expose each file's
     // availability as a cfg so include_bytes! is only expanded for files that
     // actually exist in the checkout.
