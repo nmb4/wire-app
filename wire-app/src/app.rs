@@ -5166,58 +5166,73 @@ impl AppState {
             );
 
             if ui.rect_contains_pointer(tile_rect) {
-                let is_remote = matches!(source, StreamSource::Remote(_));
-                let button_rect = egui::Rect::from_min_size(
-                    tile_rect.right_top() + egui::vec2(if is_remote { -76.0 } else { -40.0 }, 10.0),
-                    Vec2::splat(28.0),
+                // Compact overlay control group (focus + optional stop).
+                const BTN: f32 = 22.0;
+                const GAP: f32 = 2.0;
+                const PAD: f32 = 3.0;
+                const MARGIN: f32 = 8.0;
+
+                let stop_node = match source {
+                    StreamSource::Remote(node_id) => Some(node_id),
+                    StreamSource::Local => None,
+                };
+                let button_count = 1 + usize::from(stop_node.is_some());
+                let group_size = Vec2::new(
+                    PAD * 2.0
+                        + BTN * button_count as f32
+                        + GAP * button_count.saturating_sub(1) as f32,
+                    PAD * 2.0 + BTN,
                 );
-                let icon = if expanded {
+                let group_rect = egui::Rect::from_min_size(
+                    tile_rect.right_top() + egui::vec2(-group_size.x - MARGIN, MARGIN),
+                    group_size,
+                );
+
+                ui.painter().rect(
+                    group_rect,
+                    CornerRadius::same(8),
+                    pal.panel,
+                    Stroke::new(1.0_f32, pal.line_br),
+                    egui::StrokeKind::Inside,
+                );
+
+                let mut origin = group_rect.min + egui::vec2(PAD, PAD);
+                let focus_icon = if expanded {
                     Icon::LayoutGrid
                 } else {
                     Icon::Maximize2
                 };
-                let tooltip = if expanded {
+                let focus_tooltip = if expanded {
                     "Show all streams"
                 } else {
                     "Focus this stream"
                 };
-                if ui
-                    .put(
-                        button_rect,
-                        egui::Button::new(
-                            RichText::new(char::from(icon))
-                                .font(lucide(15.0))
-                                .color(pal.text),
-                        )
-                        .fill(pal.panel)
-                        .stroke(Stroke::new(1.0_f32, pal.line_br))
-                        .corner_radius(CornerRadius::same(8)),
-                    )
-                    .on_hover_text(tooltip)
-                    .clicked()
+                let focus_rect = egui::Rect::from_min_size(origin, Vec2::splat(BTN));
+                if stream_tile_group_icon_button(
+                    ui,
+                    pal,
+                    focus_rect,
+                    ui.id().with(("stream_tile_focus", source)),
+                    focus_icon,
+                    focus_tooltip,
+                )
+                .clicked()
                 {
                     self.focused_stream = if expanded { None } else { Some(source) };
                 }
 
-                if let StreamSource::Remote(node_id) = source {
-                    let stop_rect = egui::Rect::from_min_size(
-                        tile_rect.right_top() + egui::vec2(-40.0, 10.0),
-                        Vec2::splat(28.0),
-                    );
-                    if ui
-                        .put(
-                            stop_rect,
-                            egui::Button::new(
-                                RichText::new(char::from(Icon::X))
-                                    .font(lucide(15.0))
-                                    .color(pal.text),
-                            )
-                            .fill(pal.panel)
-                            .stroke(Stroke::new(1.0_f32, pal.line_br))
-                            .corner_radius(CornerRadius::same(8)),
-                        )
-                        .on_hover_text("Stop watching this screen share")
-                        .clicked()
+                if let Some(node_id) = stop_node {
+                    origin.x += BTN + GAP;
+                    let stop_rect = egui::Rect::from_min_size(origin, Vec2::splat(BTN));
+                    if stream_tile_group_icon_button(
+                        ui,
+                        pal,
+                        stop_rect,
+                        ui.id().with(("stream_tile_stop", source)),
+                        Icon::X,
+                        "Stop watching this screen share",
+                    )
+                    .clicked()
                     {
                         self.stop_watching(node_id);
                     }
@@ -6720,6 +6735,39 @@ fn paint_chat_card(ui: &Ui, rect: egui::Rect, pal: &Palette, radius: u8) {
         Stroke::new(1.0_f32, chat_hairline(pal)),
         egui::StrokeKind::Inside,
     );
+}
+
+/// Compact icon control for stream-tile overlay button groups.
+///
+/// Uses a fixed rect (overlay, not layout-allocated) and paints hover fill
+/// inside the shared group chrome rather than drawing its own border.
+fn stream_tile_group_icon_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    rect: egui::Rect,
+    id: egui::Id,
+    icon: Icon,
+    tooltip: &str,
+) -> egui::Response {
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_text(tooltip);
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), pal.panel2);
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(13.0),
+        if response.hovered() || response.has_focus() {
+            pal.text
+        } else {
+            pal.text2
+        },
+    );
+    response
 }
 
 fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Response {
