@@ -4196,40 +4196,21 @@ impl AppState {
                     .inner_margin(0.0),
             )
             .show(ctx, |ui| {
-                ui.set_width(dialog_width);
-                Frame::new()
-                    .fill(pal.panel)
-                    .inner_margin(egui::Margin::symmetric(18, 12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("CONTACTS")
-                                    .family(kh_family())
-                                    .color(pal.text)
-                                    .size(16.0),
-                            );
-                            ui.label(
-                                RichText::new("friends and calling")
-                                    .color(pal.dim)
-                                    .size(ui_font_size(11.5)),
-                            );
-                            if can_close {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ghost_icon_button(ui, &pal, ph::X)
-                                        .on_hover_text("Close contacts")
-                                        .clicked()
-                                    {
-                                        self.show_contacts = false;
-                                    }
-                                });
-                            }
-                        });
-                    });
+                let width = ui.available_width();
+                ui.set_width(width);
+                if floating_dialog_header(
+                    ui,
+                    &pal,
+                    "CONTACTS",
+                    "friends and calling",
+                    can_close.then_some("Close contacts"),
+                ) {
+                    self.show_contacts = false;
+                }
                 Frame::new()
                     .inner_margin(egui::Margin::symmetric(18, 16))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                        ui.set_min_width(ui.available_width());
                         egui::ScrollArea::vertical()
                             .id_salt("contacts-scroll")
                             .max_height(scroll_height)
@@ -5282,7 +5263,7 @@ impl AppState {
         }
 
         if compact && self.stream_view_mode != StreamViewMode::Normal {
-            if toolbar_button(ui, &pal, Icon::Minimize2, "Exit", false)
+            if toolbar_ghost_icon_button(ui, &pal, Icon::Minimize2, false)
                 .on_hover_text("Return to normal layout (Esc)")
                 .clicked()
             {
@@ -5315,30 +5296,19 @@ impl AppState {
                     .inner_margin(0.0),
             )
             .show(ctx, |ui| {
-                ui.set_width(dialog_width);
-                Frame::new()
-                    .fill(pal.panel)
-                    .inner_margin(egui::Margin::symmetric(18, 12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("SETTINGS")
-                                    .family(kh_family())
-                                    .color(pal.text)
-                                    .size(16.0),
-                            );
-                            ui.label(
-                                RichText::new("appearance, audio, video and updates")
-                                    .color(pal.dim)
-                                    .size(ui_font_size(11.5)),
-                            );
-                        });
-                    });
+                let width = ui.available_width();
+                ui.set_width(width);
+                let _ = floating_dialog_header(
+                    ui,
+                    &pal,
+                    "SETTINGS",
+                    "appearance, audio, video and updates",
+                    None,
+                );
                 Frame::new()
                     .inner_margin(egui::Margin::symmetric(18, 16))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                        ui.set_min_width(ui.available_width());
                         egui::ScrollArea::vertical()
                             .id_salt("settings-scroll")
                             .max_height(scroll_height)
@@ -6735,6 +6705,61 @@ fn paint_chat_card(ui: &Ui, rect: egui::Rect, pal: &Palette, radius: u8) {
         Stroke::new(1.0_f32, chat_hairline(pal)),
         egui::StrokeKind::Inside,
     );
+}
+
+/// Shared title band for floating settings/contacts dialogs.
+///
+/// Uses full available width and top-only rounding so the fill meets the
+/// panel edges and does not square-bleed over the outer 12px corners.
+/// Returns true when the optional close control was clicked.
+fn floating_dialog_header(
+    ui: &mut Ui,
+    pal: &Palette,
+    title: &str,
+    subtitle: &str,
+    close_tooltip: Option<&str>,
+) -> bool {
+    const RADIUS: u8 = 12;
+    let mut closed = false;
+    Frame::new()
+        .fill(pal.panel)
+        .corner_radius(CornerRadius {
+            nw: RADIUS,
+            ne: RADIUS,
+            sw: 0,
+            se: 0,
+        })
+        .inner_margin(egui::Margin::symmetric(18, 12))
+        .show(ui, |ui| {
+            // Frame sizes to content — expand to the full content max so both
+            // left and right edges meet the panel, not just the text run.
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    RichText::new(title)
+                        .family(kh_family())
+                        .color(pal.text)
+                        .size(16.0),
+                );
+                ui.label(
+                    RichText::new(subtitle)
+                        .color(pal.dim)
+                        .size(ui_font_size(11.5)),
+                );
+                if let Some(tooltip) = close_tooltip {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ghost_icon_button(ui, pal, ph::X)
+                            .on_hover_text(tooltip)
+                            .clicked()
+                        {
+                            closed = true;
+                        }
+                    });
+                }
+            });
+        });
+    closed
 }
 
 /// Compact icon control for stream-tile overlay button groups.
