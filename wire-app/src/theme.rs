@@ -6,8 +6,8 @@
 
 use eframe::egui;
 use egui::{
-    text::{LayoutJob, TextFormat},
-    Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Vec2,
+    Align2, Color32, CornerRadius, FontData, FontFamily, FontId, Margin, RichText, Sense, Stroke,
+    TextStyle, Vec2,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 // uppercase display font family used for headers / big text
@@ -313,6 +313,28 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Linear blend in sRGB channel space (good enough for subtle hover lifts).
+pub fn mix_rgb(base: Color32, tint: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel =
+        |base: u8, tint: u8| (base as f32 + (tint as f32 - base as f32) * amount).round() as u8;
+    Color32::from_rgb(
+        channel(base.r(), tint.r()),
+        channel(base.g(), tint.g()),
+        channel(base.b(), tint.b()),
+    )
+}
+
+/// Slightly lift a surface toward white for hover — no size change, just color.
+fn hover_lift(color: Color32, amount: f32) -> Color32 {
+    mix_rgb(color, Color32::WHITE, amount)
+}
+
+/// Darken a border toward black — used for light/primary fills (e.g. Slate Call).
+fn hover_dim(color: Color32, amount: f32) -> Color32 {
+    mix_rgb(color, Color32::BLACK, amount)
+}
+
 /// Build an `egui::Visuals` from a palette so built-in widgets (comboboxes,
 /// sliders, buttons, text edits, windows) pick up the active theme too.
 pub fn visuals_for(pal: &Palette) -> egui::Visuals {
@@ -324,40 +346,152 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
     visuals.faint_bg_color = pal.panel2;
     visuals.code_bg_color = pal.panel2;
 
+    // Hover should nudge fill/border only — never expand the hit/paint rect
+    // (egui defaults use expansion: 1.0 which makes buttons "grow" on hover).
+    let hover_fill = hover_lift(pal.panel2, 0.03);
+    let hover_stroke = hover_lift(pal.line_br, 0.18);
+    let active_fill = hover_lift(pal.panel2, 0.02);
+
     visuals.widgets.noninteractive.bg_fill = pal.panel;
     visuals.widgets.noninteractive.weak_bg_fill = pal.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.text2);
     visuals.widgets.noninteractive.corner_radius = CornerRadius::same(10);
+    visuals.widgets.noninteractive.expansion = 0.0;
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
     visuals.widgets.inactive.weak_bg_fill = pal.panel2;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
+    visuals.widgets.inactive.expansion = 0.0;
 
-    visuals.widgets.hovered.bg_fill = pal.panel2;
-    visuals.widgets.hovered.weak_bg_fill = pal.panel2;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
+    visuals.widgets.hovered.bg_fill = hover_fill;
+    visuals.widgets.hovered.weak_bg_fill = hover_fill;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, hover_stroke);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
+    visuals.widgets.hovered.expansion = 0.0;
 
-    visuals.widgets.active.bg_fill = pal.panel2;
-    visuals.widgets.active.weak_bg_fill = pal.panel2;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
+    visuals.widgets.active.bg_fill = active_fill;
+    visuals.widgets.active.weak_bg_fill = active_fill;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, hover_stroke);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, pal.accent);
     visuals.widgets.active.corner_radius = CornerRadius::same(10);
+    visuals.widgets.active.expansion = 0.0;
 
-    visuals.widgets.open.bg_fill = pal.panel2;
-    visuals.widgets.open.weak_bg_fill = pal.panel2;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
+    visuals.widgets.open.bg_fill = hover_fill;
+    visuals.widgets.open.weak_bg_fill = hover_fill;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, hover_stroke);
     visuals.widgets.open.corner_radius = CornerRadius::same(10);
+    visuals.widgets.open.expansion = 0.0;
 
     visuals.selection.bg_fill = pal.accent_dim;
     visuals.window_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.window_corner_radius = CornerRadius::same(10);
     visuals.menu_corner_radius = CornerRadius::same(8);
     visuals
+}
+
+/// Fill / stroke / label colors for action buttons. `hot` = hover, focus, or press.
+pub fn button_tone_style(pal: &Palette, tone: ButtonTone, hot: bool) -> (Color32, Stroke, Color32) {
+    match tone {
+        // Filled accent buttons (Call, Save, Accept…). On Slate the fill is near-white,
+        // so the border darkens hard on hover for contrast instead of glowing lighter.
+        ButtonTone::Primary => {
+            let fill = if hot {
+                hover_lift(pal.accent, 0.05)
+            } else {
+                pal.accent
+            };
+            let border = if hot {
+                hover_dim(pal.accent, 0.42)
+            } else {
+                pal.accent
+            };
+            (fill, Stroke::new(1.0_f32, border), pal.bg)
+        }
+        // Quiet panel buttons (Start call, Close, Paste…) — slight fill lift + brighter border.
+        ButtonTone::Secondary => {
+            let fill = if hot {
+                hover_lift(pal.panel2, 0.04)
+            } else {
+                pal.panel2
+            };
+            let border = if hot {
+                hover_lift(pal.line_br, 0.22)
+            } else {
+                pal.line_br
+            };
+            let text = if hot { pal.text } else { pal.text2 };
+            (fill, Stroke::new(1.0_f32, border), text)
+        }
+        ButtonTone::Danger => {
+            let fill = if hot {
+                mix_rgb(pal.panel2, pal.err, 0.05)
+            } else {
+                pal.panel2
+            };
+            let border = if hot {
+                hover_lift(pal.err, 0.22)
+            } else {
+                pal.err
+            };
+            let text = if hot {
+                hover_lift(pal.err, 0.12)
+            } else {
+                pal.err
+            };
+            (fill, Stroke::new(1.0_f32, border), text)
+        }
+    }
+}
+
+/// Paint a filled text button without hover expansion (mute/deafen-style feedback).
+pub fn painted_text_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    tone: ButtonTone,
+    width: Option<f32>,
+    height: f32,
+    font_size: f32,
+    radius: u8,
+) -> egui::Response {
+    let font = FontId::proportional(font_size);
+    let pad = ui.spacing().button_padding;
+    let measure = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE);
+    let w = width.unwrap_or_else(|| (measure.size().x + pad.x * 2.0).max(1.0));
+    let h = height.max(measure.size().y + pad.y * 2.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+
+    let enabled = ui.is_enabled();
+    let hot = enabled
+        && (response.hovered() || response.is_pointer_button_down_on() || response.has_focus());
+    let (mut fill, mut stroke, mut text_color) = button_tone_style(pal, tone, hot);
+    if !enabled {
+        fill = fill.gamma_multiply(0.55);
+        stroke.color = stroke.color.gamma_multiply(0.55);
+        text_color = text_color.gamma_multiply(0.55);
+    }
+
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(radius),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, text_color);
+    let pos = Align2::CENTER_CENTER
+        .anchor_size(rect.center(), galley.size())
+        .min;
+    ui.painter().galley(pos, galley, text_color);
+    response
 }
 
 // ----------------------- helper widgets -----------------------
@@ -446,18 +580,7 @@ pub fn action_button(
     label: &str,
     tone: ButtonTone,
 ) -> egui::Response {
-    let (fill, stroke, text) = match tone {
-        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
-        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0_f32, pal.line_br), pal.text2),
-        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0_f32, pal.err), pal.err),
-    };
-    ui.add(
-        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(CornerRadius::same(10))
-            .min_size(Vec2::new(0.0, 34.0)),
-    )
+    painted_text_button(ui, pal, label, tone, None, 34.0, ui_font_size(13.0), 10)
 }
 
 pub fn action_button_full(
@@ -466,17 +589,15 @@ pub fn action_button_full(
     label: &str,
     tone: ButtonTone,
 ) -> egui::Response {
-    let (fill, stroke, text) = match tone {
-        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
-        ButtonTone::Secondary => (pal.panel2, Stroke::new(1.0_f32, pal.line_br), pal.text2),
-        ButtonTone::Danger => (pal.panel2, Stroke::new(1.0_f32, pal.err), pal.err),
-    };
-    ui.add_sized(
-        Vec2::new(ui.available_width(), 34.0),
-        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(13.0)))
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(CornerRadius::same(10)),
+    painted_text_button(
+        ui,
+        pal,
+        label,
+        tone,
+        Some(ui.available_width().max(1.0)),
+        34.0,
+        ui_font_size(13.0),
+        10,
     )
 }
 
@@ -487,50 +608,143 @@ pub fn toolbar_button(
     label: &str,
     selected: bool,
 ) -> egui::Response {
-    let fill = if selected { pal.accent_dim } else { pal.panel2 };
-    let stroke = if selected {
-        Stroke::new(1.0_f32, pal.accent)
+    let icon_font = lucide(14.0);
+    let text_font = sans(12.0);
+    let pad = Vec2::new(12.0, 6.0);
+    let gap = 8.0;
+    let icon_advance = 14.0;
+    let label_galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), text_font.clone(), Color32::WHITE);
+    let size = Vec2::new(
+        pad.x * 2.0 + icon_advance + gap + label_galley.size().x,
+        32.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
+
+    let (fill, stroke, text) = if selected {
+        let fill = if hot {
+            hover_lift(pal.accent_dim, 0.04)
+        } else {
+            pal.accent_dim
+        };
+        let border = if hot {
+            hover_dim(pal.accent, 0.30)
+        } else {
+            pal.accent
+        };
+        (fill, Stroke::new(1.0_f32, border), pal.accent)
     } else {
-        Stroke::new(1.0_f32, pal.line_br)
+        let fill = if hot {
+            hover_lift(pal.panel2, 0.04)
+        } else {
+            pal.panel2
+        };
+        let border = if hot {
+            hover_lift(pal.line_br, 0.22)
+        } else {
+            pal.line_br
+        };
+        let text = if hot { pal.text } else { pal.text2 };
+        (fill, Stroke::new(1.0_f32, border), text)
     };
-    let text = if selected { pal.accent } else { pal.text2 };
 
-    let mut content = LayoutJob::default();
-    content.append(
-        &char::from(icon).to_string(),
-        0.0,
-        TextFormat {
-            font_id: lucide(14.0),
-            color: text,
-            ..Default::default()
-        },
-    );
-    content.append(
-        "  ",
-        0.0,
-        TextFormat {
-            font_id: sans(12.0),
-            color: text,
-            ..Default::default()
-        },
-    );
-    content.append(
-        label,
-        0.0,
-        TextFormat {
-            font_id: sans(12.0),
-            color: text,
-            ..Default::default()
-        },
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(10),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
     );
 
-    ui.add(
-        egui::Button::new(content)
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(CornerRadius::same(10))
-            .min_size(Vec2::new(0.0, 32.0)),
-    )
+    let content_left = rect.left() + pad.x;
+    let center_y = rect.center().y;
+    ui.painter().text(
+        egui::pos2(content_left + icon_advance * 0.5, center_y),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        icon_font,
+        text,
+    );
+    let label_pos = egui::pos2(content_left + icon_advance + gap, center_y);
+    let colored = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), text_font, text);
+    ui.painter().galley(
+        Align2::LEFT_CENTER
+            .anchor_size(label_pos, colored.size())
+            .min,
+        colored,
+        text,
+    );
+    response
+}
+
+/// Menu / context-menu row with icon + label and a subtle hover surface.
+///
+/// Sized to content (icon + label + padding) so popup menus stay compact.
+pub fn menu_item_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+    danger: bool,
+) -> egui::Response {
+    let height = 28.0;
+    let pad_x = 8.0;
+    let gap = 8.0;
+    let icon_size = 14.0;
+    let font = sans(12.5);
+    let measure = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE);
+    // Content-sized only — do not stretch to available_width (popup menus often
+    // report a very large max width and were becoming super-wide).
+    let width = pad_x * 2.0 + icon_size + gap + measure.size().x;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    let hot = response.hovered() || response.has_focus() || response.is_pointer_button_down_on();
+
+    if hot {
+        let fill = if danger {
+            mix_rgb(pal.panel2, pal.err, 0.045)
+        } else {
+            hover_lift(pal.panel2, 0.03)
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    }
+
+    let (icon_color, text_color) = if danger {
+        let c = if hot {
+            hover_lift(pal.err, 0.12)
+        } else {
+            pal.err
+        };
+        (c, c)
+    } else if hot {
+        (pal.text, pal.text)
+    } else {
+        (pal.text2, pal.text2)
+    };
+
+    let icon_center = egui::pos2(rect.left() + pad_x + icon_size * 0.5, rect.center().y);
+    ui.painter().text(
+        icon_center,
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(icon_size),
+        icon_color,
+    );
+    let text_pos = egui::pos2(rect.left() + pad_x + icon_size + gap, rect.center().y);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, text_color);
+    ui.painter().galley(
+        Align2::LEFT_CENTER.anchor_size(text_pos, galley.size()).min,
+        galley,
+        text_color,
+    );
+    response
 }
 
 pub fn toolbar_ghost_icon_button(

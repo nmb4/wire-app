@@ -13,7 +13,9 @@ use egui::{
 };
 use tracing::info;
 
-use crate::theme::{sans, ui_font_size, visuals_for, Palette, Theme};
+use crate::theme::{
+    button_tone_style, sans, ui_font_size, visuals_for, ButtonTone, Palette, Theme,
+};
 
 const HOST_WIDTH: f32 = 348.0;
 const INITIAL_HOST_HEIGHT: f32 = 112.0;
@@ -963,23 +965,31 @@ fn render_single_group(
             ui.add_space(7.0);
             ui.horizontal_top(|ui| {
                 for button in &group.buttons {
-                    let fill = if button.emphasized {
-                        pal.accent
+                    let tone = if button.emphasized {
+                        ButtonTone::Primary
                     } else {
-                        pal.panel2
+                        ButtonTone::Secondary
                     };
-                    let text = if button.emphasized { pal.bg } else { pal.text2 };
-                    let response = ui.add_sized(
-                        [92.0, 28.0],
-                        egui::Button::new(
-                            RichText::new(&button.label)
-                                .size(ui_font_size(10.5))
-                                .strong()
-                                .color(tint(text)),
-                        )
-                        .fill(tint(fill))
-                        .stroke(Stroke::new(1.0, tint(pal.line_br)))
-                        .corner_radius(CornerRadius::same(7)),
+                    // Capture hover before painting so opacity-tinted colors can still lift.
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(92.0, 28.0), egui::Sense::click());
+                    let hot = response.hovered()
+                        || response.is_pointer_button_down_on()
+                        || response.has_focus();
+                    let (fill, stroke, text) = button_tone_style(pal, tone, hot);
+                    ui.painter().rect(
+                        rect,
+                        CornerRadius::same(7),
+                        tint(fill),
+                        Stroke::new(stroke.width, tint(stroke.color)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &button.label,
+                        egui::FontId::proportional(ui_font_size(10.5)),
+                        tint(text),
                     );
                     if response.clicked() {
                         let _ = action_tx.send(button.action.clone());

@@ -2388,30 +2388,24 @@ impl AppState {
                                 .font(lucide(16.0))
                                 .color(pal.text2),
                             |ui| {
-                                ui.set_min_width(160.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
                                 if !show_call && !peer_is_friend {
                                     if let Some(peer) = direct_peer {
-                                        if ui
-                                            .button(
-                                                RichText::new("Add friend")
-                                                    .size(ui_font_size(12.5)),
-                                            )
-                                            .clicked()
+                                        if menu_item_button(
+                                            ui,
+                                            pal,
+                                            Icon::UserPlus,
+                                            "Add friend",
+                                            false,
+                                        )
+                                        .clicked()
                                         {
                                             friend_to_add = Some(peer);
                                             ui.close();
                                         }
                                     }
                                 }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Clear history")
-                                                .color(pal.err)
-                                                .size(ui_font_size(12.5)),
-                                        )
-                                        .fill(Color32::TRANSPARENT),
-                                    )
+                                if menu_item_button(ui, pal, Icon::Trash2, "Clear history", true)
                                     .on_hover_text(
                                         "Permanently delete this chat history for everyone",
                                     )
@@ -2673,6 +2667,7 @@ impl AppState {
                                     body_response.context_menu(|ui| {
                                         chat_message_context_menu(
                                             ui,
+                                            pal,
                                             message,
                                             own,
                                             &mut requested_restore,
@@ -2695,6 +2690,7 @@ impl AppState {
                         bubble.response.context_menu(|ui| {
                             chat_message_context_menu(
                                 ui,
+                                pal,
                                 message,
                                 own,
                                 &mut requested_restore,
@@ -2813,6 +2809,7 @@ impl AppState {
                                     body_response.context_menu(|ui| {
                                         chat_message_context_menu(
                                             ui,
+                                            pal,
                                             message,
                                             own,
                                             &mut requested_restore,
@@ -3099,6 +3096,7 @@ impl AppState {
                 response.context_menu(|ui| {
                     chat_message_context_menu(
                         ui,
+                        pal,
                         message,
                         own,
                         requested_restore,
@@ -3120,6 +3118,7 @@ impl AppState {
                 response.context_menu(|ui| {
                     chat_message_context_menu(
                         ui,
+                        pal,
                         message,
                         own,
                         requested_restore,
@@ -3148,12 +3147,20 @@ impl AppState {
                 });
             }
             response.context_menu(|ui| {
-                if ui.button("Download image").clicked() {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                if menu_item_button(ui, pal, Icon::Download, "Download image", false).clicked() {
                     save_chat_attachment(attachment);
                     ui.close();
                 }
                 ui.separator();
-                chat_message_context_menu(ui, message, own, requested_restore, requested_deletion);
+                chat_message_context_menu(
+                    ui,
+                    pal,
+                    message,
+                    own,
+                    requested_restore,
+                    requested_deletion,
+                );
             });
         }
     }
@@ -3271,13 +3278,15 @@ impl AppState {
                         .color(pal.dim),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
+                        if action_button(ui, pal, "Close", ButtonTone::Secondary).clicked() {
                             close = true;
                         }
-                        if preview.draft && ui.button("Delete").clicked() {
+                        if preview.draft
+                            && action_button(ui, pal, "Delete", ButtonTone::Danger).clicked()
+                        {
                             delete = true;
                         }
-                        if ui.button("Download").clicked() {
+                        if action_button(ui, pal, "Download", ButtonTone::Secondary).clicked() {
                             save_chat_attachment(&preview.attachment);
                         }
                     });
@@ -4470,27 +4479,27 @@ impl AppState {
                                                 .font(lucide(16.0))
                                                 .color(pal.text2),
                                             |ui| {
-                                                ui.set_min_width(148.0);
-                                                if ui
-                                                    .button(
-                                                        RichText::new("Copy node ID")
-                                                            .size(ui_font_size(12.5)),
-                                                    )
-                                                    .clicked()
+                                                ui.spacing_mut().item_spacing.y = 2.0;
+                                                if menu_item_button(
+                                                    ui,
+                                                    &pal,
+                                                    Icon::Copy,
+                                                    "Copy node ID",
+                                                    false,
+                                                )
+                                                .clicked()
                                                 {
                                                     copy_id = Some(friend.node_id.clone());
                                                     ui.close();
                                                 }
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("Remove")
-                                                                .color(pal.err)
-                                                                .size(ui_font_size(12.5)),
-                                                        )
-                                                        .fill(Color32::TRANSPARENT),
-                                                    )
-                                                    .clicked()
+                                                if menu_item_button(
+                                                    ui,
+                                                    &pal,
+                                                    Icon::UserMinus,
+                                                    "Remove",
+                                                    true,
+                                                )
+                                                .clicked()
                                                 {
                                                     remove_idx = Some(idx);
                                                     ui.close();
@@ -5905,10 +5914,13 @@ impl AppState {
                 ui.label("The new executable will be verified and placed on your Desktop.");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Download and relaunch").clicked() {
+                    let pal = Palette::for_theme(self.theme);
+                    if action_button(ui, &pal, "Download and relaunch", ButtonTone::Primary)
+                        .clicked()
+                    {
                         download = true;
                     }
-                    if ui.button("Later").clicked() {
+                    if action_button(ui, &pal, "Later", ButtonTone::Secondary).clicked() {
                         later = true;
                     }
                 });
@@ -6228,21 +6240,15 @@ fn compact_chip_button(
     label: &str,
     tone: ButtonTone,
 ) -> egui::Response {
-    let (fill, stroke, text) = match tone {
-        ButtonTone::Primary => (pal.accent, Stroke::new(1.0_f32, pal.accent), pal.bg),
-        ButtonTone::Secondary => (
-            chat_surface(pal),
-            Stroke::new(1.0_f32, chat_hairline(pal)),
-            pal.text2,
-        ),
-        ButtonTone::Danger => (Color32::TRANSPARENT, Stroke::new(1.0_f32, pal.err), pal.err),
-    };
-    ui.add(
-        egui::Button::new(RichText::new(label).color(text).size(ui_font_size(11.0)))
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
-            .min_size(Vec2::new(0.0, PARTICIPANT_ACTION_HEIGHT)),
+    painted_text_button(
+        ui,
+        pal,
+        label,
+        tone,
+        None,
+        PARTICIPANT_ACTION_HEIGHT,
+        ui_font_size(11.0),
+        CHROME_INNER_RADIUS,
     )
 }
 
@@ -6957,13 +6963,15 @@ fn chat_message_body_text(message: &ChatMessage, pal: &Palette, opacity: f32) ->
 
 fn chat_message_context_menu(
     ui: &mut Ui,
+    pal: &Palette,
     message: &ChatMessage,
     own: bool,
     requested_restore: &mut bool,
     requested_deletion: &mut Option<DeleteScope>,
 ) {
+    ui.spacing_mut().item_spacing.y = 2.0;
     if message.deletion == Some(MessageDeletion::Local) {
-        if ui.button("Restore message").clicked() {
+        if menu_item_button(ui, pal, Icon::RotateCcw, "Restore message", false).clicked() {
             *requested_restore = true;
             ui.close();
         }
@@ -6973,7 +6981,7 @@ fn chat_message_context_menu(
         } else {
             ("Delete for me", DeleteScope::Local)
         };
-        if ui.button(label).clicked() {
+        if menu_item_button(ui, pal, Icon::Trash2, label, true).clicked() {
             *requested_deletion = Some(scope);
             ui.close();
         }
