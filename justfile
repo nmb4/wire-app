@@ -144,3 +144,14 @@ release part="patch" dry_run="":
     just bump-version {{ part }}
     just package
     just upload {{ dry_run }}
+
+# Pack wire-app/assets/new-icon.png into multi-res icon.ico + icon.png.
+# Requires Pillow:  python -m pip install Pillow
+#
+#   just pack-icon
+#   just pack-icon --rm-bg                  # transparent MS Paint green #22B14C
+#   just pack-icon --rm-bg --tolerance 12   # allow near-matches
+#   just pack-icon --rm-bg --color "#00FF00"
+#   just pack-icon --rm-bg --preview        # open checkerboard preview after pack
+pack-icon *args:
+    python scripts/pack_icon.py {{ args }}
