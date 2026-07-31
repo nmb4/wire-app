@@ -31,7 +31,7 @@ mod device;
 mod noise_suppression;
 mod playback;
 
-pub const SAMPLE_RATE: SampleRate = SampleRate(48_000);
+pub const SAMPLE_RATE: SampleRate = 48_000;
 pub const ENGINE_FORMAT: AudioFormat = AudioFormat::new(SAMPLE_RATE, 2);
 
 const DURATION_10MS: Duration = Duration::from_millis(10);
@@ -209,19 +209,19 @@ impl AudioFormat {
     }
     pub const fn new2(sample_rate: u32, channel_count: u16) -> Self {
         Self {
-            sample_rate: SampleRate(sample_rate),
+            sample_rate,
             channel_count,
         }
     }
 
     pub fn duration_from_sample_count(&self, sample_count: usize) -> Duration {
         Duration::from_secs_f32(
-            (sample_count as f32 / self.channel_count as f32) / self.sample_rate.0 as f32,
+            (sample_count as f32 / self.channel_count as f32) / self.sample_rate as f32,
         )
     }
 
     pub const fn block_count(&self, duration: Duration) -> usize {
-        (self.sample_rate.0 as usize / 1000) * duration.as_millis() as usize
+        (self.sample_rate as usize / 1000) * duration.as_millis() as usize
     }
 
     pub const fn sample_count(&self, duration: Duration) -> usize {

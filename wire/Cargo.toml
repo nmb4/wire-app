@@ -9,9 +9,9 @@ authors = { workspace = true }
 [dependencies]
 anyhow = "1.0.96"
 async-channel = "2.3.1"
-audio_thread_priority = "0.33.0"
+audio_thread_priority = "0.34.0"
 bytes = "1.10.0"
-cpal = { version = "0.15.3" }
+cpal = { version = "0.17.3", features = ["audio_thread_priority"] }
 dasp_sample = "0.11.0"
 derive_more = { version = "2.0.1", features = ["debug", "deref"] }
 fixed-resample = "0.6.1"
@@ -40,7 +40,7 @@ webrtc-audio-processing = { version = "0.4.0", optional = true, features = [
 webrtc-media = "0.9.0"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-cpal = { version = "0.15.3", features = ["wasm-bindgen"] }
+cpal = { version = "0.17.3", features = ["wasm-bindgen"] }
 
 [dev-dependencies]
 clap = { version = "4.5.31", features = ["derive"] }

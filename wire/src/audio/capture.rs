@@ -73,8 +73,8 @@ impl AudioCapture {
         let (init_tx, init_rx) = oneshot::channel();
         std::thread::spawn(move || {
             if let Err(err) = audio_thread_priority::promote_current_thread_to_real_time(
-                buffer_size as u32,
-                ENGINE_FORMAT.sample_rate.0,
+                ENGINE_FORMAT.block_count(DURATION_20MS) as u32,
+                ENGINE_FORMAT.sample_rate,
             ) {
                 #[cfg(target_os = "macos")]
                 debug!("macOS kept the capture worker at normal priority: {err:?}");
@@ -139,20 +139,26 @@ fn start_capture_stream(
     processor: WebrtcAudioProcessor,
     noise_suppression_enabled: bool,
 ) -> Result<cpal::Stream> {
-    let d = device.name()?;
+    let d = device.description()?.name().to_owned();
     let config = &stream_config.config;
 
-    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
+    #[cfg(all(
+        feature = "audio-processing",
+        any(target_os = "macos", target_os = "windows")
+    ))]
     processor.init_capture(ENGINE_FORMAT.channel_count as usize)?;
-    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
+    #[cfg(all(
+        feature = "audio-processing",
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     processor.init_capture(config.channels as usize)?;
 
     let capture_format = stream_config.audio_format();
 
     let resampler = device_resampler(
         NonZeroUsize::new(ENGINE_FORMAT.channel_count as usize).unwrap(),
-        capture_format.sample_rate.0,
-        ENGINE_FORMAT.sample_rate.0,
+        capture_format.sample_rate,
+        ENGINE_FORMAT.sample_rate,
     );
     let state = CaptureState {
         format: capture_format,
@@ -224,7 +230,7 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
                     .duration_since(&info.timestamp().capture)
                     .unwrap_or_default();
                 let resampler_delay = Duration::from_secs_f32(
-                    state.resampler.output_delay() as f32 / ENGINE_FORMAT.sample_rate.0 as f32,
+                    state.resampler.output_delay() as f32 / ENGINE_FORMAT.sample_rate as f32,
                 );
                 capture_delay + resampler_delay
             };
@@ -308,7 +314,6 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
     )
 }
 
-#[cfg(target_os = "macos")]
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
@@ -340,8 +345,8 @@ fn capture_loop(
             }
         }
         // Follow the hardware clock instead of an independent sleep timer. A
-        // relative 20 ms timer drifts on macOS when realtime promotion is not
-        // available, eventually filling the capture ring and dropping audio.
+        // delayed worker can then drain every complete chunk and catch up instead
+        // of leaving permanent backlog in the capture ring.
         let available_frames = consumer.occupied_len() / samples_per_tick;
         if available_frames == 0 {
             std::thread::sleep(Duration::from_millis(1));
@@ -376,67 +381,5 @@ fn capture_loop(
             }
             tick += 1;
         }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn capture_loop(
-    mut consumer: Consumer<f32>,
-    mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
-    muted: Arc<AtomicBool>,
-) {
-    let span = tracing::span!(Level::TRACE, "capture-loop");
-    let _guard = span.enter();
-    info!("capture loop start");
-
-    let tick_duration = DURATION_20MS;
-    let samples_per_tick = ENGINE_FORMAT.sample_count(tick_duration);
-    let mut buf = vec![0.; samples_per_tick];
-    let mut sinks = vec![];
-
-    let mut tick = 0;
-    loop {
-        let start = Instant::now();
-
-        loop {
-            match sink_receiver.try_recv() {
-                Ok(sink) => {
-                    info!("new sink added to capture loop");
-                    sinks.push(sink);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    info!("stop playback mixer loop: channel closed");
-                    return;
-                }
-            }
-        }
-
-        let count = consumer.pop_slice(&mut buf);
-        if muted.load(AtomicOrdering::Relaxed) {
-            buf[..count].fill(0.0);
-        }
-
-        sinks.retain_mut(|sink| match sink.tick(&buf[..count]) {
-            Ok(ControlFlow::Continue(())) => true,
-            Ok(ControlFlow::Break(())) => {
-                debug!("remove decoder: closed");
-                false
-            }
-            Err(err) => {
-                warn!("remove decoder: failed {err:?}");
-                false
-            }
-        });
-        trace!("tick {tick} took {:?} pulled {count}", start.elapsed());
-        if start.elapsed() > tick_duration {
-            warn!(
-                "capture thread tick exceeded interval (took {:?})",
-                start.elapsed()
-            );
-        } else {
-            spin_sleep::sleep(tick_duration.saturating_sub(start.elapsed()));
-        }
-        tick += 1;
     }
 }
