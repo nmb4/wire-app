@@ -182,6 +182,7 @@ struct AppState {
     window_frame_style: WindowFrameStyle,
     muted: bool,
     deafened: bool,
+    ui_sound_volume: f32,
     sounds: Option<Sounds>,
     notifications: NotificationService,
     voluntary_hangups: AtomicU32,
@@ -340,6 +341,8 @@ fn enabled_by_default() -> bool {
 #[serde(default)]
 struct Settings {
     audio: UiAudioConfig,
+    #[serde(default = "default_ui_sound_volume")]
+    ui_sound_volume: f32,
     video: VideoConfig,
     theme: Theme,
     #[serde(default)]
@@ -357,10 +360,15 @@ struct Settings {
     show_system_usage: bool,
 }
 
+fn default_ui_sound_volume() -> f32 {
+    1.0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             audio: UiAudioConfig::default(),
+            ui_sound_volume: default_ui_sound_volume(),
             video: VideoConfig::default(),
             theme: Theme::default(),
             window_frame_style: WindowFrameStyle::default(),
@@ -416,6 +424,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.style_mut(|style| style.interaction.selectable_labels = false);
         #[cfg(windows)]
         while let Some(action) = self
             .global_hotkeys
@@ -479,7 +488,8 @@ impl App {
         let settings = saved_settings.unwrap_or_default();
         let (update_tx, update_rx) = mpsc::channel();
         let (autostart_tx, autostart_rx) = mpsc::channel();
-        let sounds = Sounds::try_new();
+        let ui_sound_volume = settings.ui_sound_volume.clamp(0.0, 1.0);
+        let sounds = Sounds::try_new(ui_sound_volume);
         if let Some(sounds) = &sounds {
             sounds.play(Sound::Whoosh2);
         }
@@ -513,6 +523,7 @@ impl App {
             window_frame_style: settings.window_frame_style,
             muted: false,
             deafened: false,
+            ui_sound_volume,
             sounds,
             notifications: NotificationService::default(),
             voluntary_hangups: AtomicU32::new(0),
@@ -1434,6 +1445,7 @@ impl AppState {
     fn persist_settings(&self) {
         save_settings(&Settings {
             audio: self.audio_config.clone(),
+            ui_sound_volume: self.ui_sound_volume,
             video: self.video_config,
             theme: self.theme,
             window_frame_style: self.window_frame_style,
@@ -2266,7 +2278,8 @@ impl AppState {
                                         egui::Label::new(chat_message_body_text(
                                             message, pal, opacity,
                                         ))
-                                        .wrap(),
+                                        .wrap()
+                                        .selectable(true),
                                     );
                                     body_response.context_menu(|ui| {
                                         chat_message_context_menu(
@@ -2405,7 +2418,8 @@ impl AppState {
                                         egui::Label::new(chat_message_body_text(
                                             message, pal, opacity,
                                         ))
-                                        .wrap(),
+                                        .wrap()
+                                        .selectable(true),
                                     );
                                     body_response.context_menu(|ui| {
                                         chat_message_context_menu(
@@ -3943,6 +3957,10 @@ impl AppState {
                             .get(node_id)
                             .map(|status| status.availability)
                     });
+                    let call_enabled = parsed
+                        .as_ref()
+                        .is_ok_and(|node_id| friend_call_enabled(self.calls.get(node_id)));
+                    let call_in_progress = parsed.is_ok() && !call_enabled;
 
                     Frame::new()
                         .fill(chat_surface(&pal))
@@ -4027,7 +4045,7 @@ impl AppState {
                                         .response;
                                     menu_response.on_hover_text("More actions");
 
-                                    ui.add_enabled_ui(parsed.is_ok(), |ui| {
+                                    let call_response = ui.add_enabled_ui(call_enabled, |ui| {
                                         if action_button(ui, &pal, "Call", ButtonTone::Primary)
                                             .clicked()
                                         {
@@ -4036,6 +4054,11 @@ impl AppState {
                                             }
                                         }
                                     });
+                                    if call_in_progress {
+                                        call_response.response.on_hover_text(
+                                            "A call with this friend is already in progress",
+                                        );
+                                    }
                                 });
                             });
                         });
@@ -5058,6 +5081,30 @@ impl AppState {
                                             }
                                         }
                                     });
+
+                                ui.add_space(8.0);
+                                let ui_sound_percent =
+                                    format!("{:.0}%", self.ui_sound_volume * 100.0);
+                                settings_field_label(
+                                    ui,
+                                    &pal,
+                                    "UI sounds",
+                                    Some(&ui_sound_percent),
+                                );
+                                let volume_changed = ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.ui_sound_volume,
+                                            0.0..=1.0,
+                                        )
+                                        .show_value(false),
+                                    )
+                                    .changed();
+                                if volume_changed {
+                                    if let Some(sounds) = &mut self.sounds {
+                                        sounds.set_volume(self.ui_sound_volume);
+                                    }
+                                }
 
                                 ui.add_space(8.0);
                                 Frame::new()
@@ -6312,6 +6359,7 @@ mod layout_tests {
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
         assert!(!settings.start_with_system);
         assert!(!settings.show_system_usage);
+        assert_eq!(settings.ui_sound_volume, 1.0);
     }
 
     #[test]
@@ -6335,6 +6383,15 @@ mod layout_tests {
     fn deafen_and_mute_toggle_together() {
         assert_eq!(next_deafen_audio_state(false), (true, true));
         assert_eq!(next_deafen_audio_state(true), (false, false));
+    }
+
+    #[test]
+    fn friend_call_button_is_disabled_while_a_call_is_visible() {
+        assert!(friend_call_enabled(None));
+        assert!(friend_call_enabled(Some(&CallState::Aborted)));
+        assert!(!friend_call_enabled(Some(&CallState::Incoming)));
+        assert!(!friend_call_enabled(Some(&CallState::Calling)));
+        assert!(!friend_call_enabled(Some(&CallState::Active)));
     }
 
     #[test]
@@ -6399,6 +6456,13 @@ enum CallState {
     Calling,
     Active,
     Aborted,
+}
+
+fn friend_call_enabled(state: Option<&CallState>) -> bool {
+    !matches!(
+        state,
+        Some(CallState::Incoming | CallState::Calling | CallState::Active)
+    )
 }
 
 enum CallInfo {

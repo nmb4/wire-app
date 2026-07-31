@@ -65,10 +65,11 @@ pub struct Sounds {
     _stream: OutputStream,
     handle: OutputStreamHandle,
     ringtone: Option<Sink>,
+    volume: f32,
 }
 
 impl Sounds {
-    pub fn try_new() -> Option<Self> {
+    pub fn try_new(volume: f32) -> Option<Self> {
         if !HAS_ANY_SOUND {
             return None;
         }
@@ -77,6 +78,7 @@ impl Sounds {
             _stream: stream,
             handle,
             ringtone: None,
+            volume: normalize_volume(volume),
         })
     }
 
@@ -90,8 +92,16 @@ impl Sounds {
         let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else {
             return;
         };
+        sink.set_volume(self.volume);
         sink.append(decoder);
         sink.detach();
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = normalize_volume(volume);
+        if let Some(ringtone) = &self.ringtone {
+            ringtone.set_volume(self.volume);
+        }
     }
 
     pub fn set_incoming_ring(&mut self, active: bool) {
@@ -108,11 +118,20 @@ impl Sounds {
             let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else {
                 return;
             };
+            sink.set_volume(self.volume);
             sink.append(decoder.repeat_infinite());
             self.ringtone = Some(sink);
         } else if let Some(sink) = self.ringtone.take() {
             sink.stop();
         }
+    }
+}
+
+fn normalize_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -126,5 +145,13 @@ mod tests {
             .bytes()
             .expect("notification Pop sound should be embedded");
         assert!(Decoder::new(Cursor::new(bytes)).is_ok());
+    }
+
+    #[test]
+    fn sound_volume_is_limited_to_the_supported_range() {
+        assert_eq!(normalize_volume(-0.5), 0.0);
+        assert_eq!(normalize_volume(0.4), 0.4);
+        assert_eq!(normalize_volume(1.5), 1.0);
+        assert_eq!(normalize_volume(f32::NAN), 1.0);
     }
 }
