@@ -139,6 +139,7 @@ fn log_dir() -> Option<PathBuf> {
     std::env::var("LOCALAPPDATA")
         .ok()
         .map(|root| PathBuf::from(root).join(LOG_DIR_NAME))
+        .or_else(|| dirs::data_local_dir().map(|root| root.join(LOG_DIR_NAME)))
 }
 
 fn legacy_log_dir() -> Option<PathBuf> {

@@ -8,6 +8,8 @@ use tracing::info;
 use zed_scap::capturer::{Capturer, Options, Resolution as ScapResolution};
 use zed_scap::frame::{Frame, FrameType};
 
+use crate::screen_capture::{resize_with_letterbox, CaptureTarget, CaptureTargetKind};
+
 pub struct ScapCapturer {
     capturer: Capturer,
     target_w: u32,
@@ -18,7 +20,12 @@ pub struct ScapCapturer {
 }
 
 impl ScapCapturer {
-    pub fn try_new(target_w: u32, target_h: u32, framerate: u32) -> Result<Self> {
+    pub fn try_new(
+        target_w: u32,
+        target_h: u32,
+        framerate: u32,
+        target: Option<&CaptureTarget>,
+    ) -> Result<Self> {
         if !cfg!(target_os = "macos") && !zed_scap::is_supported() {
             return Err(anyhow!("zed-scap not supported on this system"));
         }
@@ -26,12 +33,16 @@ impl ScapCapturer {
             return Err(anyhow!("screen capture permission is not granted"));
         }
 
+        let selected_target = target.map(resolve_target).transpose()?.flatten();
+        if target.is_some() && selected_target.is_none() {
+            return Err(anyhow!("selected screen or window is no longer available"));
+        }
         let output_resolution = map_resolution(target_w);
         let options = Options {
             fps: framerate,
             show_cursor: true,
             show_highlight: false,
-            target: None,
+            target: selected_target,
             crop_area: None,
             output_type: FrameType::BGRAFrame,
             output_resolution,
@@ -89,11 +100,21 @@ impl ScapCapturer {
 
         let src_img = Image::from_vec_u8(src_w, src_h, data, PixelType::U8x4)
             .map_err(|e| anyhow!("invalid scap frame buffer: {e}"))?;
-        self.resizer
-            .resize(&src_img, &mut self.dst, None)
-            .map_err(|e| anyhow!("resize failed: {e}"))?;
-        Ok(self.dst.buffer().to_vec())
+        resize_with_letterbox(&src_img, &mut self.resizer, &mut self.dst)
+            .map_err(|e| anyhow!("resize failed: {e}"))
     }
+}
+
+fn resolve_target(target: &CaptureTarget) -> Result<Option<zed_scap::Target>> {
+    let targets = zed_scap::get_all_targets().context("failed to enumerate native targets")?;
+    Ok(targets.into_iter().find(|candidate| match candidate {
+        zed_scap::Target::Display(display) => {
+            target.kind == CaptureTargetKind::Display && display.id == target.id
+        }
+        zed_scap::Target::Window(window) => {
+            target.kind == CaptureTargetKind::Window && window.id == target.id
+        }
+    }))
 }
 
 impl Drop for ScapCapturer {

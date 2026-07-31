@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
     D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_WRITE, D3D11_SDK_VERSION,
     D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA,
     D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -410,6 +411,7 @@ pub struct GpuVideoProcessor {
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     src_rect: RECT,
+    output_rect: RECT,
     dst_rect: RECT,
 }
 
@@ -440,6 +442,11 @@ impl GpuVideoProcessor {
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc)? };
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+        let (fit_width, fit_height) = crate::screen_capture::aspect_fit_dimensions(
+            src_width, src_height, dst_width, dst_height,
+        );
+        let offset_x = (dst_width - fit_width) / 2;
+        let offset_y = (dst_height - fit_height) / 2;
         Ok(Self {
             video_device,
             video_context,
@@ -451,11 +458,17 @@ impl GpuVideoProcessor {
                 right: src_width as i32,
                 bottom: src_height as i32,
             },
-            dst_rect: RECT {
+            output_rect: RECT {
                 left: 0,
                 top: 0,
                 right: dst_width as i32,
                 bottom: dst_height as i32,
+            },
+            dst_rect: RECT {
+                left: offset_x as i32,
+                top: offset_y as i32,
+                right: (offset_x + fit_width) as i32,
+                bottom: (offset_y + fit_height) as i32,
             },
         })
     }
@@ -511,7 +524,22 @@ impl GpuVideoProcessor {
             self.video_context.VideoProcessorSetOutputTargetRect(
                 &self.processor,
                 true,
-                Some(&self.dst_rect),
+                Some(&self.output_rect),
+            );
+            let black = D3D11_VIDEO_COLOR {
+                Anonymous: D3D11_VIDEO_COLOR_0 {
+                    RGBA: D3D11_VIDEO_COLOR_RGBA {
+                        R: 0.0,
+                        G: 0.0,
+                        B: 0.0,
+                        A: 1.0,
+                    },
+                },
+            };
+            self.video_context.VideoProcessorSetOutputBackgroundColor(
+                &self.processor,
+                false,
+                &black,
             );
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),

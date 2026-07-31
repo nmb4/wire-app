@@ -7,8 +7,8 @@ use windows::Win32::{
     Foundation::GetLastError,
     Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetWindowDC,
-        ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
-        COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
+        PatBlt, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
+        BITMAPINFOHEADER, BLACKNESS, COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
     },
     UI::WindowsAndMessaging::GetDesktopWindow,
 };
@@ -45,13 +45,24 @@ pub fn capture_monitor_scaled(
 
         SelectObject(*hdc_mem, (*h_bitmap).into());
         SetStretchBltMode(*hdc_mem, COLORONCOLOR);
+        let (fit_w, fit_h) = crate::screen_capture::aspect_fit_dimensions(
+            src_w.max(0) as u32,
+            src_h.max(0) as u32,
+            dst_w as u32,
+            dst_h as u32,
+        );
+        let offset_x = (dst_w - fit_w as i32) / 2;
+        let offset_y = (dst_h - fit_h as i32) / 2;
+        if !PatBlt(*hdc_mem, 0, 0, dst_w, dst_h, BLACKNESS).as_bool() {
+            bail!("PatBlt failed: {:?}", GetLastError());
+        }
 
         let ok = StretchBlt(
             *hdc_mem,
-            0,
-            0,
-            dst_w,
-            dst_h,
+            offset_x,
+            offset_y,
+            fit_w as i32,
+            fit_h as i32,
             Some(*hdc_desktop),
             x,
             y,

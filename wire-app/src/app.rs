@@ -175,6 +175,9 @@ struct AppState {
     focused_stream: Option<StreamSource>,
     sharing_active: bool,
     capture_error: Option<String>,
+    show_capture_picker: bool,
+    capture_targets: Vec<crate::screen_capture::CaptureTarget>,
+    selected_capture_target: Option<usize>,
     preview: Option<PreviewState>,
     friends: Vec<Friend>,
     friend_status: BTreeMap<NodeId, StatusUpdate>,
@@ -524,6 +527,9 @@ impl App {
             focused_stream: None,
             sharing_active: false,
             capture_error: None,
+            show_capture_picker: false,
+            capture_targets: Vec::new(),
+            selected_capture_target: None,
             preview: None,
             friends: load_friends(),
             friend_status: BTreeMap::new(),
@@ -710,6 +716,9 @@ impl AppState {
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
         }
+        if self.show_capture_picker {
+            self.ui_capture_picker(ctx, &pal);
+        }
         #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
@@ -720,7 +729,8 @@ impl AppState {
             let force_hide = self.show_settings
                 || !self.configured
                 || self.show_update_prompt
-                || contacts_visible;
+                || contacts_visible
+                || self.show_capture_picker;
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
                     presenter.hide_if_unused(force_hide);
@@ -971,7 +981,10 @@ impl AppState {
                         self.calls.insert(node_id, call_state);
                     }
                     if self.sharing_active && !self.has_active_call() {
-                        self.cmd(Command::ToggleSharing { enabled: false });
+                        self.cmd(Command::ToggleSharing {
+                            enabled: false,
+                            target: None,
+                        });
                     }
 
                     let has_incoming = self.dev_pair.is_none()
@@ -994,7 +1007,10 @@ impl AppState {
                     }
                     if auto_share {
                         info!("dev call automatically starting the explicit test share");
-                        self.cmd(Command::ToggleSharing { enabled: true });
+                        self.cmd(Command::ToggleSharing {
+                            enabled: true,
+                            target: None,
+                        });
                         if let Some(cycles) = std::env::var("WIRE_DEV_SHARE_TOGGLE_CYCLES")
                             .ok()
                             .and_then(|value| value.parse::<u32>().ok())
@@ -1005,7 +1021,10 @@ impl AppState {
                                 for cycle in 0..cycles {
                                     std::thread::sleep(Duration::from_secs(2));
                                     if command_tx
-                                        .send_blocking(Command::ToggleSharing { enabled: false })
+                                        .send_blocking(Command::ToggleSharing {
+                                            enabled: false,
+                                            target: None,
+                                        })
                                         .is_err()
                                     {
                                         break;
@@ -1013,7 +1032,10 @@ impl AppState {
                                     if cycle + 1 < cycles {
                                         std::thread::sleep(Duration::from_secs(1));
                                         if command_tx
-                                            .send_blocking(Command::ToggleSharing { enabled: true })
+                                            .send_blocking(Command::ToggleSharing {
+                                                enabled: true,
+                                                target: None,
+                                            })
                                             .is_err()
                                         {
                                             break;
@@ -1349,7 +1371,10 @@ impl AppState {
 
     fn handle_view_mode_input(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(mode) = self.chat.image_preview.as_ref().map(|preview| preview.mode) {
+            if self.show_capture_picker {
+                self.show_capture_picker = false;
+            } else if let Some(mode) = self.chat.image_preview.as_ref().map(|preview| preview.mode)
+            {
                 if mode == ImagePreviewMode::Fullscreen {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
@@ -1378,6 +1403,180 @@ impl AppState {
         self.calls
             .values()
             .any(|state| matches!(state, CallState::Active))
+    }
+
+    fn open_capture_picker(&mut self) {
+        match crate::screen_capture::list_capture_targets() {
+            Ok(targets) => {
+                self.selected_capture_target = targets
+                    .iter()
+                    .position(|target| target.is_primary)
+                    .or_else(|| (!targets.is_empty()).then_some(0));
+                self.capture_targets = targets;
+                self.capture_error = None;
+                self.show_capture_picker = true;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.capture_error = Some(message.clone());
+                self.notifications.error(
+                    "screen-sharing-error",
+                    "Could not list screens and windows",
+                    message,
+                );
+            }
+        }
+    }
+
+    fn stop_sharing_from_ui(&mut self) {
+        self.play_control_sound(false);
+        self.cmd(Command::ToggleSharing {
+            enabled: false,
+            target: None,
+        });
+    }
+
+    fn toggle_sharing_from_ui(&mut self) {
+        if self.sharing_active {
+            self.stop_sharing_from_ui();
+        } else {
+            self.open_capture_picker();
+        }
+    }
+
+    fn ui_capture_picker(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let mut open = self.show_capture_picker;
+        let mut selected = self.selected_capture_target;
+        let targets = self.capture_targets.clone();
+        let mut start = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        let (picker_width, picker_body_height, use_columns) =
+            capture_picker_layout(ctx.content_rect().size());
+
+        egui::Window::new("Share a screen or window")
+            .id(egui::Id::new("capture-target-picker"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(picker_width)
+            .min_width(picker_width)
+            .max_width(picker_width)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(picker_width);
+                ui.label(
+                    RichText::new("Choose exactly what people in this call can see.")
+                        .color(pal.text2),
+                );
+                ui.add_space(14.0);
+
+                if use_columns {
+                    ui.columns(2, |columns| {
+                        capture_target_column(
+                            &mut columns[0],
+                            pal,
+                            "Screens",
+                            crate::screen_capture::CaptureTargetKind::Display,
+                            Icon::Monitor,
+                            &targets,
+                            &mut selected,
+                            picker_body_height,
+                        );
+                        capture_target_column(
+                            &mut columns[1],
+                            pal,
+                            "Windows",
+                            crate::screen_capture::CaptureTargetKind::Window,
+                            Icon::AppWindow,
+                            &targets,
+                            &mut selected,
+                            picker_body_height,
+                        );
+                    });
+                } else {
+                    let compact_height = ((picker_body_height - 8.0) * 0.5).max(86.0);
+                    capture_target_column(
+                        ui,
+                        pal,
+                        "Screens",
+                        crate::screen_capture::CaptureTargetKind::Display,
+                        Icon::Monitor,
+                        &targets,
+                        &mut selected,
+                        compact_height,
+                    );
+                    ui.add_space(8.0);
+                    capture_target_column(
+                        ui,
+                        pal,
+                        "Windows",
+                        crate::screen_capture::CaptureTargetKind::Window,
+                        Icon::AppWindow,
+                        &targets,
+                        &mut selected,
+                        compact_height,
+                    );
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if action_button(ui, pal, "Refresh", ButtonTone::Secondary).clicked() {
+                        refresh = true;
+                    }
+                    if picker_width >= 640.0 {
+                        let target = selected.and_then(|index| targets.get(index));
+                        if let Some(target) = target {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Selected: {}",
+                                    ellipsize(&target.title, 42)
+                                ))
+                                .color(pal.dim)
+                                .size(ui_font_size(11.5)),
+                            );
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_enabled_ui(selected.is_some(), |ui| {
+                            if action_button(ui, pal, "Start sharing", ButtonTone::Primary)
+                                .clicked()
+                            {
+                                start = true;
+                            }
+                        });
+                        if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
+                            cancel = true;
+                        }
+                        if ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            && selected.is_some()
+                        {
+                            start = true;
+                        }
+                        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        self.selected_capture_target = selected;
+        if start {
+            if let Some(target) = selected.and_then(|index| targets.get(index)).cloned() {
+                self.play_control_sound(true);
+                self.cmd(Command::ToggleSharing {
+                    enabled: true,
+                    target: Some(target),
+                });
+                self.show_capture_picker = false;
+            }
+        } else if refresh {
+            self.open_capture_picker();
+        } else {
+            self.show_capture_picker = open && !cancel;
+        }
     }
 
     fn has_visible_call(&self) -> bool {
@@ -1612,7 +1811,13 @@ impl AppState {
                     let title = self
                         .dev_pair
                         .as_ref()
-                        .map(|dev_pair| format!("Wire · DEV {}", dev_pair.session()))
+                        .map(|dev_pair| {
+                            format!(
+                                "Wire · DEV {} · P{}",
+                                dev_pair.session(),
+                                dev_pair.peer_index()
+                            )
+                        })
                         .unwrap_or_else(|| "Wire".to_owned());
                     title_bar::ui(
                         ui,
@@ -3613,9 +3818,7 @@ impl AppState {
                     })
                     .clicked()
                 {
-                    let enabled = !self.sharing_active;
-                    self.play_control_sound(enabled);
-                    self.cmd(Command::ToggleSharing { enabled });
+                    self.toggle_sharing_from_ui();
                 }
                 if in_call {
                     ui.add_space(12.0);
@@ -4398,13 +4601,11 @@ impl AppState {
             ui.horizontal(|ui| {
                 if self.sharing_active {
                     if action_button(ui, &pal, "Stop sharing", ButtonTone::Danger).clicked() {
-                        self.play_control_sound(false);
-                        self.cmd(Command::ToggleSharing { enabled: false });
+                        self.stop_sharing_from_ui();
                     }
                     ui.label(RichText::new("Live").color(Color32::from_rgb(100, 200, 120)));
                 } else if action_button(ui, &pal, "Start sharing", ButtonTone::Primary).clicked() {
-                    self.play_control_sound(true);
-                    self.cmd(Command::ToggleSharing { enabled: true });
+                    self.open_capture_picker();
                 }
             });
 
@@ -4681,9 +4882,7 @@ impl AppState {
                         ("Share your screen", ButtonTone::Primary)
                     };
                     if action_button(ui, pal, label, tone).clicked() {
-                        let enabled = !self.sharing_active;
-                        self.play_control_sound(enabled);
-                        self.cmd(Command::ToggleSharing { enabled });
+                        self.toggle_sharing_from_ui();
                     }
                 }
             });
@@ -4707,7 +4906,7 @@ impl AppState {
             CornerRadius::same(12)
         };
         ui.painter()
-            .rect_filled(tile_rect, corner_radius, pal.panel);
+            .rect_filled(tile_rect, corner_radius, Color32::BLACK);
         let show_overlays = tile_rect.width() >= 90.0 && tile_rect.height() >= 44.0;
         let max_label_chars = ((tile_rect.width() / 8.0) as usize).saturating_sub(12);
         let label = ellipsize(&self.stream_label(source), max_label_chars.clamp(8, 30));
@@ -6105,6 +6304,162 @@ fn aspect_fit_rect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
     )
 }
 
+fn capture_picker_layout(viewport: Vec2) -> (f32, f32, bool) {
+    let width = (viewport.x - 56.0).clamp(280.0, 820.0);
+    let body_height = (viewport.y - 190.0).clamp(180.0, 390.0);
+    (width, body_height, width >= 560.0)
+}
+
+fn capture_target_column(
+    ui: &mut Ui,
+    pal: &Palette,
+    title: &str,
+    kind: crate::screen_capture::CaptureTargetKind,
+    icon: Icon,
+    targets: &[crate::screen_capture::CaptureTarget],
+    selected: &mut Option<usize>,
+    height: f32,
+) {
+    let count = targets.iter().filter(|target| target.kind == kind).count();
+    Frame::new()
+        .fill(chat_surface(pal))
+        .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+        .inner_margin(10.0)
+        .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(height);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(char::from(icon))
+                        .font(lucide(15.0))
+                        .color(pal.accent),
+                );
+                ui.label(
+                    RichText::new(title.to_uppercase())
+                        .family(kh_family())
+                        .color(pal.text2)
+                        .size(11.0),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(count.to_string())
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+
+            egui::ScrollArea::vertical()
+                .id_salt(("capture-targets", title))
+                .max_height((height - 38.0).max(48.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let mut any = false;
+                    for (index, target) in targets.iter().enumerate() {
+                        if target.kind != kind {
+                            continue;
+                        }
+                        any = true;
+                        if capture_target_row(ui, pal, target, *selected == Some(index)).clicked() {
+                            *selected = Some(index);
+                        }
+                        ui.add_space(6.0);
+                    }
+                    if !any {
+                        Frame::new()
+                            .fill(pal.panel)
+                            .corner_radius(CornerRadius::same(9))
+                            .inner_margin(14.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    RichText::new(format!("No {} available", title.to_lowercase()))
+                                        .color(pal.dim)
+                                        .size(ui_font_size(12.0)),
+                                );
+                            });
+                    }
+                });
+        });
+}
+
+fn capture_target_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    target: &crate::screen_capture::CaptureTarget,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), egui::Sense::click());
+    let hovered = response.hovered();
+    let fill = if selected {
+        pal.accent_dim
+    } else if hovered {
+        pal.panel2
+    } else {
+        pal.panel
+    };
+    let stroke = if selected {
+        Stroke::new(1.25_f32, pal.accent.gamma_multiply(0.9))
+    } else {
+        Stroke::new(1.0_f32, chat_hairline(pal))
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(9),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 25.0, rect.center().y),
+        Vec2::splat(32.0),
+    );
+    ui.painter().rect_filled(
+        icon_rect,
+        CornerRadius::same(8),
+        if selected { pal.accent_dim } else { pal.panel2 },
+    );
+    ui.painter().text(
+        icon_rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(match target.kind {
+            crate::screen_capture::CaptureTargetKind::Display => Icon::Monitor,
+            crate::screen_capture::CaptureTargetKind::Window => Icon::AppWindow,
+        }),
+        lucide(15.0),
+        if selected { pal.accent } else { pal.dim },
+    );
+
+    let text_left = rect.left() + 50.0;
+    let available_chars = ((rect.right() - text_left - 12.0) / 7.0) as usize;
+    ui.painter().text(
+        egui::pos2(text_left, rect.top() + 15.0),
+        Align2::LEFT_TOP,
+        ellipsize(&target.title, available_chars.clamp(12, 48)),
+        sans(12.5),
+        pal.text,
+    );
+    let primary = if target.is_primary {
+        "  ·  Primary"
+    } else {
+        ""
+    };
+    ui.painter().text(
+        egui::pos2(text_left, rect.top() + 36.0),
+        Align2::LEFT_TOP,
+        format!("{} × {}{}", target.width, target.height, primary),
+        sans(10.5),
+        pal.dim,
+    );
+
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn sync_rgba_texture(
     ui: &Ui,
     id: &str,
@@ -6548,6 +6903,22 @@ mod layout_tests {
     }
 
     #[test]
+    fn capture_picker_adapts_to_compact_viewports() {
+        assert_eq!(
+            capture_picker_layout(Vec2::new(1200.0, 900.0)),
+            (820.0, 390.0, true)
+        );
+        assert_eq!(
+            capture_picker_layout(Vec2::new(600.0, 500.0)),
+            (544.0, 310.0, false)
+        );
+        assert_eq!(
+            capture_picker_layout(Vec2::new(420.0, 360.0)),
+            (364.0, 180.0, false)
+        );
+    }
+
+    #[test]
     fn long_stream_names_are_clipped_cleanly() {
         assert_eq!(ellipsize("Ada", 8), "Ada");
         assert_eq!(ellipsize("Long display name", 8), "Long di…");
@@ -6687,6 +7058,13 @@ mod layout_tests {
             "invalid video frame length: 81 bytes"
         )));
     }
+
+    #[test]
+    fn only_replacement_stops_reset_the_video_stream() {
+        assert!(VideoSendCommand::Replace.resets_stream());
+        assert!(!VideoSendCommand::Finish.resets_stream());
+        assert!(!VideoSendCommand::Running.resets_stream());
+    }
 }
 
 enum Event {
@@ -6755,8 +7133,21 @@ enum CallInfo {
 
 struct VideoPeerTasks {
     send: Option<tokio::task::JoinHandle<()>>,
-    send_stop: Option<tokio::sync::watch::Sender<bool>>,
+    send_stop: Option<tokio::sync::watch::Sender<VideoSendCommand>>,
     recv: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSendCommand {
+    Running,
+    Finish,
+    Replace,
+}
+
+impl VideoSendCommand {
+    fn resets_stream(self) -> bool {
+        self == Self::Replace
+    }
 }
 
 impl VideoPeerTasks {
@@ -6793,6 +7184,7 @@ enum Command {
     },
     ToggleSharing {
         enabled: bool,
+        target: Option<crate::screen_capture::CaptureTarget>,
     },
     SetMuted {
         muted: bool,
@@ -6855,6 +7247,7 @@ struct Worker {
     capture_preview_task: Option<tokio::task::JoinHandle<()>>,
     capture_idle_trim_task: Option<tokio::task::JoinHandle<()>>,
     sharing_active: bool,
+    capture_target: Option<crate::screen_capture::CaptureTarget>,
     muted: bool,
     deafened: bool,
     chat: chat::ChatService,
@@ -6983,6 +7376,7 @@ impl Worker {
             capture_preview_task: None,
             capture_idle_trim_task: None,
             sharing_active: false,
+            capture_target: None,
             muted: false,
             deafened: false,
             chat: chat_protocols.service,
@@ -7009,6 +7403,10 @@ impl Worker {
                     let Ok(command) = command else {
                         info!("app command channel closed; stopping worker");
                         self.client_status.broadcast_offline().await;
+                        self.close_active_call_transports();
+                        if self.sharing_active {
+                            self.stop_capture().await;
+                        }
                         break;
                     };
                     if let Err(err) = self.handle_command(command).await {
@@ -7247,12 +7645,12 @@ impl Worker {
                     .expect("video peer was initialized");
                 (entry.send_stop.take(), entry.send.take())
             };
-            stop_video_send(node_id, old_stop, old_send).await;
+            stop_video_send(node_id, old_stop, old_send, VideoSendCommand::Replace).await;
             let send_conn = conn.clone();
             let frame_tx = self.video_frame_tx.clone();
             let keyframe_tx = self.keyframe_tx.clone();
             let nid = node_id;
-            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(VideoSendCommand::Running);
             info!("starting video send task for {}", node_id.fmt_short());
             let handle = tokio::spawn(async move {
                 run_video_send(send_conn, frame_tx, keyframe_tx, nid, stop_rx).await;
@@ -7272,8 +7670,11 @@ impl Worker {
             .iter_mut()
             .map(|(node_id, tasks)| (*node_id, tasks.send_stop.take(), tasks.send.take()))
             .collect();
-        for (node_id, stop, send) in tasks {
-            stop_video_send(node_id, stop, send).await;
+        for (node_id, stop, _) in &tasks {
+            request_video_send_stop(*node_id, stop.as_ref(), VideoSendCommand::Finish);
+        }
+        for (node_id, _, send) in tasks {
+            await_video_send_stop(node_id, send).await;
         }
     }
 
@@ -7293,7 +7694,13 @@ impl Worker {
 
     async fn remove_video_peer(&mut self, node_id: NodeId) {
         if let Some(mut tasks) = self.video_peers.remove(&node_id) {
-            stop_video_send(node_id, tasks.send_stop.take(), tasks.send.take()).await;
+            stop_video_send(
+                node_id,
+                tasks.send_stop.take(),
+                tasks.send.take(),
+                VideoSendCommand::Finish,
+            )
+            .await;
             if let Some(recv) = tasks.recv.take() {
                 recv.abort();
                 let _ = recv.await;
@@ -7319,6 +7726,26 @@ impl Worker {
         Ok(())
     }
 
+    fn close_active_call_transports(&self) {
+        for (node_id, call) in &self.active_calls {
+            let connection = match call {
+                CallInfo::Connecting(connection)
+                | CallInfo::Incoming(connection)
+                | CallInfo::Active(connection) => Some(connection),
+                CallInfo::Calling => None,
+            };
+            if let Some(connection) = connection {
+                info!(
+                    node = %node_id.fmt_short(),
+                    "closing active call transport during app shutdown"
+                );
+                connection
+                    .transport()
+                    .close(0u32.into(), b"wire app shutdown");
+            }
+        }
+    }
+
     fn start_capture(&mut self) -> Result<()> {
         if let Some(trim_task) = self.capture_idle_trim_task.take() {
             trim_task.abort();
@@ -7335,6 +7762,18 @@ impl Worker {
         if let Some(stale_task) = self.capture_preview_task.take() {
             stale_task.abort();
         }
+
+        let thread = crate::screen_capture::start(
+            config,
+            self.capture_target.clone(),
+            stop_flag.clone(),
+            self.video_frame_tx.clone(),
+            preview_tx,
+            self.keyframe_tx.clone(),
+        )?;
+
+        self.capture_thread = Some(thread);
+        self.capture_stop_flag = Some(stop_flag);
         self.capture_preview_task = Some(tokio::task::spawn(async move {
             while let Ok(update) = preview_rx.recv().await {
                 let _ = event_tx
@@ -7351,17 +7790,6 @@ impl Worker {
                 }
             }
         }));
-
-        let thread = crate::screen_capture::start(
-            config,
-            stop_flag.clone(),
-            self.video_frame_tx.clone(),
-            preview_tx,
-            self.keyframe_tx.clone(),
-        );
-
-        self.capture_thread = Some(thread);
-        self.capture_stop_flag = Some(stop_flag);
         info!(
             "screen capture started ({}x{} @ {}fps, {} kbps, {} active call(s))",
             target_w,
@@ -7393,10 +7821,11 @@ impl Worker {
     }
 
     async fn stop_capture(&mut self) {
-        self.stop_capture_pipeline().await;
         self.sharing_active = false;
+        self.capture_target = None;
         self.finish_all_video_send().await;
         let _ = self.emit(Event::SharingToggled(false)).await;
+        self.stop_capture_pipeline().await;
         self.schedule_idle_working_set_trim();
     }
 
@@ -7437,20 +7866,33 @@ impl Worker {
                 }
                 self.video_config = video_config;
                 if restart_capture {
-                    self.start_capture()?;
+                    if let Err(error) = self.start_capture() {
+                        warn!("screen capture restart failed: {error:#}");
+                        self.sharing_active = false;
+                        self.capture_target = None;
+                        self.finish_all_video_send().await;
+                        self.emit(Event::SharingFailed(error.to_string())).await?;
+                    }
                 }
             }
-            Command::ToggleSharing { enabled } => {
+            Command::ToggleSharing { enabled, target } => {
                 if enabled && !self.sharing_active {
                     if let Err(error) = crate::screen_capture::ensure_capture_permission() {
                         warn!("screen sharing permission unavailable: {error:#}");
                         self.emit(Event::SharingFailed(error.to_string())).await?;
                         return Ok(());
                     }
+                    self.capture_target = target;
                     self.sharing_active = true;
+                    if let Err(error) = self.start_capture() {
+                        warn!("screen capture failed to start: {error:#}");
+                        self.sharing_active = false;
+                        self.capture_target = None;
+                        self.emit(Event::SharingFailed(error.to_string())).await?;
+                        return Ok(());
+                    }
                     let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
-                    self.start_capture()?;
                     self.emit(Event::SharingToggled(true)).await?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture().await;
@@ -7561,19 +8003,33 @@ const VIDEO_SEND_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn stop_video_send(
     node_id: NodeId,
-    stop: Option<tokio::sync::watch::Sender<bool>>,
-    mut handle: Option<tokio::task::JoinHandle<()>>,
+    stop: Option<tokio::sync::watch::Sender<VideoSendCommand>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    command: VideoSendCommand,
 ) {
-    let Some(mut handle) = handle.take() else {
-        return;
-    };
+    request_video_send_stop(node_id, stop.as_ref(), command);
+    await_video_send_stop(node_id, handle).await;
+}
+
+fn request_video_send_stop(
+    node_id: NodeId,
+    stop: Option<&tokio::sync::watch::Sender<VideoSendCommand>>,
+    command: VideoSendCommand,
+) {
     if let Some(stop) = stop {
-        let _ = stop.send(true);
+        let _ = stop.send(command);
         info!(
             node = %node_id.fmt_short(),
+            ?command,
             "requested cooperative video sender stop"
         );
     }
+}
+
+async fn await_video_send_stop(node_id: NodeId, mut handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut handle) = handle.take() else {
+        return;
+    };
     // `timeout` polls `&mut handle` to completion on success. A second
     // `handle.await` after that panics ("JoinHandle polled after completion"),
     // so only await again on the abort fallback path.
@@ -7606,7 +8062,7 @@ async fn run_video_send(
     frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
     keyframe_tx: tokio::sync::broadcast::Sender<()>,
     node_id: NodeId,
-    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<VideoSendCommand>,
 ) {
     let result: Result<()> = async {
         info!("opening video stream to {}", node_id.fmt_short());
@@ -7623,12 +8079,12 @@ async fn run_video_send(
         let mut window_bytes = 0u64;
         let mut window_send_ms = Vec::with_capacity(300);
         let mut last_stats_log = std::time::Instant::now();
-        let mut stop_requested = false;
+        let mut stop_command = VideoSendCommand::Finish;
         loop {
             let frame = tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_ok() {
-                        stop_requested = true;
+                        stop_command = *stop_rx.borrow_and_update();
                     }
                     break;
                 }
@@ -7664,7 +8120,7 @@ async fn run_video_send(
             let send_result = tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_ok() {
-                        stop_requested = true;
+                        stop_command = *stop_rx.borrow_and_update();
                     }
                     break;
                 }
@@ -7733,18 +8189,28 @@ async fn run_video_send(
                 last_stats_log = std::time::Instant::now();
             }
         }
-        let reset_result = send.reset(VIDEO_STREAM_RESET_CODE);
-        info!(
-            node = %node_id.fmt_short(),
-            reset_code = "0x51",
-            cooperative = stop_requested,
-            "resetting video send stream"
-        );
-        if reset_result.is_err() {
-            warn!(
-                "video send reset for {} failed: {reset_result:?}",
-                node_id.fmt_short()
+        if stop_command.resets_stream() {
+            let reset_result = send.reset(VIDEO_STREAM_RESET_CODE);
+            info!(
+                node = %node_id.fmt_short(),
+                reset_code = "0x51",
+                "resetting video send stream for replacement"
             );
+            if reset_result.is_err() {
+                warn!(
+                    "video send reset for {} failed: {reset_result:?}",
+                    node_id.fmt_short()
+                );
+            }
+        } else {
+            let finish_result = send.finish();
+            info!(node = %node_id.fmt_short(), "finishing video send stream");
+            if finish_result.is_err() {
+                warn!(
+                    "video send finish for {} failed: {finish_result:?}",
+                    node_id.fmt_short()
+                );
+            }
         }
         drain_task.abort();
         let _ = drain_task.await;
@@ -7760,7 +8226,7 @@ async fn run_video_send(
 
 async fn drain_quic_recv(
     mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<VideoSendCommand>,
 ) {
     let mut buf = [0u8; 256];
     loop {
@@ -7794,9 +8260,9 @@ async fn run_video_recv(
     // Keep one decoder across brief share restarts. Media Foundation and the GPU
     // driver retain sizeable allocator caches when a decoder is destroyed and
     // immediately recreated, which makes repeated button presses look like a
-    // leak even though every COM object is eventually released. The UI retains
-    // the last frame during this grace period; a genuinely idle stream is
-    // cleared when the decoder is released.
+    // leak even though every COM object is eventually released. A replacement
+    // retains the last frame during this grace period, while an explicit stop
+    // clears it immediately and only retains the decoder allocation.
     let mut worker = None;
     let mut decoder_idle_deadline: Option<tokio::time::Instant> = None;
     let mut next_generation = 0u64;
@@ -7896,12 +8362,20 @@ async fn run_video_recv(
                         match stream_result {
                             Ok(()) => {
                                 info!(
-                                    "video stream from {} generation {} ended cleanly; retaining decoder for {:?}",
+                                    "video stream from {} generation {} ended cleanly; clearing the frame and retaining the decoder for {:?}",
                                     node_id.fmt_short(),
                                     generation,
                                     DECODER_IDLE_GRACE
                                 );
-                                pending_end = Some((generation, VideoStreamEndReason::CleanEof));
+                                notify_video_stream_ended(
+                                    &event_tx,
+                                    callback.as_ref(),
+                                    node_id,
+                                    generation,
+                                    VideoStreamEndReason::CleanEof,
+                                );
+                                active_generation = None;
+                                pending_end = None;
                                 decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                             }
                             Err(error) if is_video_stream_replacement_error(&error) => {
@@ -7916,11 +8390,19 @@ async fn run_video_recv(
                             }
                             Err(error) => {
                                 warn!(
-                                    "video stream from {} generation {} failed: {error:?}; waiting for a replacement stream",
+                                    "video stream from {} generation {} failed: {error:?}; clearing the frame while waiting for a replacement stream",
                                     node_id.fmt_short(),
                                     generation
                                 );
-                                pending_end = Some((generation, VideoStreamEndReason::ReceiveError));
+                                notify_video_stream_ended(
+                                    &event_tx,
+                                    callback.as_ref(),
+                                    node_id,
+                                    generation,
+                                    VideoStreamEndReason::ReceiveError,
+                                );
+                                active_generation = None;
+                                pending_end = None;
                                 decoder_idle_deadline = Some(tokio::time::Instant::now() + DECODER_IDLE_GRACE);
                             }
                         }

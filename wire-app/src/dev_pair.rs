@@ -60,6 +60,10 @@ impl DevPairState {
         &self.session
     }
 
+    pub fn peer_index(&self) -> usize {
+        self.peer_index
+    }
+
     /// Registers this instance and returns every earlier participant. Connecting
     /// each new participant to all lower indexes produces one full-mesh call
     /// without duplicate connections between any pair.

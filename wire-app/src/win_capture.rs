@@ -21,11 +21,13 @@ use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings};
+use windows_capture::window::Window;
 
+use crate::screen_capture::{CaptureTarget, CaptureTargetKind};
 use crate::win_mf_d3d::{GpuVideoProcessor, MfD3d};
 
 const FRAME_QUEUE_DEPTH: usize = 1;
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(800);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct GpuSlot {
     texture: ID3D11Texture2D,
@@ -210,19 +212,52 @@ pub struct WindowsCapturer {
 }
 
 impl WindowsCapturer {
-    pub fn try_new(target_w: u32, target_h: u32) -> Result<Self> {
+    pub fn try_new(target_w: u32, target_h: u32, target: Option<&CaptureTarget>) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
-        let monitor = Monitor::primary().context("failed to get primary monitor")?;
-        let settings = Settings::new(
-            monitor,
-            CursorCaptureSettings::WithCursor,
-            DrawBorderSettings::Default,
-            ColorFormat::Bgra8,
-            CaptureFlags { tx },
-        );
-
-        let control = CaptureHandler::start_free_threaded(settings)
-            .context("failed to start direct Windows Graphics Capture")?;
+        let flags = CaptureFlags { tx };
+        let control = match target.map(|target| target.kind) {
+            Some(CaptureTargetKind::Display) => {
+                let target = target.expect("capture target was present");
+                let monitor = Monitor::enumerate()
+                    .context("failed to enumerate monitors")?
+                    .into_iter()
+                    .find(|monitor| monitor.as_raw_hmonitor() as usize as u32 == target.id)
+                    .context("selected monitor is no longer available")?;
+                CaptureHandler::start_free_threaded(Settings::new(
+                    monitor,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                ))
+            }
+            Some(CaptureTargetKind::Window) => {
+                let target = target.expect("capture target was present");
+                let window = Window::enumerate()
+                    .context("failed to enumerate windows")?
+                    .into_iter()
+                    .find(|window| window.as_raw_hwnd() as usize as u32 == target.id)
+                    .context("selected window is no longer available")?;
+                CaptureHandler::start_free_threaded(Settings::new(
+                    window,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                ))
+            }
+            None => {
+                let monitor = Monitor::primary().context("failed to get primary monitor")?;
+                CaptureHandler::start_free_threaded(Settings::new(
+                    monitor,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                ))
+            }
+        }
+        .context("failed to start direct Windows Graphics Capture")?;
 
         let first = match rx.recv_timeout(FIRST_FRAME_TIMEOUT) {
             Ok(frame) => frame,
@@ -258,13 +293,15 @@ impl WindowsCapturer {
                 .rx
                 .recv()
                 .context("direct WGC capture channel closed")?;
-            if frame.width == self.src_w && frame.height == self.src_h {
-                return Ok(frame);
+            if frame.width != self.src_w || frame.height != self.src_h {
+                info!(
+                    "direct WGC target resized from {}x{} to {}x{}",
+                    self.src_w, self.src_h, frame.width, frame.height
+                );
+                self.src_w = frame.width;
+                self.src_h = frame.height;
             }
-            warn!(
-                "dropping direct WGC frame with unexpected size {}x{} (expected {}x{})",
-                frame.width, frame.height, self.src_w, self.src_h
-            );
+            return Ok(frame);
         }
     }
 }
@@ -288,6 +325,7 @@ struct CaptureHandler {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     slots: Vec<Arc<GpuSlot>>,
+    source_dimensions: Option<(u32, u32)>,
     copy_samples: Vec<f64>,
     copied: u64,
     last_stats_log: Instant,
@@ -304,6 +342,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             device: ctx.device,
             context: ctx.device_context,
             slots: Vec::new(),
+            source_dimensions: None,
             copy_samples: Vec::with_capacity(300),
             copied: 0,
             last_stats_log: Instant::now(),
@@ -319,6 +358,15 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let width = frame.width();
         let height = frame.height();
         let source = unsafe { frame.as_raw_texture() };
+        if self.source_dimensions != Some((width, height)) {
+            if let Some((old_width, old_height)) = self.source_dimensions {
+                info!(
+                    "recreating direct WGC texture ring after target resized from {old_width}x{old_height} to {width}x{height}"
+                );
+            }
+            self.slots.clear();
+            self.source_dimensions = Some((width, height));
+        }
         if self.slots.is_empty() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { source.GetDesc(&mut desc) };
@@ -419,7 +467,7 @@ mod tests {
     fn repeated_wgc_start_stop_reaches_a_memory_plateau() {
         let mut stopped_memory = Vec::new();
         for _ in 0..8 {
-            let mut capture = WindowsCapturer::try_new(1920, 1080).unwrap();
+            let mut capture = WindowsCapturer::try_new(1920, 1080, None).unwrap();
             for _ in 0..30 {
                 drop(capture.capture_gpu().unwrap());
             }

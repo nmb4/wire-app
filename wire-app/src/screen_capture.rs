@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_channel::Sender;
 use spin_sleep::SpinSleeper;
 use tokio::sync::broadcast;
@@ -15,10 +13,7 @@ use wire::video::{
     bitstream::contains_idr, codec::VideoEncoder, transport::EncodedVideoFrame, VideoConfig,
 };
 
-#[cfg(not(target_os = "macos"))]
 use fast_image_resize::{images::Image, PixelType, Resizer};
-#[cfg(all(not(windows), not(target_os = "macos")))]
-use image::DynamicImage;
 
 #[cfg(any(windows, target_os = "macos"))]
 use crate::scap_capture::ScapCapturer;
@@ -30,6 +25,114 @@ use crate::win_mf_codec::MfH264Encoder;
 const FRAME_CHANNEL_DEPTH: usize = 1;
 const PREVIEW_DIVISOR: u32 = 3;
 const PREVIEW_CHANNEL_DEPTH: usize = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureTargetKind {
+    Display,
+    Window,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureTarget {
+    pub kind: CaptureTargetKind,
+    pub id: u32,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
+pub fn list_capture_targets() -> Result<Vec<CaptureTarget>> {
+    ensure_capture_permission()?;
+
+    let mut targets = Vec::new();
+    for monitor in xcap::Monitor::all().context("failed to enumerate displays")? {
+        let id = monitor.id().context("failed to read display id")?;
+        let width = monitor.width().context("failed to read display width")?;
+        let height = monitor.height().context("failed to read display height")?;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        targets.push(CaptureTarget {
+            kind: CaptureTargetKind::Display,
+            id,
+            title: monitor
+                .name()
+                .unwrap_or_else(|_| format!("Display {}", targets.len() + 1)),
+            width,
+            height,
+            is_primary: monitor.is_primary().unwrap_or(false),
+        });
+    }
+
+    match xcap::Window::all() {
+        Ok(windows) => {
+            for window in windows {
+                let Ok(id) = window.id() else { continue };
+                let Ok(width) = window.width() else { continue };
+                let Ok(height) = window.height() else {
+                    continue;
+                };
+                if width == 0 || height == 0 || window.is_minimized().unwrap_or(false) {
+                    continue;
+                }
+                let title = window.title().unwrap_or_default();
+                let app_name = window.app_name().unwrap_or_default();
+                let title = match (app_name.trim(), title.trim()) {
+                    ("", "") => continue,
+                    ("", title) => title.to_owned(),
+                    (app, "") => app.to_owned(),
+                    (app, title) if app == title => title.to_owned(),
+                    (app, title) => format!("{app} — {title}"),
+                };
+                targets.push(CaptureTarget {
+                    kind: CaptureTargetKind::Window,
+                    id,
+                    title,
+                    width,
+                    height,
+                    is_primary: false,
+                });
+            }
+        }
+        Err(error) => warn!("failed to enumerate capturable windows: {error}"),
+    }
+
+    normalize_capture_targets(&mut targets);
+
+    if targets.is_empty() {
+        anyhow::bail!("No screens or windows are available to share.");
+    }
+    Ok(targets)
+}
+
+fn normalize_capture_targets(targets: &mut Vec<CaptureTarget>) {
+    targets.sort_by(|left, right| {
+        let left_group = match left.kind {
+            CaptureTargetKind::Display => 0,
+            CaptureTargetKind::Window => 1,
+        };
+        let right_group = match right.kind {
+            CaptureTargetKind::Display => 0,
+            CaptureTargetKind::Window => 1,
+        };
+        left_group
+            .cmp(&right_group)
+            .then_with(|| right.is_primary.cmp(&left.is_primary))
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut seen = Vec::new();
+    targets.retain(|target| {
+        let key = (target.kind, target.id);
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+}
 
 pub struct PreviewUpdate {
     pub data: Arc<Vec<u8>>,
@@ -157,16 +260,18 @@ enum CaptureFrame {
 /// Runs capture+resize and encode in parallel threads.
 pub fn start(
     config: VideoConfig,
+    target: Option<CaptureTarget>,
     stop_flag: Arc<AtomicBool>,
     encoded_tx: broadcast::Sender<Arc<EncodedVideoFrame>>,
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>> {
     let target_w = config.resolution.width();
     let target_h = config.resolution.height();
     let target_interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
+    let (startup_tx, startup_rx) = mpsc::sync_channel(1);
 
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<CaptureFrame>(FRAME_CHANNEL_DEPTH);
         let (preview_input_tx, preview_input_rx) =
             mpsc::sync_channel::<PreviewInput>(PREVIEW_CHANNEL_DEPTH);
@@ -184,8 +289,11 @@ pub fn start(
                 target_h,
                 target_interval,
                 capture_fps,
+                target.as_ref(),
                 &frame_tx,
+                &startup_tx,
             ) {
+                let _ = startup_tx.try_send(Err(format!("{e:#}")));
                 info!("capture thread stopped: {e:?}");
             }
         });
@@ -208,7 +316,19 @@ pub fn start(
         let _ = capture_handle.join();
         let _ = preview_handle.join();
         info!("capture, encode, and preview threads exited");
-    })
+    });
+
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(message)) => {
+            let _ = handle.join();
+            anyhow::bail!(message);
+        }
+        Err(_) => {
+            let _ = handle.join();
+            anyhow::bail!("screen capture stopped before producing its first frame");
+        }
+    }
 }
 
 pub fn ensure_capture_permission() -> Result<()> {
@@ -246,26 +366,40 @@ enum CaptureSource {
         src_w: i32,
         src_h: i32,
     },
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(not(windows))]
     Xcap {
         monitor: xcap::Monitor,
         resizer: Resizer,
-        dst: Image,
+        dst: Image<'static>,
+    },
+    #[cfg(not(windows))]
+    XcapWindow {
+        window: xcap::Window,
+        resizer: Resizer,
+        dst: Image<'static>,
     },
 }
 
-fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<CaptureSource> {
+fn init_capture_source(
+    target_w: u32,
+    target_h: u32,
+    framerate: u32,
+    target: Option<&CaptureTarget>,
+) -> Result<CaptureSource> {
     #[cfg(windows)]
     {
         // Prefer the direct Windows Graphics Capture path: it avoids zed-scap's unconditional
         // full-frame buffer_crop call for display capture.
-        match WindowsCapturer::try_new(target_w, target_h) {
+        match WindowsCapturer::try_new(target_w, target_h, target) {
             Ok(capturer) => return Ok(CaptureSource::Windows(capturer)),
+            Err(error) if target.is_some() => {
+                return Err(error).context("direct capture of the selected target failed");
+            }
             Err(e) => info!("direct WGC capture unavailable, trying zed-scap: {e:?}"),
         }
 
         // Prefer WGC: GDI StretchBlt blocks the desktop compositor and causes system-wide stutter.
-        if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate) {
+        if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate, target) {
             return Ok(CaptureSource::Scap(scap));
         }
         let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
@@ -274,24 +408,68 @@ fn init_capture_source(target_w: u32, target_h: u32, framerate: u32) -> Result<C
     }
     #[cfg(target_os = "macos")]
     {
+        if target.is_some_and(|target| target.kind == CaptureTargetKind::Window) {
+            // zed-scap 0.0.8 asks NSApp for external-window geometry on macOS. NSApp only
+            // owns Wire's windows, so other applications resolve to a zero-sized stream.
+            // xcap uses CoreGraphics' real window bounds and capture API instead.
+            return init_xcap_source(target_w, target_h, target);
+        }
         Ok(CaptureSource::Scap(ScapCapturer::try_new(
-            target_w, target_h, framerate,
+            target_w, target_h, framerate, target,
         )?))
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        let monitors = xcap::Monitor::all().context("failed to enumerate monitors")?;
-        let monitor = monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .or(monitors.first())
-            .context("no monitors found")?
-            .clone();
-        Ok(CaptureSource::Xcap {
-            monitor,
-            resizer: Resizer::new(),
-            dst: Image::new(target_w, target_h, PixelType::U8x4),
-        })
+        init_xcap_source(target_w, target_h, target)
+    }
+}
+
+#[cfg(not(windows))]
+fn init_xcap_source(
+    target_w: u32,
+    target_h: u32,
+    target: Option<&CaptureTarget>,
+) -> Result<CaptureSource> {
+    match target.map(|target| target.kind) {
+        Some(CaptureTargetKind::Window) => {
+            let target = target.expect("capture target was present");
+            let window = xcap::Window::all()
+                .context("failed to enumerate windows")?
+                .into_iter()
+                .find(|window| window.id().ok() == Some(target.id))
+                .context("selected window is no longer available")?;
+            info!(
+                "capturing selected window '{}' ({}x{}) via xcap",
+                target.title, target.width, target.height
+            );
+            Ok(CaptureSource::XcapWindow {
+                window,
+                resizer: Resizer::new(),
+                dst: Image::new(target_w, target_h, PixelType::U8x4),
+            })
+        }
+        _ => {
+            let monitors = xcap::Monitor::all().context("failed to enumerate monitors")?;
+            let monitor = if let Some(target) = target {
+                monitors
+                    .into_iter()
+                    .find(|monitor| monitor.id().ok() == Some(target.id))
+                    .context("selected display is no longer available")?
+            } else {
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.is_primary().unwrap_or(false))
+                    .or(monitors.first())
+                    .context("no monitors found")?
+                    .clone()
+            };
+            info!("capturing display via xcap");
+            Ok(CaptureSource::Xcap {
+                monitor,
+                resizer: Resizer::new(),
+                dst: Image::new(target_w, target_h, PixelType::U8x4),
+            })
+        }
     }
 }
 
@@ -313,7 +491,7 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
             )
             .map(CaptureFrame::Cpu)
         }
-        #[cfg(all(not(windows), not(target_os = "macos")))]
+        #[cfg(not(windows))]
         CaptureSource::Xcap {
             monitor,
             resizer,
@@ -322,12 +500,111 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
             let img = monitor
                 .capture_image()
                 .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
-            let src = DynamicImage::ImageRgba8(img);
-            resizer
-                .resize(&src, dst, None)
-                .map_err(|e| anyhow::anyhow!("resize error: {e}"))?;
-            Ok(CaptureFrame::Cpu(dst.buffer().to_vec()))
+            resize_xcap_frame(img, resizer, dst)
         }
+        #[cfg(not(windows))]
+        CaptureSource::XcapWindow {
+            window,
+            resizer,
+            dst,
+        } => {
+            let img = window
+                .capture_image()
+                .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
+            resize_xcap_frame(img, resizer, dst)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn resize_xcap_frame(
+    image: image::RgbaImage,
+    resizer: &mut Resizer,
+    destination: &mut Image<'static>,
+) -> Result<CaptureFrame> {
+    let (source_width, source_height) = image.dimensions();
+    let source = Image::from_vec_u8(
+        source_width,
+        source_height,
+        image.into_raw(),
+        PixelType::U8x4,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid xcap frame buffer: {error}"))?;
+    let mut data = resize_with_letterbox(&source, resizer, destination)?;
+    #[cfg(target_os = "macos")]
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(CaptureFrame::Cpu(data))
+}
+
+pub(crate) fn resize_with_letterbox(
+    source: &Image<'_>,
+    resizer: &mut Resizer,
+    destination: &mut Image<'static>,
+) -> Result<Vec<u8>> {
+    let target_width = destination.width();
+    let target_height = destination.height();
+    let (fit_width, fit_height) =
+        aspect_fit_dimensions(source.width(), source.height(), target_width, target_height);
+    if fit_width == target_width && fit_height == target_height {
+        if source.width() == target_width && source.height() == target_height {
+            return Ok(source.buffer().to_vec());
+        }
+        resizer
+            .resize(source, destination, None)
+            .map_err(|error| anyhow::anyhow!("resize error: {error}"))?;
+        return Ok(destination.buffer().to_vec());
+    }
+
+    let mut fitted = Image::new(fit_width, fit_height, PixelType::U8x4);
+    resizer
+        .resize(source, &mut fitted, None)
+        .map_err(|error| anyhow::anyhow!("resize error: {error}"))?;
+
+    // The encoder keeps a stable configured resolution. Center the source inside that
+    // frame instead of stretching it, and make the unused pixels opaque black.
+    let mut letterboxed = vec![0u8; (target_width * target_height * 4) as usize];
+    for pixel in letterboxed.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    let offset_x = (target_width - fit_width) / 2;
+    let offset_y = (target_height - fit_height) / 2;
+    let source_stride = fit_width as usize * 4;
+    let target_stride = target_width as usize * 4;
+    for row in 0..fit_height as usize {
+        let source_start = row * source_stride;
+        let target_start = (row + offset_y as usize) * target_stride + offset_x as usize * 4;
+        letterboxed[target_start..target_start + source_stride]
+            .copy_from_slice(&fitted.buffer()[source_start..source_start + source_stride]);
+    }
+    Ok(letterboxed)
+}
+
+pub(crate) fn aspect_fit_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return (target_width, target_height);
+    }
+
+    if u64::from(source_width) * u64::from(target_height)
+        > u64::from(target_width) * u64::from(source_height)
+    {
+        (
+            target_width,
+            ((u64::from(target_width) * u64::from(source_height)) / u64::from(source_width)).max(1)
+                as u32,
+        )
+    } else {
+        (
+            ((u64::from(target_height) * u64::from(source_width)) / u64::from(source_height)).max(1)
+                as u32,
+            target_height,
+        )
     }
 }
 
@@ -337,9 +614,16 @@ fn run_capture_loop(
     target_h: u32,
     target_interval: Duration,
     framerate: u32,
+    target: Option<&CaptureTarget>,
     frame_tx: &mpsc::SyncSender<CaptureFrame>,
+    startup_tx: &mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
-    let mut source = init_capture_source(target_w, target_h, framerate)?;
+    let mut source = init_capture_source(target_w, target_h, framerate, target)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let needs_explicit_pacing = !matches!(&source, CaptureSource::Scap(_));
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let needs_explicit_pacing = true;
+    let mut startup_pending = true;
     let sleeper = SpinSleeper::default();
     let mut window_captured = 0u64;
     let mut window_dropped = 0u64;
@@ -353,6 +637,10 @@ fn run_capture_loop(
         let frame = capture_frame(&mut source, target_w, target_h)?;
         if matches!(&frame, CaptureFrame::Cpu(data) if data.is_empty()) {
             continue;
+        }
+        if startup_pending {
+            let _ = startup_tx.send(Ok(()));
+            startup_pending = false;
         }
         match frame_tx.try_send(frame) {
             Ok(()) => {
@@ -388,7 +676,7 @@ fn run_capture_loop(
             window_captured = 0;
             window_dropped = 0;
         }
-        if !cfg!(target_os = "macos") && elapsed < target_interval {
+        if needs_explicit_pacing && elapsed < target_interval {
             sleeper.sleep(target_interval - elapsed);
         }
     }
@@ -427,6 +715,8 @@ fn run_encode_loop(
     let preview_interval = (config.framerate.max(1) / 5).max(1) as u64;
     #[cfg(windows)]
     let mut gpu_encoder_ready = false;
+    #[cfg(windows)]
+    let mut gpu_input_dimensions: Option<(u32, u32)> = None;
     #[cfg(windows)]
     let mut cpu_resizer = Resizer::new();
     #[cfg(windows)]
@@ -477,15 +767,28 @@ fn run_encode_loop(
         #[cfg(windows)]
         let encoded_result = has_subscribers.then(|| match &frame {
             CaptureFrame::Gpu(gpu) => {
+                let dimensions = (gpu.width, gpu.height);
+                if gpu_encoder_ready && gpu_input_dimensions != Some(dimensions) {
+                    info!(
+                        "recreating GPU video encoder after capture target resized to {}x{}",
+                        gpu.width, gpu.height
+                    );
+                    encoder = None;
+                    gpu_encoder_ready = false;
+                    gpu_input_dimensions = None;
+                    force_keyframe_pending = true;
+                }
                 if encoder.is_none() {
                     match FrameEncoder::try_new_with_wgc_device(&config, &gpu.device) {
                         Ok(new_encoder) => {
                             encoder = Some(new_encoder);
                             gpu_encoder_ready = true;
+                            gpu_input_dimensions = Some(dimensions);
                         }
                         Err(e) => {
                             warn!("GPU-native encode unavailable; using CPU fallback: {e:#}");
                             encoder = Some(FrameEncoder::try_new_for_cpu_input(&config)?);
+                            gpu_input_dimensions = None;
                         }
                     }
                 }
@@ -549,6 +852,7 @@ fn run_encode_loop(
                             );
                             encoder = Some(FrameEncoder::try_new_with_mf(&config)?);
                             gpu_encoder_ready = false;
+                            gpu_input_dimensions = None;
                         } else {
                             warn!(
                                 "MF encoder produced no output for {MF_EMPTY_FALLBACK} frames, switching to OpenH264"
@@ -788,7 +1092,76 @@ fn make_preview(
 
 #[cfg(test)]
 mod preview_tests {
-    use super::make_preview;
+    use fast_image_resize::{images::Image, PixelType, Resizer};
+
+    use super::{
+        aspect_fit_dimensions, make_preview, normalize_capture_targets, resize_with_letterbox,
+        CaptureTarget, CaptureTargetKind,
+    };
+
+    #[test]
+    fn aspect_fit_dimensions_preserve_landscape_and_portrait_sources() {
+        assert_eq!(aspect_fit_dimensions(1600, 900, 1920, 1080), (1920, 1080));
+        assert_eq!(aspect_fit_dimensions(1200, 900, 1920, 1080), (1440, 1080));
+        assert_eq!(aspect_fit_dimensions(900, 1200, 1920, 1080), (810, 1080));
+    }
+
+    #[test]
+    fn resize_with_letterbox_centers_source_on_opaque_black() {
+        let source_pixels = vec![255u8; 4 * 2 * 4];
+        let source = Image::from_vec_u8(4, 2, source_pixels, PixelType::U8x4).unwrap();
+        let mut destination = Image::new(4, 4, PixelType::U8x4);
+        let output = resize_with_letterbox(&source, &mut Resizer::new(), &mut destination).unwrap();
+
+        assert_eq!(&output[0..16], &[0, 0, 0, 255].repeat(4));
+        assert_eq!(&output[16..48], &[255; 32]);
+        assert_eq!(&output[48..64], &[0, 0, 0, 255].repeat(4));
+    }
+
+    #[test]
+    fn capture_targets_put_primary_screen_first_and_deduplicate_ids() {
+        let mut targets = vec![
+            CaptureTarget {
+                kind: CaptureTargetKind::Window,
+                id: 9,
+                title: "Browser".to_owned(),
+                width: 1200,
+                height: 800,
+                is_primary: false,
+            },
+            CaptureTarget {
+                kind: CaptureTargetKind::Display,
+                id: 2,
+                title: "External".to_owned(),
+                width: 2560,
+                height: 1440,
+                is_primary: false,
+            },
+            CaptureTarget {
+                kind: CaptureTargetKind::Display,
+                id: 1,
+                title: "Built-in".to_owned(),
+                width: 1920,
+                height: 1080,
+                is_primary: true,
+            },
+            CaptureTarget {
+                kind: CaptureTargetKind::Window,
+                id: 9,
+                title: "Browser duplicate".to_owned(),
+                width: 1200,
+                height: 800,
+                is_primary: false,
+            },
+        ];
+
+        normalize_capture_targets(&mut targets);
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].id, 1);
+        assert_eq!(targets[1].id, 2);
+        assert_eq!(targets[2].kind, CaptureTargetKind::Window);
+    }
 
     #[test]
     fn converts_bgra_preview_to_rgba() {
@@ -803,6 +1176,34 @@ mod preview_tests {
     fn preserves_rgba_preview() {
         let rgba = [240, 20, 10, 255];
         assert_eq!(make_preview(&rgba, 1, 1, 1, 1, false), rgba);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires Screen Recording permission and an on-screen application window"]
+    fn selected_macos_window_produces_a_first_frame() {
+        let window = xcap::Window::all()
+            .unwrap()
+            .into_iter()
+            .find(|window| {
+                window.width().unwrap_or(0) > 0
+                    && window.height().unwrap_or(0) > 0
+                    && !window.is_minimized().unwrap_or(true)
+            })
+            .expect("an on-screen window is required");
+        let target = CaptureTarget {
+            kind: CaptureTargetKind::Window,
+            id: window.id().unwrap(),
+            title: window.title().unwrap_or_else(|_| "Test window".to_owned()),
+            width: window.width().unwrap(),
+            height: window.height().unwrap(),
+            is_primary: false,
+        };
+        let mut source = super::init_xcap_source(640, 360, Some(&target)).unwrap();
+        let frame = super::capture_frame(&mut source, 640, 360).unwrap();
+        match frame {
+            super::CaptureFrame::Cpu(data) => assert_eq!(data.len(), 640 * 360 * 4),
+        }
     }
 
     #[cfg(windows)]
@@ -842,7 +1243,15 @@ mod preview_tests {
             let (encoded_tx, encoded_rx) = broadcast::channel(32);
             let (keyframe_tx, _) = broadcast::channel(4);
             let (preview_tx, preview_rx) = async_channel::bounded(4);
-            let handle = super::start(config, stop.clone(), encoded_tx, preview_tx, keyframe_tx);
+            let handle = super::start(
+                config,
+                None,
+                stop.clone(),
+                encoded_tx,
+                preview_tx,
+                keyframe_tx,
+            )
+            .unwrap();
             // Holding both receivers exercises the active GPU encode and preview paths.
             let _receivers = (encoded_rx, preview_rx);
             std::thread::sleep(Duration::from_secs(2));
@@ -883,13 +1292,8 @@ fn resize_bgra(
     resizer: &mut Resizer,
     destination: &mut Image<'static>,
 ) -> Result<Vec<u8>> {
-    if src_w == destination.width() && src_h == destination.height() {
-        return Ok(source);
-    }
     let source = Image::from_vec_u8(src_w, src_h, source, PixelType::U8x4)
         .map_err(|e| anyhow::anyhow!("invalid WGC readback buffer: {e}"))?;
-    resizer
-        .resize(&source, destination, None)
-        .map_err(|e| anyhow::anyhow!("WGC CPU fallback resize failed: {e}"))?;
-    Ok(destination.buffer().to_vec())
+    resize_with_letterbox(&source, resizer, destination)
+        .map_err(|e| anyhow::anyhow!("WGC CPU fallback resize failed: {e}"))
 }
