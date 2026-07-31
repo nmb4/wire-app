@@ -47,6 +47,8 @@ use crate::update::{self, ReleaseInfo};
 
 const DEFAULT: &str = "<default>";
 const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
+const VIDEO_CONTROL_PAUSE: u8 = 0;
+const VIDEO_CONTROL_RESUME: u8 = 1;
 
 pub struct App {
     is_first_update: bool,
@@ -172,6 +174,7 @@ struct AppState {
     video_frames: BTreeMap<NodeId, VideoFrameState>,
     video_stream_generations: BTreeMap<NodeId, u64>,
     ended_video_stream_generations: BTreeMap<NodeId, u64>,
+    stopped_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
     sharing_active: bool,
     capture_error: Option<String>,
@@ -524,6 +527,7 @@ impl App {
             video_frames: Default::default(),
             video_stream_generations: Default::default(),
             ended_video_stream_generations: Default::default(),
+            stopped_video_stream_generations: Default::default(),
             focused_stream: None,
             sharing_active: false,
             capture_error: None,
@@ -974,6 +978,7 @@ impl AppState {
                         self.video_frames.remove(&node_id);
                         self.video_stream_generations.remove(&node_id);
                         self.ended_video_stream_generations.remove(&node_id);
+                        self.stopped_video_stream_generations.remove(&node_id);
                         if self.focused_stream == Some(StreamSource::Remote(node_id)) {
                             self.focused_stream = None;
                         }
@@ -1068,6 +1073,13 @@ impl AppState {
                     }
                     self.video_stream_generations.insert(node_id, generation);
                     self.ended_video_stream_generations.remove(&node_id);
+                    if self
+                        .stopped_video_stream_generations
+                        .get(&node_id)
+                        .is_some_and(|stopped| generation > *stopped)
+                    {
+                        self.stopped_video_stream_generations.remove(&node_id);
+                    }
                 }
                 Event::VideoFrame {
                     node_id,
@@ -1085,6 +1097,10 @@ impl AppState {
                             .ended_video_stream_generations
                             .get(&node_id)
                             .is_some_and(|ended| generation <= *ended)
+                        || self
+                            .stopped_video_stream_generations
+                            .get(&node_id)
+                            .is_some_and(|stopped| generation <= *stopped)
                     {
                         continue;
                     }
@@ -1128,6 +1144,13 @@ impl AppState {
                     if is_current {
                         self.ended_video_stream_generations
                             .insert(node_id, generation);
+                        if self
+                            .stopped_video_stream_generations
+                            .get(&node_id)
+                            .is_some_and(|stopped| *stopped == generation)
+                        {
+                            self.stopped_video_stream_generations.remove(&node_id);
+                        }
                         self.video_frames.remove(&node_id);
                         if self.focused_stream == Some(StreamSource::Remote(node_id)) {
                             self.focused_stream = None;
@@ -1606,6 +1629,45 @@ impl AppState {
             }
         }
         sources
+    }
+
+    fn stopped_stream_nodes(&self) -> Vec<NodeId> {
+        self.stopped_video_stream_generations
+            .iter()
+            .filter_map(|(node_id, stopped)| {
+                (self.video_stream_generations.get(node_id) == Some(stopped)
+                    && matches!(self.calls.get(node_id), Some(CallState::Active)))
+                .then_some(*node_id)
+            })
+            .collect()
+    }
+
+    fn stop_watching(&mut self, node_id: NodeId) {
+        let Some(generation) = self.video_stream_generations.get(&node_id).copied() else {
+            return;
+        };
+        self.stopped_video_stream_generations
+            .insert(node_id, generation);
+        self.video_frames.remove(&node_id);
+        if self.focused_stream == Some(StreamSource::Remote(node_id)) {
+            self.focused_stream = None;
+        }
+        self.cmd(Command::SetWatching {
+            node_id,
+            generation,
+            watching: false,
+        });
+    }
+
+    fn resume_watching(&mut self, node_id: NodeId) {
+        let Some(generation) = self.stopped_video_stream_generations.remove(&node_id) else {
+            return;
+        };
+        self.cmd(Command::SetWatching {
+            node_id,
+            generation,
+            watching: true,
+        });
     }
 
     fn stream_label(&self, source: StreamSource) -> String {
@@ -3457,6 +3519,14 @@ impl AppState {
             .video_frames
             .get(&node_id)
             .is_some_and(|frame| frame.width > 0 && frame.height > 0);
+        let stopped_watching = self
+            .stopped_video_stream_generations
+            .get(&node_id)
+            .is_some_and(|stopped| {
+                self.video_stream_generations
+                    .get(&node_id)
+                    .is_some_and(|current| current == stopped)
+            });
         let (status_label, status_color) = match state {
             CallState::Incoming => (Some("incoming"), pal.accent),
             CallState::Calling => (Some("connecting"), pal.accent),
@@ -3493,7 +3563,13 @@ impl AppState {
                             .size(ui_font_size(12.0)),
                     );
 
-                    if is_streaming {
+                    if stopped_watching {
+                        ui.label(
+                            RichText::new("stream paused")
+                                .color(pal.dim)
+                                .size(ui_font_size(11.0)),
+                        );
+                    } else if is_streaming {
                         dot(ui, pal.ok, 5.0);
                     } else if let Some(status) = status_label {
                         ui.label(
@@ -3521,6 +3597,13 @@ impl AppState {
                             }
                         }
                         CallState::Calling | CallState::Active => {
+                            if stopped_watching
+                                && compact_chip_button(ui, pal, "Watch", ButtonTone::Primary)
+                                    .on_hover_text("Resume watching this screen share")
+                                    .clicked()
+                            {
+                                self.resume_watching(node_id);
+                            }
                             if let Some(volume) = self.volumes.get(&node_id) {
                                 let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
                                 if ui
@@ -4795,6 +4878,17 @@ impl AppState {
 
         let roomy = area.height() >= 150.0;
         let has_capture_error = self.capture_error.is_some();
+        let stopped_streams = self.stopped_stream_nodes();
+        let showing_stopped =
+            !has_capture_error && !self.sharing_active && !stopped_streams.is_empty();
+        let stopped_title = if stopped_streams.len() == 1 {
+            format!(
+                "{}'s stream is paused",
+                self.peer_display_name(stopped_streams[0])
+            )
+        } else {
+            format!("{} streams are paused", stopped_streams.len())
+        };
         let block_height = if roomy {
             if has_capture_error {
                 190.0
@@ -4825,6 +4919,8 @@ impl AppState {
                         ph::WARNING
                     } else if self.sharing_active {
                         ph::SPINNER_GAP
+                    } else if showing_stopped {
+                        ph::PLAY
                     } else {
                         ph::MONITOR
                     },
@@ -4843,6 +4939,8 @@ impl AppState {
                         "Screen sharing needs access"
                     } else if self.sharing_active {
                         "Starting your screen share"
+                    } else if showing_stopped {
+                        &stopped_title
                     } else {
                         "Nothing is being shared"
                     })
@@ -4854,6 +4952,8 @@ impl AppState {
                     let detail = self.capture_error.as_deref().unwrap_or_else(|| {
                         if self.sharing_active {
                             "Preparing the first frame. This usually takes a moment."
+                        } else if showing_stopped {
+                            "Video data is paused. Resume whenever you want to watch again."
                         } else {
                             "Shared screens and incoming video will appear here."
                         }
@@ -4876,13 +4976,23 @@ impl AppState {
                     {
                         open_screen_recording_settings();
                     }
-                    let (label, tone) = if self.sharing_active {
+                    let (label, tone) = if showing_stopped {
+                        ("Resume watching", ButtonTone::Primary)
+                    } else if self.sharing_active {
                         ("Stop sharing", ButtonTone::Secondary)
                     } else {
                         ("Share your screen", ButtonTone::Primary)
                     };
                     if action_button(ui, pal, label, tone).clicked() {
-                        self.toggle_sharing_from_ui();
+                        if showing_stopped {
+                            for node_id in stopped_streams.iter().copied() {
+                                self.resume_watching(node_id);
+                            }
+                        } else {
+                            // Prefer the capture-picker path from origin/main over a
+                            // bare ToggleSharing toggle from the feature branch.
+                            self.toggle_sharing_from_ui();
+                        }
                     }
                 }
             });
@@ -5056,8 +5166,9 @@ impl AppState {
             );
 
             if ui.rect_contains_pointer(tile_rect) {
+                let is_remote = matches!(source, StreamSource::Remote(_));
                 let button_rect = egui::Rect::from_min_size(
-                    tile_rect.right_top() + egui::vec2(-40.0, 10.0),
+                    tile_rect.right_top() + egui::vec2(if is_remote { -76.0 } else { -40.0 }, 10.0),
                     Vec2::splat(28.0),
                 );
                 let icon = if expanded {
@@ -5086,6 +5197,30 @@ impl AppState {
                     .clicked()
                 {
                     self.focused_stream = if expanded { None } else { Some(source) };
+                }
+
+                if let StreamSource::Remote(node_id) = source {
+                    let stop_rect = egui::Rect::from_min_size(
+                        tile_rect.right_top() + egui::vec2(-40.0, 10.0),
+                        Vec2::splat(28.0),
+                    );
+                    if ui
+                        .put(
+                            stop_rect,
+                            egui::Button::new(
+                                RichText::new(char::from(Icon::X))
+                                    .font(lucide(15.0))
+                                    .color(pal.text),
+                            )
+                            .fill(pal.panel)
+                            .stroke(Stroke::new(1.0_f32, pal.line_br))
+                            .corner_radius(CornerRadius::same(8)),
+                        )
+                        .on_hover_text("Stop watching this screen share")
+                        .clicked()
+                    {
+                        self.stop_watching(node_id);
+                    }
                 }
             }
         }
@@ -7065,6 +7200,25 @@ mod layout_tests {
         assert!(!VideoSendCommand::Finish.resets_stream());
         assert!(!VideoSendCommand::Running.resets_stream());
     }
+
+    #[tokio::test]
+    async fn video_subscription_controls_pause_and_resume_independently() {
+        let (mut writer, reader) = tokio::io::duplex(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(read_video_controls(reader, control_tx));
+
+        tokio::io::AsyncWriteExt::write_all(
+            &mut writer,
+            &[VIDEO_CONTROL_PAUSE, VIDEO_CONTROL_RESUME],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(control_rx.recv().await, Some(false));
+        assert_eq!(control_rx.recv().await, Some(true));
+        drop(writer);
+        task.await.unwrap();
+    }
 }
 
 enum Event {
@@ -7135,6 +7289,7 @@ struct VideoPeerTasks {
     send: Option<tokio::task::JoinHandle<()>>,
     send_stop: Option<tokio::sync::watch::Sender<VideoSendCommand>>,
     recv: Option<tokio::task::JoinHandle<()>>,
+    recv_control: Option<tokio::sync::mpsc::UnboundedSender<VideoReceiveControl>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7156,8 +7311,15 @@ impl VideoPeerTasks {
             send: None,
             send_stop: None,
             recv: None,
+            recv_control: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VideoReceiveControl {
+    generation: u64,
+    watching: bool,
 }
 
 type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
@@ -7185,6 +7347,11 @@ enum Command {
     ToggleSharing {
         enabled: bool,
         target: Option<crate::screen_capture::CaptureTarget>,
+    },
+    SetWatching {
+        node_id: NodeId,
+        generation: u64,
+        watching: bool,
     },
     SetMuted {
         muted: bool,
@@ -7628,13 +7795,16 @@ impl Worker {
             let event_tx = self.event_tx.clone();
             let callback = self.update_callback.clone();
             let nid = node_id;
+            let (recv_control_tx, recv_control_rx) = tokio::sync::mpsc::unbounded_channel();
             let handle = tokio::spawn(async move {
-                run_video_recv(recv_conn, nid, event_tx, callback).await;
+                run_video_recv(recv_conn, nid, event_tx, callback, recv_control_rx).await;
             });
-            self.video_peers
+            let entry = self
+                .video_peers
                 .get_mut(&node_id)
-                .expect("video peer was initialized")
-                .recv = Some(handle);
+                .expect("video peer was initialized");
+            entry.recv = Some(handle);
+            entry.recv_control = Some(recv_control_tx);
         }
 
         if self.sharing_active {
@@ -7898,6 +8068,22 @@ impl Worker {
                     self.stop_capture().await;
                 }
             }
+            Command::SetWatching {
+                node_id,
+                generation,
+                watching,
+            } => {
+                if let Some(control) = self
+                    .video_peers
+                    .get(&node_id)
+                    .and_then(|tasks| tasks.recv_control.as_ref())
+                {
+                    let _ = control.send(VideoReceiveControl {
+                        generation,
+                        watching,
+                    });
+                }
+            }
             Command::SetMuted { muted } => {
                 self.muted = muted;
                 if let Some(audio_context) = &self.audio_context {
@@ -8066,11 +8252,14 @@ async fn run_video_send(
 ) {
     let result: Result<()> = async {
         info!("opening video stream to {}", node_id.fmt_short());
-        let (mut send, recv) = conn.transport().open_bi().await?;
+        let (mut send, control_recv) = conn.transport().open_bi().await?;
         let _ = send.set_priority(10);
-        let drain_task = tokio::spawn(drain_quic_recv(recv, stop_rx.clone()));
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control_task = tokio::spawn(read_video_controls(control_recv, control_tx));
         let mut rx = frame_tx.subscribe();
         let _ = keyframe_tx.send(());
+        let mut subscribed = true;
+        let mut control_open = true;
         let mut sent = 0u64;
         let mut skipped = 0u64;
         let mut resyncs = 0u64;
@@ -8081,6 +8270,32 @@ async fn run_video_send(
         let mut last_stats_log = std::time::Instant::now();
         let mut stop_command = VideoSendCommand::Finish;
         loop {
+            if !subscribed {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_ok() {
+                            stop_command = *stop_rx.borrow_and_update();
+                        }
+                        break;
+                    }
+                    control = control_rx.recv(), if control_open => match control {
+                        Some(true) => {
+                            subscribed = true;
+                            keyframe_gate.require_keyframe();
+                            let _ = keyframe_tx.send(());
+                            last_stats_log = std::time::Instant::now();
+                            info!(
+                                "video subscriber {} resumed; waiting for a fresh keyframe",
+                                node_id.fmt_short()
+                            );
+                        }
+                        Some(false) => {}
+                        None => break,
+                    }
+                }
+                continue;
+            }
+
             let frame = tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_ok() {
@@ -8088,6 +8303,25 @@ async fn run_video_send(
                     }
                     break;
                 }
+                control = control_rx.recv(), if control_open => match control {
+                    Some(false) => {
+                        subscribed = false;
+                        info!(
+                            "video subscriber {} paused; suspending frame transmission",
+                            node_id.fmt_short()
+                        );
+                        continue;
+                    }
+                    Some(true) => continue,
+                    None => {
+                        // Older Wire clients drop the reverse half of the
+                        // video stream because they do not implement
+                        // subscription controls. Keep automatic viewing
+                        // working for those peers.
+                        control_open = false;
+                        continue;
+                    }
+                },
                 frame = rx.recv() => match frame {
                     Ok(frame) => frame,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
@@ -8212,8 +8446,8 @@ async fn run_video_send(
                 );
             }
         }
-        drain_task.abort();
-        let _ = drain_task.await;
+        control_task.abort();
+        let _ = control_task.await;
         Ok(())
     }
     .await;
@@ -8224,18 +8458,23 @@ async fn run_video_send(
     }
 }
 
-async fn drain_quic_recv(
+async fn read_video_controls(
     mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    mut stop_rx: tokio::sync::watch::Receiver<VideoSendCommand>,
+    control_tx: tokio::sync::mpsc::UnboundedSender<bool>,
 ) {
-    let mut buf = [0u8; 256];
     loop {
-        tokio::select! {
-            _ = stop_rx.changed() => break,
-            result = tokio::io::AsyncReadExt::read(&mut recv, &mut buf) => match result {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        let mut value = [0u8; 1];
+        match tokio::io::AsyncReadExt::read_exact(&mut recv, &mut value).await {
+            Ok(_) if value[0] == VIDEO_CONTROL_PAUSE => {
+                let _ = control_tx.send(false);
             }
+            Ok(_) if value[0] == VIDEO_CONTROL_RESUME => {
+                let _ = control_tx.send(true);
+            }
+            Ok(_) => {
+                warn!("ignored unknown video subscriber control byte {}", value[0]);
+            }
+            Err(_) => break,
         }
     }
 }
@@ -8254,6 +8493,7 @@ async fn run_video_recv(
     node_id: NodeId,
     event_tx: async_channel::Sender<Event>,
     callback: Option<UpdateCallback>,
+    mut control_rx: tokio::sync::mpsc::UnboundedReceiver<VideoReceiveControl>,
 ) {
     const DECODER_IDLE_GRACE: Duration = Duration::from_secs(5);
 
@@ -8317,7 +8557,7 @@ async fn run_video_recv(
             }
             stream = accept => {
                 match stream {
-                    Ok((_send, mut recv)) => {
+                    Ok((mut control_send, mut recv)) => {
                         next_generation = next_generation
                             .checked_add(1)
                             .expect("video stream generation exhausted");
@@ -8357,6 +8597,8 @@ async fn run_video_recv(
                             node_id,
                             generation,
                             worker.as_ref().expect("video decoder was initialized"),
+                            &mut control_send,
+                            &mut control_rx,
                         )
                         .await;
                         match stream_result {
@@ -8507,6 +8749,8 @@ async fn recv_video_on_stream(
     node_id: NodeId,
     generation: u64,
     worker: &VideoDecodeWorker,
+    control_send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    control_rx: &mut tokio::sync::mpsc::UnboundedReceiver<VideoReceiveControl>,
 ) -> Result<()> {
     let mut received = 0u64;
     let mut received_bytes = 0u64;
@@ -8515,10 +8759,48 @@ async fn recv_video_on_stream(
     let mut age_samples = Vec::with_capacity(300);
     let mut last_sequence: Option<u64> = None;
     let mut last_stats_log = std::time::Instant::now();
+    let mut watching = true;
+    let mut waiting_for_keyframe = false;
 
     loop {
-        match transport::recv_frame(recv).await {
+        let frame = loop {
+            tokio::select! {
+                frame = transport::recv_frame(&mut *recv) => break frame,
+                control = control_rx.recv() => {
+                    let Some(control) = control else {
+                        continue;
+                    };
+                    if control.generation != generation || control.watching == watching {
+                        continue;
+                    }
+                    let value = if control.watching {
+                        VIDEO_CONTROL_RESUME
+                    } else {
+                        VIDEO_CONTROL_PAUSE
+                    };
+                    tokio::io::AsyncWriteExt::write_all(control_send, &[value]).await?;
+                    watching = control.watching;
+                    waiting_for_keyframe = watching;
+                    info!(
+                        node = %node_id.fmt_short(),
+                        generation,
+                        watching,
+                        "updated video subscription"
+                    );
+                }
+            }
+        };
+        match frame {
             Ok(Some(frame)) => {
+                if !watching {
+                    continue;
+                }
+                if waiting_for_keyframe {
+                    if !frame.keyframe {
+                        continue;
+                    }
+                    waiting_for_keyframe = false;
+                }
                 if let Some(previous) = last_sequence {
                     let expected = previous.wrapping_add(1);
                     if frame.sequence != expected {
