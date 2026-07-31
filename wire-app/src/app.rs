@@ -38,10 +38,12 @@ use crate::{
     sounds::{Sound, Sounds},
     theme::*,
     title_bar,
-    update::{self, ReleaseInfo},
     video_decode::{DecodedFrame, DecodedFrameData, VideoDecodeWorker},
     window_frame,
 };
+
+#[cfg(windows)]
+use crate::update::{self, ReleaseInfo};
 
 const DEFAULT: &str = "<default>";
 const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
@@ -186,11 +188,15 @@ struct AppState {
     sounds: Option<Sounds>,
     notifications: NotificationService,
     voluntary_hangups: AtomicU32,
+    #[cfg(windows)]
     update_tx: mpsc::Sender<UpdateMessage>,
+    #[cfg(windows)]
     update_rx: mpsc::Receiver<UpdateMessage>,
     autostart_tx: mpsc::Sender<AutostartMessage>,
     autostart_rx: mpsc::Receiver<AutostartMessage>,
+    #[cfg(windows)]
     update_status: UpdateStatus,
+    #[cfg(windows)]
     show_update_prompt: bool,
     resource_monitor: ResourceMonitor,
     dev_pair: Option<DevPairState>,
@@ -226,6 +232,7 @@ struct ChatUiState {
     timelines: BTreeMap<String, Vec<ChatMessage>>,
     delivery: BTreeMap<String, (DeliveryState, Option<String>)>,
     selected: Option<String>,
+    unseen: BTreeSet<String>,
     composer: String,
     draft_attachments: Vec<ChatAttachment>,
     attachment_textures: BTreeMap<String, egui::TextureHandle>,
@@ -235,6 +242,8 @@ struct ChatUiState {
     show_group_editor: bool,
     group_name: String,
     group_members: BTreeSet<NodeId>,
+    friend_candidate: Option<NodeId>,
+    friend_candidate_name: String,
 }
 
 #[derive(Clone)]
@@ -259,7 +268,7 @@ enum ImagePreviewAction {
     SetMode(ImagePreviewMode),
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 enum UpdateStatus {
     Idle,
     Checking,
@@ -269,7 +278,7 @@ enum UpdateStatus {
     Error(String),
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 enum UpdateMessage {
     CheckFinished(anyhow::Result<Option<ReleaseInfo>>),
     DownloadFinished(anyhow::Result<PathBuf>),
@@ -486,6 +495,7 @@ impl App {
             .unwrap_or(false)
             || dev_fixture;
         let settings = saved_settings.unwrap_or_default();
+        #[cfg(windows)]
         let (update_tx, update_rx) = mpsc::channel();
         let (autostart_tx, autostart_rx) = mpsc::channel();
         let ui_sound_volume = settings.ui_sound_volume.clamp(0.0, 1.0);
@@ -527,11 +537,15 @@ impl App {
             sounds,
             notifications: NotificationService::default(),
             voluntary_hangups: AtomicU32::new(0),
+            #[cfg(windows)]
             update_tx,
+            #[cfg(windows)]
             update_rx,
             autostart_tx,
             autostart_rx,
+            #[cfg(windows)]
             update_status: UpdateStatus::Idle,
+            #[cfg(windows)]
             show_update_prompt: false,
             resource_monitor: ResourceMonitor::start(),
             dev_pair: DevPairState::from_env(),
@@ -607,6 +621,7 @@ impl AppState {
             // Keep the optional process resource readout current while the rest of the UI is idle.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        #[cfg(windows)]
         self.process_update_events(ctx);
         self.process_autostart_events();
         let pal = Palette::for_theme(self.theme);
@@ -614,6 +629,7 @@ impl AppState {
 
         self.process_notification_actions(ctx);
         self.process_events(ctx);
+        self.mark_visible_conversation_seen(ctx);
         if self.notifications.take_sound_request() {
             self.play_sound(Sound::Notification);
         }
@@ -694,6 +710,7 @@ impl AppState {
         if self.show_settings || !self.configured {
             self.ui_settings_window(ctx);
         }
+        #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
         }
@@ -712,7 +729,7 @@ impl AppState {
         }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     fn start_update_check(&mut self, ctx: &egui::Context) {
         if matches!(self.update_status, UpdateStatus::Checking) {
             return;
@@ -727,6 +744,7 @@ impl AppState {
         });
     }
 
+    #[cfg(windows)]
     fn start_update_download(&mut self, ctx: &egui::Context, release: ReleaseInfo) {
         if matches!(self.update_status, UpdateStatus::Downloading(_)) {
             return;
@@ -742,6 +760,7 @@ impl AppState {
         });
     }
 
+    #[cfg(windows)]
     fn process_update_events(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.update_rx.try_recv() {
             match message {
@@ -882,10 +901,12 @@ impl AppState {
                 }
                 Event::ClientStatus(update) => {
                     let peer = update.peer;
+                    #[cfg(windows)]
                     let peer_is_newer = update.client_version.as_deref().is_some_and(|version| {
                         update::is_version_newer(version, crate::APP_VERSION)
                     });
                     self.friend_status.insert(peer, update);
+                    #[cfg(windows)]
                     if peer_is_newer {
                         info!(
                             peer = %peer.fmt_short(),
@@ -1195,6 +1216,7 @@ impl AppState {
                 let root_focused = ctx.input(|input| input.viewport().focused == Some(true));
                 let conversation_is_open = root_focused
                     && self.app_mode == AppMode::Text
+                    && !self.show_settings
                     && self.chat.selected.as_deref() == Some(id.as_str());
                 let our_node_id = self.our_node_id.map(|node_id| node_id.to_string());
                 let new_remote_messages = known_messages
@@ -1228,6 +1250,10 @@ impl AppState {
                         })
                     });
                 let conversation_title = conversation.title.clone();
+                let mark_unseen = should_mark_conversation_unseen(
+                    conversation_is_open,
+                    new_remote_messages.as_deref(),
+                );
                 self.chat.conversations.insert(id.clone(), conversation);
                 let mut by_id: BTreeMap<_, _> = messages
                     .into_iter()
@@ -1273,6 +1299,9 @@ impl AppState {
                     self.chat.selected = Some(id.clone());
                 }
                 if !conversation_is_open {
+                    if mark_unseen {
+                        self.chat.unseen.insert(id.clone());
+                    }
                     for message in new_remote_messages.into_iter().flatten() {
                         let author = NodeId::from_str(&message.author_id)
                             .ok()
@@ -1305,6 +1334,15 @@ impl AppState {
                 self.notifications
                     .error("chat-error", "Messages need attention", error.clone());
                 self.chat.error = Some(error);
+            }
+        }
+    }
+
+    fn mark_visible_conversation_seen(&mut self, ctx: &egui::Context) {
+        let root_focused = ctx.input(|input| input.viewport().focused == Some(true));
+        if root_focused && self.app_mode == AppMode::Text && !self.show_settings {
+            if let Some(id) = &self.chat.selected {
+                self.chat.unseen.remove(id);
             }
         }
     }
@@ -1404,6 +1442,13 @@ impl AppState {
                 let name = friend.name.trim();
                 (!name.is_empty() && name != friend.node_id.trim()).then_some(name)
             })
+    }
+
+    fn is_friend(&self, node_id: NodeId) -> bool {
+        let node_id = node_id.to_string();
+        self.friends
+            .iter()
+            .any(|friend| friend.node_id.trim() == node_id)
     }
 
     fn peer_display_name(&self, node_id: NodeId) -> String {
@@ -1700,11 +1745,19 @@ impl AppState {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let text_active = self.app_mode == AppMode::Text;
-                    if chat_segment_button(ui, pal, "Text chats", text_active).clicked() {
+                    if chat_segment_button(
+                        ui,
+                        pal,
+                        "Text chats",
+                        text_active,
+                        !self.chat.unseen.is_empty(),
+                    )
+                    .clicked()
+                    {
                         self.app_mode = AppMode::Text;
                     }
                     let calls_active = self.app_mode == AppMode::Calls;
-                    if chat_segment_button(ui, pal, "Voice calls", calls_active).clicked() {
+                    if chat_segment_button(ui, pal, "Voice calls", calls_active, false).clicked() {
                         self.app_mode = AppMode::Calls;
                     }
                 });
@@ -1756,6 +1809,9 @@ impl AppState {
         });
         if self.chat.show_group_editor {
             self.ui_group_editor(ctx, pal);
+        }
+        if self.chat.friend_candidate.is_some() {
+            self.ui_add_chat_friend(ctx, pal);
         }
     }
 
@@ -1813,8 +1869,9 @@ impl AppState {
                         let selected = id
                             .as_ref()
                             .is_some_and(|id| self.chat.selected.as_deref() == Some(id.as_str()));
+                        let unseen = id.as_ref().is_some_and(|id| self.chat.unseen.contains(id));
                         let label = format!("{}   {}", self.peer_initial(peer), friend.name);
-                        if chat_navigation_button(ui, pal, &label, selected).clicked() {
+                        if chat_navigation_button(ui, pal, &label, selected, unseen).clicked() {
                             if let Some(id) = id {
                                 self.chat.selected = Some(id.clone());
                                 if !self.chat.conversations.contains_key(&id) {
@@ -1824,6 +1881,42 @@ impl AppState {
                                     });
                                 }
                             }
+                        }
+                        ui.add_space(3.0);
+                    }
+
+                    let known_peers = self
+                        .friends
+                        .iter()
+                        .filter_map(|friend| NodeId::from_str(friend.node_id.trim()).ok())
+                        .collect::<BTreeSet<_>>();
+                    let unknown_directs =
+                        unknown_direct_conversations(&self.chat.conversations, &known_peers);
+                    if !unknown_directs.is_empty() {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("UNKNOWN")
+                                .family(kh_family())
+                                .color(pal.dim)
+                                .size(11.0),
+                        );
+                        ui.add_space(5.0);
+                    }
+                    for (id, peer) in unknown_directs {
+                        let selected = self.chat.selected.as_deref() == Some(id.as_str());
+                        let label =
+                            format!("{}   Peer {}", self.peer_initial(peer), peer.fmt_short());
+                        if chat_navigation_button(
+                            ui,
+                            pal,
+                            &label,
+                            selected,
+                            self.chat.unseen.contains(&id),
+                        )
+                        .on_hover_text("Unknown sender · add them from the chat header")
+                        .clicked()
+                        {
+                            self.chat.selected = Some(id);
                         }
                         ui.add_space(3.0);
                     }
@@ -1852,6 +1945,7 @@ impl AppState {
                             pal,
                             &format!("#   {}", group.title),
                             selected,
+                            self.chat.unseen.contains(&group.id),
                         )
                         .clicked()
                         {
@@ -2017,6 +2111,9 @@ impl AppState {
                     );
                 });
                 let mut clear_history = false;
+                let direct_peer = conversation.direct_peer();
+                let peer_is_friend = direct_peer.is_some_and(|peer| self.is_friend(peer));
+                let mut friend_to_add = None;
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let menu_response = ui
                         .menu_button(
@@ -2025,6 +2122,20 @@ impl AppState {
                                 .color(pal.text2),
                             |ui| {
                                 ui.set_min_width(160.0);
+                                if !show_call && !peer_is_friend {
+                                    if let Some(peer) = direct_peer {
+                                        if ui
+                                            .button(
+                                                RichText::new("Add friend")
+                                                    .size(ui_font_size(12.5)),
+                                            )
+                                            .clicked()
+                                        {
+                                            friend_to_add = Some(peer);
+                                            ui.close();
+                                        }
+                                    }
+                                }
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2047,17 +2158,28 @@ impl AppState {
                         .response;
                     menu_response.on_hover_text("Chat actions");
                     if show_call {
-                        if let Some(peer) = conversation.direct_peer() {
-                            if action_button(ui, pal, "Start call", ButtonTone::Secondary)
-                                .on_hover_text("Start a separate voice call")
+                        if let Some(peer) = direct_peer {
+                            if peer_is_friend {
+                                if action_button(ui, pal, "Start call", ButtonTone::Secondary)
+                                    .on_hover_text("Start a separate voice call")
+                                    .clicked()
+                                {
+                                    self.cmd(Command::Call { node_id: peer });
+                                    self.app_mode = AppMode::Calls;
+                                }
+                            } else if action_button(ui, pal, "Add friend", ButtonTone::Primary)
+                                .on_hover_text("Save this sender using their full node ID")
                                 .clicked()
                             {
-                                self.cmd(Command::Call { node_id: peer });
-                                self.app_mode = AppMode::Calls;
+                                friend_to_add = Some(peer);
                             }
                         }
                     }
                 });
+                if let Some(peer) = friend_to_add {
+                    self.chat.friend_candidate = Some(peer);
+                    self.chat.friend_candidate_name.clear();
+                }
                 if clear_history {
                     self.clear_chat_history(&conversation.id);
                 }
@@ -2977,6 +3099,68 @@ impl AppState {
         self.chat.show_group_editor &= open;
     }
 
+    fn ui_add_chat_friend(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(peer) = self.chat.friend_candidate else {
+            return;
+        };
+        let mut open = true;
+        let mut add = false;
+        let mut cancel = false;
+        egui::Window::new("Add friend")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.label(
+                    RichText::new(format!("Peer {}", peer.fmt_short()))
+                        .monospace()
+                        .color(pal.text2),
+                );
+                ui.label(
+                    RichText::new("The complete node ID will be saved automatically.")
+                        .color(pal.dim)
+                        .size(ui_font_size(11.5)),
+                );
+                ui.add_space(10.0);
+                ui.label(RichText::new("Name").color(pal.text2));
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut self.chat.friend_candidate_name)
+                        .hint_text(format!("Peer {}", peer.fmt_short()))
+                        .desired_width(ui.available_width()),
+                );
+                if name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    add = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if action_button(ui, pal, "Add friend", ButtonTone::Primary).clicked() {
+                        add = true;
+                    }
+                    if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
+                        cancel = true;
+                    }
+                    if action_button(ui, pal, "Copy ID", ButtonTone::Secondary).clicked() {
+                        copy_to_clipboard(&peer.to_string());
+                    }
+                });
+            });
+
+        if add {
+            let name = if self.chat.friend_candidate_name.trim().is_empty() {
+                format!("Peer {}", peer.fmt_short())
+            } else {
+                self.chat.friend_candidate_name.trim().to_owned()
+            };
+            self.add_friend_record(peer, name);
+            self.chat.friend_candidate = None;
+            self.chat.friend_candidate_name.clear();
+        } else if cancel || !open {
+            self.chat.friend_candidate = None;
+            self.chat.friend_candidate_name.clear();
+        }
+    }
+
     fn ui_call_participant_bar(&mut self, ui: &mut Ui, pal: &Palette) {
         let bar_height = ui.available_height();
         let bar_width = ui.available_width();
@@ -3159,7 +3343,7 @@ impl AppState {
             .response
     }
 
-    fn ui_top_bar_content(&mut self, ui: &mut Ui, ctx: &egui::Context, pal: &Palette) {
+    fn ui_top_bar_content(&mut self, ui: &mut Ui, _ctx: &egui::Context, pal: &Palette) {
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             self.ui_mode_switcher(ui, pal);
 
@@ -3232,6 +3416,7 @@ impl AppState {
                 }
             }
 
+            #[cfg(windows)]
             let available_update = match &self.update_status {
                 UpdateStatus::Available(release) => Some(release.clone()),
                 _ => None,
@@ -3250,17 +3435,20 @@ impl AppState {
                     self.app_mode = AppMode::Calls;
                     self.show_contacts = true;
                 }
-                if let Some(release) = available_update {
-                    if action_button(
-                        ui,
-                        &pal,
-                        &format!("Update v{}", release.version),
-                        ButtonTone::Primary,
-                    )
-                    .on_hover_text("Download the update to Desktop and relaunch")
-                    .clicked()
-                    {
-                        self.start_update_download(ctx, release);
+                #[cfg(windows)]
+                {
+                    if let Some(release) = available_update {
+                        if action_button(
+                            ui,
+                            &pal,
+                            &format!("Update v{}", release.version),
+                            ButtonTone::Primary,
+                        )
+                        .on_hover_text("Download the update to Desktop and relaunch")
+                        .clicked()
+                        {
+                            self.start_update_download(_ctx, release);
+                        }
                     }
                 }
                 if self.app_mode == AppMode::Text {
@@ -4096,17 +4284,27 @@ impl AppState {
         } else {
             self.new_friend_name.trim().to_string()
         };
-        self.play_sound(Sound::Button2);
-        if !self.friends.iter().any(|f| f.node_id == node_id) {
-            self.friends.push(Friend {
-                name,
-                node_id: node_id.clone(),
-            });
-            save_friends(&self.friends);
-            self.sync_friends_with_worker();
-        }
+        self.add_friend_record(
+            NodeId::from_str(&node_id).expect("node ID was validated"),
+            name,
+        );
         self.new_friend_name.clear();
         self.new_friend_id.clear();
+    }
+
+    fn add_friend_record(&mut self, node_id: NodeId, name: String) {
+        if self.is_friend(node_id) {
+            return;
+        }
+        self.play_sound(Sound::Button2);
+        self.friends.push(Friend {
+            name,
+            node_id: node_id.to_string(),
+        });
+        self.friends
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        save_friends(&self.friends);
+        self.sync_friends_with_worker();
     }
 
     #[allow(dead_code)]
@@ -5362,6 +5560,7 @@ impl AppState {
             });
     }
 
+    #[cfg(windows)]
     fn ui_update_prompt(&mut self, ctx: &egui::Context) {
         let release = match &self.update_status {
             UpdateStatus::Available(release) => release.clone(),
@@ -6053,7 +6252,13 @@ fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Resp
     response
 }
 
-fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
+fn chat_segment_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    selected: bool,
+    unseen: bool,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(100.0, CHROME_CONTROL_HEIGHT),
         egui::Sense::click(),
@@ -6074,6 +6279,10 @@ fn chat_segment_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) 
         egui::FontId::new(ui_font_size(12.0), egui::FontFamily::Proportional),
         if selected { pal.text } else { pal.text2 },
     );
+    if unseen {
+        ui.painter()
+            .circle_filled(rect.right_top() + Vec2::new(-8.0, 8.0), 3.5, pal.accent);
+    }
     response
 }
 
@@ -6082,6 +6291,7 @@ fn chat_navigation_button(
     pal: &Palette,
     label: &str,
     selected: bool,
+    unseen: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(1.0), 42.0),
@@ -6110,6 +6320,10 @@ fn chat_navigation_button(
         egui::FontId::new(ui_font_size(13.0), egui::FontFamily::Proportional),
         if selected { pal.text } else { pal.text2 },
     );
+    if unseen {
+        ui.painter()
+            .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
+    }
     response
 }
 
@@ -6246,6 +6460,28 @@ fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -
         && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
 }
 
+fn should_mark_conversation_unseen(
+    conversation_is_open: bool,
+    new_remote_messages: Option<&[ChatMessage]>,
+) -> bool {
+    !conversation_is_open && new_remote_messages.is_some_and(|messages| !messages.is_empty())
+}
+
+fn unknown_direct_conversations(
+    conversations: &BTreeMap<String, ChatConversation>,
+    known_peers: &BTreeSet<NodeId>,
+) -> Vec<(String, NodeId)> {
+    let mut unknown = conversations
+        .values()
+        .filter_map(|conversation| {
+            let peer = conversation.direct_peer()?;
+            (!known_peers.contains(&peer)).then(|| (conversation.id.clone(), peer))
+        })
+        .collect::<Vec<_>>();
+    unknown.sort_by_key(|(_, peer)| peer.fmt_short().to_string());
+    unknown
+}
+
 fn next_deafen_audio_state(currently_deafened: bool) -> (bool, bool) {
     let enabled = !currently_deafened;
     (enabled, enabled)
@@ -6343,6 +6579,51 @@ mod layout_tests {
             &message("alice", 60_001),
             &message("bob", 60_002),
         ));
+    }
+
+    #[test]
+    fn unseen_indicator_requires_a_new_remote_message_in_a_hidden_conversation() {
+        let message = ChatMessage {
+            version: 1,
+            message_id: "message-1".to_owned(),
+            author_id: "alice".to_owned(),
+            sent_at: 1,
+            body: "hello".to_owned(),
+            nonce: 0,
+            client_version: None,
+            attachments: Vec::new(),
+            deletion: None,
+        };
+
+        assert!(should_mark_conversation_unseen(
+            false,
+            Some(&[message.clone()])
+        ));
+        assert!(!should_mark_conversation_unseen(true, Some(&[message])));
+        assert!(!should_mark_conversation_unseen(false, Some(&[])));
+        assert!(!should_mark_conversation_unseen(false, None));
+    }
+
+    #[test]
+    fn unknown_direct_conversations_stay_visible_until_the_peer_is_a_friend() {
+        let peer = iroh::SecretKey::from_bytes(&[17; 32]).public();
+        let direct = ChatConversation {
+            id: "unknown-direct".to_owned(),
+            title: "Direct".to_owned(),
+            kind: ConversationKind::Direct {
+                peer_id: peer.to_string(),
+            },
+            members: Vec::new(),
+            document_id: "document".to_owned(),
+            history_epoch: 0,
+        };
+        let conversations = BTreeMap::from([(direct.id.clone(), direct)]);
+
+        assert_eq!(
+            unknown_direct_conversations(&conversations, &BTreeSet::new()),
+            vec![("unknown-direct".to_owned(), peer)]
+        );
+        assert!(unknown_direct_conversations(&conversations, &BTreeSet::from([peer])).is_empty());
     }
 
     #[test]

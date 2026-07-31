@@ -17,6 +17,7 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 mod scap_capture;
 mod screen_capture;
 pub mod theme;
+#[cfg(windows)]
 mod update;
 mod video_decode;
 #[cfg(windows)]

@@ -33,6 +33,7 @@ pub enum Availability {
 pub struct StatusUpdate {
     pub peer: NodeId,
     pub availability: Availability,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub client_version: Option<String>,
 }
 
