@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, warn};
 use wire::{
-    audio::{AudioConfig, AudioContext, AudioQuality, VolumeHandle},
+    audio::{AudioConfig, AudioContext, AudioLevelHandle, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
     video::{transport, BitratePreset, StreamPreset, VideoConfig},
 };
@@ -170,6 +170,8 @@ struct AppState {
     video_config: VideoConfig,
     calls: BTreeMap<NodeId, CallState>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
+    local_audio_level: Option<AudioLevelHandle>,
+    remote_audio_levels: BTreeMap<NodeId, AudioLevelHandle>,
     rtts: BTreeMap<NodeId, Duration>,
     video_frames: BTreeMap<NodeId, VideoFrameState>,
     video_stream_generations: BTreeMap<NodeId, u64>,
@@ -523,6 +525,8 @@ impl App {
             video_config: settings.video,
             calls: Default::default(),
             volumes: Default::default(),
+            local_audio_level: None,
+            remote_audio_levels: Default::default(),
             rtts: Default::default(),
             video_frames: Default::default(),
             video_stream_generations: Default::default(),
@@ -630,6 +634,9 @@ impl AppState {
         if self.show_system_usage {
             // Keep the optional process resource readout current while the rest of the UI is idle.
             ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if self.has_visible_call() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         #[cfg(windows)]
         self.process_update_events(ctx);
@@ -974,6 +981,7 @@ impl AppState {
                     if matches!(call_state, CallState::Aborted) {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
+                        self.remote_audio_levels.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
                         self.video_stream_generations.remove(&node_id);
@@ -1051,8 +1059,16 @@ impl AppState {
                         }
                     }
                 }
-                Event::VolumeHandle(node_id, volume) => {
+                Event::LocalAudioLevel(level) => {
+                    self.local_audio_level = Some(level);
+                }
+                Event::ParticipantAudioHandles {
+                    node_id,
+                    volume,
+                    level,
+                } => {
                     self.volumes.insert(node_id, volume);
+                    self.remote_audio_levels.insert(node_id, level);
                 }
                 Event::SetRtt(node_id, rtt) => {
                     self.rtts.insert(node_id, rtt);
@@ -3508,6 +3524,16 @@ impl AppState {
                             .color(pal.text2)
                             .size(ui_font_size(12.0)),
                     );
+                    let level = self
+                        .local_audio_level
+                        .as_ref()
+                        .map(load_audio_level)
+                        .unwrap_or(0.0);
+                    voice_level_meter(ui, pal, level).on_hover_text(if self.muted {
+                        "Microphone muted"
+                    } else {
+                        "Your microphone level"
+                    });
                     if self.sharing_active {
                         dot(ui, pal.ok, 6.0);
                     }
@@ -3547,6 +3573,11 @@ impl AppState {
         } else {
             chat_surface(pal)
         };
+        let voice_level = self
+            .remote_audio_levels
+            .get(&node_id)
+            .map(load_audio_level)
+            .unwrap_or(0.0);
 
         Frame::new()
             .fill(fill)
@@ -3571,6 +3602,9 @@ impl AppState {
                             .color(if is_active { pal.text } else { pal.text2 })
                             .size(ui_font_size(12.0)),
                     );
+
+                    voice_level_meter(ui, pal, voice_level)
+                        .on_hover_text("Voice received from this participant");
 
                     if stopped_watching {
                         ui.label(
@@ -6210,6 +6244,35 @@ const CHROME_SIDE_INSET: i8 = 14;
 const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
 const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
 const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
+
+fn load_audio_level(level: &AudioLevelHandle) -> f32 {
+    f32::from_bits(level.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+}
+
+fn voice_level_meter(ui: &mut Ui, pal: &Palette, level: f32) -> egui::Response {
+    const BAR_COUNT: usize = 5;
+    const GAP: f32 = 2.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(25.0, 14.0), egui::Sense::hover());
+    let bar_width = (rect.width() - GAP * (BAR_COUNT - 1) as f32) / BAR_COUNT as f32;
+
+    for index in 0..BAR_COUNT {
+        let height = 4.0 + index as f32 * 2.0;
+        let min = egui::pos2(
+            rect.left() + index as f32 * (bar_width + GAP),
+            rect.bottom() - height,
+        );
+        let bar = egui::Rect::from_min_size(min, egui::vec2(bar_width, height));
+        let threshold = (index + 1) as f32 / BAR_COUNT as f32;
+        let color = if level >= threshold {
+            pal.ok
+        } else {
+            chat_hairline(pal)
+        };
+        ui.painter().rect_filled(bar, 1.0, color);
+    }
+
+    response
+}
 const PARTICIPANT_CARD_SLOT_WIDTH: f32 = 250.0;
 const PARTICIPANT_GAP: f32 = 8.0;
 
@@ -7309,7 +7372,12 @@ enum Event {
     Chat(ChatNotification),
     WorkerFailed(String),
     SetCallState(NodeId, CallState),
-    VolumeHandle(NodeId, VolumeHandle),
+    LocalAudioLevel(AudioLevelHandle),
+    ParticipantAudioHandles {
+        node_id: NodeId,
+        volume: VolumeHandle,
+        level: AudioLevelHandle,
+    },
     SetRtt(NodeId, Duration),
     VideoStreamAccepted {
         node_id: NodeId,
@@ -7774,9 +7842,14 @@ impl Worker {
     async fn accept_from_connect(&mut self, conn: RtcConnection, track: MediaTrack) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
-        self.emit(Event::VolumeHandle(node_id, volume.clone()))
-            .await?;
+        self.emit(Event::ParticipantAudioHandles {
+            node_id,
+            volume: volume.clone(),
+            level: level.clone(),
+        })
+        .await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -7793,7 +7866,9 @@ impl Worker {
             info!("starting connection with {}", node_id.fmt_short());
 
             let fut = async {
-                audio_context.play_track_with_volume(track, volume).await?;
+                audio_context
+                    .play_track_with_volume_and_level(track, volume, level)
+                    .await?;
                 let capture_track = audio_context.capture_track().await?;
                 audio_conn.send_track(capture_track).await?;
                 #[allow(clippy::redundant_pattern_matching)]
@@ -7810,9 +7885,14 @@ impl Worker {
     async fn accept_from_accept(&mut self, conn: RtcConnection) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
-        self.emit(Event::VolumeHandle(node_id, volume.clone()))
-            .await?;
+        self.emit(Event::ParticipantAudioHandles {
+            node_id,
+            volume: volume.clone(),
+            level: level.clone(),
+        })
+        .await?;
         self.active_calls
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
@@ -7841,7 +7921,11 @@ impl Worker {
                     match remote_track.kind() {
                         TrackKind::Audio => {
                             audio_context
-                                .play_track_with_volume(remote_track, volume.clone())
+                                .play_track_with_volume_and_level(
+                                    remote_track,
+                                    volume.clone(),
+                                    level.clone(),
+                                )
                                 .await?;
                         }
                         TrackKind::Video => unimplemented!(),
@@ -8108,6 +8192,8 @@ impl Worker {
                 let audio_context = AudioContext::new(audio_config).await?;
                 audio_context.set_muted(self.muted);
                 audio_context.set_deafened(self.deafened);
+                self.emit(Event::LocalAudioLevel(audio_context.capture_level()))
+                    .await?;
                 self.audio_context = Some(audio_context);
             }
             Command::SetVideoConfig { video_config } => {

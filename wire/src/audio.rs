@@ -1,4 +1,11 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -36,6 +43,28 @@ pub const ENGINE_FORMAT: AudioFormat = AudioFormat::new(SAMPLE_RATE, 2);
 
 const DURATION_10MS: Duration = Duration::from_millis(10);
 const DURATION_20MS: Duration = Duration::from_millis(20);
+
+/// Shared, normalized audio level for UI meters. Stored as `f32::to_bits()`.
+pub type AudioLevelHandle = Arc<AtomicU32>;
+
+fn update_audio_level(level: &AudioLevelHandle, samples: &[f32]) {
+    let rms = if samples.is_empty() {
+        0.0
+    } else {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    };
+    // Map -60 dBFS..0 dBFS to a useful visual range, then smooth fast attacks
+    // and slower releases so speech remains readable at a glance.
+    let target = if rms > 0.000_001 {
+        ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let previous = f32::from_bits(level.load(Ordering::Relaxed));
+    let smoothing = if target > previous { 0.7 } else { 0.18 };
+    let smoothed = previous + (target - previous) * smoothing;
+    level.store(smoothed.to_bits(), Ordering::Relaxed);
+}
 
 fn device_resampler(
     channels: NonZeroUsize,
@@ -126,6 +155,22 @@ impl AudioContext {
     ) -> Result<()> {
         self.playback.add_track_with_volume(track, volume).await?;
         Ok(())
+    }
+
+    pub async fn play_track_with_volume_and_level(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+        level: AudioLevelHandle,
+    ) -> Result<()> {
+        self.playback
+            .add_track_with_volume_and_level(track, volume, level)
+            .await?;
+        Ok(())
+    }
+
+    pub fn capture_level(&self) -> AudioLevelHandle {
+        self.capture.level_handle()
     }
 
     /// Stop or resume sending microphone samples to active call tracks.
@@ -237,6 +282,19 @@ mod format_tests {
     fn distinguishes_device_frames_from_interleaved_samples() {
         assert_eq!(ENGINE_FORMAT.block_count(DURATION_20MS), 960);
         assert_eq!(ENGINE_FORMAT.sample_count(DURATION_20MS), 1_920);
+    }
+
+    #[test]
+    fn audio_level_responds_to_signal_and_decays_on_silence() {
+        let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        update_audio_level(&level, &[1.0; 64]);
+        let active = f32::from_bits(level.load(Ordering::Relaxed));
+        assert!(active > 0.5);
+
+        update_audio_level(&level, &[]);
+        let decaying = f32::from_bits(level.load(Ordering::Relaxed));
+        assert!(decaying > 0.0);
+        assert!(decaying < active);
     }
 
     #[cfg(target_os = "macos")]

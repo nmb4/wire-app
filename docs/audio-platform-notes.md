@@ -66,15 +66,17 @@ into sustained bad audio:
 3. CPAL buffer sizes are frames, but Windows requested 1,920 interleaved stereo
    samples as though they were frames. Device buffer requests now use the
    selected device rate and a real 20 ms frame count on every platform.
-4. Windows workers used independent relative sleeps. Once delayed, capture only
-   drained one chunk per tick and retained the backlog, while playback lost its
-   latency cushion. Windows now follows device ring occupancy like macOS: capture
-   drains every complete chunk, and playback maintains a bounded three-chunk
-   cushion that is restored after a scheduling stall.
+4. Windows workers use independent relative sleeps. An attempt to replace those
+   timers with the macOS occupancy-driven capture and playback paths caused
+   severe lag on both peers in a real Windows call. That part of the change was
+   rolled back: Windows again uses its previous fixed-cadence workers, playback
+   buffering, callback draining, and WebRTC processor framing. The CPAL upgrade,
+   corrected real-time workload size, and frame-based device buffer request are
+   retained because they are independent of the regressed queueing path.
 
-The occupancy-based Windows playback path also pulls only the engine samples
-needed for the current device callback. Keeping the cushion visible in the ring
-prevents a private resampler queue from growing latency.
+The occupancy-driven approach is now macOS-only. Do not enable it on Windows
+again without a real two-peer hardware test that verifies both latency and audio
+quality under normal load and CPU saturation.
 
 When the app is next tested on Windows:
 

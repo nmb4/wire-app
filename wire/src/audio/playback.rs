@@ -23,15 +23,15 @@ use tracing::{debug, error, info, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_output_stream_config, Direction, StreamConfigWithFormat},
-    device_resampler, AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS,
-    ENGINE_FORMAT, SAMPLE_RATE,
+    device_resampler, update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor,
+    DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
     codec::opus::MediaTrackOpusDecoder,
     rtc::{MediaFrame, MediaTrack},
 };
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const PLAYBACK_PREBUFFER_CHUNKS: usize = 3;
 
 pub trait AudioSource: Send + 'static {
@@ -44,12 +44,16 @@ pub type VolumeHandle = Arc<AtomicU32>;
 pub struct GainSource {
     inner: Box<dyn AudioSource>,
     volume: VolumeHandle,
+    level: Option<AudioLevelHandle>,
 }
 
 impl AudioSource for GainSource {
     fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>> {
         let result = self.inner.tick(buf)?;
         if let ControlFlow::Continue(count) = &result {
+            if let Some(level) = &self.level {
+                update_audio_level(level, &buf[..*count]);
+            }
             let gain = f32::from_bits(self.volume.load(Ordering::Relaxed));
             for sample in buf[..*count].iter_mut() {
                 *sample *= gain;
@@ -78,7 +82,7 @@ impl AudioPlayback {
         #[allow(unused_mut)]
         let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(buffer_size).split();
 
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             // Prime the device before stream.play() can invoke its first callback.
             // Three 20 ms chunks cover the callback plus scheduler jitter.
@@ -138,6 +142,22 @@ impl AudioPlayback {
         self.add_source(GainSource {
             inner: Box::new(decoder),
             volume,
+            level: None,
+        })
+        .await
+    }
+
+    pub async fn add_track_with_volume_and_level(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+        level: AudioLevelHandle,
+    ) -> Result<()> {
+        let decoder = MediaTrackOpusDecoder::new(track)?;
+        self.add_source(GainSource {
+            inner: Box::new(decoder),
+            volume,
+            level: Some(level),
         })
         .await
     }
@@ -155,7 +175,7 @@ impl AudioPlayback {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn playback_loop(
     mut producer: Producer<f32>,
     mut source_receiver: mpsc::Receiver<Box<dyn AudioSource>>,
@@ -251,7 +271,7 @@ fn playback_loop(
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(target_os = "macos"))]
 fn playback_loop(
     mut producer: Producer<f32>,
     mut source_receiver: mpsc::Receiver<Box<dyn AudioSource>>,
@@ -348,15 +368,9 @@ fn start_playback_stream(
 ) -> Result<cpal::Stream> {
     let config = &stream_config.config;
     let format = stream_config.audio_format();
-    #[cfg(all(
-        feature = "audio-processing",
-        any(target_os = "macos", target_os = "windows")
-    ))]
+    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
     processor.init_playback(ENGINE_FORMAT.channel_count as usize)?;
-    #[cfg(all(
-        feature = "audio-processing",
-        not(any(target_os = "macos", target_os = "windows"))
-    ))]
+    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
     processor.init_playback(config.channels as usize)?;
     let resampler = device_resampler(
         NonZeroUsize::new(format.channel_count as usize).unwrap(),
@@ -400,13 +414,13 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
     config: &cpal::StreamConfig,
     mut state: PlaybackState,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     let frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "macos"))]
     let frame_size = state.format.sample_count(DURATION_10MS);
     let mut unprocessed: Vec<f32> = Vec::with_capacity(frame_size);
     let mut processed: Vec<f32> = Vec::with_capacity(frame_size);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     let mut resample_input: Vec<f32> = Vec::with_capacity(frame_size);
     let mut resampled: Vec<f32> = Vec::with_capacity(frame_size);
     let mut tick = 0;
@@ -448,14 +462,14 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             // cushion into `resampled`, where the producer can no longer see it
             // and refills it on every callback. Only pull enough engine audio for
             // this callback, keeping the latency bounded in the ring.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             {
                 let missing_output = data.len().saturating_sub(resampled.len());
                 let required_input = required_engine_samples(missing_output, state.format)
                     .saturating_sub(unprocessed.len());
                 unprocessed.extend(state.consumer.pop_iter().take(required_input));
             }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(not(target_os = "macos"))]
             unprocessed.extend(state.consumer.pop_iter());
 
             // process
@@ -475,7 +489,7 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             // channels to the selected device before resampling; a mono output
             // must not interpret interleaved stereo samples as twice as many
             // mono frames.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             {
                 match state.format.channel_count {
                     1 => resample_input.extend(
@@ -496,7 +510,7 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
                 );
                 resample_input.clear();
             }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(not(target_os = "macos"))]
             state.resampler.process_interleaved(&processed, |samples|{
                 resampled.extend_from_slice(samples);
             } , None, false);
@@ -537,7 +551,7 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn required_engine_samples(output_samples: usize, output_format: AudioFormat) -> usize {
     if output_samples == 0 {
         return 0;
@@ -552,7 +566,7 @@ fn required_engine_samples(output_samples: usize, output_format: AudioFormat) ->
     engine_samples.div_ceil(processor_frame_size) * processor_frame_size
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

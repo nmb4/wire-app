@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     ops::ControlFlow,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
         Arc,
     },
     time::{Duration, Instant},
@@ -28,7 +28,8 @@ use super::{
     device::{find_device, find_input_stream_config, Direction, StreamConfigWithFormat},
     device_resampler,
     noise_suppression::RnnoiseSuppressor,
-    AudioFormat, WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
+    update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor, DURATION_10MS,
+    DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{
     codec::opus::{AudioQuality, MediaTrackOpusEncoder},
@@ -44,6 +45,7 @@ pub struct AudioCapture {
     sink_sender: mpsc::Sender<Box<dyn AudioSink>>,
     quality: AudioQuality,
     muted: Arc<AtomicBool>,
+    level: AudioLevelHandle,
 }
 
 impl AudioCapture {
@@ -69,6 +71,8 @@ impl AudioCapture {
         let (sink_sender, sink_receiver) = mpsc::channel(16);
         let muted = Arc::new(AtomicBool::new(false));
         let muted_for_thread = muted.clone();
+        let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let level_for_thread = level.clone();
 
         let (init_tx, init_rx) = oneshot::channel();
         std::thread::spawn(move || {
@@ -99,7 +103,7 @@ impl AudioCapture {
                     return;
                 }
             };
-            capture_loop(consumer, sink_receiver, muted_for_thread);
+            capture_loop(consumer, sink_receiver, muted_for_thread, level_for_thread);
             drop(stream);
         });
         init_rx.await??;
@@ -107,6 +111,7 @@ impl AudioCapture {
             sink_sender,
             quality,
             muted,
+            level,
         };
         Ok(handle)
     }
@@ -130,6 +135,10 @@ impl AudioCapture {
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, AtomicOrdering::Relaxed);
     }
+
+    pub fn level_handle(&self) -> AudioLevelHandle {
+        self.level.clone()
+    }
 }
 
 fn start_capture_stream(
@@ -142,15 +151,9 @@ fn start_capture_stream(
     let d = device.description()?.name().to_owned();
     let config = &stream_config.config;
 
-    #[cfg(all(
-        feature = "audio-processing",
-        any(target_os = "macos", target_os = "windows")
-    ))]
+    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
     processor.init_capture(ENGINE_FORMAT.channel_count as usize)?;
-    #[cfg(all(
-        feature = "audio-processing",
-        not(any(target_os = "macos", target_os = "windows"))
-    ))]
+    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
     processor.init_capture(config.channels as usize)?;
 
     let capture_format = stream_config.audio_format();
@@ -314,10 +317,12 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
     )
 }
 
+#[cfg(not(target_os = "windows"))]
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
     muted: Arc<AtomicBool>,
+    level: AudioLevelHandle,
 ) {
     let span = tracing::span!(Level::TRACE, "capture-loop");
     let _guard = span.enter();
@@ -360,6 +365,7 @@ fn capture_loop(
             if muted.load(AtomicOrdering::Relaxed) {
                 buf.fill(0.0);
             }
+            update_audio_level(&level, &buf);
 
             sinks.retain_mut(|sink| match sink.tick(&buf) {
                 Ok(ControlFlow::Continue(())) => true,
@@ -381,5 +387,72 @@ fn capture_loop(
             }
             tick += 1;
         }
+    }
+}
+
+// The occupancy-driven catch-up loop introduced for GEN-89 causes severe
+// distortion on Windows. Keep the previous fixed-cadence behavior there until
+// the Windows audio path can be diagnosed with a real two-peer hardware call.
+#[cfg(target_os = "windows")]
+fn capture_loop(
+    mut consumer: Consumer<f32>,
+    mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
+    muted: Arc<AtomicBool>,
+    level: AudioLevelHandle,
+) {
+    let span = tracing::span!(Level::TRACE, "capture-loop");
+    let _guard = span.enter();
+    info!("capture loop start");
+
+    let tick_duration = DURATION_20MS;
+    let samples_per_tick = ENGINE_FORMAT.sample_count(tick_duration);
+    let mut buf = vec![0.; samples_per_tick];
+    let mut sinks = vec![];
+
+    let mut tick = 0;
+    loop {
+        let start = Instant::now();
+
+        loop {
+            match sink_receiver.try_recv() {
+                Ok(sink) => {
+                    info!("new sink added to capture loop");
+                    sinks.push(sink);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("stop playback mixer loop: channel closed");
+                    return;
+                }
+            }
+        }
+
+        let count = consumer.pop_slice(&mut buf);
+        if muted.load(AtomicOrdering::Relaxed) {
+            buf[..count].fill(0.0);
+        }
+        update_audio_level(&level, &buf[..count]);
+
+        sinks.retain_mut(|sink| match sink.tick(&buf[..count]) {
+            Ok(ControlFlow::Continue(())) => true,
+            Ok(ControlFlow::Break(())) => {
+                debug!("remove decoder: closed");
+                false
+            }
+            Err(err) => {
+                warn!("remove decoder: failed {err:?}");
+                false
+            }
+        });
+        trace!("tick {tick} took {:?} pulled {count}", start.elapsed());
+        if start.elapsed() > tick_duration {
+            warn!(
+                "capture thread tick exceeded interval (took {:?})",
+                start.elapsed()
+            );
+        } else {
+            spin_sleep::sleep(tick_duration.saturating_sub(start.elapsed()));
+        }
+        tick += 1;
     }
 }
