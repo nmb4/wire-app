@@ -56,6 +56,10 @@ const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CHAT_FIRST_RETRY: Duration = Duration::from_millis(400);
 /// Min gap between receipt-driven wakes (avoids connect storms that block sends).
 const CHAT_RECEIPT_WAKE_COOLDOWN: Duration = Duration::from_secs(2);
+/// Retry missing attachment blobs independently of document changes. A peer can
+/// publish the message metadata before its blob address is usable, so one
+/// failed fetch must not leave the UI on "Loading image…" forever.
+const ATTACHMENT_RETRY_MAX: Duration = Duration::from_secs(60);
 /// After this many consecutive failed probes, show Queued and switch to slow
 /// offline probes (see `delivery_retry_delay(..., offline=true)`).
 const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
@@ -704,6 +708,7 @@ pub struct ChatService {
     wake_failures: BTreeMap<String, u8>,
     max_image_bytes: Option<u64>,
     attachment_downloads: BTreeSet<Hash>,
+    attachment_retries: BTreeMap<Hash, AttachmentRetry>,
     blob_downloader: iroh_blobs::downloader::Downloader,
     #[cfg(test)]
     invite_attempts: AtomicU64,
@@ -714,6 +719,13 @@ struct ConversationRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
     messages: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct AttachmentRetry {
+    conversation_id: String,
+    attempts: u8,
+    next_attempt: tokio::time::Instant,
 }
 
 pub(crate) enum ChatInput {
@@ -802,6 +814,7 @@ impl ChatService {
             wake_failures: BTreeMap::new(),
             max_image_bytes: None,
             attachment_downloads: BTreeSet::new(),
+            attachment_retries: BTreeMap::new(),
             blob_downloader,
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
@@ -1002,14 +1015,18 @@ impl ChatService {
             } => {
                 self.attachment_downloads.remove(&hash);
                 if succeeded {
+                    self.attachment_retries.remove(&hash);
                     if let Err(error) = self.publish_timeline(&conversation_id).await {
                         return Some(ChatNotification::Error(format!(
                             "Could not refresh downloaded image: {error:#}"
                         )));
                     }
+                } else {
+                    self.schedule_attachment_retry(&conversation_id, hash);
                 }
             }
             ChatInput::Retry => {
+                self.retry_due_attachment_downloads().await;
                 self.retry_due_deliveries().await;
             }
         }
@@ -1849,6 +1866,8 @@ impl ChatService {
         }
         self.staged_inbound.remove(conversation_id);
         self.retry_state.remove(conversation_id);
+        self.attachment_retries
+            .retain(|_, retry| retry.conversation_id != conversation_id);
         if self
             .local_deletions
             .conversations
@@ -2242,26 +2261,126 @@ impl ChatService {
         Ok(())
     }
 
+    fn schedule_attachment_retry(&mut self, conversation_id: &str, hash: Hash) {
+        let retry = self
+            .attachment_retries
+            .entry(hash)
+            .or_insert_with(|| AttachmentRetry {
+                conversation_id: conversation_id.to_owned(),
+                attempts: 0,
+                next_attempt: tokio::time::Instant::now(),
+            });
+        retry.conversation_id = conversation_id.to_owned();
+        retry.attempts = retry.attempts.saturating_add(1);
+        retry.next_attempt = tokio::time::Instant::now() + attachment_retry_delay(retry.attempts);
+        trace!(
+            conversation = %log_id(conversation_id),
+            image = %hash.fmt_short(),
+            attempts = retry.attempts,
+            "scheduled missing image retry"
+        );
+    }
+
+    async fn retry_due_attachment_downloads(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .attachment_retries
+            .iter()
+            .filter(|(hash, retry)| {
+                retry.next_attempt <= now && !self.attachment_downloads.contains(*hash)
+            })
+            .map(|(hash, retry)| (*hash, retry.conversation_id.clone()))
+            .collect();
+
+        for (hash, conversation_id) in due {
+            let Some(stored) = self.index.conversations.get(&conversation_id).cloned() else {
+                self.attachment_retries.remove(&hash);
+                continue;
+            };
+            let mut messages = match self.load_messages(&stored).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    trace!(
+                        conversation = %log_id(&conversation_id),
+                        image = %hash.fmt_short(),
+                        "could not inspect missing image before retry: {error:#}"
+                    );
+                    self.schedule_attachment_retry(&conversation_id, hash);
+                    continue;
+                }
+            };
+            self.merge_staged_inbound(&conversation_id, &mut messages);
+            let hash_string = hash.to_string();
+            let still_needed = messages.iter().any(|message| {
+                message.author_id != self.our_node_id.to_string()
+                    && message.attachments.iter().any(|attachment| {
+                        attachment.hash == hash_string
+                            && attachment.data.is_none()
+                            && !self
+                                .max_image_bytes
+                                .is_some_and(|limit| attachment.byte_len > limit)
+                    })
+            });
+            if !still_needed {
+                self.attachment_retries.remove(&hash);
+                continue;
+            }
+            self.request_missing_attachments(&conversation_id, &messages)
+                .await;
+        }
+    }
+
+    fn attachment_providers(&self, conversation_id: &str) -> Vec<NodeAddr> {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return Vec::new();
+        };
+        let mut providers = BTreeMap::<NodeId, NodeAddr>::new();
+
+        // The document ticket may contain the only currently usable relay or
+        // direct address. Register it before the blobs downloader dials by
+        // NodeId; iroh-blobs' downloader uses the endpoint address book for
+        // those dials.
+        if let Ok(ticket) = DocTicket::from_str(&stored.ticket) {
+            for address in ticket.nodes {
+                if address.node_id == self.our_node_id {
+                    continue;
+                }
+                if !address.is_empty() {
+                    let _ = self.endpoint.add_node_addr(address.clone());
+                }
+                providers.insert(address.node_id, address);
+            }
+        }
+
+        for node in stored
+            .public
+            .members
+            .iter()
+            .filter_map(|member| NodeId::from_str(member).ok())
+            .filter(|node| *node != self.our_node_id)
+        {
+            if let Some(info) = self.endpoint.remote_info(node) {
+                let address: NodeAddr = info.into();
+                if !address.is_empty() {
+                    let _ = self.endpoint.add_node_addr(address.clone());
+                }
+                providers.insert(node, address);
+            } else {
+                providers
+                    .entry(node)
+                    .or_insert_with(|| NodeAddr::from(node));
+            }
+        }
+        providers.into_values().collect()
+    }
+
     async fn request_missing_attachments(
         &mut self,
         conversation_id: &str,
         messages: &[ChatMessage],
     ) {
-        let providers = self
-            .index
-            .conversations
-            .get(conversation_id)
-            .map(|stored| {
-                stored
-                    .public
-                    .members
-                    .iter()
-                    .filter_map(|member| NodeId::from_str(member).ok())
-                    .filter(|member| *member != self.our_node_id)
-                    .map(NodeAddr::from)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let providers = self.attachment_providers(conversation_id);
+        let now = tokio::time::Instant::now();
         for message in messages {
             if message.author_id == self.our_node_id.to_string() {
                 continue;
@@ -2276,6 +2395,24 @@ impl ChatService {
                 let Ok(hash) = Hash::from_str(&attachment.hash) else {
                     continue;
                 };
+                if self
+                    .attachment_retries
+                    .get(&hash)
+                    .is_some_and(|retry| retry.next_attempt > now)
+                {
+                    continue;
+                }
+                if self
+                    .blobs
+                    .get(&hash)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|blob| blob.is_complete())
+                {
+                    self.attachment_retries.remove(&hash);
+                    continue;
+                }
                 if attachment.data.is_some() || !self.attachment_downloads.insert(hash) {
                     continue;
                 }
@@ -2285,6 +2422,7 @@ impl ChatService {
                 let providers = providers.clone();
                 if providers.is_empty() {
                     self.attachment_downloads.remove(&hash);
+                    self.schedule_attachment_retry(&conversation_id, hash);
                     continue;
                 }
                 tokio::spawn(async move {
@@ -3067,6 +3205,16 @@ fn delivery_retry_delay(conversation_id: &str, attempts: u8, offline: bool) -> D
     Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
 
+fn attachment_retry_delay(attempts: u8) -> Duration {
+    match attempts {
+        0 | 1 => Duration::from_secs(2),
+        2 => Duration::from_secs(5),
+        3 => Duration::from_secs(10),
+        4 => Duration::from_secs(20),
+        _ => ATTACHMENT_RETRY_MAX,
+    }
+}
+
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
     let mut members: Vec<_> = nodes.into_iter().map(|node| node.to_string()).collect();
     members.sort();
@@ -3256,6 +3404,35 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_attachment(
+        service: &mut ChatService,
+        message_id: &str,
+        expected: &[u8],
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Conversation { messages, .. } =
+                    service.next_notification().await
+                {
+                    if messages.iter().any(|message| {
+                        message.message_id == message_id
+                            && message.attachments.iter().any(|attachment| {
+                                attachment
+                                    .data
+                                    .as_deref()
+                                    .is_some_and(|data| data.as_slice() == expected)
+                            })
+                    }) {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for replicated chat image")?;
+        Ok(())
+    }
+
     async fn wait_for_delivery(service: &mut ChatService, message_id: &str) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -3430,6 +3607,55 @@ mod tests {
                 .is_some_and(|message_ids| message_ids.contains(&later_id)),
             "restoring a message must remove its persisted local tombstone"
         );
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn image_attachment_downloads_after_message_metadata_arrives() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("wire_app=debug,iroh_blobs=debug")
+            .with_test_writer()
+            .try_init();
+        let temp = tempfile::tempdir()?;
+        let left_root = temp.path().join("left");
+        let right_root = temp.path().join("right");
+        let left_secret = SecretKey::from_bytes(&[101; 32]);
+        let right_secret = SecretKey::from_bytes(&[102; 32]);
+        let image = b"wire-image-transfer".to_vec();
+        let image_hash = Hash::new(&image).to_string();
+
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&left_root, left_secret).await?;
+        let (right_endpoint, right_router, mut right) =
+            spawn_test_node(&right_root, right_secret).await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        let attachment = ChatAttachment {
+            id: image_hash.clone(),
+            name: "transfer.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            byte_len: image.len() as u64,
+            width: 1,
+            height: 1,
+            hash: image_hash,
+            data: Some(Arc::new(image.clone())),
+        };
+        let message = ChatMessage::new_with_attachments(
+            left_endpoint.node_id(),
+            String::new(),
+            vec![attachment],
+        );
+        let message_id = message.message_id.clone();
+        left.send_message(conversation_id, message).await;
+
+        wait_for_attachment(&mut right, &message_id, &image).await?;
+
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())
