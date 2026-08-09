@@ -77,8 +77,8 @@ impl AudioCapture {
         let (init_tx, init_rx) = oneshot::channel();
         std::thread::spawn(move || {
             if let Err(err) = audio_thread_priority::promote_current_thread_to_real_time(
-                ENGINE_FORMAT.block_count(DURATION_20MS) as u32,
-                ENGINE_FORMAT.sample_rate,
+                buffer_size as u32,
+                ENGINE_FORMAT.sample_rate.0,
             ) {
                 #[cfg(target_os = "macos")]
                 debug!("macOS kept the capture worker at normal priority: {err:?}");
@@ -148,7 +148,7 @@ fn start_capture_stream(
     processor: WebrtcAudioProcessor,
     noise_suppression_enabled: bool,
 ) -> Result<cpal::Stream> {
-    let d = device.description()?.name().to_owned();
+    let d = device.name()?;
     let config = &stream_config.config;
 
     #[cfg(all(feature = "audio-processing", target_os = "macos"))]
@@ -160,8 +160,8 @@ fn start_capture_stream(
 
     let resampler = device_resampler(
         NonZeroUsize::new(ENGINE_FORMAT.channel_count as usize).unwrap(),
-        capture_format.sample_rate,
-        ENGINE_FORMAT.sample_rate,
+        capture_format.sample_rate.0,
+        ENGINE_FORMAT.sample_rate.0,
     );
     let state = CaptureState {
         format: capture_format,
@@ -233,7 +233,7 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
                     .duration_since(&info.timestamp().capture)
                     .unwrap_or_default();
                 let resampler_delay = Duration::from_secs_f32(
-                    state.resampler.output_delay() as f32 / ENGINE_FORMAT.sample_rate as f32,
+                    state.resampler.output_delay() as f32 / ENGINE_FORMAT.sample_rate.0 as f32,
                 );
                 capture_delay + resampler_delay
             };
@@ -317,7 +317,7 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
     )
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,
@@ -350,8 +350,8 @@ fn capture_loop(
             }
         }
         // Follow the hardware clock instead of an independent sleep timer. A
-        // delayed worker can then drain every complete chunk and catch up instead
-        // of leaving permanent backlog in the capture ring.
+        // relative 20 ms timer drifts on macOS when realtime promotion is not
+        // available, eventually filling the capture ring and dropping audio.
         let available_frames = consumer.occupied_len() / samples_per_tick;
         if available_frames == 0 {
             std::thread::sleep(Duration::from_millis(1));
@@ -390,10 +390,7 @@ fn capture_loop(
     }
 }
 
-// The occupancy-driven catch-up loop introduced for GEN-89 causes severe
-// distortion on Windows. Keep the previous fixed-cadence behavior there until
-// the Windows audio path can be diagnosed with a real two-peer hardware call.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 fn capture_loop(
     mut consumer: Consumer<f32>,
     mut sink_receiver: mpsc::Receiver<Box<dyn AudioSink>>,

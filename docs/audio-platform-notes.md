@@ -46,37 +46,21 @@ After the fix, a processor-enabled three-instance release trace showed:
   frames, errors, or panics;
 - two or three source misses per process during initial track startup only.
 
-## Windows load-resilience investigation (2026-07-31)
+## Windows compatibility boundary
 
-A two-peer call was reported to suffer severe capture and playback degradation
-while a large Rust build saturated the machine, with Windows the main target for
-the investigation. Four scheduling problems made a temporary CPU stall turn
-into sustained bad audio:
+The Windows audio path was the original working baseline and is intentionally
+unchanged by the macOS pacing fix. `cfg`-gated non-macOS code retains:
 
-1. The pinned CPAL fork attempted to raise its WASAPI callback threads by
-   casting `GetCurrentThreadId()` to a thread handle. `SetThreadPriority`
-   therefore failed, and its return value was ignored. Wire now uses upstream
-   CPAL with its `audio_thread_priority` support, which enrolls those callbacks
-   in Windows MMCSS.
-2. Wire's own capture and playback workers passed interleaved ring capacity to
-   `audio_thread_priority`, although the API expects device frames per callback.
-   They now report the actual 960-frame, 20 ms workload. This also gives macOS a
-   realistic time-constraint policy instead of describing roughly 640 ms of
-   audio as one callback.
-3. CPAL buffer sizes are frames, but Windows requested 1,920 interleaved stereo
-   samples as though they were frames. Device buffer requests now use the
-   selected device rate and a real 20 ms frame count on every platform.
-4. Windows workers use independent relative sleeps. An attempt to replace those
-   timers with the macOS occupancy-driven capture and playback paths caused
-   severe lag on both peers in a real Windows call. That part of the change was
-   rolled back: Windows again uses its previous fixed-cadence workers, playback
-   buffering, callback draining, and WebRTC processor framing. The CPAL upgrade,
-   corrected real-time workload size, and frame-based device buffer request are
-   retained because they are independent of the regressed queueing path.
+- the original independently paced 20 ms capture and playback workers;
+- the original CPAL buffer-size calculation;
+- the original high-quality device resampler;
+- the existing device-channel audio-processor initialization and callback
+  draining behavior.
 
-The occupancy-driven approach is now macOS-only. Do not enable it on Windows
-again without a real two-peer hardware test that verifies both latency and audio
-quality under normal load and CPU saturation.
+Do not apply the macOS hardware-clock or channel-conversion code to Windows
+without first reproducing a Windows problem. In particular, matching 48 kHz
+stereo hardware does not exercise the resampling and mono-conversion failures
+that Bluetooth exposed on macOS.
 
 When the app is next tested on Windows:
 
@@ -84,8 +68,7 @@ When the app is next tested on Windows:
 2. Test a real two-machine voice call before treating a same-machine dev pair
    as representative. Three local processes share one physical device and can
    create feedback or doubled audio even when queue timing is healthy.
-3. Run a CPU-saturating build during the call, confirm that audio remains
-   realtime for several minutes, and watch for
+3. Confirm that audio remains realtime for several minutes and watch for
    `capture xrun`, `playback xrun`, `audio source xrun`, `increase silence`, or
    `mediatrack recv lagged`.
 4. If a regression appears, capture the selected input/output configurations,

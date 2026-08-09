@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
 macro_rules! optional_sound {
     ($cfg:ident, $path:literal) => {{
@@ -62,8 +62,9 @@ const HAS_ANY_SOUND: bool = cfg!(any(
 ));
 
 pub struct Sounds {
-    output: MixerDeviceSink,
-    ringtone: Option<Player>,
+    _stream: OutputStream,
+    handle: OutputStreamHandle,
+    ringtone: Option<Sink>,
     volume: f32,
 }
 
@@ -72,9 +73,10 @@ impl Sounds {
         if !HAS_ANY_SOUND {
             return None;
         }
-        let output = DeviceSinkBuilder::open_default_sink().ok()?;
+        let (stream, handle) = OutputStream::try_default().ok()?;
         Some(Self {
-            output,
+            _stream: stream,
+            handle,
             ringtone: None,
             volume: normalize_volume(volume),
         })
@@ -84,7 +86,9 @@ impl Sounds {
         let Some(bytes) = sound.bytes() else {
             return;
         };
-        let sink = Player::connect_new(self.output.mixer());
+        let Ok(sink) = Sink::try_new(&self.handle) else {
+            return;
+        };
         let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else {
             return;
         };
@@ -105,7 +109,9 @@ impl Sounds {
             if self.ringtone.is_some() {
                 return;
             }
-            let sink = Player::connect_new(self.output.mixer());
+            let Ok(sink) = Sink::try_new(&self.handle) else {
+                return;
+            };
             let Some(bytes) = Sound::IncomingRing.bytes() else {
                 return;
             };

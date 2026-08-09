@@ -138,7 +138,7 @@ impl MediaTrackOpusDecoder {
         };
         let audio_format = AudioFormat::new2(OPUS_SAMPLE_RATE, channel_count as u16);
         let decoder =
-            opus::Decoder::new(OPUS_STREAM_PARAMS.sample_rate, channel_count.into()).unwrap();
+            opus::Decoder::new(OPUS_STREAM_PARAMS.sample_rate.0, channel_count.into()).unwrap();
         let buffer_size = audio_format.sample_count(DURATION_20MS);
         let decode_buf = vec![0.; buffer_size];
         let audio_buf = vec![];

@@ -8,7 +8,7 @@ use cpal::{
 use tracing::{debug, info};
 
 use super::{AudioFormat, SAMPLE_RATE};
-use crate::audio::{DURATION_20MS, ENGINE_FORMAT};
+use crate::audio::{DURATION_10MS, DURATION_20MS, ENGINE_FORMAT};
 use crate::codec::opus::AudioQuality;
 
 #[derive(Debug, Clone)]
@@ -57,11 +57,11 @@ pub fn list_devices() -> Result<Devices> {
     let host = cpal::default_host();
     let input = host
         .input_devices()?
-        .filter_map(|x| x.description().ok().map(|d| d.name().to_owned()))
+        .filter_map(|x| x.name().ok())
         .collect();
     let output = host
         .output_devices()?
-        .filter_map(|x| x.description().ok().map(|d| d.name().to_owned()))
+        .filter_map(|x| x.name().ok())
         .collect();
     Ok(Devices { input, output })
 }
@@ -80,9 +80,7 @@ pub fn find_device(host: &cpal::Host, direction: Direction, name: Option<&str>) 
     let default = || {
         // On linux, prefer the `pipewire` device, if available.
         #[cfg(target_os = "linux")]
-        if let Some(device) =
-            iter()?.find(|x| x.description().ok().is_some_and(|d| d.name() == "pipewire"))
-        {
+        if let Some(device) = iter()?.find(|x| x.name().ok().as_deref() == Some("pipewire")) {
             return anyhow::Ok(Some(device));
         };
 
@@ -99,11 +97,7 @@ pub fn find_device(host: &cpal::Host, direction: Direction, name: Option<&str>) 
     };
 
     let device = match &name {
-        Some(device) => iter()?.find(|x| {
-            x.description()
-                .map(|description| description.name() == *device)
-                .unwrap_or(false)
-        }),
+        Some(device) => iter()?.find(|x| x.name().map(|y| &y == device).unwrap_or(false)),
         None => default()?,
     };
     device.with_context(|| {
@@ -150,7 +144,7 @@ pub fn find_input_stream_config(
     device: &Device,
     format: &AudioFormat,
 ) -> Result<StreamConfigWithFormat> {
-    let d = device.description().unwrap().name().to_owned();
+    let d = device.name().unwrap();
     debug!("find capture stream config for device {d} and format {format:?}");
     let mut supported_configs: Vec<_> = device
         .supported_input_configs()
@@ -171,11 +165,14 @@ pub fn find_input_stream_config(
         })?
     };
 
+    #[cfg(target_os = "macos")]
     let ideal_buffer_size = AudioFormat {
         sample_rate: config.sample_rate(),
         channel_count: config.channels(),
     }
     .block_count(DURATION_20MS) as u32;
+    #[cfg(not(target_os = "macos"))]
+    let ideal_buffer_size = format.sample_count(DURATION_20MS) as u32;
     info!("selected capture stream config: {config:?}");
     Ok(StreamConfigWithFormat::new(config, ideal_buffer_size))
 }
@@ -184,7 +181,7 @@ pub fn find_output_stream_config(
     device: &Device,
     format: &AudioFormat,
 ) -> Result<StreamConfigWithFormat> {
-    let d = device.description().unwrap().name().to_owned();
+    let d = device.name().unwrap();
     debug!("find playback stream config for device {d} and format {format:?}");
     let mut supported_configs: Vec<_> = device
         .supported_output_configs()
@@ -206,11 +203,14 @@ pub fn find_output_stream_config(
     };
     info!("selected playback stream config: {config:?}");
 
+    #[cfg(target_os = "macos")]
     let ideal_buffer_size = AudioFormat {
         sample_rate: config.sample_rate(),
         channel_count: config.channels(),
     }
     .block_count(DURATION_20MS) as u32;
+    #[cfg(not(target_os = "macos"))]
+    let ideal_buffer_size = format.sample_count(DURATION_20MS) as u32;
     Ok(StreamConfigWithFormat::new(config, ideal_buffer_size))
 }
 

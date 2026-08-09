@@ -85,7 +85,7 @@ impl AudioPlayback {
         #[cfg(target_os = "macos")]
         {
             // Prime the device before stream.play() can invoke its first callback.
-            // Three 20 ms chunks cover the callback plus scheduler jitter.
+            // Three 20 ms chunks cover one CoreAudio callback plus scheduler jitter.
             let prebuffer =
                 vec![0.0; ENGINE_FORMAT.sample_count(DURATION_20MS) * PLAYBACK_PREBUFFER_CHUNKS];
             let primed = producer.push_slice(&prebuffer);
@@ -99,8 +99,8 @@ impl AudioPlayback {
 
         std::thread::spawn(move || {
             if let Err(err) = audio_thread_priority::promote_current_thread_to_real_time(
-                ENGINE_FORMAT.block_count(DURATION_20MS) as u32,
-                ENGINE_FORMAT.sample_rate,
+                buffer_size as u32,
+                ENGINE_FORMAT.sample_rate.0,
             ) {
                 #[cfg(target_os = "macos")]
                 debug!("macOS kept the playback worker at normal priority: {err:?}");
@@ -208,8 +208,8 @@ fn playback_loop(
             }
         }
 
-        // Refill based on what the device actually consumed. This keeps a small
-        // stable cushion and lets the worker catch up after scheduler stalls.
+        // Refill based on what CoreAudio actually consumed. This keeps a small
+        // stable cushion without relying on a second clock that can drift.
         let target_samples = buffer_size * PLAYBACK_PREBUFFER_CHUNKS;
         let missing_frames = target_samples
             .saturating_sub(producer.occupied_len())
@@ -374,8 +374,8 @@ fn start_playback_stream(
     processor.init_playback(config.channels as usize)?;
     let resampler = device_resampler(
         NonZeroUsize::new(format.channel_count as usize).unwrap(),
-        SAMPLE_RATE,
-        format.sample_rate,
+        SAMPLE_RATE.0,
+        format.sample_rate.0,
     );
     let state = PlaybackState {
         consumer,
@@ -395,7 +395,7 @@ fn start_playback_stream(
     }?;
     info!(
         "start playback stream on {} with {format:?}",
-        device.description()?.name()
+        device.name()?
     );
     stream.play()?;
     Ok(stream)
@@ -438,9 +438,7 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
                     .callback
                     .duration_since(&info.timestamp().playback)
                     .unwrap_or_default();
-                let resampler_delay = Duration::from_secs_f32(
-                    state.resampler.output_delay() as f32 / state.format.sample_rate as f32,
-                );
+                let resampler_delay = Duration::from_secs_f32(state.resampler.output_delay() as f32 / state.format.sample_rate.0 as f32);
                 output_delay + resampler_delay
             };
 
@@ -457,11 +455,11 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             #[cfg(feature = "audio-processing")]
             state.processor.set_playback_delay(delay);
 
-            // The device may invoke this callback with a buffer smaller than the
+            // CoreAudio may invoke this callback with a buffer smaller than the
             // playback ring's latency cushion. Pulling the entire ring moves that
             // cushion into `resampled`, where the producer can no longer see it
             // and refills it on every callback. Only pull enough engine audio for
-            // this callback, keeping the latency bounded in the ring.
+            // this callback on macOS, keeping the latency bounded in the ring.
             #[cfg(target_os = "macos")]
             {
                 let missing_output = data.len().saturating_sub(resampled.len());
@@ -486,9 +484,9 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             unprocessed.truncate(remainder_len);
 
             // The mixer ring uses the 48 kHz stereo engine format. Adapt its
-            // channels to the selected device before resampling; a mono output
-            // must not interpret interleaved stereo samples as twice as many
-            // mono frames.
+            // channels to the selected macOS device before resampling; a mono
+            // Bluetooth output must not interpret interleaved stereo samples as
+            // twice as many mono frames.
             #[cfg(target_os = "macos")]
             {
                 match state.format.channel_count {
@@ -560,7 +558,7 @@ fn required_engine_samples(output_samples: usize, output_format: AudioFormat) ->
     let output_channels = output_format.channel_count as usize;
     let output_frames = output_samples.div_ceil(output_channels);
     let engine_frames =
-        (output_frames * SAMPLE_RATE as usize).div_ceil(output_format.sample_rate as usize);
+        (output_frames * SAMPLE_RATE.0 as usize).div_ceil(output_format.sample_rate.0 as usize);
     let engine_samples = engine_frames * ENGINE_FORMAT.channel_count as usize;
     let processor_frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
     engine_samples.div_ceil(processor_frame_size) * processor_frame_size

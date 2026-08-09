@@ -22,7 +22,7 @@ pub(crate) struct RtpMediaTrackSender {
 
 pub(crate) const MTU: usize = 1100;
 
-pub(crate) const CLOCK_RATE: u32 = crate::audio::SAMPLE_RATE;
+pub(crate) const CLOCK_RATE: u32 = crate::audio::SAMPLE_RATE.0;
 
 impl RtpMediaTrackSender {
     pub(crate) async fn run(mut self) -> Result<()> {
