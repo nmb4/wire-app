@@ -16,7 +16,7 @@ use iroh_blobs::{
     downloader::DownloadRequest,
     net_protocol::Blobs,
     store::{fs::Store as BlobStore, Map, Store},
-    BlobFormat, Hash, HashAndFormat,
+    BlobFormat, Hash, HashAndFormat, Tag,
 };
 use iroh_docs::{
     engine::LiveEvent,
@@ -60,6 +60,11 @@ const CHAT_RECEIPT_WAKE_COOLDOWN: Duration = Duration::from_secs(2);
 /// publish the message metadata before its blob address is usable, so one
 /// failed fetch must not leave the UI on "Loading image…" forever.
 const ATTACHMENT_RETRY_MAX: Duration = Duration::from_secs(60);
+/// A downloader intent can remain pending while it retries an address that is
+/// no longer usable. Bound each intent so a fresh attempt can pick up address
+/// information learned from later chat/status connections.
+const ATTACHMENT_DOWNLOAD_TIMEOUT_MIN: Duration = Duration::from_secs(10);
+const ATTACHMENT_DOWNLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(120);
 /// After this many consecutive failed probes, show Queued and switch to slow
 /// offline probes (see `delivery_retry_delay(..., offline=true)`).
 const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
@@ -1188,6 +1193,12 @@ impl ChatService {
                 if *tag.hash() != expected {
                     bail!("image attachment hash mismatch");
                 }
+                self.blobs
+                    .set_tag(
+                        attachment_blob_tag(expected),
+                        Some(HashAndFormat::raw(expected)),
+                    )
+                    .await?;
             } else if !self
                 .blobs
                 .get(&expected)
@@ -2330,7 +2341,11 @@ impl ChatService {
         }
     }
 
-    fn attachment_providers(&self, conversation_id: &str) -> Vec<NodeAddr> {
+    fn attachment_providers(
+        &self,
+        conversation_id: &str,
+        preferred: Option<NodeId>,
+    ) -> Vec<NodeAddr> {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return Vec::new();
         };
@@ -2371,7 +2386,14 @@ impl ChatService {
                     .or_insert_with(|| NodeAddr::from(node));
             }
         }
-        providers.into_values().collect()
+        let mut providers: Vec<_> = providers.into_values().collect();
+        // The author is the only peer guaranteed to have the original blob.
+        // Trying it first also avoids waiting on unrelated/offline group
+        // members before reaching the actual source.
+        if let Some(preferred) = preferred {
+            providers.sort_by_key(|address| address.node_id != preferred);
+        }
+        providers
     }
 
     async fn request_missing_attachments(
@@ -2379,12 +2401,13 @@ impl ChatService {
         conversation_id: &str,
         messages: &[ChatMessage],
     ) {
-        let providers = self.attachment_providers(conversation_id);
         let now = tokio::time::Instant::now();
         for message in messages {
             if message.author_id == self.our_node_id.to_string() {
                 continue;
             }
+            let author = NodeId::from_str(&message.author_id).ok();
+            let providers = self.attachment_providers(conversation_id, author);
             for attachment in &message.attachments {
                 if self
                     .max_image_bytes
@@ -2417,24 +2440,55 @@ impl ChatService {
                     continue;
                 }
                 let downloader = self.blob_downloader.clone();
+                let blob_store = self.blobs.clone();
                 let tx = self.wake_tx.clone();
                 let conversation_id = conversation_id.to_owned();
                 let providers = providers.clone();
+                let timeout = attachment_download_timeout(attachment.byte_len);
                 if providers.is_empty() {
                     self.attachment_downloads.remove(&hash);
                     self.schedule_attachment_retry(&conversation_id, hash);
                     continue;
                 }
                 tokio::spawn(async move {
-                    let request = DownloadRequest::new(HashAndFormat::raw(hash), providers);
-                    let handle = downloader.queue(request).await;
-                    let succeeded = match handle.await {
-                        Ok(_) => true,
-                        Err(error) => {
-                            trace!(image = %hash.fmt_short(), "image download failed: {error}");
+                    let hash_and_format = HashAndFormat::raw(hash);
+                    // iroh-blobs requires the caller to pin a download while it
+                    // is in progress; otherwise GC is allowed to remove its
+                    // partial/just-completed data before the UI consumes it.
+                    let _download_pin = blob_store.temp_tag(hash_and_format);
+                    let request = DownloadRequest::new(hash_and_format, providers);
+                    let mut handle = downloader.queue(request).await;
+                    let mut succeeded = match tokio::time::timeout(timeout, &mut handle).await {
+                        Ok(Ok(_)) => true,
+                        Ok(Err(error)) => {
+                            debug!(image = %hash.fmt_short(), "image download failed: {error}");
+                            false
+                        }
+                        Err(_) => {
+                            // Dropping a DownloadHandle does not cancel its
+                            // intent. Explicit cancellation is required or a
+                            // stuck intent keeps this hash occupied forever.
+                            downloader.cancel(handle).await;
+                            debug!(
+                                image = %hash.fmt_short(),
+                                timeout_ms = timeout.as_millis(),
+                                "image download timed out; cancelled for a fresh retry"
+                            );
                             false
                         }
                     };
+                    if succeeded {
+                        if let Err(error) = blob_store
+                            .set_tag(attachment_blob_tag(hash), Some(hash_and_format))
+                            .await
+                        {
+                            debug!(
+                                image = %hash.fmt_short(),
+                                "could not persist downloaded image tag: {error}"
+                            );
+                            succeeded = false;
+                        }
+                    }
                     let _ = tx
                         .send(ChatInput::AttachmentDownloadFinished {
                             conversation_id,
@@ -3215,6 +3269,19 @@ fn attachment_retry_delay(attempts: u8) -> Duration {
     }
 }
 
+fn attachment_download_timeout(byte_len: u64) -> Duration {
+    // Allow roughly 256 KiB/s after a fixed dial/relay allowance. This keeps
+    // small-image recovery quick without cancelling legitimate large images
+    // merely because the peer is on a slow uplink.
+    let transfer_seconds = byte_len.div_ceil(256 * 1024);
+    (ATTACHMENT_DOWNLOAD_TIMEOUT_MIN + Duration::from_secs(transfer_seconds))
+        .min(ATTACHMENT_DOWNLOAD_TIMEOUT_MAX)
+}
+
+fn attachment_blob_tag(hash: Hash) -> Tag {
+    Tag::from(format!("wire-chat-attachment-{hash}"))
+}
+
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
     let mut members: Vec<_> = nodes.into_iter().map(|node| node.to_string()).collect();
     members.sort();
@@ -3678,6 +3745,22 @@ mod tests {
         assert!(
             delivery_retry_delay("dm/offline", 3, true) >= Duration::from_secs(5),
             "offline probes must not use the online sub-second schedule"
+        );
+    }
+
+    #[test]
+    fn attachment_download_timeouts_scale_but_stay_bounded() {
+        assert_eq!(
+            attachment_download_timeout(1),
+            ATTACHMENT_DOWNLOAD_TIMEOUT_MIN + Duration::from_secs(1)
+        );
+        assert_eq!(
+            attachment_download_timeout(512 * 1024),
+            ATTACHMENT_DOWNLOAD_TIMEOUT_MIN + Duration::from_secs(2)
+        );
+        assert_eq!(
+            attachment_download_timeout(u64::MAX),
+            ATTACHMENT_DOWNLOAD_TIMEOUT_MAX
         );
     }
 
