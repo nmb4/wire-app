@@ -38,6 +38,7 @@ use tracing::{debug, info, trace, warn};
 pub const CHAT_ALPN: &[u8] = b"wire/chat-invite/1";
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_BYTES: usize = 256 * 1024;
+const MAX_ATTACHMENT_PUSH_BYTES: u64 = 1024 * 1024 * 1024;
 const MESSAGE_PREFIX: &[u8] = b"message/";
 const DELETION_PREFIX: &[u8] = b"deletion/";
 const RECEIPT_PREFIX: &[u8] = b"receipt/";
@@ -391,7 +392,19 @@ struct ChatInvite {
 #[serde(untagged)]
 enum ChatProtocolMessage {
     Invite(ChatInvite),
+    AttachmentPush(AttachmentPush),
     SyncRequest(SyncRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachmentPush {
+    kind: String,
+    version: u8,
+    conversation_id: String,
+    hash: String,
+    byte_len: u64,
+    #[serde(skip)]
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -972,6 +985,15 @@ impl ChatService {
                         );
                     }
                 }
+                ChatProtocolMessage::AttachmentPush(push) => {
+                    let remote = incoming.remote;
+                    if let Err(error) = self.apply_attachment_push(remote, push).await {
+                        warn!(
+                            peer = %remote.fmt_short(),
+                            "ignored chat attachment push: {error:#}"
+                        );
+                    }
+                }
             },
             ChatInput::Document(signal) => match signal {
                 DocumentSignal::Changed {
@@ -1303,6 +1325,13 @@ impl ChatService {
                 .await
                 .ok()
                 .or_else(|| Some(stored.ticket.clone()));
+            push_payload_attachments(
+                sessions.clone(),
+                &peers,
+                &conversation_id,
+                &payload.messages,
+            )
+            .await;
             let reached = wake_peers(
                 sessions,
                 peers,
@@ -1653,6 +1682,55 @@ impl ChatService {
         Ok(())
     }
 
+    async fn apply_attachment_push(&mut self, remote: NodeId, push: AttachmentPush) -> Result<()> {
+        if push.kind != "attachment-push" || push.version != 1 {
+            bail!("unsupported attachment push version {}", push.version);
+        }
+        if !self.is_conversation_member(&push.conversation_id, remote) {
+            bail!("attachment sender is not a conversation member");
+        }
+        if push.byte_len == 0 || push.byte_len > MAX_ATTACHMENT_PUSH_BYTES {
+            bail!("attachment push size is outside the safety limit");
+        }
+        if self
+            .max_image_bytes
+            .is_some_and(|limit| push.byte_len > limit)
+        {
+            return Ok(());
+        }
+        if push.data.len() as u64 != push.byte_len {
+            bail!("attachment push body length does not match metadata");
+        }
+        let expected = Hash::from_str(&push.hash).context("invalid attachment push hash")?;
+        if Hash::new(&push.data) != expected {
+            bail!("attachment push hash mismatch");
+        }
+        let tag = self
+            .blobs
+            .import_bytes(push.data.into(), BlobFormat::Raw)
+            .await?;
+        if *tag.hash() != expected {
+            bail!("imported attachment push hash mismatch");
+        }
+        self.blobs
+            .set_tag(
+                attachment_blob_tag(expected),
+                Some(HashAndFormat::raw(expected)),
+            )
+            .await?;
+        self.attachment_downloads.remove(&expected);
+        self.attachment_retries.remove(&expected);
+        info!(
+            conversation = %log_id(&push.conversation_id),
+            peer = %remote.fmt_short(),
+            image = %expected.fmt_short(),
+            bytes = push.byte_len,
+            "accepted pushed chat image"
+        );
+        self.publish_timeline(&push.conversation_id).await?;
+        Ok(())
+    }
+
     fn apply_direct_receipts(
         &mut self,
         conversation_id: &str,
@@ -1862,6 +1940,31 @@ impl ChatService {
         if staged.is_empty() {
             self.staged_inbound.remove(conversation_id);
         }
+    }
+
+    async fn hydrate_attachment_bytes(&self, messages: &mut [ChatMessage]) -> Result<()> {
+        for message in messages {
+            for attachment in &mut message.attachments {
+                if attachment.data.is_some() {
+                    continue;
+                }
+                let Ok(hash) = Hash::from_str(&attachment.hash) else {
+                    continue;
+                };
+                let Some(blob) = self.blobs.get(&hash).await? else {
+                    continue;
+                };
+                if !blob.is_complete() {
+                    continue;
+                }
+                let len = usize::try_from(attachment.byte_len).unwrap_or(usize::MAX);
+                let mut reader = blob.data_reader();
+                if let Ok(bytes) = reader.read_at(0, len).await {
+                    attachment.data = Some(Arc::new(bytes.to_vec()));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn forget_conversation_local_state(&mut self, conversation_id: &str) {
@@ -2195,6 +2298,7 @@ impl ChatService {
             .context("unknown conversation")?;
         let mut messages = self.load_messages(&stored).await?;
         self.merge_staged_inbound(id, &mut messages);
+        self.hydrate_attachment_bytes(&mut messages).await?;
         self.request_missing_attachments(id, &messages).await;
         for message in &messages {
             if message.author_id != self.our_node_id.to_string() {
@@ -2919,6 +3023,44 @@ async fn send_sync_request(
     .await
 }
 
+async fn push_payload_attachments(
+    sessions: ChatSessionPool,
+    peers: &[NodeId],
+    conversation_id: &str,
+    messages: &[ChatMessage],
+) {
+    for message in messages {
+        for attachment in &message.attachments {
+            let Some(data) = attachment.data.as_ref() else {
+                continue;
+            };
+            if data.len() as u64 != attachment.byte_len
+                || attachment.byte_len > MAX_ATTACHMENT_PUSH_BYTES
+            {
+                continue;
+            }
+            for peer in peers {
+                let packet = ChatProtocolMessage::AttachmentPush(AttachmentPush {
+                    kind: "attachment-push".to_owned(),
+                    version: 1,
+                    conversation_id: conversation_id.to_owned(),
+                    hash: attachment.hash.clone(),
+                    byte_len: attachment.byte_len,
+                    data: data.as_ref().clone(),
+                });
+                if let Err(error) = send_chat_packet(sessions.clone(), *peer, packet).await {
+                    debug!(
+                        conversation = %log_id(conversation_id),
+                        peer = %peer.fmt_short(),
+                        image = %attachment.hash.get(..10).unwrap_or(&attachment.hash),
+                        "could not push chat image over sender connection: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn wake_peers(
     sessions: ChatSessionPool,
     peers: Vec<NodeId>,
@@ -3046,6 +3188,15 @@ async fn send_chat_packet(
     if payload.len() > MAX_INVITE_BYTES {
         bail!("chat protocol message exceeds safety cap");
     }
+    let body = match &packet {
+        ChatProtocolMessage::AttachmentPush(push) => push.data.as_slice(),
+        _ => &[],
+    };
+    let stream_timeout = if body.is_empty() {
+        CHAT_STREAM_TIMEOUT
+    } else {
+        attachment_download_timeout(body.len() as u64)
+    };
     // One send/dial at a time per peer — concurrent wakes were closing each
     // other's fresh connections and forcing multi-second redial storms.
     let gate = sessions.peer_gate(peer).await;
@@ -3054,8 +3205,12 @@ async fn send_chat_packet(
     // Try warm session with a tight timeout, then fresh dial.
     if let Some(connection) = sessions.get(peer).await {
         match tokio::time::timeout(
-            CHAT_REUSE_TIMEOUT,
-            send_chat_packet_on(&connection, &payload),
+            if body.is_empty() {
+                CHAT_REUSE_TIMEOUT
+            } else {
+                stream_timeout
+            },
+            send_chat_packet_on(&connection, &payload, body),
         )
         .await
         {
@@ -3080,8 +3235,8 @@ async fn send_chat_packet(
     }
     let connection = sessions.dial(peer).await?;
     match tokio::time::timeout(
-        CHAT_STREAM_TIMEOUT,
-        send_chat_packet_on(&connection, &payload),
+        stream_timeout,
+        send_chat_packet_on(&connection, &payload, body),
     )
     .await
     {
@@ -3122,14 +3277,27 @@ fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool
                 "chat delivery wake-up sent"
             );
         }
+        ChatProtocolMessage::AttachmentPush(push) => {
+            debug!(
+                peer = %peer.fmt_short(),
+                conversation = %log_id(&push.conversation_id),
+                image = %push.hash.get(..10).unwrap_or(&push.hash),
+                bytes = push.byte_len,
+                reused,
+                "chat image pushed over sender connection"
+            );
+        }
     }
 }
 
-async fn send_chat_packet_on(connection: &Connection, payload: &[u8]) -> Result<()> {
+async fn send_chat_packet_on(connection: &Connection, payload: &[u8], body: &[u8]) -> Result<()> {
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&(payload.len() as u32).to_be_bytes())
         .await?;
     send.write_all(payload).await?;
+    if !body.is_empty() {
+        send.write_all(body).await?;
+    }
     send.finish()?;
     let mut ack = [0u8; 2];
     recv.read_exact(&mut ack).await?;
@@ -3151,8 +3319,16 @@ async fn accept_chat_stream(
     }
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes).await?;
-    let message: ChatProtocolMessage =
+    let mut message: ChatProtocolMessage =
         serde_json::from_slice(&bytes).context("invalid Wire chat protocol message")?;
+    if let ChatProtocolMessage::AttachmentPush(push) = &mut message {
+        if push.byte_len == 0 || push.byte_len > MAX_ATTACHMENT_PUSH_BYTES {
+            bail!("chat attachment push exceeds safety cap");
+        }
+        let len = usize::try_from(push.byte_len).context("attachment push is too large")?;
+        push.data.resize(len, 0);
+        recv.read_exact(&mut push.data).await?;
+    }
     send.write_all(b"ok").await?;
     send.finish()?;
     Ok(message)
@@ -3454,6 +3630,34 @@ mod tests {
         Ok((endpoint, router, protocols.service))
     }
 
+    async fn spawn_test_node_without_blob_provider(
+        root: &Path,
+        secret: SecretKey,
+    ) -> Result<(Endpoint, Router, ChatService)> {
+        let endpoint = Endpoint::builder()
+            .secret_key(secret)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![
+                iroh_blobs::ALPN.to_vec(),
+                iroh_docs::ALPN.to_vec(),
+                iroh_gossip::ALPN.to_vec(),
+                CHAT_ALPN.to_vec(),
+            ])
+            .bind()
+            .await?;
+        let protocols = ChatService::build(endpoint.clone(), root).await?;
+        // Deliberately omit the blob protocol. This models the real asymmetric
+        // path where sender -> receiver chat works but receiver -> sender blob
+        // dialing cannot be established.
+        let router = Router::builder(endpoint.clone())
+            .accept(iroh_docs::ALPN, protocols.docs.clone())
+            .accept(iroh_gossip::ALPN, protocols.gossip.clone())
+            .accept(CHAT_ALPN, protocols.invites.clone())
+            .spawn()
+            .await?;
+        Ok((endpoint, router, protocols.service))
+    }
+
     async fn wait_for_body(service: &mut ChatService, expected: &str) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -3694,7 +3898,7 @@ mod tests {
         let image_hash = Hash::new(&image).to_string();
 
         let (left_endpoint, left_router, mut left) =
-            spawn_test_node(&left_root, left_secret).await?;
+            spawn_test_node_without_blob_provider(&left_root, left_secret).await?;
         let (right_endpoint, right_router, mut right) =
             spawn_test_node(&right_root, right_secret).await?;
         left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;

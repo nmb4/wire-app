@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.5.13"
+version = "0.5.14"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
