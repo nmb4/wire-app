@@ -380,6 +380,36 @@ struct LocalDeletionIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAttachmentDelivery {
+    message_id: String,
+    hash: String,
+    byte_len: u64,
+    pending_peers: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingDeletionDelivery {
+    deletion: ReplicatedDeletion,
+    pending_peers: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingInviteDelivery {
+    history_epoch: u64,
+    pending_peers: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ReliableControlIndex {
+    #[serde(default)]
+    attachments: BTreeMap<String, BTreeMap<String, PendingAttachmentDelivery>>,
+    #[serde(default)]
+    deletions: BTreeMap<String, BTreeMap<String, PendingDeletionDelivery>>,
+    #[serde(default)]
+    invites: BTreeMap<String, PendingInviteDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatInvite {
     version: u8,
     conversation: ChatConversation,
@@ -433,6 +463,12 @@ struct SyncRequest {
     /// can receive our chat connection but cannot dial our Docs endpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deletions: Vec<ReplicatedDeletion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachment_acks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deletion_acks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_history_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -440,6 +476,10 @@ struct WakePayload {
     messages: Vec<ChatMessage>,
     receipts: Vec<ReplicatedReceipt>,
     deletions: Vec<ReplicatedDeletion>,
+    attachment_acks: Vec<String>,
+    deletion_acks: Vec<String>,
+    accepted_history_epoch: Option<u64>,
+    attachments: Vec<PendingAttachmentDelivery>,
 }
 
 #[derive(Debug)]
@@ -705,6 +745,7 @@ pub struct ChatService {
     root: PathBuf,
     index: ChatIndex,
     local_deletions: LocalDeletionIndex,
+    reliable_control: ReliableControlIndex,
     our_node_id: NodeId,
     invite_rx: async_channel::Receiver<IncomingInvite>,
     doc_event_tx: async_channel::Sender<DocumentSignal>,
@@ -736,6 +777,7 @@ pub struct ChatService {
     max_image_bytes: Option<u64>,
     attachment_downloads: BTreeSet<Hash>,
     attachment_retries: BTreeMap<Hash, AttachmentRetry>,
+    control_retries: BTreeMap<String, ControlRetry>,
     blob_downloader: iroh_blobs::downloader::Downloader,
     #[cfg(test)]
     invite_attempts: AtomicU64,
@@ -753,6 +795,12 @@ struct ConversationRetry {
 #[derive(Debug)]
 struct AttachmentRetry {
     conversation_id: String,
+    attempts: u8,
+    next_attempt: tokio::time::Instant,
+}
+
+#[derive(Debug)]
+struct ControlRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
 }
@@ -812,6 +860,7 @@ impl ChatService {
         let (wake_tx, wake_rx) = async_channel::bounded(64);
         let index = load_index(&root.join("index.json"));
         let local_deletions = load_local_deletions(&root.join("local-deletions.json"));
+        let reliable_control = load_reliable_control(&root.join("reliable-control.json"));
         let conversation_count = index.conversations.len();
         let mut service = Self {
             endpoint: endpoint.clone(),
@@ -822,6 +871,7 @@ impl ChatService {
             root,
             index,
             local_deletions,
+            reliable_control,
             our_node_id: endpoint.node_id(),
             invite_rx,
             doc_event_tx,
@@ -845,6 +895,7 @@ impl ChatService {
             max_image_bytes: None,
             attachment_downloads: BTreeSet::new(),
             attachment_retries: BTreeMap::new(),
+            control_retries: BTreeMap::new(),
             blob_downloader,
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
@@ -878,7 +929,9 @@ impl ChatService {
             }
         }
         self.restore_pending_delivery_retries().await;
-        self.retry_invites();
+        self.initialize_invite_deliveries();
+        self.restore_control_retries();
+        self.retry_due_controls();
     }
 
     async fn restore_pending_delivery_retries(&mut self) {
@@ -961,12 +1014,29 @@ impl ChatService {
             ChatInput::Invite(incoming) => match incoming.message {
                 ChatProtocolMessage::Invite(invite) => {
                     let remote = incoming.remote;
+                    let conversation_id = invite.conversation.id.clone();
+                    let history_epoch = invite.conversation.history_epoch;
                     note_peer_client_version(remote, invite.client_version.as_deref(), "invite");
                     if let Err(error) = self.accept_invite(remote, invite).await {
                         return Some(ChatNotification::Error(format!(
                             "Chat invitation failed: {error:#}"
                         )));
                     }
+                    self.reliable_control.invites.insert(
+                        conversation_id.clone(),
+                        PendingInviteDelivery {
+                            history_epoch,
+                            pending_peers: BTreeSet::new(),
+                        },
+                    );
+                    self.save_reliable_control();
+                    self.spawn_control_ack(
+                        &conversation_id,
+                        remote,
+                        vec![],
+                        vec![],
+                        Some(history_epoch),
+                    );
                     self.resume_deliveries_for_peer(remote).await;
                 }
                 ChatProtocolMessage::SyncRequest(request) => {
@@ -1069,6 +1139,7 @@ impl ChatService {
             ChatInput::Retry => {
                 self.retry_due_attachment_downloads().await;
                 self.retry_due_deliveries().await;
+                self.retry_due_controls();
             }
         }
         self.pop_notification()
@@ -1167,6 +1238,7 @@ impl ChatService {
                     .insert(message_id.clone(), conversation_id.clone());
                 self.pending_outbound
                     .insert(message_id.clone(), message.clone());
+                self.register_attachment_deliveries(&conversation_id, &message);
                 // Optimistic pending — do not block the chat worker on dial/reuse.
                 // A background wake nudges peers; WakeFinished parks as Queued if
                 // nobody is reachable. See docs/chat-delivery-asymmetry.md.
@@ -1285,6 +1357,205 @@ impl ChatService {
         }
     }
 
+    fn save_reliable_control(&self) {
+        if let Err(error) = save_reliable_control(
+            &self.root.join("reliable-control.json"),
+            &self.reliable_control,
+        ) {
+            warn!("failed to persist reliable chat control queue: {error:#}");
+        }
+    }
+
+    fn schedule_control_retry(&mut self, conversation_id: &str, immediate: bool) {
+        let now = tokio::time::Instant::now();
+        let retry = self
+            .control_retries
+            .entry(conversation_id.to_owned())
+            .or_insert(ControlRetry {
+                attempts: 0,
+                next_attempt: now + CHAT_FIRST_RETRY,
+            });
+        if immediate {
+            retry.next_attempt = now;
+        }
+    }
+
+    fn conversation_has_pending_control(&self, conversation_id: &str) -> bool {
+        self.reliable_control
+            .attachments
+            .get(conversation_id)
+            .is_some_and(|entries| {
+                entries
+                    .values()
+                    .any(|entry| !entry.pending_peers.is_empty())
+            })
+            || self
+                .reliable_control
+                .deletions
+                .get(conversation_id)
+                .is_some_and(|entries| {
+                    entries
+                        .values()
+                        .any(|entry| !entry.pending_peers.is_empty())
+                })
+            || self
+                .reliable_control
+                .invites
+                .get(conversation_id)
+                .is_some_and(|entry| !entry.pending_peers.is_empty())
+    }
+
+    fn conversation_peer_strings(&self, conversation_id: &str) -> BTreeSet<String> {
+        self.index
+            .conversations
+            .get(conversation_id)
+            .map(|stored| {
+                self.other_members(stored)
+                    .into_iter()
+                    .map(|peer| peer.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn register_attachment_deliveries(&mut self, conversation_id: &str, message: &ChatMessage) {
+        let pending_peers = self.conversation_peer_strings(conversation_id);
+        if pending_peers.is_empty() || message.attachments.is_empty() {
+            return;
+        }
+        let entries = self
+            .reliable_control
+            .attachments
+            .entry(conversation_id.to_owned())
+            .or_default();
+        for attachment in &message.attachments {
+            entries.insert(
+                attachment.hash.clone(),
+                PendingAttachmentDelivery {
+                    message_id: message.message_id.clone(),
+                    hash: attachment.hash.clone(),
+                    byte_len: attachment.byte_len,
+                    pending_peers: pending_peers.clone(),
+                },
+            );
+        }
+        self.save_reliable_control();
+        self.schedule_control_retry(conversation_id, false);
+    }
+
+    fn register_deletion_delivery(&mut self, conversation_id: &str, deletion: ReplicatedDeletion) {
+        let pending_peers = self.conversation_peer_strings(conversation_id);
+        if pending_peers.is_empty() {
+            return;
+        }
+        self.reliable_control
+            .deletions
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(
+                deletion.message_id.clone(),
+                PendingDeletionDelivery {
+                    deletion,
+                    pending_peers,
+                },
+            );
+        self.save_reliable_control();
+        self.schedule_control_retry(conversation_id, false);
+    }
+
+    fn register_invite_delivery(&mut self, conversation_id: &str) {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return;
+        };
+        let history_epoch = stored.public.history_epoch;
+        let pending_peers = self.conversation_peer_strings(conversation_id);
+        self.reliable_control.invites.insert(
+            conversation_id.to_owned(),
+            PendingInviteDelivery {
+                history_epoch,
+                pending_peers,
+            },
+        );
+        self.save_reliable_control();
+        self.schedule_control_retry(conversation_id, true);
+    }
+
+    fn initialize_invite_deliveries(&mut self) {
+        let conversations: Vec<_> = self
+            .index
+            .conversations
+            .iter()
+            .map(|(id, stored)| (id.clone(), stored.public.history_epoch))
+            .collect();
+        let mut changed = false;
+        for (conversation_id, history_epoch) in conversations {
+            let current = self.reliable_control.invites.get(&conversation_id);
+            if current.is_some_and(|pending| pending.history_epoch == history_epoch) {
+                continue;
+            }
+            let pending_peers = self.conversation_peer_strings(&conversation_id);
+            self.reliable_control.invites.insert(
+                conversation_id.clone(),
+                PendingInviteDelivery {
+                    history_epoch,
+                    pending_peers,
+                },
+            );
+            changed = true;
+        }
+        if changed {
+            self.save_reliable_control();
+        }
+    }
+
+    fn restore_control_retries(&mut self) {
+        let conversations: Vec<_> = self
+            .index
+            .conversations
+            .keys()
+            .filter(|id| self.conversation_has_pending_control(id))
+            .cloned()
+            .collect();
+        for conversation_id in conversations {
+            self.schedule_control_retry(&conversation_id, true);
+        }
+    }
+
+    fn apply_control_acks(&mut self, conversation_id: &str, remote: NodeId, request: &SyncRequest) {
+        let remote = remote.to_string();
+        let mut changed = false;
+        if let Some(entries) = self.reliable_control.attachments.get_mut(conversation_id) {
+            for hash in &request.attachment_acks {
+                if let Some(entry) = entries.get_mut(hash) {
+                    changed |= entry.pending_peers.remove(&remote);
+                }
+            }
+            entries.retain(|_, entry| !entry.pending_peers.is_empty());
+        }
+        if let Some(entries) = self.reliable_control.deletions.get_mut(conversation_id) {
+            for message_id in &request.deletion_acks {
+                if let Some(entry) = entries.get_mut(message_id) {
+                    changed |= entry.pending_peers.remove(&remote);
+                }
+            }
+            entries.retain(|_, entry| !entry.pending_peers.is_empty());
+        }
+        if let (Some(epoch), Some(invite)) = (
+            request.accepted_history_epoch,
+            self.reliable_control.invites.get_mut(conversation_id),
+        ) {
+            if invite.history_epoch == epoch {
+                changed |= invite.pending_peers.remove(&remote);
+            }
+        }
+        if changed {
+            self.save_reliable_control();
+            if !self.conversation_has_pending_control(conversation_id) {
+                self.control_retries.remove(conversation_id);
+            }
+        }
+    }
+
     fn wake_payload_for(&self, conversation_id: &str) -> WakePayload {
         let mut messages = Vec::new();
         let mut used = 0usize;
@@ -1305,10 +1576,32 @@ impl ChatService {
             used = used.saturating_add(size);
             messages.push(message.clone());
         }
+        let deletions = self
+            .reliable_control
+            .deletions
+            .get(conversation_id)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|pending| !pending.pending_peers.is_empty())
+            .map(|pending| pending.deletion.clone())
+            .collect();
+        let attachments = self
+            .reliable_control
+            .attachments
+            .get(conversation_id)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|pending| !pending.pending_peers.is_empty())
+            .cloned()
+            .collect();
         WakePayload {
             messages,
             receipts: Vec::new(),
-            deletions: Vec::new(),
+            deletions,
+            attachment_acks: Vec::new(),
+            deletion_acks: Vec::new(),
+            accepted_history_epoch: None,
+            attachments,
         }
     }
 
@@ -1331,6 +1624,7 @@ impl ChatService {
             .or_insert(0) += 1;
         let sessions = self.sessions.clone();
         let docs = self.docs.clone();
+        let blobs = self.blobs.clone();
         let stored = stored.clone();
         let endpoint = self.endpoint.clone();
         let wake_tx = self.wake_tx.clone();
@@ -1340,11 +1634,12 @@ impl ChatService {
                 .await
                 .ok()
                 .or_else(|| Some(stored.ticket.clone()));
-            push_payload_attachments(
+            push_pending_attachments(
+                blobs,
                 sessions.clone(),
                 &peers,
                 &conversation_id,
-                &payload.messages,
+                &payload.attachments,
             )
             .await;
             let reached = wake_peers(
@@ -1395,6 +1690,45 @@ impl ChatService {
         let mut payload = self.wake_payload_for(conversation_id);
         payload.receipts = receipts;
         self.spawn_wake_with(conversation_id, payload);
+    }
+
+    fn spawn_control_ack(
+        &self,
+        conversation_id: &str,
+        peer: NodeId,
+        attachment_acks: Vec<String>,
+        deletion_acks: Vec<String>,
+        accepted_history_epoch: Option<u64>,
+    ) {
+        let Some(stored) = self.index.conversations.get(conversation_id).cloned() else {
+            return;
+        };
+        let payload = WakePayload {
+            attachment_acks,
+            deletion_acks,
+            accepted_history_epoch,
+            ..WakePayload::default()
+        };
+        let sessions = self.sessions.clone();
+        let docs = self.docs.clone();
+        let endpoint = self.endpoint.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            let ticket = refresh_share_ticket(&docs, &stored, &endpoint)
+                .await
+                .ok()
+                .or_else(|| Some(stored.ticket.clone()));
+            if let Err(error) =
+                send_sync_request(sessions, peer, &conversation_id, ticket.as_deref(), payload)
+                    .await
+            {
+                trace!(
+                    conversation = %log_id(&conversation_id),
+                    peer = %peer.fmt_short(),
+                    "chat control acknowledgement did not reach peer: {error:#}"
+                );
+            }
+        });
     }
 
     fn conversation_is_queued(&self, conversation_id: &str) -> bool {
@@ -1549,6 +1883,52 @@ impl ChatService {
         }
     }
 
+    fn retry_due_controls(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .control_retries
+            .iter()
+            .filter_map(|(id, retry)| (retry.next_attempt <= now).then_some(id.clone()))
+            .collect();
+        for conversation_id in due {
+            if !self.conversation_has_pending_control(&conversation_id) {
+                self.control_retries.remove(&conversation_id);
+                continue;
+            }
+            if self
+                .wake_inflight
+                .get(&conversation_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                if let Some(retry) = self.control_retries.get_mut(&conversation_id) {
+                    retry.next_attempt = now + CHAT_FIRST_RETRY;
+                }
+                continue;
+            }
+            self.send_pending_invites(&conversation_id);
+            if self
+                .reliable_control
+                .attachments
+                .get(&conversation_id)
+                .is_some_and(|entries| !entries.is_empty())
+                || self
+                    .reliable_control
+                    .deletions
+                    .get(&conversation_id)
+                    .is_some_and(|entries| !entries.is_empty())
+            {
+                self.spawn_wake(&conversation_id);
+            }
+            if let Some(retry) = self.control_retries.get_mut(&conversation_id) {
+                retry.attempts = retry.attempts.saturating_add(1);
+                retry.next_attempt = now
+                    + delivery_retry_delay(&conversation_id, retry.attempts, retry.attempts >= 5);
+            }
+        }
+    }
+
     async fn resume_deliveries_for_peer(&mut self, peer: NodeId) {
         let peer_s = peer.to_string();
         let conversation_ids: Vec<_> = self
@@ -1565,6 +1945,17 @@ impl ChatService {
             .collect();
         for conversation_id in conversation_ids {
             self.resume_queued_deliveries(&conversation_id).await;
+        }
+        let control_ids: Vec<_> = self
+            .index
+            .conversations
+            .iter()
+            .filter(|(_, stored)| stored.public.members.iter().any(|member| member == &peer_s))
+            .map(|(id, _)| id.clone())
+            .filter(|id| self.conversation_has_pending_control(id))
+            .collect();
+        for conversation_id in control_ids {
+            self.schedule_control_retry(&conversation_id, true);
         }
     }
 
@@ -1631,6 +2022,10 @@ impl ChatService {
     }
 
     async fn apply_sync_request(&mut self, remote: NodeId, request: &SyncRequest) -> Result<()> {
+        let carries_control_ack = !request.attachment_acks.is_empty()
+            || !request.deletion_acks.is_empty()
+            || request.accepted_history_epoch.is_some();
+        self.apply_control_acks(&request.conversation_id, remote, request);
         let remote_s = remote.to_string();
         let mut accepted_messages = 0u32;
         for message in &request.messages {
@@ -1673,9 +2068,18 @@ impl ChatService {
         }
         let accepted_deletions =
             self.apply_direct_deletions(&request.conversation_id, remote, &request.deletions);
+        if !accepted_deletions.is_empty() {
+            self.spawn_control_ack(
+                &request.conversation_id,
+                remote,
+                vec![],
+                accepted_deletions.clone(),
+                None,
+            );
+        }
         // Publish first so staged bodies + receipts hit the UI immediately,
         // then nudge docs for durable multi-device sync.
-        if accepted_messages > 0 || !request.receipts.is_empty() || accepted_deletions > 0 {
+        if accepted_messages > 0 || !request.receipts.is_empty() || !accepted_deletions.is_empty() {
             if let Err(error) = self.publish_timeline(&request.conversation_id).await {
                 warn!(
                     conversation = %log_id(&request.conversation_id),
@@ -1687,7 +2091,11 @@ impl ChatService {
             .pull_conversation(&request.conversation_id, request.ticket.as_deref())
             .await
         {
-            if accepted_messages == 0 && request.receipts.is_empty() && accepted_deletions == 0 {
+            if accepted_messages == 0
+                && request.receipts.is_empty()
+                && accepted_deletions.is_empty()
+                && !carries_control_ack
+            {
                 return Err(error);
             }
             warn!(
@@ -1704,16 +2112,16 @@ impl ChatService {
         conversation_id: &str,
         remote: NodeId,
         deletions: &[ReplicatedDeletion],
-    ) -> u32 {
+    ) -> Vec<String> {
         if !self.is_conversation_member(conversation_id, remote) {
-            return 0;
+            return Vec::new();
         }
         let remote_s = remote.to_string();
         let staged = self
             .staged_deletions
             .entry(conversation_id.to_owned())
             .or_default();
-        let mut accepted = 0u32;
+        let mut accepted = Vec::new();
         for deletion in deletions.iter().take(128) {
             if deletion.validate().is_err() {
                 continue;
@@ -1721,8 +2129,8 @@ impl ChatService {
             let inserted = staged
                 .insert(deletion.message_id.clone(), remote_s.clone())
                 .is_none();
+            accepted.push(deletion.message_id.clone());
             if inserted {
-                accepted += 1;
                 info!(
                     conversation = %log_id(conversation_id),
                     peer = %remote.fmt_short(),
@@ -1733,7 +2141,7 @@ impl ChatService {
         }
         #[cfg(test)]
         self.direct_deletions_accepted
-            .fetch_add(u64::from(accepted), Ordering::Relaxed);
+            .fetch_add(accepted.len() as u64, Ordering::Relaxed);
         accepted
     }
 
@@ -1751,6 +2159,13 @@ impl ChatService {
             .max_image_bytes
             .is_some_and(|limit| push.byte_len > limit)
         {
+            self.spawn_control_ack(
+                &push.conversation_id,
+                remote,
+                vec![push.hash.clone()],
+                vec![],
+                None,
+            );
             return Ok(());
         }
         if push.data.len() as u64 != push.byte_len {
@@ -1781,6 +2196,13 @@ impl ChatService {
             image = %expected.fmt_short(),
             bytes = push.byte_len,
             "accepted pushed chat image"
+        );
+        self.spawn_control_ack(
+            &push.conversation_id,
+            remote,
+            vec![push.hash.clone()],
+            vec![],
+            None,
         );
         self.publish_timeline(&push.conversation_id).await?;
         Ok(())
@@ -1857,10 +2279,9 @@ impl ChatService {
                     )));
                 }
                 if let Some(deletion) = deletion {
-                    let mut payload = self.wake_payload_for(&conversation_id);
-                    payload.deletions.push(deletion);
+                    self.register_deletion_delivery(&conversation_id, deletion);
                     self.spawn_doc_sync(&conversation_id);
-                    self.spawn_wake_with(&conversation_id, payload);
+                    self.spawn_wake(&conversation_id);
                 }
             }
             Err(error) => {
@@ -2067,6 +2488,25 @@ impl ChatService {
         }
         self.staged_inbound.remove(conversation_id);
         self.staged_deletions.remove(conversation_id);
+        let controls_removed = self
+            .reliable_control
+            .attachments
+            .remove(conversation_id)
+            .is_some()
+            | self
+                .reliable_control
+                .deletions
+                .remove(conversation_id)
+                .is_some()
+            | self
+                .reliable_control
+                .invites
+                .remove(conversation_id)
+                .is_some();
+        self.control_retries.remove(conversation_id);
+        if controls_removed {
+            self.save_reliable_control();
+        }
         self.retry_state.remove(conversation_id);
         self.attachment_retries
             .retain(|_, retry| retry.conversation_id != conversation_id);
@@ -3019,44 +3459,61 @@ impl ChatService {
         Ok(())
     }
 
-    fn retry_invites(&self) {
-        let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
-        for id in ids {
-            self.invite_members(&id);
-        }
-    }
-
-    fn invite_members(&self, conversation_id: &str) {
+    fn send_pending_invites(&self, conversation_id: &str) {
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return;
         };
-        let invite = ChatInvite {
-            version: 1,
-            conversation: stored.public.clone(),
-            ticket: stored.ticket.clone(),
-            client_version: Some(crate::APP_VERSION.to_owned()),
+        let Some(pending) = self.reliable_control.invites.get(conversation_id) else {
+            return;
         };
-        for peer in self.other_members(stored) {
-            #[cfg(test)]
-            self.invite_attempts.fetch_add(1, Ordering::Relaxed);
-            let sessions = self.sessions.clone();
-            let invite = invite.clone();
-            tokio::spawn(async move {
-                if let Err(error) = send_invite(sessions, peer, &invite).await {
+        if pending.history_epoch != stored.public.history_epoch {
+            return;
+        }
+        let peers: Vec<_> = self
+            .other_members(stored)
+            .into_iter()
+            .filter(|peer| pending.pending_peers.contains(&peer.to_string()))
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        self.invite_attempts
+            .fetch_add(peers.len() as u64, Ordering::Relaxed);
+        let sessions = self.sessions.clone();
+        let docs = self.docs.clone();
+        let endpoint = self.endpoint.clone();
+        let stored = stored.clone();
+        tokio::spawn(async move {
+            let ticket = refresh_share_ticket(&docs, &stored, &endpoint)
+                .await
+                .unwrap_or_else(|_| stored.ticket.clone());
+            let invite = ChatInvite {
+                version: 1,
+                conversation: stored.public,
+                ticket,
+                client_version: Some(crate::APP_VERSION.to_owned()),
+            };
+            for peer in peers {
+                if let Err(error) = send_invite(sessions.clone(), peer, &invite).await {
                     trace!(peer = %peer.fmt_short(), "chat peer not currently reachable: {error:#}");
                 }
-            });
-        }
+            }
+        });
     }
 
-    async fn invite_members_wait(&self, conversation_id: &str) {
+    async fn invite_members_wait(&mut self, conversation_id: &str) {
+        self.register_invite_delivery(conversation_id);
         let Some(stored) = self.index.conversations.get(conversation_id) else {
             return;
         };
+        let ticket = refresh_share_ticket(&self.docs, stored, &self.endpoint)
+            .await
+            .unwrap_or_else(|_| stored.ticket.clone());
         let invite = ChatInvite {
             version: 1,
             conversation: stored.public.clone(),
-            ticket: stored.ticket.clone(),
+            ticket,
             client_version: Some(crate::APP_VERSION.to_owned()),
         };
         let mut join_set = tokio::task::JoinSet::new();
@@ -3108,44 +3565,60 @@ async fn send_sync_request(
             messages: payload.messages,
             receipts: payload.receipts,
             deletions: payload.deletions,
+            attachment_acks: payload.attachment_acks,
+            deletion_acks: payload.deletion_acks,
+            accepted_history_epoch: payload.accepted_history_epoch,
         }),
     )
     .await
 }
 
-async fn push_payload_attachments(
+async fn push_pending_attachments(
+    blobs: BlobStore,
     sessions: ChatSessionPool,
     peers: &[NodeId],
     conversation_id: &str,
-    messages: &[ChatMessage],
+    attachments: &[PendingAttachmentDelivery],
 ) {
-    for message in messages {
-        for attachment in &message.attachments {
-            let Some(data) = attachment.data.as_ref() else {
-                continue;
-            };
-            if data.len() as u64 != attachment.byte_len
-                || attachment.byte_len > MAX_ATTACHMENT_PUSH_BYTES
-            {
+    for attachment in attachments {
+        if attachment.byte_len == 0 || attachment.byte_len > MAX_ATTACHMENT_PUSH_BYTES {
+            continue;
+        }
+        let Ok(hash) = Hash::from_str(&attachment.hash) else {
+            continue;
+        };
+        let Ok(Some(blob)) = blobs.get(&hash).await else {
+            continue;
+        };
+        if !blob.is_complete() {
+            continue;
+        }
+        let Ok(len) = usize::try_from(attachment.byte_len) else {
+            continue;
+        };
+        let mut reader = blob.data_reader();
+        let Ok(data) = reader.read_at(0, len).await else {
+            continue;
+        };
+        for peer in peers {
+            if !attachment.pending_peers.contains(&peer.to_string()) {
                 continue;
             }
-            for peer in peers {
-                let packet = ChatProtocolMessage::AttachmentPush(AttachmentPush {
-                    kind: "attachment-push".to_owned(),
-                    version: 1,
-                    conversation_id: conversation_id.to_owned(),
-                    hash: attachment.hash.clone(),
-                    byte_len: attachment.byte_len,
-                    data: data.as_ref().clone(),
-                });
-                if let Err(error) = send_chat_packet(sessions.clone(), *peer, packet).await {
-                    debug!(
-                        conversation = %log_id(conversation_id),
-                        peer = %peer.fmt_short(),
-                        image = %attachment.hash.get(..10).unwrap_or(&attachment.hash),
-                        "could not push chat image over sender connection: {error:#}"
-                    );
-                }
+            let packet = ChatProtocolMessage::AttachmentPush(AttachmentPush {
+                kind: "attachment-push".to_owned(),
+                version: 1,
+                conversation_id: conversation_id.to_owned(),
+                hash: attachment.hash.clone(),
+                byte_len: attachment.byte_len,
+                data: data.to_vec(),
+            });
+            if let Err(error) = send_chat_packet(sessions.clone(), *peer, packet).await {
+                debug!(
+                    conversation = %log_id(conversation_id),
+                    peer = %peer.fmt_short(),
+                    image = %attachment.hash.get(..10).unwrap_or(&attachment.hash),
+                    "could not push chat image over sender connection: {error:#}"
+                );
             }
         }
     }
@@ -3365,6 +3838,9 @@ fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool
                 messages = request.messages.len(),
                 receipts = request.receipts.len(),
                 deletions = request.deletions.len(),
+                attachment_acks = request.attachment_acks.len(),
+                deletion_acks = request.deletion_acks.len(),
+                accepted_history_epoch = ?request.accepted_history_epoch,
                 "chat delivery wake-up sent"
             );
         }
@@ -3593,6 +4069,13 @@ fn load_local_deletions(path: &Path) -> LocalDeletionIndex {
         .unwrap_or_default()
 }
 
+fn load_reliable_control(path: &Path) -> ReliableControlIndex {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 fn save_index(path: &Path, index: &ChatIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -3602,6 +4085,14 @@ fn save_index(path: &Path, index: &ChatIndex) -> Result<()> {
 }
 
 fn save_local_deletions(path: &Path, index: &LocalDeletionIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(index)?)?;
+    Ok(())
+}
+
+fn save_reliable_control(path: &Path, index: &ReliableControlIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3645,6 +4136,92 @@ mod tests {
         let decoded: ChatMessage = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.deletion, None);
         assert!(!String::from_utf8(encoded).unwrap().contains("deletion"));
+    }
+
+    #[test]
+    fn reliable_control_queue_survives_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("reliable-control.json");
+        let peer = node(2).to_string();
+        let mut index = ReliableControlIndex::default();
+        index
+            .attachments
+            .entry("dm/test".to_owned())
+            .or_default()
+            .insert(
+                "image-hash".to_owned(),
+                PendingAttachmentDelivery {
+                    message_id: "a".repeat(64),
+                    hash: "image-hash".to_owned(),
+                    byte_len: 42,
+                    pending_peers: BTreeSet::from([peer.clone()]),
+                },
+            );
+        index
+            .deletions
+            .entry("dm/test".to_owned())
+            .or_default()
+            .insert(
+                "b".repeat(64),
+                PendingDeletionDelivery {
+                    deletion: ReplicatedDeletion::new("b".repeat(64)),
+                    pending_peers: BTreeSet::from([peer.clone()]),
+                },
+            );
+        index.invites.insert(
+            "dm/test".to_owned(),
+            PendingInviteDelivery {
+                history_epoch: 3,
+                pending_peers: BTreeSet::from([peer]),
+            },
+        );
+
+        save_reliable_control(&path, &index)?;
+        let restored = load_reliable_control(&path);
+        assert_eq!(restored.attachments["dm/test"]["image-hash"].byte_len, 42);
+        assert_eq!(
+            restored.deletions["dm/test"][&"b".repeat(64)]
+                .deletion
+                .message_id,
+            "b".repeat(64)
+        );
+        assert_eq!(restored.invites["dm/test"].history_epoch, 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_invite_retry_survives_service_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let secret = SecretKey::from_bytes(&[19; 32]);
+        let peer = node(20);
+        let (endpoint, router, mut service) = spawn_test_node(temp.path(), secret.clone()).await?;
+        let conversation_id = direct_conversation_id(endpoint.node_id(), peer);
+        let stored = service
+            .create_conversation(
+                conversation_id.clone(),
+                "Offline".to_owned(),
+                ConversationKind::Direct {
+                    peer_id: peer.to_string(),
+                },
+                sorted_members([endpoint.node_id(), peer]),
+                0,
+            )
+            .await?;
+        service
+            .index
+            .conversations
+            .insert(conversation_id.clone(), stored);
+        service.persist_index()?;
+        service.register_invite_delivery(&conversation_id);
+        assert!(service.conversation_has_pending_control(&conversation_id));
+        router.shutdown().await?;
+        drop(service);
+
+        let (_endpoint, router, restored) = spawn_test_node(temp.path(), secret).await?;
+        assert!(restored.conversation_has_pending_control(&conversation_id));
+        assert!(restored.control_retries.contains_key(&conversation_id));
+        router.shutdown().await?;
+        Ok(())
     }
 
     #[test]
@@ -3815,6 +4392,74 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_attachment_ack(
+        service: &mut ChatService,
+        conversation_id: &str,
+        hash: &str,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let pending = service
+                    .reliable_control
+                    .attachments
+                    .get(conversation_id)
+                    .is_some_and(|entries| entries.contains_key(hash));
+                if !pending {
+                    return;
+                }
+                let input = service.wait_input().await;
+                let _ = service.process_input(input).await;
+            }
+        })
+        .await
+        .context("timed out waiting for image acknowledgement")?;
+        Ok(())
+    }
+
+    async fn wait_for_deletion_ack(
+        service: &mut ChatService,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let pending = service
+                    .reliable_control
+                    .deletions
+                    .get(conversation_id)
+                    .is_some_and(|entries| entries.contains_key(message_id));
+                if !pending {
+                    return;
+                }
+                let input = service.wait_input().await;
+                let _ = service.process_input(input).await;
+            }
+        })
+        .await
+        .context("timed out waiting for deletion acknowledgement")?;
+        Ok(())
+    }
+
+    async fn wait_for_invite_ack(service: &mut ChatService, conversation_id: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let pending = service
+                    .reliable_control
+                    .invites
+                    .get(conversation_id)
+                    .is_some_and(|invite| !invite.pending_peers.is_empty());
+                if !pending {
+                    return;
+                }
+                let input = service.wait_input().await;
+                let _ = service.process_input(input).await;
+            }
+        })
+        .await
+        .context("timed out waiting for conversation acknowledgement")?;
+        Ok(())
+    }
+
     async fn wait_for_deletion(
         service: &mut ChatService,
         message_id: &str,
@@ -3886,9 +4531,14 @@ mod tests {
         left.send_message(conversation_id.clone(), outbound).await;
         wait_for_body(&mut right, "delete me").await?;
 
-        left.delete_message(conversation_id, message_id.clone(), DeleteScope::Everyone)
-            .await;
+        left.delete_message(
+            conversation_id.clone(),
+            message_id.clone(),
+            DeleteScope::Everyone,
+        )
+        .await;
         wait_for_direct_deletion(&mut right, &message_id).await?;
+        wait_for_deletion_ack(&mut left, &conversation_id, &message_id).await?;
 
         left_router.shutdown().await?;
         right_router.shutdown().await?;
@@ -4062,7 +4712,7 @@ mod tests {
             byte_len: image.len() as u64,
             width: 1,
             height: 1,
-            hash: image_hash,
+            hash: image_hash.clone(),
             data: Some(Arc::new(image.clone())),
         };
         let message = ChatMessage::new_with_attachments(
@@ -4071,9 +4721,10 @@ mod tests {
             vec![attachment],
         );
         let message_id = message.message_id.clone();
-        left.send_message(conversation_id, message).await;
+        left.send_message(conversation_id.clone(), message).await;
 
         wait_for_attachment(&mut right, &message_id, &image).await?;
+        wait_for_attachment_ack(&mut left, &conversation_id, &image_hash).await?;
 
         left_router.shutdown().await?;
         right_router.shutdown().await?;
@@ -4123,6 +4774,9 @@ mod tests {
         assert!(parsed.messages.is_empty());
         assert!(parsed.receipts.is_empty());
         assert!(parsed.deletions.is_empty());
+        assert!(parsed.attachment_acks.is_empty());
+        assert!(parsed.deletion_acks.is_empty());
+        assert!(parsed.accepted_history_epoch.is_none());
         assert!(parsed.ticket.is_none());
 
         let author = SecretKey::from_bytes(&[7; 32]).public();
@@ -4138,15 +4792,23 @@ mod tests {
             messages: vec![message.clone()],
             receipts: vec![receipt],
             deletions: vec![deletion],
+            attachment_acks: vec!["hash".to_owned()],
+            deletion_acks: vec![message.message_id.clone()],
+            accepted_history_epoch: Some(2),
         };
         let encoded = serde_json::to_value(&full).unwrap();
         assert_eq!(encoded["messages"][0]["body"], "fast");
         assert_eq!(encoded["receipts"][0]["message_id"], message.message_id);
         assert_eq!(encoded["deletions"][0]["message_id"], message.message_id);
+        assert_eq!(encoded["attachment_acks"][0], "hash");
+        assert_eq!(encoded["accepted_history_epoch"], 2);
         let roundtrip: SyncRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(roundtrip.messages.len(), 1);
         assert_eq!(roundtrip.receipts.len(), 1);
         assert_eq!(roundtrip.deletions.len(), 1);
+        assert_eq!(roundtrip.attachment_acks.len(), 1);
+        assert_eq!(roundtrip.deletion_acks.len(), 1);
+        assert_eq!(roundtrip.accepted_history_epoch, Some(2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4185,6 +4847,7 @@ mod tests {
         left.clear_history(conversation_id.clone()).await;
         wait_for_history_epoch(&mut left, &conversation_id, 1).await?;
         wait_for_history_epoch(&mut right, &conversation_id, 1).await?;
+        wait_for_invite_ack(&mut left, &conversation_id).await?;
 
         let left_stored = left.index.conversations[&conversation_id].clone();
         let right_stored = right.index.conversations[&conversation_id].clone();
