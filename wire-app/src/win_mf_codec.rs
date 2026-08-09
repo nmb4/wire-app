@@ -13,7 +13,9 @@ use wire::video::VideoConfig;
 
 use std::sync::Arc;
 
-use crate::win_mf_d3d::{enumerate_adapters, GpuNv12Frames, GpuVideoProcessor, MfD3d};
+use crate::win_mf_d3d::{
+    enumerate_adapters, GpuNv12Frames, GpuVideoProcessor, GpuVideoProcessorOutput, MfD3d,
+};
 use crate::yuv_convert::{bgra_to_nv12, nv12_to_rgba};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Texture2D, D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET,
@@ -1659,6 +1661,7 @@ impl MfH264Encoder {
                 self.width,
                 self.height,
                 (10_000_000i64 / self.frame_duration.max(1)) as u32,
+                GpuVideoProcessorOutput::Nv12StudioRange,
             )?;
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: self.width,

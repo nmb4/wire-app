@@ -24,7 +24,7 @@ use windows_capture::settings::{ColorFormat, CursorCaptureSettings, DrawBorderSe
 use windows_capture::window::Window;
 
 use crate::screen_capture::{CaptureTarget, CaptureTargetKind};
-use crate::win_mf_d3d::{GpuVideoProcessor, MfD3d};
+use crate::win_mf_d3d::{GpuVideoProcessor, GpuVideoProcessorOutput, MfD3d};
 
 const FRAME_QUEUE_DEPTH: usize = 1;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
@@ -117,6 +117,7 @@ impl GpuPreviewScaler {
             output_width,
             output_height,
             5,
+            GpuVideoProcessorOutput::BgraFullRange,
         )?;
         let base = D3D11_TEXTURE2D_DESC {
             Width: output_width,

@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
@@ -418,6 +418,21 @@ pub struct GpuVideoProcessor {
     dst_rect: RECT,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuVideoProcessorOutput {
+    BgraFullRange,
+    Nv12StudioRange,
+}
+
+impl GpuVideoProcessorOutput {
+    fn color_space(self) -> DXGI_COLOR_SPACE_TYPE {
+        match self {
+            Self::BgraFullRange => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            Self::Nv12StudioRange => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+        }
+    }
+}
+
 impl GpuVideoProcessor {
     pub fn new(
         d3d: &MfD3d,
@@ -426,6 +441,7 @@ impl GpuVideoProcessor {
         dst_width: u32,
         dst_height: u32,
         framerate: u32,
+        output: GpuVideoProcessorOutput,
     ) -> Result<Self> {
         let video_device: ID3D11VideoDevice = d3d.device.cast()?;
         let video_context: ID3D11VideoContext = d3d.context.cast()?;
@@ -445,8 +461,9 @@ impl GpuVideoProcessor {
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc)? };
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
-        // WGC supplies full-range RGB. The encoder consumes studio-range NV12;
-        // specifying both sides prevents driver-dependent range selection.
+        // WGC supplies full-range RGB. Keep BGRA preview output full-range, but
+        // convert encoder-bound NV12 output to studio range. This processor is
+        // shared by both paths, so the output contract must be explicit.
         if let Ok(context1) = video_context.cast::<ID3D11VideoContext1>() {
             unsafe {
                 context1.VideoProcessorSetStreamColorSpace1(
@@ -454,10 +471,7 @@ impl GpuVideoProcessor {
                     0,
                     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                 );
-                context1.VideoProcessorSetOutputColorSpace1(
-                    &processor,
-                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-                );
+                context1.VideoProcessorSetOutputColorSpace1(&processor, output.color_space());
             }
         }
         let (fit_width, fit_height) = crate::screen_capture::aspect_fit_dimensions(
@@ -575,5 +589,22 @@ impl GpuVideoProcessor {
             result.context("running D3D11 video processor blit")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processor_outputs_keep_preview_full_range_and_encoder_studio_range() {
+        assert_eq!(
+            GpuVideoProcessorOutput::BgraFullRange.color_space(),
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+        );
+        assert_eq!(
+            GpuVideoProcessorOutput::Nv12StudioRange.color_space(),
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
+        );
     }
 }
