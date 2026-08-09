@@ -428,12 +428,18 @@ struct SyncRequest {
     /// a docs pull of the recipient's receipt entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     receipts: Vec<ReplicatedReceipt>,
+    /// Optional author tombstones for immediate delete-for-everyone updates.
+    /// The durable source remains Iroh Docs; this fast path covers peers that
+    /// can receive our chat connection but cannot dial our Docs endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deletions: Vec<ReplicatedDeletion>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct WakePayload {
     messages: Vec<ChatMessage>,
     receipts: Vec<ReplicatedReceipt>,
+    deletions: Vec<ReplicatedDeletion>,
 }
 
 #[derive(Debug)]
@@ -717,6 +723,9 @@ pub struct ChatService {
     /// docs author (that would forge peer entries); merged into the timeline
     /// until `load_messages` sees the real replica.
     staged_inbound: BTreeMap<String, BTreeMap<String, ChatMessage>>,
+    /// Author-validated tombstones received over the chat ALPN before Docs
+    /// replication lands them. conversation_id -> message_id -> author_id.
+    staged_deletions: BTreeMap<String, BTreeMap<String, String>>,
     /// In-flight background wakes per conversation — prevents a losing race
     /// from parking deliveries as Queued right after a successful wake.
     wake_inflight: BTreeMap<String, u32>,
@@ -730,6 +739,8 @@ pub struct ChatService {
     blob_downloader: iroh_blobs::downloader::Downloader,
     #[cfg(test)]
     invite_attempts: AtomicU64,
+    #[cfg(test)]
+    direct_deletions_accepted: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -827,6 +838,7 @@ impl ChatService {
             pending_deliveries: BTreeMap::new(),
             pending_outbound: BTreeMap::new(),
             staged_inbound: BTreeMap::new(),
+            staged_deletions: BTreeMap::new(),
             wake_inflight: BTreeMap::new(),
             last_receipt_wake: BTreeMap::new(),
             wake_failures: BTreeMap::new(),
@@ -836,6 +848,8 @@ impl ChatService {
             blob_downloader,
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            direct_deletions_accepted: AtomicU64::new(0),
         };
         service.initialize().await;
         info!(
@@ -1294,6 +1308,7 @@ impl ChatService {
         WakePayload {
             messages,
             receipts: Vec::new(),
+            deletions: Vec::new(),
         }
     }
 
@@ -1656,9 +1671,11 @@ impl ChatService {
         if !request.receipts.is_empty() {
             self.apply_direct_receipts(&request.conversation_id, remote, &request.receipts);
         }
+        let accepted_deletions =
+            self.apply_direct_deletions(&request.conversation_id, remote, &request.deletions);
         // Publish first so staged bodies + receipts hit the UI immediately,
         // then nudge docs for durable multi-device sync.
-        if accepted_messages > 0 || !request.receipts.is_empty() {
+        if accepted_messages > 0 || !request.receipts.is_empty() || accepted_deletions > 0 {
             if let Err(error) = self.publish_timeline(&request.conversation_id).await {
                 warn!(
                     conversation = %log_id(&request.conversation_id),
@@ -1670,7 +1687,7 @@ impl ChatService {
             .pull_conversation(&request.conversation_id, request.ticket.as_deref())
             .await
         {
-            if accepted_messages == 0 && request.receipts.is_empty() {
+            if accepted_messages == 0 && request.receipts.is_empty() && accepted_deletions == 0 {
                 return Err(error);
             }
             warn!(
@@ -1680,6 +1697,44 @@ impl ChatService {
             );
         }
         Ok(())
+    }
+
+    fn apply_direct_deletions(
+        &mut self,
+        conversation_id: &str,
+        remote: NodeId,
+        deletions: &[ReplicatedDeletion],
+    ) -> u32 {
+        if !self.is_conversation_member(conversation_id, remote) {
+            return 0;
+        }
+        let remote_s = remote.to_string();
+        let staged = self
+            .staged_deletions
+            .entry(conversation_id.to_owned())
+            .or_default();
+        let mut accepted = 0u32;
+        for deletion in deletions.iter().take(128) {
+            if deletion.validate().is_err() {
+                continue;
+            }
+            let inserted = staged
+                .insert(deletion.message_id.clone(), remote_s.clone())
+                .is_none();
+            if inserted {
+                accepted += 1;
+                info!(
+                    conversation = %log_id(conversation_id),
+                    peer = %remote.fmt_short(),
+                    message = %log_id(&deletion.message_id),
+                    "accepted message deletion over ALPN fast path"
+                );
+            }
+        }
+        #[cfg(test)]
+        self.direct_deletions_accepted
+            .fetch_add(u64::from(accepted), Ordering::Relaxed);
+        accepted
     }
 
     async fn apply_attachment_push(&mut self, remote: NodeId, push: AttachmentPush) -> Result<()> {
@@ -1780,14 +1835,16 @@ impl ChatService {
         scope: DeleteScope,
     ) {
         let result = match scope {
-            DeleteScope::Local => self.delete_message_locally(&conversation_id, &message_id),
-            DeleteScope::Everyone => {
-                self.insert_replicated_deletion(&conversation_id, &message_id)
-                    .await
-            }
+            DeleteScope::Local => self
+                .delete_message_locally(&conversation_id, &message_id)
+                .map(|()| None),
+            DeleteScope::Everyone => self
+                .insert_replicated_deletion(&conversation_id, &message_id)
+                .await
+                .map(Some),
         };
         match result {
-            Ok(()) => {
+            Ok(deletion) => {
                 info!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
@@ -1798,6 +1855,12 @@ impl ChatService {
                     self.queued.push_back(ChatNotification::Error(format!(
                         "Could not refresh deleted message: {error:#}"
                     )));
+                }
+                if let Some(deletion) = deletion {
+                    let mut payload = self.wake_payload_for(&conversation_id);
+                    payload.deletions.push(deletion);
+                    self.spawn_doc_sync(&conversation_id);
+                    self.spawn_wake_with(&conversation_id, payload);
                 }
             }
             Err(error) => {
@@ -1942,6 +2005,30 @@ impl ChatService {
         }
     }
 
+    fn merge_staged_deletions(&mut self, conversation_id: &str, messages: &mut [ChatMessage]) {
+        let Some(staged) = self.staged_deletions.get_mut(conversation_id) else {
+            return;
+        };
+        staged.retain(|message_id, author_id| {
+            let Some(message) = messages
+                .iter_mut()
+                .find(|message| message.message_id == *message_id)
+            else {
+                return true;
+            };
+            if message.deletion == Some(MessageDeletion::Everyone) {
+                return false;
+            }
+            if message.author_id == *author_id {
+                message.deletion = Some(MessageDeletion::Everyone);
+            }
+            true
+        });
+        if staged.is_empty() {
+            self.staged_deletions.remove(conversation_id);
+        }
+    }
+
     async fn hydrate_attachment_bytes(&self, messages: &mut [ChatMessage]) -> Result<()> {
         for message in messages {
             for attachment in &mut message.attachments {
@@ -1979,6 +2066,7 @@ impl ChatService {
             self.pending_outbound.remove(&message_id);
         }
         self.staged_inbound.remove(conversation_id);
+        self.staged_deletions.remove(conversation_id);
         self.retry_state.remove(conversation_id);
         self.attachment_retries
             .retain(|_, retry| retry.conversation_id != conversation_id);
@@ -2298,6 +2386,7 @@ impl ChatService {
             .context("unknown conversation")?;
         let mut messages = self.load_messages(&stored).await?;
         self.merge_staged_inbound(id, &mut messages);
+        self.merge_staged_deletions(id, &mut messages);
         self.hydrate_attachment_bytes(&mut messages).await?;
         self.request_missing_attachments(id, &messages).await;
         for message in &messages {
@@ -2864,7 +2953,7 @@ impl ChatService {
         &self,
         conversation_id: &str,
         message_id: &str,
-    ) -> Result<()> {
+    ) -> Result<ReplicatedDeletion> {
         if !is_message_id(message_id) {
             bail!("invalid message id");
         }
@@ -2905,7 +2994,7 @@ impl ChatService {
             serde_json::to_vec(&deletion)?,
         )
         .await?;
-        Ok(())
+        Ok(deletion)
     }
 
     async fn insert_message(&self, conversation_id: &str, message: &ChatMessage) -> Result<()> {
@@ -3018,6 +3107,7 @@ async fn send_sync_request(
             client_version: Some(crate::APP_VERSION.to_owned()),
             messages: payload.messages,
             receipts: payload.receipts,
+            deletions: payload.deletions,
         }),
     )
     .await
@@ -3274,6 +3364,7 @@ fn log_chat_packet_sent(peer: NodeId, packet: &ChatProtocolMessage, reused: bool
                 reused,
                 messages = request.messages.len(),
                 receipts = request.receipts.len(),
+                deletions = request.deletions.len(),
                 "chat delivery wake-up sent"
             );
         }
@@ -3747,6 +3838,63 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_direct_deletion(service: &mut ChatService, message_id: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let notification = service.next_notification().await;
+                let arrived_over_chat =
+                    service.direct_deletions_accepted.load(Ordering::Relaxed) > 0;
+                let visible = matches!(
+                    notification,
+                    ChatNotification::Conversation { ref messages, .. }
+                        if messages.iter().any(|message| {
+                            message.message_id == message_id
+                                && message.deletion == Some(MessageDeletion::Everyone)
+                        })
+                );
+                if arrived_over_chat && visible {
+                    return;
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for direct message deletion")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_for_everyone_is_pushed_over_sender_connection() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("wire_app=debug,iroh_docs=info")
+            .with_test_writer()
+            .try_init();
+        let temp = tempfile::tempdir()?;
+        let left_secret = SecretKey::from_bytes(&[31; 32]);
+        let right_secret = SecretKey::from_bytes(&[32; 32]);
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&temp.path().join("left"), left_secret).await?;
+        let (right_endpoint, right_router, mut right) =
+            spawn_test_node(&temp.path().join("right"), right_secret).await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        let outbound = ChatMessage::new(left_endpoint.node_id(), "delete me".to_owned());
+        let message_id = outbound.message_id.clone();
+        left.send_message(conversation_id.clone(), outbound).await;
+        wait_for_body(&mut right, "delete me").await?;
+
+        left.delete_message(conversation_id, message_id.clone(), DeleteScope::Everyone)
+            .await;
+        wait_for_direct_deletion(&mut right, &message_id).await?;
+
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_exchange_and_reload_messages_without_calls() -> Result<()> {
         let _ = tracing_subscriber::fmt()
@@ -3974,11 +4122,13 @@ mod tests {
         let parsed: SyncRequest = serde_json::from_str(legacy).unwrap();
         assert!(parsed.messages.is_empty());
         assert!(parsed.receipts.is_empty());
+        assert!(parsed.deletions.is_empty());
         assert!(parsed.ticket.is_none());
 
         let author = SecretKey::from_bytes(&[7; 32]).public();
         let message = ChatMessage::new(author, "fast".to_owned());
         let receipt = ReplicatedReceipt::new(message.message_id.clone());
+        let deletion = ReplicatedDeletion::new(message.message_id.clone());
         let full = SyncRequest {
             kind: "sync-request".to_owned(),
             version: 1,
@@ -3987,13 +4137,16 @@ mod tests {
             client_version: Some("0.4.15".to_owned()),
             messages: vec![message.clone()],
             receipts: vec![receipt],
+            deletions: vec![deletion],
         };
         let encoded = serde_json::to_value(&full).unwrap();
         assert_eq!(encoded["messages"][0]["body"], "fast");
         assert_eq!(encoded["receipts"][0]["message_id"], message.message_id);
+        assert_eq!(encoded["deletions"][0]["message_id"], message.message_id);
         let roundtrip: SyncRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(roundtrip.messages.len(), 1);
         assert_eq!(roundtrip.receipts.len(), 1);
+        assert_eq!(roundtrip.deletions.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
