@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TY
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
-    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
     D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_WRITE, D3D11_SDK_VERSION,
     D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA,
@@ -21,7 +21,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
     D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+    DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
@@ -442,6 +445,21 @@ impl GpuVideoProcessor {
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc)? };
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+        // WGC supplies full-range RGB. The encoder consumes studio-range NV12;
+        // specifying both sides prevents driver-dependent range selection.
+        if let Ok(context1) = video_context.cast::<ID3D11VideoContext1>() {
+            unsafe {
+                context1.VideoProcessorSetStreamColorSpace1(
+                    &processor,
+                    0,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                );
+                context1.VideoProcessorSetOutputColorSpace1(
+                    &processor,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+                );
+            }
+        }
         let (fit_width, fit_height) = crate::screen_capture::aspect_fit_dimensions(
             src_width, src_height, dst_width, dst_height,
         );

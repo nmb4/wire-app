@@ -24,7 +24,7 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                     let b = row[i] as i32;
                     let g = row[i + 1] as i32;
                     let r = row[i + 2] as i32;
-                    *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
+                    *y_out = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
                 }
             });
 
@@ -43,8 +43,8 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                     let i0 = x * 4;
                     let i1 = i0 + 4;
                     let (r, g, b) = avg_rgb(row0, i0, row1, i1);
-                    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-                    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                    let u = (((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                    let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
                     uv_row[x] = u;
                     uv_row[x + 1] = v;
                 }
@@ -61,7 +61,7 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                 let b = row[i] as i32;
                 let g = row[i + 1] as i32;
                 let r = row[i + 2] as i32;
-                *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
+                *y_out = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
             }
         }
 
@@ -77,8 +77,8 @@ pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
                 let i0 = x * 4;
                 let i1 = i0 + 4;
                 let (r, g, b) = avg_rgb(row0, i0, row1, i1);
-                let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-                let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                let u = (((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
                 uv_row[x] = u;
                 uv_row[x + 1] = v;
             }
@@ -124,7 +124,7 @@ pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
             out,
             width * 4,
             YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
+            YuvStandardMatrix::Bt709,
             YuvConversionMode::Balanced,
         )
         .expect("validated NV12 frame dimensions");
@@ -149,10 +149,12 @@ fn convert_nv12_rows(
     for x in (0..width).step_by(2) {
         let u = uv_row[x] as i32 - 128;
         let v = uv_row[x + 1] as i32 - 128;
-        let rv = (1436 * v) >> 10;
-        let gu = (352 * u) >> 10;
-        let gv = (731 * v) >> 10;
-        let bu = (1814 * u) >> 10;
+        // BT.709 limited-range YCbCr. NV12 luma uses 16 for black and 235
+        // for white, so expand that range while converting to full-range RGB.
+        let rv = 1836 * v;
+        let gu = 218 * u;
+        let gv = 546 * v;
+        let bu = 2163 * u;
 
         for dy in 0..2 {
             let py = y + dy;
@@ -166,11 +168,11 @@ fn convert_nv12_rows(
                 if px >= width {
                     continue;
                 }
-                let y_val = y_row[px] as i32;
+                let y_val = 1192 * (y_row[px] as i32 - 16);
                 let i = px * 4;
-                out_row[i] = (y_val + rv).clamp(0, 255) as u8;
-                out_row[i + 1] = (y_val - gu - gv).clamp(0, 255) as u8;
-                out_row[i + 2] = (y_val + bu).clamp(0, 255) as u8;
+                out_row[i] = ((y_val + rv) >> 10).clamp(0, 255) as u8;
+                out_row[i + 1] = ((y_val - gu - gv) >> 10).clamp(0, 255) as u8;
+                out_row[i + 2] = ((y_val + bu) >> 10).clamp(0, 255) as u8;
                 out_row[i + 3] = 255;
             }
         }
@@ -179,7 +181,19 @@ fn convert_nv12_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::nv12_to_rgba;
+    use super::{bgra_to_nv12, nv12_to_rgba};
+
+    #[test]
+    fn bgra_to_nv12_uses_limited_range_endpoints() {
+        for (channel, expected_y) in [(0u8, 16u8), (255u8, 235u8)] {
+            let bgra = [channel, channel, channel, 255].repeat(4);
+            let mut nv12 = [0u8; 6];
+            bgra_to_nv12(&bgra, 2, 2, &mut nv12);
+            assert_eq!(&nv12[..4], &[expected_y; 4]);
+            assert!(nv12[4].abs_diff(128) <= 1);
+            assert!(nv12[5].abs_diff(128) <= 1);
+        }
+    }
 
     #[test]
     fn nv12_limited_range_maps_black_and_white() {

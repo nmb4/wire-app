@@ -645,6 +645,12 @@ fn negotiate_output_type(
             output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
             output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             output_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+            // Every NV12 producer in Wire emits video/studio-range samples
+            // (Y=16..235, Cb/Cr=16..240). Keep that range in the H.264 VUI so
+            // receivers do not normalize the luma a second time and darken it.
+            let _ =
+                output_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+            let _ = output_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
         }
 
         if unsafe { transform.SetOutputType(stream_id, &output_type, 0) }.is_ok() {
@@ -661,6 +667,8 @@ fn negotiate_output_type(
         true,
     )?;
     unsafe {
+        let _ = output_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+        let _ = output_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
         transform.SetOutputType(stream_id, &output_type, 0)?;
     }
     Ok(())
@@ -697,7 +705,8 @@ fn negotiate_input_type(
             let _ = input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width);
             let _ = input_type.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1);
             let _ = input_type.SetUINT32(&MF_MT_SAMPLE_SIZE, nv12_buffer_size(width, height));
-            let _ = input_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32);
+            let _ =
+                input_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
             let _ = input_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
         }
 
@@ -712,6 +721,8 @@ fn negotiate_input_type(
         input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
         input_type.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
         input_type.SetUINT32(&MF_MT_SAMPLE_SIZE, nv12_buffer_size(width, height))?;
+        let _ = input_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+        let _ = input_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
         transform.SetInputType(stream_id, &input_type, 0)?;
     }
     Ok(())
@@ -1120,6 +1131,20 @@ fn configure_processor(
     let output_type = create_video_media_type(output, width, height, 30, None, false)?;
     let input_type = create_video_media_type(input, width, height, 30, None, false)?;
     unsafe {
+        let input_range = if input == MFVideoFormat_NV12 {
+            MFNominalRange_16_235
+        } else {
+            MFNominalRange_0_255
+        };
+        let output_range = if output == MFVideoFormat_NV12 {
+            MFNominalRange_16_235
+        } else {
+            MFNominalRange_0_255
+        };
+        let _ = input_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, input_range.0 as u32);
+        let _ = input_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+        let _ = output_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, output_range.0 as u32);
+        let _ = output_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
         transform.SetOutputType(0, &output_type, 0)?;
         transform.SetInputType(0, &input_type, 0)?;
         transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
