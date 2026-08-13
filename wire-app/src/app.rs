@@ -178,6 +178,7 @@ struct AppState {
     video_config: VideoConfig,
     calls: BTreeMap<NodeId, CallState>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
+    stream_volumes: BTreeMap<NodeId, VolumeHandle>,
     local_audio_level: Option<AudioLevelHandle>,
     remote_audio_levels: BTreeMap<NodeId, AudioLevelHandle>,
     rtts: BTreeMap<NodeId, Duration>,
@@ -187,6 +188,8 @@ struct AppState {
     stopped_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
     sharing_active: bool,
+    share_system_audio: bool,
+    system_audio_active: bool,
     capture_error: Option<String>,
     show_capture_picker: bool,
     capture_targets: Vec<crate::screen_capture::CaptureTarget>,
@@ -493,6 +496,8 @@ struct Settings {
     start_with_system: bool,
     #[serde(default)]
     show_system_usage: bool,
+    #[serde(default = "enabled_by_default")]
+    share_system_audio: bool,
 }
 
 fn default_ui_sound_volume() -> f32 {
@@ -513,6 +518,7 @@ impl Default for Settings {
             max_image_bytes: None,
             start_with_system: false,
             show_system_usage: false,
+            share_system_audio: true,
         }
     }
 }
@@ -643,6 +649,7 @@ impl App {
             video_config: settings.video,
             calls: Default::default(),
             volumes: Default::default(),
+            stream_volumes: Default::default(),
             local_audio_level: None,
             remote_audio_levels: Default::default(),
             rtts: Default::default(),
@@ -652,6 +659,8 @@ impl App {
             stopped_video_stream_generations: Default::default(),
             focused_stream: None,
             sharing_active: false,
+            share_system_audio: settings.share_system_audio,
+            system_audio_active: false,
             capture_error: None,
             show_capture_picker: false,
             capture_targets: Vec::new(),
@@ -1102,6 +1111,7 @@ impl AppState {
                     if matches!(call_state, CallState::Aborted) {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
+                        self.stream_volumes.remove(&node_id);
                         self.remote_audio_levels.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
@@ -1118,6 +1128,7 @@ impl AppState {
                         self.cmd(Command::ToggleSharing {
                             enabled: false,
                             target: None,
+                            share_system_audio: false,
                         });
                     }
 
@@ -1144,6 +1155,7 @@ impl AppState {
                         self.cmd(Command::ToggleSharing {
                             enabled: true,
                             target: None,
+                            share_system_audio: self.share_system_audio,
                         });
                         if let Some(cycles) = std::env::var("WIRE_DEV_SHARE_TOGGLE_CYCLES")
                             .ok()
@@ -1158,6 +1170,7 @@ impl AppState {
                                         .send_blocking(Command::ToggleSharing {
                                             enabled: false,
                                             target: None,
+                                            share_system_audio: false,
                                         })
                                         .is_err()
                                     {
@@ -1169,6 +1182,7 @@ impl AppState {
                                             .send_blocking(Command::ToggleSharing {
                                                 enabled: true,
                                                 target: None,
+                                                share_system_audio: true,
                                             })
                                             .is_err()
                                         {
@@ -1186,9 +1200,11 @@ impl AppState {
                 Event::ParticipantAudioHandles {
                     node_id,
                     volume,
+                    stream_volume,
                     level,
                 } => {
                     self.volumes.insert(node_id, volume);
+                    self.stream_volumes.insert(node_id, stream_volume);
                     self.remote_audio_levels.insert(node_id, level);
                 }
                 Event::SetRtt(node_id, rtt) => {
@@ -1307,14 +1323,22 @@ impl AppState {
                         );
                     }
                 }
-                Event::SharingToggled(active) => {
+                Event::SharingToggled {
+                    active,
+                    system_audio,
+                } => {
                     self.sharing_active = active;
+                    self.system_audio_active = active && system_audio;
                     if active {
                         self.capture_error = None;
                         self.notifications.success(
                             "screen-sharing",
                             "Screen sharing started",
-                            "Your screen is now visible to the call.",
+                            if system_audio {
+                                "Your screen and computer sound are now in the call."
+                            } else {
+                                "Your screen is now visible to the call."
+                            },
                         );
                     } else {
                         self.notifications.info(
@@ -1330,8 +1354,20 @@ impl AppState {
                         }
                     }
                 }
+                Event::SystemAudioToggled(active) => {
+                    self.system_audio_active = active && self.sharing_active;
+                }
+                Event::SystemAudioFailed(message) => {
+                    self.system_audio_active = false;
+                    self.notifications.error(
+                        "system-audio-error",
+                        "Could not share computer sound",
+                        message,
+                    );
+                }
                 Event::SharingFailed(message) => {
                     self.sharing_active = false;
+                    self.system_audio_active = false;
                     self.preview = None;
                     self.notifications.error(
                         "screen-sharing-error",
@@ -1619,7 +1655,19 @@ impl AppState {
         self.cmd(Command::ToggleSharing {
             enabled: false,
             target: None,
+            share_system_audio: false,
         });
+    }
+
+    fn set_share_system_audio_from_ui(&mut self, enabled: bool) {
+        if self.share_system_audio == enabled && self.system_audio_active == enabled {
+            return;
+        }
+        self.share_system_audio = enabled;
+        self.persist_settings();
+        if self.sharing_active {
+            self.cmd(Command::SetSystemAudio { enabled });
+        }
     }
 
     fn toggle_sharing_from_ui(&mut self) {
@@ -1637,6 +1685,7 @@ impl AppState {
         let mut start = false;
         let mut cancel = false;
         let mut refresh = false;
+        let mut share_system_audio = self.share_system_audio;
         let (picker_width, picker_body_height, use_columns) =
             capture_picker_layout(ctx.content_rect().size());
 
@@ -1652,7 +1701,7 @@ impl AppState {
             .show(ctx, |ui| {
                 ui.set_width(picker_width);
                 ui.label(
-                    RichText::new("Choose exactly what people in this call can see.")
+                    RichText::new("Choose exactly what people in this call can see and hear.")
                         .color(pal.text2),
                 );
                 ui.add_space(14.0);
@@ -1705,7 +1754,9 @@ impl AppState {
                     );
                 }
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
+                system_audio_share_row(ui, pal, &mut share_system_audio);
+                ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1749,12 +1800,17 @@ impl AppState {
             });
 
         self.selected_capture_target = selected;
+        if self.share_system_audio != share_system_audio {
+            self.share_system_audio = share_system_audio;
+            self.persist_settings();
+        }
         if start {
             if let Some(target) = selected.and_then(|index| targets.get(index)).cloned() {
                 self.play_control_sound(true);
                 self.cmd(Command::ToggleSharing {
                     enabled: true,
                     target: Some(target),
+                    share_system_audio: self.share_system_audio,
                 });
                 self.show_capture_picker = false;
             }
@@ -1835,6 +1891,7 @@ impl AppState {
 
     fn stream_label(&self, source: StreamSource) -> String {
         match source {
+            StreamSource::Local if self.system_audio_active => "You · audio".to_string(),
             StreamSource::Local => "You".to_string(),
             StreamSource::Remote(node_id) => self.peer_display_name(node_id),
         }
@@ -1924,6 +1981,7 @@ impl AppState {
             max_image_bytes: self.max_image_bytes,
             start_with_system: self.saved_start_with_system,
             show_system_usage: self.show_system_usage,
+            share_system_audio: self.share_system_audio,
         });
     }
 
@@ -3830,17 +3888,24 @@ impl AppState {
                             {
                                 self.resume_watching(node_id);
                             }
-                            if let Some(volume) = self.volumes.get(&node_id) {
-                                let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
-                                if ui
-                                    .add_sized(
-                                        [48.0, PARTICIPANT_ACTION_HEIGHT],
-                                        egui::Slider::new(&mut value, 0.0..=2.0).show_value(false),
-                                    )
-                                    .on_hover_text("Peer volume")
-                                    .changed()
-                                {
-                                    volume.store(value.to_bits(), Ordering::Relaxed);
+                            if let Some(volume) = self.volumes.get(&node_id).cloned() {
+                                peer_volume_slider(
+                                    ui,
+                                    &volume,
+                                    48.0,
+                                    PARTICIPANT_ACTION_HEIGHT,
+                                    "Voice volume",
+                                );
+                            }
+                            if is_streaming {
+                                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                                    peer_volume_slider(
+                                        ui,
+                                        &volume,
+                                        48.0,
+                                        PARTICIPANT_ACTION_HEIGHT,
+                                        "Stream volume",
+                                    );
                                 }
                             }
                             if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
@@ -3881,9 +3946,13 @@ impl AppState {
                             );
                             if self.sharing_active {
                                 ui.label(
-                                    RichText::new("· sharing")
-                                        .color(pal.accent)
-                                        .size(ui_font_size(11.5)),
+                                    RichText::new(if self.system_audio_active {
+                                        "· sharing audio"
+                                    } else {
+                                        "· sharing"
+                                    })
+                                    .color(pal.accent)
+                                    .size(ui_font_size(11.5)),
                                 );
                             }
                         });
@@ -3909,9 +3978,13 @@ impl AppState {
                                 ui.spacing_mut().item_spacing.x = 7.0;
                                 dot(ui, pal.accent, 6.0);
                                 ui.label(
-                                    RichText::new("Sharing screen")
-                                        .color(pal.text2)
-                                        .size(ui_font_size(12.0)),
+                                    RichText::new(if self.system_audio_active {
+                                        "Sharing screen + audio"
+                                    } else {
+                                        "Sharing screen"
+                                    })
+                                    .color(pal.text2)
+                                    .size(ui_font_size(12.0)),
                                 );
                             });
                         });
@@ -4118,7 +4191,9 @@ impl AppState {
                     })
                     .inner;
                 if share_response
-                    .on_hover_text(if self.sharing_active {
+                    .on_hover_text(if self.sharing_active && self.system_audio_active {
+                        "Stop sharing your screen and computer sound"
+                    } else if self.sharing_active {
                         "Stop sharing"
                     } else if !in_call {
                         "Join a call before sharing your screen"
@@ -4337,15 +4412,13 @@ impl AppState {
                                     .size(ui_font_size(11.0)),
                             );
                         }
-                        if let Some(volume) = self.volumes.get(&node_id) {
-                            let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
-                            ui.add_sized(
-                                [56.0, 18.0],
-                                egui::Slider::new(&mut value, 0.0..=2.0)
-                                    .show_value(false)
-                                    .max_decimals(1),
-                            );
-                            volume.store(value.to_bits(), Ordering::Relaxed);
+                        if let Some(volume) = self.volumes.get(&node_id).cloned() {
+                            peer_volume_slider(ui, &volume, 56.0, 18.0, "Voice volume");
+                        }
+                        if self.video_frames.contains_key(&node_id) {
+                            if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                                peer_volume_slider(ui, &volume, 56.0, 18.0, "Stream volume");
+                            }
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if action_button(ui, pal, "End", ButtonTone::Danger).clicked() {
@@ -4862,17 +4935,25 @@ impl AppState {
                         });
 
                         if matches!(state, CallState::Active) {
-                            if let Some(volume) = self.volumes.get(&node_id) {
-                                let mut vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                            if let Some(volume) = self.volumes.get(&node_id).cloned() {
                                 ui.horizontal(|ui| {
-                                    ui.label("Volume");
-                                    ui.add(
-                                        egui::Slider::new(&mut vol, 0.0..=2.0)
-                                            .show_value(false)
-                                            .fixed_decimals(1),
-                                    );
+                                    ui.label("Voice");
+                                    peer_volume_slider(ui, &volume, 120.0, 18.0, "Voice volume");
                                 });
-                                volume.store(vol.to_bits(), Ordering::Relaxed);
+                            }
+                            if self.video_frames.contains_key(&node_id) {
+                                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Stream");
+                                        peer_volume_slider(
+                                            ui,
+                                            &volume,
+                                            120.0,
+                                            18.0,
+                                            "Stream volume",
+                                        );
+                                    });
+                                }
                             }
                             if let Some(rtt) = self.rtts.get(&node_id) {
                                 ui.label(rtt_label(*rtt));
@@ -5383,7 +5464,9 @@ impl AppState {
                     StreamSource::Remote(node_id) => Some(node_id),
                     StreamSource::Local => None,
                 };
-                let button_count = 1 + usize::from(stop_node.is_some());
+                let local_audio = matches!(source, StreamSource::Local);
+                let button_count =
+                    1 + usize::from(stop_node.is_some()) + usize::from(local_audio);
                 let group_size = Vec2::new(
                     PAD * 2.0
                         + BTN * button_count as f32
@@ -5428,6 +5511,31 @@ impl AppState {
                     self.focused_stream = if expanded { None } else { Some(source) };
                 }
 
+                if local_audio {
+                    origin.x += BTN + GAP;
+                    let audio_rect = egui::Rect::from_min_size(origin, Vec2::splat(BTN));
+                    let audio_on = self.system_audio_active;
+                    if stream_tile_group_icon_button(
+                        ui,
+                        pal,
+                        audio_rect,
+                        ui.id().with(("stream_tile_audio", source)),
+                        if audio_on {
+                            Icon::Volume2
+                        } else {
+                            Icon::VolumeX
+                        },
+                        if audio_on {
+                            "Stop sharing computer sound"
+                        } else {
+                            "Also share computer sound"
+                        },
+                    )
+                    .clicked()
+                    {
+                        self.set_share_system_audio_from_ui(!audio_on);
+                    }
+                }
                 if let Some(node_id) = stop_node {
                     origin.x += BTN + GAP;
                     let stop_rect = egui::Rect::from_min_size(origin, Vec2::splat(BTN));
@@ -5442,6 +5550,38 @@ impl AppState {
                     .clicked()
                     {
                         self.stop_watching(node_id);
+                    }
+                }
+            }
+
+            if let StreamSource::Remote(node_id) = source {
+                if tile_rect.width() >= 240.0 {
+                    if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                        const MARGIN: f32 = 8.0;
+                        let slider_size = Vec2::new(118.0, 26.0);
+                        let slider_rect = egui::Rect::from_min_size(
+                            tile_rect.right_bottom()
+                                + egui::vec2(-slider_size.x - MARGIN, -slider_size.y - MARGIN),
+                            slider_size,
+                        );
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(slider_rect), |ui| {
+                            ui.painter().rect(
+                                slider_rect,
+                                CornerRadius::same(8),
+                                overlay_fill,
+                                Stroke::new(1.0_f32, pal.line_br),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(char::from(Icon::Volume2))
+                                        .font(lucide(13.0))
+                                        .color(pal.text2),
+                                );
+                                peer_volume_slider(ui, &volume, 84.0, 18.0, "Stream volume");
+                            });
+                        });
                     }
                 }
             }
@@ -5982,6 +6122,22 @@ impl AppState {
                                             }
                                         }
                                     });
+
+                                ui.add_space(10.0);
+                                if ui
+                                    .checkbox(
+                                        &mut self.share_system_audio,
+                                        RichText::new("Also share system audio")
+                                            .color(pal.text2)
+                                            .size(ui_font_size(12.0)),
+                                    )
+                                    .on_hover_text(
+                                        "When you share a screen, send this computer's sound to the call",
+                                    )
+                                    .changed()
+                                {
+                                    self.set_share_system_audio_from_ui(self.share_system_audio);
+                                }
 
                                 #[cfg(windows)]
                                 {
@@ -6672,8 +6828,115 @@ fn aspect_fit_rect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
 
 fn capture_picker_layout(viewport: Vec2) -> (f32, f32, bool) {
     let width = (viewport.x - 56.0).clamp(280.0, 820.0);
-    let body_height = (viewport.y - 190.0).clamp(180.0, 390.0);
+    let body_height = (viewport.y - 250.0).clamp(160.0, 360.0);
     (width, body_height, width >= 560.0)
+}
+
+fn peer_volume_slider(
+    ui: &mut Ui,
+    volume: &VolumeHandle,
+    width: f32,
+    height: f32,
+    hover: &str,
+) {
+    let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
+    if ui
+        .add_sized(
+            [width, height],
+            egui::Slider::new(&mut value, 0.0..=2.0).show_value(false),
+        )
+        .on_hover_text(hover)
+        .changed()
+    {
+        volume.store(value.to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn system_audio_share_row(ui: &mut Ui, pal: &Palette, enabled: &mut bool) {
+    let response = Frame::new()
+        .fill(if *enabled {
+            pal.accent_dim
+        } else {
+            chat_surface(pal)
+        })
+        .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .stroke(Stroke::new(
+            1.0_f32,
+            if *enabled {
+                pal.accent.gamma_multiply(0.7)
+            } else {
+                chat_hairline(pal)
+            },
+        ))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let icon_rect = ui
+                    .allocate_exact_size(Vec2::splat(28.0), egui::Sense::hover())
+                    .0;
+                ui.painter()
+                    .rect_filled(icon_rect, CornerRadius::same(8), pal.panel2);
+                ui.painter().text(
+                    icon_rect.center(),
+                    Align2::CENTER_CENTER,
+                    char::from(if *enabled {
+                        Icon::Volume2
+                    } else {
+                        Icon::VolumeX
+                    }),
+                    lucide(14.0),
+                    if *enabled { pal.accent } else { pal.dim },
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Also share system audio")
+                            .color(pal.text)
+                            .size(ui_font_size(12.5)),
+                    );
+                    ui.label(
+                        RichText::new("People in this call will hear this computer.")
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (check_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+                    ui.painter().rect(
+                        check_rect,
+                        CornerRadius::same(5),
+                        if *enabled {
+                            pal.accent
+                        } else {
+                            pal.panel
+                        },
+                        Stroke::new(
+                            1.0_f32,
+                            if *enabled { pal.accent } else { pal.line_br },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    if *enabled {
+                        ui.painter().text(
+                            check_rect.center(),
+                            Align2::CENTER_CENTER,
+                            char::from(Icon::Check),
+                            lucide(12.0),
+                            pal.bg,
+                        );
+                    }
+                });
+            });
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Share the sound this computer is playing, not just your microphone");
+    if response.clicked() {
+        *enabled = !*enabled;
+    }
 }
 
 fn capture_target_column(
@@ -7362,15 +7625,15 @@ mod layout_tests {
     fn capture_picker_adapts_to_compact_viewports() {
         assert_eq!(
             capture_picker_layout(Vec2::new(1200.0, 900.0)),
-            (820.0, 390.0, true)
+            (820.0, 360.0, true)
         );
         assert_eq!(
             capture_picker_layout(Vec2::new(600.0, 500.0)),
-            (544.0, 310.0, false)
+            (544.0, 250.0, false)
         );
         assert_eq!(
             capture_picker_layout(Vec2::new(420.0, 360.0)),
-            (364.0, 180.0, false)
+            (364.0, 160.0, false)
         );
     }
 
@@ -7467,6 +7730,7 @@ mod layout_tests {
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
         assert!(!settings.start_with_system);
         assert!(!settings.show_system_usage);
+        assert!(settings.share_system_audio);
         assert_eq!(settings.ui_sound_volume, 1.0);
     }
 
@@ -7553,6 +7817,7 @@ enum Event {
     ParticipantAudioHandles {
         node_id: NodeId,
         volume: VolumeHandle,
+        stream_volume: VolumeHandle,
         level: AudioLevelHandle,
     },
     SetRtt(NodeId, Duration),
@@ -7570,7 +7835,12 @@ enum Event {
         generation: u64,
         reason: VideoStreamEndReason,
     },
-    SharingToggled(bool),
+    SharingToggled {
+        active: bool,
+        system_audio: bool,
+    },
+    SystemAudioToggled(bool),
+    SystemAudioFailed(String),
     SharingFailed(String),
     PreviewFrame {
         width: u32,
@@ -7673,6 +7943,10 @@ enum Command {
     ToggleSharing {
         enabled: bool,
         target: Option<crate::screen_capture::CaptureTarget>,
+        share_system_audio: bool,
+    },
+    SetSystemAudio {
+        enabled: bool,
     },
     SetWatching {
         node_id: NodeId,
@@ -7733,6 +8007,7 @@ struct Worker {
     event_tx: Sender<Event>,
     active_calls: BTreeMap<NodeId, CallInfo>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
+    stream_volumes: BTreeMap<NodeId, VolumeHandle>,
     update_callback: Option<UpdateCallback>,
     endpoint: Endpoint,
     handler: RtcProtocol,
@@ -7759,6 +8034,7 @@ struct Worker {
     capture_failure_rx: async_channel::Receiver<String>,
     capture_idle_trim_task: Option<tokio::task::JoinHandle<()>>,
     sharing_active: bool,
+    system_audio: Option<crate::system_audio::SystemAudioShare>,
     capture_target: Option<crate::screen_capture::CaptureTarget>,
     muted: bool,
     deafened: bool,
@@ -7887,6 +8163,7 @@ impl Worker {
             event_tx,
             active_calls: Default::default(),
             volumes: Default::default(),
+            stream_volumes: Default::default(),
             call_tasks: JoinSet::new(),
             connect_tasks: JoinSet::new(),
             track_tasks: JoinSet::new(),
@@ -7913,6 +8190,7 @@ impl Worker {
             capture_failure_rx,
             capture_idle_trim_task: None,
             sharing_active: false,
+            system_audio: None,
             capture_target: None,
             muted: false,
             deafened: false,
@@ -7973,6 +8251,7 @@ impl Worker {
                     self.call_generations.remove(&node_id);
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
+                    self.stream_volumes.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
@@ -8087,6 +8366,7 @@ impl Worker {
                 self.active_calls.remove(&node_id);
                 self.call_generations.remove(&node_id);
                 self.volumes.remove(&node_id);
+                self.stream_volumes.remove(&node_id);
                 self.cleanup_after_call_end().await;
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
@@ -8134,11 +8414,14 @@ impl Worker {
     ) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let stream_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
+        self.stream_volumes.insert(node_id, stream_volume.clone());
         self.emit(Event::ParticipantAudioHandles {
             node_id,
             volume: volume.clone(),
+            stream_volume: stream_volume.clone(),
             level: level.clone(),
         })
         .await?;
@@ -8152,6 +8435,7 @@ impl Worker {
             .context("missing audio context")?;
 
         self.ensure_video_streams(node_id, conn.clone()).await;
+        let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
         self.call_tasks.spawn(async move {
@@ -8159,12 +8443,33 @@ impl Worker {
 
             let fut = async {
                 audio_context
-                    .play_track_with_volume_and_level(track, volume, level)
+                    .play_track_with_volume_and_level(track, volume.clone(), level.clone())
                     .await?;
                 let capture_track = audio_context.capture_track().await?;
                 audio_conn.send_track(capture_track).await?;
-                #[allow(clippy::redundant_pattern_matching)]
-                while let Some(_) = audio_conn.recv_track().await? {}
+                if let Some(system_audio_track) = system_audio_track {
+                    audio_conn.send_track(system_audio_track).await?;
+                }
+                while let Some(remote_track) = audio_conn.recv_track().await? {
+                    info!(
+                        "new remote track: {:?} {:?}",
+                        remote_track.kind(),
+                        remote_track.codec()
+                    );
+                    match remote_track.kind() {
+                        TrackKind::Audio => {
+                            audio_context
+                                .play_track_with_volume(remote_track, stream_volume.clone())
+                                .await?;
+                        }
+                        TrackKind::Video => {
+                            warn!(
+                                node = %node_id.fmt_short(),
+                                "ignored unexpected RTC video track"
+                            );
+                        }
+                    }
+                }
                 anyhow::Ok(())
             };
             let res = fut.await;
@@ -8177,11 +8482,14 @@ impl Worker {
     async fn accept_from_accept(&mut self, conn: RtcConnection, generation: u64) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let stream_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
+        self.stream_volumes.insert(node_id, stream_volume.clone());
         self.emit(Event::ParticipantAudioHandles {
             node_id,
             volume: volume.clone(),
+            stream_volume: stream_volume.clone(),
             level: level.clone(),
         })
         .await?;
@@ -8195,6 +8503,7 @@ impl Worker {
             .context("missing audio context")?;
 
         self.ensure_video_streams(node_id, conn.clone()).await;
+        let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
         self.call_tasks.spawn(async move {
@@ -8203,7 +8512,11 @@ impl Worker {
             let fut = async {
                 let capture_track = audio_context.capture_track().await?;
                 audio_conn.send_track(capture_track).await?;
+                if let Some(system_audio_track) = system_audio_track {
+                    audio_conn.send_track(system_audio_track).await?;
+                }
                 info!("added capture track to rtc connection");
+                let mut first_audio = true;
                 while let Some(remote_track) = audio_conn.recv_track().await? {
                     info!(
                         "new remote track: {:?} {:?}",
@@ -8212,13 +8525,20 @@ impl Worker {
                     );
                     match remote_track.kind() {
                         TrackKind::Audio => {
-                            audio_context
-                                .play_track_with_volume_and_level(
-                                    remote_track,
-                                    volume.clone(),
-                                    level.clone(),
-                                )
-                                .await?;
+                            if first_audio {
+                                first_audio = false;
+                                audio_context
+                                    .play_track_with_volume_and_level(
+                                        remote_track,
+                                        volume.clone(),
+                                        level.clone(),
+                                    )
+                                    .await?;
+                            } else {
+                                audio_context
+                                    .play_track_with_volume(remote_track, stream_volume.clone())
+                                    .await?;
+                            }
                         }
                         // Video uses the dedicated framed transport below. A
                         // malformed/older peer must not crash the call worker by
@@ -8308,6 +8628,45 @@ impl Worker {
         for (node_id, _, send) in tasks {
             await_video_send_stop(node_id, send).await;
         }
+    }
+
+    async fn start_system_audio(&mut self) {
+        if self.system_audio.is_some() {
+            return;
+        }
+        match crate::system_audio::SystemAudioShare::start() {
+            Ok(share) => {
+                if let Err(error) = self.send_system_audio_track(&share.track()).await {
+                    warn!("could not send system audio to active calls: {error:#}");
+                    self.emit(Event::SystemAudioFailed(error.to_string()))
+                        .await
+                        .ok();
+                    return;
+                }
+                self.system_audio = Some(share);
+            }
+            Err(error) => {
+                warn!("system audio capture failed to start: {error:#}");
+                self.emit(Event::SystemAudioFailed(error.to_string()))
+                    .await
+                    .ok();
+            }
+        }
+    }
+
+    async fn send_system_audio_track(&self, track: &MediaTrack) -> Result<()> {
+        let active: Vec<_> = self
+            .active_calls
+            .iter()
+            .filter_map(|(_, info)| match info {
+                CallInfo::Active(conn) => Some(conn.clone()),
+                _ => None,
+            })
+            .collect();
+        for conn in active {
+            conn.send_track(track.clone()).await?;
+        }
+        Ok(())
     }
 
     async fn attach_video_to_active_calls(&mut self) {
@@ -8471,6 +8830,7 @@ impl Worker {
         }
         warn!("screen capture pipeline failed after startup: {message}");
         self.sharing_active = false;
+        self.system_audio = None;
         self.capture_target = None;
         self.finish_all_video_send().await;
         self.stop_capture_pipeline().await;
@@ -8480,9 +8840,15 @@ impl Worker {
 
     async fn stop_capture(&mut self) {
         self.sharing_active = false;
+        self.system_audio = None;
         self.capture_target = None;
         self.finish_all_video_send().await;
-        let _ = self.emit(Event::SharingToggled(false)).await;
+        let _ = self
+            .emit(Event::SharingToggled {
+                active: false,
+                system_audio: false,
+            })
+            .await;
         self.stop_capture_pipeline().await;
         self.schedule_idle_working_set_trim();
     }
@@ -8529,13 +8895,18 @@ impl Worker {
                     if let Err(error) = self.start_capture() {
                         warn!("screen capture restart failed: {error:#}");
                         self.sharing_active = false;
+                        self.system_audio = None;
                         self.capture_target = None;
                         self.finish_all_video_send().await;
                         self.emit(Event::SharingFailed(error.to_string())).await?;
                     }
                 }
             }
-            Command::ToggleSharing { enabled, target } => {
+            Command::ToggleSharing {
+                enabled,
+                target,
+                share_system_audio,
+            } => {
                 if enabled && !self.sharing_active {
                     if let Err(error) = crate::screen_capture::ensure_capture_permission() {
                         warn!("screen sharing permission unavailable: {error:#}");
@@ -8547,15 +8918,41 @@ impl Worker {
                     if let Err(error) = self.start_capture() {
                         warn!("screen capture failed to start: {error:#}");
                         self.sharing_active = false;
+                        self.system_audio = None;
                         self.capture_target = None;
                         self.emit(Event::SharingFailed(error.to_string())).await?;
                         return Ok(());
                     }
                     let _ = self.keyframe_tx.send(());
                     self.attach_video_to_active_calls().await;
-                    self.emit(Event::SharingToggled(true)).await?;
+                    if share_system_audio {
+                        self.start_system_audio().await;
+                    } else {
+                        self.system_audio = None;
+                    }
+                    self.emit(Event::SharingToggled {
+                        active: true,
+                        system_audio: self.system_audio.is_some(),
+                    })
+                    .await?;
                 } else if !enabled && self.sharing_active {
                     self.stop_capture().await;
+                }
+            }
+            Command::SetSystemAudio { enabled } => {
+                if !self.sharing_active {
+                    self.system_audio = None;
+                    self.emit(Event::SystemAudioToggled(false)).await?;
+                    return Ok(());
+                }
+                if enabled {
+                    if self.system_audio.is_none() {
+                        self.start_system_audio().await;
+                    }
+                    self.emit(Event::SystemAudioToggled(self.system_audio.is_some()))
+                        .await?;
+                } else if self.system_audio.take().is_some() {
+                    self.emit(Event::SystemAudioToggled(false)).await?;
                 }
             }
             Command::SetWatching {
@@ -8689,6 +9086,7 @@ impl Worker {
                         }
                     }
                     self.volumes.remove(&node_id);
+                    self.stream_volumes.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     match state {

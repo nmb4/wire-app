@@ -9,6 +9,7 @@ mod notifications;
 mod persistence;
 mod resource_monitor;
 mod sounds;
+mod system_audio;
 mod title_bar;
 pub mod window_frame;
 /// The application version embedded at compile time from this package's Cargo manifest.

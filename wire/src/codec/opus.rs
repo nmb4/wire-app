@@ -265,15 +265,43 @@ pub struct MediaTrackOpusEncoder {
 impl MediaTrackOpusEncoder {
     pub fn new(
         track_channel_cap: usize,
+        audio_format: AudioFormat,
+        quality: AudioQuality,
+    ) -> Result<(Self, MediaTrack)> {
+        Self::new_with_application(
+            track_channel_cap,
+            audio_format,
+            quality,
+            opus::Application::Voip,
+        )
+    }
+
+    /// Encode full-band stereo content such as shared system audio.
+    pub fn new_for_content(
+        track_channel_cap: usize,
+        audio_format: AudioFormat,
+        quality: AudioQuality,
+    ) -> Result<(Self, MediaTrack)> {
+        Self::new_with_application(
+            track_channel_cap,
+            audio_format,
+            quality,
+            opus::Application::Audio,
+        )
+    }
+
+    fn new_with_application(
+        track_channel_cap: usize,
         _audio_format: AudioFormat,
         quality: AudioQuality,
+        application: opus::Application,
     ) -> Result<(Self, MediaTrack)> {
         let (sender, receiver) = broadcast::channel(track_channel_cap);
         let channels = quality.channels();
         let track = MediaTrack::new(receiver, Codec::Opus { channels }, TrackKind::Audio);
         let encoder = MediaTrackOpusEncoder {
             sender,
-            encoder: OpusEncoder::new(quality),
+            encoder: OpusEncoder::new_with_application(quality, application),
         };
         Ok((encoder, track))
     }
@@ -312,11 +340,14 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     pub fn new(quality: AudioQuality) -> Self {
+        Self::new_with_application(quality, opus::Application::Voip)
+    }
+
+    pub fn new_with_application(quality: AudioQuality, application: opus::Application) -> Self {
         let channels = quality.channels();
         let sample_rate = quality.sample_rate();
         let format = AudioFormat::new2(sample_rate, channels as u16);
-        let mut encoder =
-            opus::Encoder::new(sample_rate, channels.into(), opus::Application::Voip).unwrap();
+        let mut encoder = opus::Encoder::new(sample_rate, channels.into(), application).unwrap();
         encoder
             .set_bitrate(opus::Bitrate::Bits(quality.bitrate()))
             .ok();

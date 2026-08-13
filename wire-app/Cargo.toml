@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.5.16"
+version = "0.5.18"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -52,6 +52,7 @@ rfd = "0.15"
 sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.61"
 clipboard-win = "5.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 raw-window-handle = "0.6"
@@ -68,8 +69,10 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_Performance",
     "Win32_System_ProcessStatus",

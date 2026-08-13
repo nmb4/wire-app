@@ -41,6 +41,7 @@ pub struct CaptureTarget {
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
+    pub pid: Option<u32>,
 }
 
 pub fn list_capture_targets() -> Result<Vec<CaptureTarget>> {
@@ -63,6 +64,7 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>> {
             width,
             height,
             is_primary: monitor.is_primary().unwrap_or(false),
+            pid: None,
         });
     }
 
@@ -93,6 +95,7 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>> {
                     width,
                     height,
                     is_primary: false,
+                    pid: window.pid().ok().filter(|pid| *pid != 0),
                 });
             }
         }
@@ -1154,6 +1157,7 @@ mod preview_tests {
                 width: 1200,
                 height: 800,
                 is_primary: false,
+                pid: Some(100),
             },
             CaptureTarget {
                 kind: CaptureTargetKind::Display,
@@ -1162,6 +1166,7 @@ mod preview_tests {
                 width: 2560,
                 height: 1440,
                 is_primary: false,
+                pid: None,
             },
             CaptureTarget {
                 kind: CaptureTargetKind::Display,
@@ -1170,6 +1175,7 @@ mod preview_tests {
                 width: 1920,
                 height: 1080,
                 is_primary: true,
+                pid: None,
             },
             CaptureTarget {
                 kind: CaptureTargetKind::Window,
@@ -1178,6 +1184,7 @@ mod preview_tests {
                 width: 1200,
                 height: 800,
                 is_primary: false,
+                pid: Some(100),
             },
         ];
 
@@ -1224,6 +1231,7 @@ mod preview_tests {
             width: window.width().unwrap(),
             height: window.height().unwrap(),
             is_primary: false,
+            pid: window.pid().ok(),
         };
         let mut source = super::init_xcap_source(640, 360, Some(&target)).unwrap();
         let frame = super::capture_frame(&mut source, 640, 360).unwrap();
