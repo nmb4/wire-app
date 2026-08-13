@@ -21,6 +21,7 @@ pub const CLIENT_STATUS_ALPN: &[u8] = b"wire/client-status/1";
 const MAX_PACKET_BYTES: usize = 4 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const SHUTDOWN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +121,15 @@ impl ClientStatusProtocol {
                 let _ = update_tx.send(update).await;
             });
         }
+    }
+
+    pub fn refresh_allowed_peers(&self) {
+        let peers = self
+            .allowed_peers
+            .read()
+            .expect("client status peer lock poisoned")
+            .clone();
+        self.announce_online(peers);
     }
 
     pub async fn broadcast_offline(&self) {

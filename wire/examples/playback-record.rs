@@ -4,20 +4,20 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use wire::{
-    codec::{
-        opus::{OpusChannels, OpusEncoder, OPUS_SAMPLE_RATE},
-        Codec,
-    },
-    net::bind_endpoint,
-    rtc::{MediaFrame, MediaTrack, RtcConnection, RtcProtocol, TrackKind},
-};
 use clap::Parser;
 use cpal::Sample;
 use hound::{WavReader, WavWriter};
 use iroh::protocol::Router;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+use wire::{
+    codec::{
+        opus::{AudioQuality, OpusChannels, OpusEncoder, OPUS_SAMPLE_RATE},
+        Codec,
+    },
+    net::bind_endpoint,
+    rtc::{MediaFrame, MediaTrack, RtcConnection, RtcProtocol, TrackKind},
+};
 
 #[derive(Debug, Parser, Clone)]
 struct Args {
@@ -168,7 +168,11 @@ fn stream_wav(file_path: PathBuf, sender: broadcast::Sender<MediaFrame>) -> Resu
                 OPUS_SAMPLE_RATE
             )
         }
-        let mut encoder = OpusEncoder::new(channels);
+        let quality = match channels {
+            OpusChannels::Mono => AudioQuality::Medium,
+            OpusChannels::Stereo => AudioQuality::High,
+        };
+        let mut encoder = OpusEncoder::new(quality);
         info!("wav info: {:?}", reader.spec());
         let start = Instant::now();
         let time_per_sample = Duration::from_secs(1) / 48_000;
@@ -193,7 +197,7 @@ fn stream_wav(file_path: PathBuf, sender: broadcast::Sender<MediaFrame>) -> Resu
                 }
                 let music_time = time_per_sample * i as u32 / channels as u32;
                 let actual_time = start.elapsed();
-                let sleep_time = music_time - actual_time;
+                let sleep_time = music_time.saturating_sub(actual_time);
                 debug!("sleep {sleep_time:?}");
                 std::thread::sleep(sleep_time);
             }

@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler};
 use iroh_roq::{
@@ -116,7 +116,7 @@ pub async fn handle_connection_with_audio_context(
             TrackKind::Audio => {
                 audio_ctx.play_track(remote_track).await?;
             }
-            TrackKind::Video => unimplemented!(),
+            TrackKind::Video => bail!("audio-only connection helper received a video track"),
         }
     }
     Ok(())

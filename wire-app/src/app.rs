@@ -18,7 +18,7 @@ use iroh::{endpoint::VarInt, protocol::Router, Endpoint, KeyParsingError, NodeId
 use lucide_icons::Icon;
 use tokio::task::JoinSet;
 use tokio::time;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wire::{
     audio::{AudioConfig, AudioContext, AudioLevelHandle, AudioQuality, VolumeHandle},
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
@@ -31,9 +31,13 @@ use crate::{
         self, ChatAttachment, ChatConversation, ChatMessage, ChatNotification, ConversationKind,
         DeleteScope, DeliveryState, MessageDeletion, RetentionPolicy,
     },
-    client_status::{Availability, ClientStatusProtocol, StatusUpdate, CLIENT_STATUS_ALPN},
+    client_status::{
+        Availability, ClientStatusProtocol, StatusUpdate, CLIENT_STATUS_ALPN,
+        PRESENCE_REFRESH_INTERVAL,
+    },
     dev_pair::DevPairState,
     notifications::{NotificationAction, NotificationService},
+    persistence,
     resource_monitor::ResourceMonitor,
     sounds::{Sound, Sounds},
     theme::*,
@@ -71,16 +75,21 @@ fn friends_path() -> Option<PathBuf> {
 }
 
 fn load_friends_from(path: &Path) -> Option<Vec<Friend>> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    match persistence::read_json(path) {
+        Ok(friends) => friends,
+        Err(error) => {
+            warn!(path = %path.display(), "could not load friends: {error:#}");
+            None
+        }
+    }
 }
 
 fn load_friends() -> Vec<Friend> {
     if let Some(path) = friends_path() {
         if let Some(friends) = load_friends_from(&path) {
-            if !friends.is_empty() {
-                return friends;
-            }
+            // An empty current file is intentional. Falling through here used to
+            // resurrect contacts from the legacy location on every restart.
+            return friends;
         }
     }
 
@@ -99,11 +108,8 @@ fn load_friends() -> Vec<Friend> {
 
 fn save_friends(friends: &[Friend]) {
     if let Some(path) = friends_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(contents) = serde_json::to_string_pretty(friends) {
-            let _ = std::fs::write(&path, contents);
+        if let Err(error) = persistence::write_json(&path, friends) {
+            warn!(path = %path.display(), "could not save friends: {error:#}");
         }
     }
 }
@@ -114,17 +120,19 @@ fn settings_path() -> Option<PathBuf> {
 
 fn load_settings() -> Option<Settings> {
     let path = settings_path()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    match persistence::read_json(&path) {
+        Ok(settings) => settings,
+        Err(error) => {
+            warn!(path = %path.display(), "could not load settings: {error:#}");
+            None
+        }
+    }
 }
 
 fn save_settings(settings: &Settings) {
     if let Some(path) = settings_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(contents) = serde_json::to_string_pretty(settings) {
-            let _ = std::fs::write(path, contents);
+        if let Err(error) = persistence::write_json(&path, settings) {
+            warn!(path = %path.display(), "could not save settings: {error:#}");
         }
     }
 }
@@ -243,7 +251,9 @@ struct ChatUiState {
     unseen: BTreeSet<String>,
     composer: String,
     draft_attachments: Vec<ChatAttachment>,
-    attachment_textures: BTreeMap<String, egui::TextureHandle>,
+    attachment_textures: AttachmentTextureCache,
+    attachment_requests: BTreeSet<String>,
+    conversations_with_older_messages: BTreeSet<String>,
     image_preview: Option<ImagePreview>,
     error: Option<String>,
     service_error: Option<String>,
@@ -252,6 +262,114 @@ struct ChatUiState {
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
     friend_candidate_name: String,
+}
+
+const MAX_ATTACHMENT_TEXTURES: usize = 128;
+const MAX_CACHED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHED_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
+
+struct AttachmentTextureEntry {
+    texture: egui::TextureHandle,
+    last_used: u64,
+    data: Option<Arc<Vec<u8>>>,
+    texture_bytes: usize,
+}
+
+#[derive(Default)]
+struct AttachmentTextureCache {
+    entries: BTreeMap<String, AttachmentTextureEntry>,
+    clock: u64,
+    data_bytes: usize,
+    texture_bytes: usize,
+}
+
+impl AttachmentTextureCache {
+    fn get_or_insert(
+        &mut self,
+        ctx: &egui::Context,
+        attachment: &ChatAttachment,
+    ) -> Option<&egui::TextureHandle> {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&attachment.id) {
+            entry.last_used = self.clock;
+        } else {
+            self.insert_data(ctx, attachment, attachment.data.as_ref()?.clone())?;
+        }
+        self.entries.get(&attachment.id).map(|entry| &entry.texture)
+    }
+
+    fn insert_data(
+        &mut self,
+        ctx: &egui::Context,
+        attachment: &ChatAttachment,
+        data: Arc<Vec<u8>>,
+    ) -> Option<()> {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&attachment.id) {
+            self.data_bytes = self
+                .data_bytes
+                .saturating_sub(entry.data.as_ref().map_or(0, |data| data.len()));
+            self.data_bytes = self.data_bytes.saturating_add(data.len());
+            entry.data = Some(data);
+            entry.last_used = self.clock;
+        } else {
+            let decoded = image::load_from_memory(&data).ok()?.to_rgba8();
+            let size = [decoded.width() as usize, decoded.height() as usize];
+            let pixels = decoded.into_raw();
+            if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
+                return None;
+            }
+            let texture_bytes = pixels.len();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            let texture = ctx.load_texture(
+                format!("chat-image-{}", attachment.id),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.data_bytes = self.data_bytes.saturating_add(data.len());
+            self.texture_bytes = self.texture_bytes.saturating_add(texture_bytes);
+            self.entries.insert(
+                attachment.id.clone(),
+                AttachmentTextureEntry {
+                    texture,
+                    last_used: self.clock,
+                    data: Some(data),
+                    texture_bytes,
+                },
+            );
+        }
+        while self.entries.len() > MAX_ATTACHMENT_TEXTURES
+            || self.texture_bytes > MAX_CACHED_TEXTURE_BYTES
+        {
+            let oldest = self.oldest_id(false)?;
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.data_bytes = self
+                    .data_bytes
+                    .saturating_sub(entry.data.as_ref().map_or(0, |data| data.len()));
+                self.texture_bytes = self.texture_bytes.saturating_sub(entry.texture_bytes);
+            }
+        }
+        while self.data_bytes > MAX_CACHED_ATTACHMENT_BYTES {
+            let oldest = self.oldest_id(true)?;
+            let entry = self.entries.get_mut(&oldest)?;
+            if let Some(data) = entry.data.take() {
+                self.data_bytes = self.data_bytes.saturating_sub(data.len());
+            }
+        }
+        Some(())
+    }
+
+    fn oldest_id(&self, require_data: bool) -> Option<String> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !require_data || entry.data.is_some())
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(id, _)| id.clone())
+    }
+
+    fn data(&self, id: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(id)?.data.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -585,6 +703,9 @@ impl App {
         }
         state.cmd(Command::SetMaxImageBytes {
             max_image_bytes: state.max_image_bytes,
+        });
+        state.cmd(Command::SetChatRetention {
+            retention: state.chat_retention,
         });
         state.sync_friends_with_worker();
 
@@ -1266,6 +1387,7 @@ impl AppState {
             ChatNotification::Conversation {
                 conversation,
                 messages,
+                has_more,
             } => {
                 let id = conversation.id.clone();
                 let known_messages = self.chat.timelines.get(&id).map(|timeline| {
@@ -1356,6 +1478,13 @@ impl AppState {
                 let mut timeline: Vec<_> = by_id.into_values().collect();
                 timeline.sort();
                 self.chat.timelines.insert(id.clone(), timeline);
+                if has_more {
+                    self.chat
+                        .conversations_with_older_messages
+                        .insert(id.clone());
+                } else {
+                    self.chat.conversations_with_older_messages.remove(&id);
+                }
                 if self.chat.selected.is_none() {
                     self.chat.selected = Some(id.clone());
                 }
@@ -1382,6 +1511,24 @@ impl AppState {
                             },
                         );
                     }
+                }
+            }
+            ChatNotification::AttachmentData { hash, data } => {
+                self.chat.attachment_requests.remove(&hash);
+                let attachment = self
+                    .chat
+                    .timelines
+                    .values()
+                    .flat_map(|timeline| timeline.iter())
+                    .flat_map(|message| message.attachments.iter())
+                    .find(|attachment| attachment.hash == hash)
+                    .cloned();
+                if let Some(attachment) = attachment {
+                    let _ = self.chat.attachment_textures.insert_data(
+                        ctx,
+                        &attachment,
+                        data,
+                    );
                 }
             }
             ChatNotification::Delivery {
@@ -1805,7 +1952,7 @@ impl AppState {
     }
 
     fn cmd(&self, command: Command) {
-        if self.worker.command_tx.send_blocking(command).is_err() {
+        if self.worker.command_tx.try_send(command).is_err() {
             warn!("ignored command because the Wire worker is unavailable");
         }
     }
@@ -2469,6 +2616,23 @@ impl AppState {
                 .fill(pal.bg)
                 .inner_margin(egui::Margin::symmetric(18, 8))
                 .show(ui, |ui| {
+                    if self
+                        .chat
+                        .conversations_with_older_messages
+                        .contains(&conversation.id)
+                    {
+                        ui.vertical_centered(|ui| {
+                            if ui.small_button("Load older messages").clicked() {
+                                self.chat
+                                    .conversations_with_older_messages
+                                    .remove(&conversation.id);
+                                self.cmd(Command::LoadOlderChatMessages {
+                                    conversation_id: conversation.id.clone(),
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
                     let timeline = self
                         .chat
                         .timelines
@@ -2695,6 +2859,7 @@ impl AppState {
                                     self.ui_message_attachments(
                                         ui,
                                         pal,
+                                        conversation_id,
                                         message,
                                         own,
                                         opacity,
@@ -2837,6 +3002,7 @@ impl AppState {
                                     self.ui_message_attachments(
                                         ui,
                                         pal,
+                                        conversation_id,
                                         message,
                                         own,
                                         opacity,
@@ -3079,6 +3245,7 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
+        conversation_id: &str,
         message: &ChatMessage,
         own: bool,
         opacity: f32,
@@ -3086,6 +3253,10 @@ impl AppState {
         requested_deletion: &mut Option<DeleteScope>,
     ) {
         for (index, attachment) in message.attachments.iter().enumerate() {
+            let mut downloadable_attachment = attachment.clone();
+            if downloadable_attachment.data.is_none() {
+                downloadable_attachment.data = self.chat.attachment_textures.data(&attachment.id);
+            }
             if index > 0 || !message.body.trim().is_empty() {
                 ui.add_space(6.0);
             }
@@ -3124,6 +3295,18 @@ impl AppState {
             let Some(texture) =
                 attachment_texture(ui.ctx(), &mut self.chat.attachment_textures, attachment)
             else {
+                if attachment.data.is_none()
+                    && self
+                        .chat
+                        .attachment_requests
+                        .insert(attachment.hash.clone())
+                {
+                    self.cmd(Command::LoadChatAttachment {
+                        conversation_id: conversation_id.to_owned(),
+                        hash: attachment.hash.clone(),
+                        byte_len: attachment.byte_len,
+                    });
+                }
                 let response = ui.label(
                     RichText::new(format!(
                         "Loading image… ({})",
@@ -3165,7 +3348,7 @@ impl AppState {
             response.context_menu(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 if menu_item_button(ui, pal, Icon::Download, "Download image", false).clicked() {
-                    save_chat_attachment(attachment);
+                    save_chat_attachment(&downloadable_attachment);
                     ui.close();
                 }
                 ui.separator();
@@ -5904,6 +6087,9 @@ impl AppState {
                                 self.cmd(Command::SetMaxImageBytes {
                                     max_image_bytes: self.max_image_bytes,
                                 });
+                                self.cmd(Command::SetChatRetention {
+                                    retention: self.chat_retention,
+                                });
                                 // Persist all regular settings immediately. The
                                 // startup preference is committed after the OS
                                 // integration succeeds on a background thread.
@@ -6059,23 +6245,10 @@ fn image_media_type(format: image::ImageFormat) -> &'static str {
 
 fn attachment_texture<'a>(
     ctx: &egui::Context,
-    textures: &'a mut BTreeMap<String, egui::TextureHandle>,
+    textures: &'a mut AttachmentTextureCache,
     attachment: &ChatAttachment,
 ) -> Option<&'a egui::TextureHandle> {
-    if !textures.contains_key(&attachment.id) {
-        let data = attachment.data.as_ref()?;
-        let decoded = image::load_from_memory(data).ok()?.to_rgba8();
-        let size = [decoded.width() as usize, decoded.height() as usize];
-        let pixels = decoded.into_raw();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-        let texture = ctx.load_texture(
-            format!("chat-image-{}", attachment.id),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-        textures.insert(attachment.id.clone(), texture);
-    }
-    textures.get(&attachment.id)
+    textures.get_or_insert(ctx, attachment)
 }
 
 fn square_attachment_preview(
@@ -6111,9 +6284,13 @@ fn image_preview_panel(
     ui: &mut Ui,
     pal: &Palette,
     preview: &ImagePreview,
-    textures: &mut BTreeMap<String, egui::TextureHandle>,
+    textures: &mut AttachmentTextureCache,
 ) -> Option<ImagePreviewAction> {
     let mut action = None;
+    let mut downloadable_attachment = preview.attachment.clone();
+    if downloadable_attachment.data.is_none() {
+        downloadable_attachment.data = textures.data(&preview.attachment.id);
+    }
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format!(
@@ -6132,7 +6309,7 @@ fn image_preview_panel(
                 action = Some(ImagePreviewAction::Delete);
             }
             if toolbar_button(ui, pal, Icon::Download, "Download", false).clicked() {
-                save_chat_attachment(&preview.attachment);
+                save_chat_attachment(&downloadable_attachment);
             }
             if toolbar_button(
                 ui,
@@ -7520,8 +7697,19 @@ enum Command {
         conversation_id: String,
         message: ChatMessage,
     },
+    LoadChatAttachment {
+        conversation_id: String,
+        hash: String,
+        byte_len: u64,
+    },
+    LoadOlderChatMessages {
+        conversation_id: String,
+    },
     SetMaxImageBytes {
         max_image_bytes: Option<u64>,
+    },
+    SetChatRetention {
+        retention: RetentionPolicy,
     },
     SetFriends {
         friends: BTreeSet<NodeId>,
@@ -7548,12 +7736,17 @@ struct Worker {
     update_callback: Option<UpdateCallback>,
     endpoint: Endpoint,
     handler: RtcProtocol,
-    call_tasks: JoinSet<(NodeId, Result<()>)>,
-    connect_tasks: JoinSet<(NodeId, Result<RtcConnection>)>,
-    track_tasks: JoinSet<(NodeId, Result<MediaTrack>)>,
+    call_tasks: JoinSet<(NodeId, u64, Result<()>)>,
+    connect_tasks: JoinSet<(NodeId, u64, Result<RtcConnection>)>,
+    track_tasks: JoinSet<(NodeId, u64, Result<MediaTrack>)>,
+    incoming_tasks: JoinSet<(NodeId, u64)>,
+    connect_aborts: BTreeMap<NodeId, (u64, tokio::task::AbortHandle)>,
+    call_generations: BTreeMap<NodeId, u64>,
+    next_call_generation: u64,
     _router: Router,
     audio_context: Option<AudioContext>,
     rtt_interval: time::Interval,
+    presence_interval: time::Interval,
     video_config: VideoConfig,
     video_frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
     keyframe_tx: tokio::sync::broadcast::Sender<()>,
@@ -7561,6 +7754,9 @@ struct Worker {
     capture_thread: Option<std::thread::JoinHandle<()>>,
     capture_stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     capture_preview_task: Option<tokio::task::JoinHandle<()>>,
+    capture_failure_task: Option<tokio::task::JoinHandle<()>>,
+    capture_failure_tx: async_channel::Sender<String>,
+    capture_failure_rx: async_channel::Receiver<String>,
     capture_idle_trim_task: Option<tokio::task::JoinHandle<()>>,
     sharing_active: bool,
     capture_target: Option<crate::screen_capture::CaptureTarget>,
@@ -7578,6 +7774,9 @@ struct WorkerHandle {
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
+        // Wake a worker that is blocked publishing into a full event queue before
+        // waiting for its thread. The UI no longer drains this receiver in Drop.
+        self.event_rx.close();
         self.command_tx.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -7586,8 +7785,21 @@ impl Drop for WorkerHandle {
 }
 
 impl Worker {
+    fn begin_call(&mut self, node_id: NodeId) -> u64 {
+        self.next_call_generation = self.next_call_generation.wrapping_add(1).max(1);
+        let generation = self.next_call_generation;
+        self.call_generations.insert(node_id, generation);
+        generation
+    }
+
+    fn call_is_current(&self, node_id: NodeId, generation: u64) -> bool {
+        self.call_generations.get(&node_id) == Some(&generation)
+    }
+
     pub fn spawn() -> WorkerHandle {
-        let (command_tx, command_rx) = async_channel::bounded(16);
+        // UI actions must never block the egui thread while the worker is busy
+        // stopping capture, dialing, or reconciling chat state.
+        let (command_tx, command_rx) = async_channel::unbounded();
         let (event_tx, event_rx) = async_channel::bounded(64);
         let thread = std::thread::spawn(move || {
             info!("Wire worker thread starting");
@@ -7669,6 +7881,7 @@ impl Worker {
         info!("Wire protocol router started");
         let (video_frame_tx, _) = tokio::sync::broadcast::channel(32);
         let (keyframe_tx, _) = tokio::sync::broadcast::channel(16);
+        let (capture_failure_tx, capture_failure_rx) = async_channel::unbounded();
         Ok(Self {
             command_rx,
             event_tx,
@@ -7677,12 +7890,17 @@ impl Worker {
             call_tasks: JoinSet::new(),
             connect_tasks: JoinSet::new(),
             track_tasks: JoinSet::new(),
+            incoming_tasks: JoinSet::new(),
+            connect_aborts: BTreeMap::new(),
+            call_generations: BTreeMap::new(),
+            next_call_generation: 0,
             endpoint,
             handler,
             _router,
             audio_context: None,
             update_callback: None,
             rtt_interval: time::interval(Duration::from_secs(1)),
+            presence_interval: time::interval(PRESENCE_REFRESH_INTERVAL),
             video_config: VideoConfig::default(),
             video_frame_tx,
             keyframe_tx,
@@ -7690,6 +7908,9 @@ impl Worker {
             capture_thread: None,
             capture_stop_flag: None,
             capture_preview_task: None,
+            capture_failure_task: None,
+            capture_failure_tx,
+            capture_failure_rx,
             capture_idle_trim_task: None,
             sharing_active: false,
             capture_target: None,
@@ -7735,13 +7956,21 @@ impl Worker {
                     };
                     self.handle_incoming(conn).await?;
                 }
-                Some(res) = self.call_tasks.join_next(), if !self.call_tasks.is_empty() => {
-                    let (node_id, res) = res.expect("connection task panicked");
+                Some(joined) = self.call_tasks.join_next(), if !self.call_tasks.is_empty() => {
+                    let Ok((node_id, generation, res)) = joined else {
+                        warn!("call task was cancelled or panicked");
+                        continue;
+                    };
+                    if !self.call_is_current(node_id, generation) {
+                        debug!(node = %node_id.fmt_short(), generation, "ignored stale call completion");
+                        continue;
+                    }
                     if let Err(err) = res {
                         warn!("connection with {} closed: {err:?}", node_id.fmt_short());
                     } else {
                         info!("connection with {} closed", node_id.fmt_short());
                     }
+                    self.call_generations.remove(&node_id);
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id).await;
@@ -7749,16 +7978,41 @@ impl Worker {
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;
                 }
-                Some(res) = self.connect_tasks.join_next(), if !self.connect_tasks.is_empty() => {
-                    let (node_id, res) = res.expect("connect task panicked");
-                    self.handle_quic_connected(node_id, res).await?;
+                Some(joined) = self.connect_tasks.join_next(), if !self.connect_tasks.is_empty() => {
+                    let Ok((node_id, generation, res)) = joined else {
+                        warn!("connect task was cancelled or panicked");
+                        continue;
+                    };
+                    if self.connect_aborts.get(&node_id).is_some_and(|(current, _)| *current == generation) {
+                        self.connect_aborts.remove(&node_id);
+                    }
+                    self.handle_quic_connected(node_id, generation, res).await?;
                 }
-                Some(res) = self.track_tasks.join_next(), if !self.track_tasks.is_empty() => {
-                    let (node_id, res) = res.expect("track task panicked");
-                    self.handle_track_received(node_id, res).await?;
+                Some(joined) = self.track_tasks.join_next(), if !self.track_tasks.is_empty() => {
+                    let Ok((node_id, generation, res)) = joined else {
+                        warn!("track task was cancelled or panicked");
+                        continue;
+                    };
+                    self.handle_track_received(node_id, generation, res).await?;
+                }
+                Some(joined) = self.incoming_tasks.join_next(), if !self.incoming_tasks.is_empty() => {
+                    let Ok((node_id, generation)) = joined else {
+                        continue;
+                    };
+                    if self.call_is_current(node_id, generation)
+                        && matches!(self.active_calls.get(&node_id), Some(CallInfo::Incoming(_)))
+                    {
+                        info!(node = %node_id.fmt_short(), generation, "incoming caller disconnected before acceptance");
+                        self.call_generations.remove(&node_id);
+                        self.active_calls.remove(&node_id);
+                        self.emit(Event::SetCallState(node_id, CallState::Aborted)).await?;
+                    }
                 }
                 _ = self.rtt_interval.tick() => {
                     self.query_rtts().await?;
+                }
+                _ = self.presence_interval.tick() => {
+                    self.client_status.refresh_allowed_peers();
                 }
                 input = self.chat.wait_input() => {
                     if let Some(notification) = self.chat.process_input(input).await {
@@ -7768,6 +8022,11 @@ impl Worker {
                 status = self.client_status.next_update() => {
                     self.emit(Event::ClientStatus(status?)).await?;
                 }
+                failure = self.capture_failure_rx.recv() => {
+                    if let Ok(message) = failure {
+                        self.handle_capture_failure(message).await;
+                    }
+                }
             }
         }
         Ok(())
@@ -7775,7 +8034,18 @@ impl Worker {
 
     async fn handle_incoming(&mut self, conn: RtcConnection) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
+        if self.active_calls.contains_key(&node_id) {
+            info!(node = %node_id.fmt_short(), "rejecting duplicate incoming call");
+            conn.transport().close(1u32.into(), b"call already active");
+            return Ok(());
+        }
+        let generation = self.begin_call(node_id);
         info!("incoming connection from {}", node_id.fmt_short());
+        let monitor = conn.clone();
+        self.incoming_tasks.spawn(async move {
+            let _ = monitor.transport().closed().await;
+            (node_id, generation)
+        });
         self.active_calls.insert(node_id, CallInfo::Incoming(conn));
         self.emit(Event::SetCallState(node_id, CallState::Incoming))
             .await?;
@@ -7785,8 +8055,18 @@ impl Worker {
     async fn handle_quic_connected(
         &mut self,
         node_id: NodeId,
+        generation: u64,
         conn: Result<RtcConnection>,
     ) -> Result<()> {
+        if !self.call_is_current(node_id, generation)
+            || !matches!(self.active_calls.get(&node_id), Some(CallInfo::Calling))
+        {
+            if let Ok(conn) = conn {
+                conn.transport().close(0u32.into(), b"stale call attempt");
+            }
+            debug!(node = %node_id.fmt_short(), generation, "ignored stale connect completion");
+            return Ok(());
+        }
         match conn {
             Ok(conn) => {
                 info!("quic connected to {}", node_id.fmt_short());
@@ -7799,12 +8079,13 @@ impl Worker {
                             .ok_or_else(|| anyhow!("connection closed without receiving a track"))
                     }
                     .await;
-                    (node_id, res)
+                    (node_id, generation, res)
                 });
             }
             Err(err) => {
                 warn!("connection to {} failed: {err:?}", node_id.fmt_short());
                 self.active_calls.remove(&node_id);
+                self.call_generations.remove(&node_id);
                 self.volumes.remove(&node_id);
                 self.cleanup_after_call_end().await;
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
@@ -7817,13 +8098,18 @@ impl Worker {
     async fn handle_track_received(
         &mut self,
         node_id: NodeId,
+        generation: u64,
         track: Result<MediaTrack>,
     ) -> Result<()> {
+        if !self.call_is_current(node_id, generation) {
+            debug!(node = %node_id.fmt_short(), generation, "ignored stale track completion");
+            return Ok(());
+        }
         let Some(CallInfo::Connecting(conn)) = self.active_calls.remove(&node_id) else {
             return Ok(());
         };
         match track {
-            Ok(track) => self.accept_from_connect(conn, track).await?,
+            Ok(track) => self.accept_from_connect(conn, track, generation).await?,
             Err(err) => {
                 warn!(
                     "failed to receive audio track from {}: {err:?}",
@@ -7832,6 +8118,7 @@ impl Worker {
                 self.remove_video_peer(node_id).await;
                 self.cleanup_after_call_end().await;
                 conn.transport().close(0u32.into(), b"bye");
+                self.call_generations.remove(&node_id);
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -7839,7 +8126,12 @@ impl Worker {
         Ok(())
     }
 
-    async fn accept_from_connect(&mut self, conn: RtcConnection, track: MediaTrack) -> Result<()> {
+    async fn accept_from_connect(
+        &mut self,
+        conn: RtcConnection,
+        track: MediaTrack,
+        generation: u64,
+    ) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
@@ -7877,12 +8169,12 @@ impl Worker {
             };
             let res = fut.await;
             info!("connection with {} closed: {:?}", node_id.fmt_short(), res);
-            (node_id, res)
+            (node_id, generation, res)
         });
         Ok(())
     }
 
-    async fn accept_from_accept(&mut self, conn: RtcConnection) -> Result<()> {
+    async fn accept_from_accept(&mut self, conn: RtcConnection, generation: u64) -> Result<()> {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
@@ -7928,14 +8220,19 @@ impl Worker {
                                 )
                                 .await?;
                         }
-                        TrackKind::Video => unimplemented!(),
+                        // Video uses the dedicated framed transport below. A
+                        // malformed/older peer must not crash the call worker by
+                        // advertising video as a generic RTC media track.
+                        TrackKind::Video => {
+                            warn!(node = %node_id.fmt_short(), "ignored unexpected RTC video track");
+                        }
                     }
                 }
                 anyhow::Ok(())
             };
             let res = fut.await;
             info!("connection with {} closed: {:?}", node_id.fmt_short(), res);
-            (node_id, res)
+            (node_id, generation, res)
         });
         Ok(())
     }
@@ -8098,7 +8395,7 @@ impl Worker {
             stale_task.abort();
         }
 
-        let thread = crate::screen_capture::start(
+        let pipeline = crate::screen_capture::start(
             config,
             self.capture_target.clone(),
             stop_flag.clone(),
@@ -8107,8 +8404,17 @@ impl Worker {
             self.keyframe_tx.clone(),
         )?;
 
-        self.capture_thread = Some(thread);
+        self.capture_thread = Some(pipeline.thread);
         self.capture_stop_flag = Some(stop_flag);
+        if let Some(stale_task) = self.capture_failure_task.take() {
+            stale_task.abort();
+        }
+        let failure_tx = self.capture_failure_tx.clone();
+        self.capture_failure_task = Some(tokio::spawn(async move {
+            if let Ok(message) = pipeline.failure_rx.recv().await {
+                let _ = failure_tx.send(message).await;
+            }
+        }));
         self.capture_preview_task = Some(tokio::task::spawn(async move {
             while let Ok(update) = preview_rx.recv().await {
                 let _ = event_tx
@@ -8152,7 +8458,24 @@ impl Worker {
             preview_task.abort();
             let _ = preview_task.await;
         }
+        if let Some(failure_task) = self.capture_failure_task.take() {
+            failure_task.abort();
+            let _ = failure_task.await;
+        }
         info!("screen capture pipeline fully stopped");
+    }
+
+    async fn handle_capture_failure(&mut self, message: String) {
+        if !self.sharing_active {
+            return;
+        }
+        warn!("screen capture pipeline failed after startup: {message}");
+        self.sharing_active = false;
+        self.capture_target = None;
+        self.finish_all_video_send().await;
+        self.stop_capture_pipeline().await;
+        self.schedule_idle_working_set_trim();
+        let _ = self.emit(Event::SharingFailed(message)).await;
     }
 
     async fn stop_capture(&mut self) {
@@ -8275,8 +8598,31 @@ impl Worker {
             } => {
                 self.chat.send_message(conversation_id, message).await;
             }
+            Command::LoadChatAttachment {
+                conversation_id,
+                hash,
+                byte_len,
+            } => {
+                if let Err(error) = self
+                    .chat
+                    .load_attachment_data(&conversation_id, &hash, byte_len)
+                    .await
+                {
+                    warn!("could not load chat attachment {hash}: {error:#}");
+                }
+            }
+            Command::LoadOlderChatMessages { conversation_id } => {
+                if let Err(error) = self.chat.load_older_messages(&conversation_id).await {
+                    warn!("could not load older chat messages: {error:#}");
+                }
+            }
             Command::SetMaxImageBytes { max_image_bytes } => {
                 self.chat.set_max_image_bytes(max_image_bytes);
+            }
+            Command::SetChatRetention { retention } => {
+                if let Err(error) = self.chat.set_retention_policy(retention).await {
+                    warn!("could not apply chat retention policy: {error:#}");
+                }
             }
             Command::SetFriends { friends } => {
                 self.client_status.replace_peers(friends.clone());
@@ -8304,21 +8650,29 @@ impl Worker {
                 if self.active_calls.contains_key(&node_id) {
                     return Ok(());
                 }
+                let generation = self.begin_call(node_id);
                 self.active_calls.insert(node_id, CallInfo::Calling);
                 self.emit(Event::SetCallState(node_id, CallState::Calling))
                     .await?;
 
                 let handler = self.handler.clone();
-                self.connect_tasks
-                    .spawn(async move { (node_id, handler.connect(node_id).await) });
+                let abort = self
+                    .connect_tasks
+                    .spawn(async move { (node_id, generation, handler.connect(node_id).await) });
+                self.connect_aborts.insert(node_id, (generation, abort));
             }
             Command::HandleIncoming { node_id, accept } => {
                 let Some(CallInfo::Incoming(conn)) = self.active_calls.remove(&node_id) else {
                     return Ok(());
                 };
+                let Some(generation) = self.call_generations.get(&node_id).copied() else {
+                    conn.transport().close(0u32.into(), b"stale incoming call");
+                    return Ok(());
+                };
                 if accept {
-                    self.accept_from_accept(conn).await?;
+                    self.accept_from_accept(conn, generation).await?;
                 } else {
+                    self.call_generations.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     conn.transport().close(0u32.into(), b"bye");
                     self.cleanup_after_call_end().await;
@@ -8328,6 +8682,12 @@ impl Worker {
             }
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
+                    let generation = self.call_generations.remove(&node_id);
+                    if let Some((task_generation, abort)) = self.connect_aborts.remove(&node_id) {
+                        if generation == Some(task_generation) {
+                            abort.abort();
+                        }
+                    }
                     self.volumes.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;

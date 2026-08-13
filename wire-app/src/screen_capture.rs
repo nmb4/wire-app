@@ -25,6 +25,7 @@ use crate::win_mf_codec::MfH264Encoder;
 const FRAME_CHANNEL_DEPTH: usize = 1;
 const PREVIEW_DIVISOR: u32 = 3;
 const PREVIEW_CHANNEL_DEPTH: usize = 1;
+const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureTargetKind {
@@ -140,6 +141,11 @@ pub struct PreviewUpdate {
     pub height: u32,
     pub actual_fps: f64,
     pub encode_time_ms: f64,
+}
+
+pub struct CapturePipeline {
+    pub thread: JoinHandle<()>,
+    pub failure_rx: async_channel::Receiver<String>,
 }
 
 struct PreviewInput {
@@ -265,11 +271,13 @@ pub fn start(
     encoded_tx: broadcast::Sender<Arc<EncodedVideoFrame>>,
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
-) -> Result<JoinHandle<()>> {
+) -> Result<CapturePipeline> {
     let target_w = config.resolution.width();
     let target_h = config.resolution.height();
     let target_interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+    let startup_stop = stop_flag.clone();
+    let (failure_tx, failure_rx) = async_channel::bounded(1);
 
     let handle = thread::spawn(move || {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<CaptureFrame>(FRAME_CHANNEL_DEPTH);
@@ -283,7 +291,7 @@ pub fn start(
         let capture_stop = stop_flag.clone();
         let capture_fps = config.framerate;
         let capture_handle = thread::spawn(move || {
-            if let Err(e) = run_capture_loop(
+            let result = run_capture_loop(
                 &capture_stop,
                 target_w,
                 target_h,
@@ -292,13 +300,15 @@ pub fn start(
                 target.as_ref(),
                 &frame_tx,
                 &startup_tx,
-            ) {
-                let _ = startup_tx.try_send(Err(format!("{e:#}")));
-                info!("capture thread stopped: {e:?}");
+            );
+            if let Err(error) = &result {
+                let _ = startup_tx.try_send(Err(format!("{error:#}")));
+                info!("capture thread stopped: {error:?}");
             }
+            result
         });
 
-        let encode_stop = stop_flag;
+        let encode_stop = stop_flag.clone();
         let encode_result = run_encode_loop(
             &encode_stop,
             config,
@@ -309,23 +319,39 @@ pub fn start(
             preview_input_tx,
             keyframe_tx,
         );
-        if let Err(e) = encode_result {
-            info!("encode thread stopped: {e:?}");
+        if let Err(error) = &encode_result {
+            info!("encode thread stopped: {error:?}");
         }
 
-        let _ = capture_handle.join();
+        let capture_result = capture_handle
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("screen capture thread panicked")));
         let _ = preview_handle.join();
+        if !stop_flag.load(Ordering::Relaxed) {
+            if let Some(error) = capture_result.err().or_else(|| encode_result.err()) {
+                let _ = failure_tx.send_blocking(format!("{error:#}"));
+            }
+        }
         info!("capture, encode, and preview threads exited");
     });
 
-    match startup_rx.recv() {
-        Ok(Ok(())) => Ok(handle),
+    match startup_rx.recv_timeout(CAPTURE_STARTUP_TIMEOUT) {
+        Ok(Ok(())) => Ok(CapturePipeline {
+            thread: handle,
+            failure_rx,
+        }),
         Ok(Err(message)) => {
             let _ = handle.join();
             anyhow::bail!(message);
         }
-        Err(_) => {
-            let _ = handle.join();
+        Err(RecvTimeoutError::Timeout) => {
+            startup_stop.store(true, Ordering::Relaxed);
+            anyhow::bail!(
+                "screen capture did not produce a frame within {:?}",
+                CAPTURE_STARTUP_TIMEOUT
+            );
+        }
+        Err(RecvTimeoutError::Disconnected) => {
             anyhow::bail!("screen capture stopped before producing its first frame");
         }
     }
@@ -1256,7 +1282,10 @@ mod preview_tests {
             let _receivers = (encoded_rx, preview_rx);
             std::thread::sleep(Duration::from_secs(2));
             stop.store(true, Ordering::Relaxed);
-            handle.join().expect("capture pipeline should stop cleanly");
+            handle
+                .thread
+                .join()
+                .expect("capture pipeline should stop cleanly");
             drop(_receivers);
             std::thread::sleep(Duration::from_millis(750));
             stopped_memory.push(working_set_bytes());

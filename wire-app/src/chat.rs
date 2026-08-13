@@ -9,13 +9,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::persistence;
 use anyhow::{bail, Context, Result};
 use futures_lite::StreamExt;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint, NodeAddr, NodeId};
 use iroh_blobs::{
     downloader::DownloadRequest,
     net_protocol::Blobs,
-    store::{fs::Store as BlobStore, Map, Store},
+    store::{fs::Store as BlobStore, GcConfig, Map, Store},
     BlobFormat, Hash, HashAndFormat, Tag,
 };
 use iroh_docs::{
@@ -25,7 +26,7 @@ use iroh_docs::{
         client::docs::{MemClient, ShareMode},
         AddrInfoOptions,
     },
-    store::Query,
+    store::{Query, SortBy, SortDirection},
     AuthorId, DocTicket, NamespaceId,
 };
 use iroh_gossip::net::Gossip;
@@ -48,6 +49,7 @@ const MAX_RETRY_SECONDS: u64 = 60;
 /// See `docs/chat-keepalive-sessions.md`.
 const CHAT_SESSION_IDLE: Duration = Duration::from_secs(60);
 const CHAT_SESSION_POOL_CAP: usize = 8;
+const CHAT_PEER_GATE_CAP: usize = 64;
 /// Half-open pooled sessions must fail fast — logs showed a hard ~3s floor on
 /// every send while waiting out a full stream timeout on a dead reuse.
 const CHAT_REUSE_TIMEOUT: Duration = Duration::from_millis(400);
@@ -66,6 +68,7 @@ const ATTACHMENT_RETRY_MAX: Duration = Duration::from_secs(60);
 /// information learned from later chat/status connections.
 const ATTACHMENT_DOWNLOAD_TIMEOUT_MIN: Duration = Duration::from_secs(10);
 const ATTACHMENT_DOWNLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(120);
+const CHAT_TIMELINE_PAGE: usize = 250;
 /// After this many consecutive failed probes, show Queued and switch to slow
 /// offline probes (see `delivery_retry_delay(..., offline=true)`).
 const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
@@ -351,6 +354,11 @@ pub enum ChatNotification {
     Conversation {
         conversation: ChatConversation,
         messages: Vec<ChatMessage>,
+        has_more: bool,
+    },
+    AttachmentData {
+        hash: String,
+        data: Arc<Vec<u8>>,
     },
     Delivery {
         message_id: String,
@@ -519,7 +527,7 @@ impl ProtocolHandler for ChatInviteProtocol {
             // Connect — chat ALPN often works while docs DirectJoin still has no
             // usable NodeAddr (see docs/chat-delivery-asymmetry.md).
             sessions.remember_connection(remote, &connection);
-            sessions.insert(remote, connection.clone()).await;
+            let pooled = sessions.insert(remote, connection.clone()).await;
             // Keep accepting bi-streams until idle so rapid chatter reuses this
             // session instead of dialing again (see docs/chat-keepalive-sessions.md).
             let mut idle = Box::pin(tokio::time::sleep(CHAT_SESSION_IDLE));
@@ -576,7 +584,9 @@ impl ProtocolHandler for ChatInviteProtocol {
             }
             // Forget the pool entry but do not force-close — the peer may still
             // be using this QUIC session for in-flight docs/blob traffic.
-            sessions.forget(remote).await;
+            if pooled {
+                sessions.forget_if(remote, &connection).await;
+            }
             Ok(())
         }
         .boxed()
@@ -619,6 +629,11 @@ impl ChatSessionPool {
 
     async fn peer_gate(&self, peer: NodeId) -> Arc<tokio::sync::Mutex<()>> {
         let mut guard = self.inner.lock().await;
+        if guard.peer_gates.len() >= CHAT_PEER_GATE_CAP {
+            guard
+                .peer_gates
+                .retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
         guard
             .peer_gates
             .entry(peer)
@@ -642,7 +657,7 @@ impl ChatSessionPool {
         }
     }
 
-    async fn insert(&self, peer: NodeId, connection: Connection) {
+    async fn insert(&self, peer: NodeId, connection: Connection) -> bool {
         self.remember_connection(peer, &connection);
         let mut guard = self.inner.lock().await;
         Self::sweep_locked(&mut guard.sessions);
@@ -653,7 +668,7 @@ impl ChatSessionPool {
             if let Some(session) = guard.sessions.get_mut(&peer) {
                 session.last_used = tokio::time::Instant::now();
             }
-            return;
+            return false;
         }
         guard.sessions.insert(
             peer,
@@ -663,6 +678,7 @@ impl ChatSessionPool {
             },
         );
         Self::evict_locked(&mut guard.sessions);
+        true
     }
 
     async fn touch(&self, peer: NodeId) {
@@ -682,14 +698,15 @@ impl ChatSessionPool {
     }
 
     /// Drop a pooled handle without closing the QUIC connection.
-    async fn forget(&self, peer: NodeId) {
-        self.inner.lock().await.sessions.remove(&peer);
-    }
-
-    /// Drop a pooled handle after a failed stream. Only close if this was our
-    /// pooled connection — never close a live peer session on a guess.
-    async fn invalidate(&self, peer: NodeId) {
-        self.inner.lock().await.sessions.remove(&peer);
+    async fn forget_if(&self, peer: NodeId, connection: &Connection) {
+        let mut guard = self.inner.lock().await;
+        if guard
+            .sessions
+            .get(&peer)
+            .is_some_and(|session| session.connection.stable_id() == connection.stable_id())
+        {
+            guard.sessions.remove(&peer);
+        }
     }
 
     fn sweep_locked(sessions: &mut BTreeMap<NodeId, HotSession>) {
@@ -775,8 +792,10 @@ pub struct ChatService {
     /// Consecutive failed wake probes per conversation.
     wake_failures: BTreeMap<String, u8>,
     max_image_bytes: Option<u64>,
+    retention: RetentionPolicy,
     attachment_downloads: BTreeSet<Hash>,
     attachment_retries: BTreeMap<Hash, AttachmentRetry>,
+    timeline_limits: BTreeMap<String, usize>,
     control_retries: BTreeMap<String, ControlRetry>,
     blob_downloader: iroh_blobs::downloader::Downloader,
     #[cfg(test)]
@@ -816,6 +835,7 @@ pub(crate) enum ChatInput {
     AttachmentDownloadFinished {
         conversation_id: String,
         hash: Hash,
+        byte_len: u64,
         succeeded: bool,
     },
     Retry,
@@ -851,6 +871,10 @@ impl ChatService {
         let blob_downloader = blobs.downloader().clone();
         let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
         let docs = Docs::persistent(docs_path).spawn(&blobs, &gossip).await?;
+        blobs.start_gc(GcConfig {
+            period: Duration::from_secs(30 * 60),
+            done_callback: None,
+        })?;
         debug!("persistent Iroh Docs engine opened");
         let sessions = ChatSessionPool::new(endpoint.clone());
         let (invites, invite_rx) = ChatInviteProtocol::new(sessions.clone());
@@ -893,8 +917,10 @@ impl ChatService {
             last_receipt_wake: BTreeMap::new(),
             wake_failures: BTreeMap::new(),
             max_image_bytes: None,
+            retention: RetentionPolicy::Unlimited,
             attachment_downloads: BTreeSet::new(),
             attachment_retries: BTreeMap::new(),
+            timeline_limits: BTreeMap::new(),
             control_retries: BTreeMap::new(),
             blob_downloader,
             #[cfg(test)]
@@ -1122,12 +1148,13 @@ impl ChatService {
             ChatInput::AttachmentDownloadFinished {
                 conversation_id,
                 hash,
+                byte_len,
                 succeeded,
             } => {
                 self.attachment_downloads.remove(&hash);
                 if succeeded {
                     self.attachment_retries.remove(&hash);
-                    if let Err(error) = self.publish_timeline(&conversation_id).await {
+                    if let Err(error) = self.queue_attachment_data(hash, byte_len).await {
                         return Some(ChatNotification::Error(format!(
                             "Could not refresh downloaded image: {error:#}"
                         )));
@@ -1283,6 +1310,86 @@ impl ChatService {
                 trace!("could not queue image-limit refresh: {error}");
             }
         }
+    }
+
+    pub async fn set_retention_policy(&mut self, retention: RetentionPolicy) -> Result<()> {
+        self.retention = retention;
+        self.release_expired_attachment_tags().await?;
+        let ids: Vec<_> = self.index.conversations.keys().cloned().collect();
+        for id in ids {
+            self.publish_timeline(&id).await?;
+        }
+        Ok(())
+    }
+
+    async fn release_expired_attachment_tags(&self) -> Result<()> {
+        let RetentionPolicy::Days(_) = self.retention else {
+            return Ok(());
+        };
+        let now = now_millis();
+        let mut expired = BTreeSet::new();
+        let mut retained = BTreeSet::new();
+        for stored in self.index.conversations.values() {
+            for message in self.load_messages(stored).await? {
+                let target = if self.retention.includes(message.sent_at, now) {
+                    &mut retained
+                } else {
+                    &mut expired
+                };
+                for attachment in message.attachments {
+                    if let Ok(hash) = Hash::from_str(&attachment.hash) {
+                        target.insert(hash);
+                    }
+                }
+            }
+        }
+        for hash in expired.difference(&retained).copied() {
+            self.blobs.set_tag(attachment_blob_tag(hash), None).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_older_messages(&mut self, conversation_id: &str) -> Result<()> {
+        let limit = self
+            .timeline_limits
+            .entry(conversation_id.to_owned())
+            .or_insert(CHAT_TIMELINE_PAGE);
+        *limit = limit.saturating_add(CHAT_TIMELINE_PAGE);
+        self.publish_timeline(conversation_id).await
+    }
+
+    pub async fn load_attachment_data(
+        &mut self,
+        conversation_id: &str,
+        hash: &str,
+        byte_len: u64,
+    ) -> Result<()> {
+        if self.max_image_bytes.is_some_and(|limit| byte_len > limit) {
+            return Ok(());
+        }
+        let hash = Hash::from_str(hash).context("invalid chat attachment hash")?;
+        if self.queue_attachment_data(hash, byte_len).await? {
+            return Ok(());
+        }
+        self.schedule_attachment_retry(conversation_id, hash);
+        Ok(())
+    }
+
+    async fn queue_attachment_data(&mut self, hash: Hash, byte_len: u64) -> Result<bool> {
+        let Some(blob) = self.blobs.get(&hash).await? else {
+            return Ok(false);
+        };
+        if !blob.is_complete() {
+            return Ok(false);
+        }
+        let len = usize::try_from(byte_len).context("chat attachment is too large")?;
+        let mut reader = blob.data_reader();
+        let bytes = reader.read_at(0, len).await?;
+        self.queued.push_back(ChatNotification::AttachmentData {
+            hash: hash.to_string(),
+            data: Arc::new(bytes.to_vec()),
+        });
+        Ok(true)
     }
 
     async fn import_attachment_bytes(&self, message: &ChatMessage) -> Result<()> {
@@ -2377,6 +2484,13 @@ impl ChatService {
             .cloned()
             .context("unknown conversation")?;
         let old_document_id = current.public.document_id.clone();
+        let old_attachment_hashes: BTreeSet<_> = self
+            .load_messages(&current)
+            .await?
+            .into_iter()
+            .flat_map(|message| message.attachments)
+            .filter_map(|attachment| Hash::from_str(&attachment.hash).ok())
+            .collect();
         let next_epoch = current.public.history_epoch.saturating_add(1);
         let fresh = self
             .create_conversation(
@@ -2396,6 +2510,8 @@ impl ChatService {
             .conversations
             .insert(conversation_id.to_owned(), fresh);
         self.persist_index()?;
+        self.release_unreferenced_attachment_tags(old_attachment_hashes)
+            .await?;
         self.drop_document(&old_document_id).await;
         self.open_and_publish(conversation_id).await?;
         info!(
@@ -2406,6 +2522,31 @@ impl ChatService {
             "rotated chat document after history delete"
         );
         Ok(epoch)
+    }
+
+    async fn release_unreferenced_attachment_tags(
+        &self,
+        mut candidates: BTreeSet<Hash>,
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        for stored in self.index.conversations.values() {
+            for message in self.load_messages(stored).await? {
+                for attachment in message.attachments {
+                    if let Ok(hash) = Hash::from_str(&attachment.hash) {
+                        candidates.remove(&hash);
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        for hash in candidates {
+            self.blobs.set_tag(attachment_blob_tag(hash), None).await?;
+        }
+        Ok(())
     }
 
     fn merge_staged_inbound(&mut self, conversation_id: &str, messages: &mut Vec<ChatMessage>) {
@@ -2448,31 +2589,6 @@ impl ChatService {
         if staged.is_empty() {
             self.staged_deletions.remove(conversation_id);
         }
-    }
-
-    async fn hydrate_attachment_bytes(&self, messages: &mut [ChatMessage]) -> Result<()> {
-        for message in messages {
-            for attachment in &mut message.attachments {
-                if attachment.data.is_some() {
-                    continue;
-                }
-                let Ok(hash) = Hash::from_str(&attachment.hash) else {
-                    continue;
-                };
-                let Some(blob) = self.blobs.get(&hash).await? else {
-                    continue;
-                };
-                if !blob.is_complete() {
-                    continue;
-                }
-                let len = usize::try_from(attachment.byte_len).unwrap_or(usize::MAX);
-                let mut reader = blob.data_reader();
-                if let Ok(bytes) = reader.read_at(0, len).await {
-                    attachment.data = Some(Arc::new(bytes.to_vec()));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn forget_conversation_local_state(&mut self, conversation_id: &str) {
@@ -2824,10 +2940,19 @@ impl ChatService {
             .get(id)
             .cloned()
             .context("unknown conversation")?;
-        let mut messages = self.load_messages(&stored).await?;
+        let limit = self
+            .timeline_limits
+            .get(id)
+            .copied()
+            .unwrap_or(CHAT_TIMELINE_PAGE);
+        let (mut messages, mut has_more) = self.load_recent_messages(&stored, limit).await?;
         self.merge_staged_inbound(id, &mut messages);
         self.merge_staged_deletions(id, &mut messages);
-        self.hydrate_attachment_bytes(&mut messages).await?;
+        let now = now_millis();
+        messages.retain(|message| self.retention.includes(message.sent_at, now));
+        // Message keys are chronological. If this page already contains expired
+        // rows, no older page can contain a retained row.
+        has_more &= messages.len() == limit;
         self.request_missing_attachments(id, &messages).await;
         for message in &messages {
             if message.author_id != self.our_node_id.to_string() {
@@ -2850,22 +2975,6 @@ impl ChatService {
             self.spawn_receipt_wake(id, new_receipts);
         }
         let delivered = self.load_delivered_message_ids(&stored).await?;
-        let visible: BTreeSet<_> = messages
-            .iter()
-            .map(|message| message.message_id.clone())
-            .collect();
-        let dropped_pending: Vec<_> = self
-            .pending_deliveries
-            .iter()
-            .filter(|(message_id, conversation_id)| {
-                *conversation_id == id && !visible.contains(*message_id)
-            })
-            .map(|(message_id, _)| message_id.clone())
-            .collect();
-        for message_id in dropped_pending {
-            self.pending_deliveries.remove(&message_id);
-            self.pending_outbound.remove(&message_id);
-        }
         for message in &messages {
             if message.author_id == self.our_node_id.to_string()
                 && delivered.contains(&message.message_id)
@@ -2901,6 +3010,7 @@ impl ChatService {
         self.queued.push_back(ChatNotification::Conversation {
             conversation: stored.public,
             messages,
+            has_more,
         });
         Ok(())
     }
@@ -3077,7 +3187,8 @@ impl ChatService {
                 let tx = self.wake_tx.clone();
                 let conversation_id = conversation_id.to_owned();
                 let providers = providers.clone();
-                let timeout = attachment_download_timeout(attachment.byte_len);
+                let byte_len = attachment.byte_len;
+                let timeout = attachment_download_timeout(byte_len);
                 if providers.is_empty() {
                     self.attachment_downloads.remove(&hash);
                     self.schedule_attachment_retry(&conversation_id, hash);
@@ -3126,6 +3237,7 @@ impl ChatService {
                         .send(ChatInput::AttachmentDownloadFinished {
                             conversation_id,
                             hash,
+                            byte_len,
                             succeeded,
                         })
                         .await;
@@ -3146,19 +3258,26 @@ impl ChatService {
             _ => self.docs.import(ticket).await?,
         };
         let mut wrote = Vec::new();
+        let mut existing_entries = doc
+            .get_many(
+                Query::author(self.author)
+                    .key_prefix(RECEIPT_PREFIX)
+                    .build(),
+            )
+            .await?;
+        let mut existing = BTreeSet::new();
+        while let Some(entry) = existing_entries.next().await {
+            let entry = entry?;
+            if let Some(message_id) = receipt_message_id_from_key(entry.key()) {
+                existing.insert(message_id);
+            }
+        }
         for message in messages
             .iter()
             .filter(|message| message.author_id != self.our_node_id.to_string())
         {
             let receipt = ReplicatedReceipt::new(message.message_id.clone());
-            let mut existing = doc
-                .get_many(
-                    Query::author(self.author)
-                        .key_exact(receipt.entry_key())
-                        .build(),
-                )
-                .await?;
-            if existing.next().await.transpose()?.is_none() {
+            if existing.insert(message.message_id.clone()) {
                 doc.set_bytes(
                     self.author,
                     receipt.entry_key(),
@@ -3226,15 +3345,41 @@ impl ChatService {
     }
 
     async fn load_messages(&self, stored: &StoredConversation) -> Result<Vec<ChatMessage>> {
+        self.load_messages_query(stored, None).await
+    }
+
+    async fn load_recent_messages(
+        &self,
+        stored: &StoredConversation,
+        limit: usize,
+    ) -> Result<(Vec<ChatMessage>, bool)> {
+        let query_limit = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+        let mut messages = self.load_messages_query(stored, Some(query_limit)).await?;
+        let has_more = messages.len() > limit;
+        if has_more {
+            let excess = messages.len() - limit;
+            messages.drain(..excess);
+        }
+        Ok((messages, has_more))
+    }
+
+    async fn load_messages_query(
+        &self,
+        stored: &StoredConversation,
+        limit: Option<u64>,
+    ) -> Result<Vec<ChatMessage>> {
         let ticket = DocTicket::from_str(&stored.ticket)?;
         let document_id = NamespaceId::from_str(&stored.public.document_id)?;
         let doc = match self.docs.open(document_id).await {
             Ok(Some(doc)) => doc,
             _ => self.docs.import(ticket).await?,
         };
-        let mut entries = doc
-            .get_many(Query::key_prefix(MESSAGE_PREFIX).build())
-            .await?;
+        let mut query =
+            Query::key_prefix(MESSAGE_PREFIX).sort_by(SortBy::KeyAuthor, SortDirection::Desc);
+        if let Some(limit) = limit {
+            query = query.limit(limit);
+        }
+        let mut entries = doc.get_many(query.build()).await?;
         let mut messages = BTreeMap::<String, (ChatMessage, AuthorId)>::new();
         while let Some(entry) = entries.next().await {
             let entry = entry?;
@@ -3254,23 +3399,6 @@ impl ChatService {
                 continue;
             };
             if message.validate().is_ok() {
-                let mut message = message;
-                for attachment in &mut message.attachments {
-                    let Ok(hash) = Hash::from_str(&attachment.hash) else {
-                        continue;
-                    };
-                    let Some(blob) = self.blobs.get(&hash).await? else {
-                        continue;
-                    };
-                    if !blob.is_complete() {
-                        continue;
-                    }
-                    let len = usize::try_from(attachment.byte_len).unwrap_or(usize::MAX);
-                    let mut reader = blob.data_reader();
-                    if let Ok(bytes) = reader.read_at(0, len).await {
-                        attachment.data = Some(Arc::new(bytes.to_vec()));
-                    }
-                }
                 messages
                     .entry(message.message_id.clone())
                     .or_insert((message, entry.author()));
@@ -3788,11 +3916,11 @@ async fn send_chat_packet(
                     peer = %peer.fmt_short(),
                     "chat session reuse failed; redialing: {error:#}"
                 );
-                sessions.forget(peer).await;
+                sessions.forget_if(peer, &connection).await;
             }
             Err(_) => {
                 trace!(peer = %peer.fmt_short(), "chat session reuse timed out; redialing");
-                sessions.forget(peer).await;
+                sessions.forget_if(peer, &connection).await;
             }
         }
     }
@@ -3810,11 +3938,11 @@ async fn send_chat_packet(
             Ok(())
         }
         Ok(Err(error)) => {
-            sessions.forget(peer).await;
+            sessions.forget_if(peer, &connection).await;
             Err(error).context("chat session send failed")
         }
         Err(_) => {
-            sessions.forget(peer).await;
+            sessions.forget_if(peer, &connection).await;
             bail!("chat session send timed out")
         }
     }
@@ -4056,48 +4184,38 @@ fn receipt_message_id_from_key(key: &[u8]) -> Option<String> {
 }
 
 fn load_index(path: &Path) -> ChatIndex {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_local_json(path, "chat index")
 }
 
 fn load_local_deletions(path: &Path) -> LocalDeletionIndex {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_local_json(path, "local deletion index")
 }
 
 fn load_reliable_control(path: &Path) -> ReliableControlIndex {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_local_json(path, "reliable-control index")
+}
+
+fn load_local_json<T: serde::de::DeserializeOwned + Default>(path: &Path, label: &str) -> T {
+    match persistence::read_json(path) {
+        Ok(Some(value)) => value,
+        Ok(None) => T::default(),
+        Err(error) => {
+            warn!(path = %path.display(), "could not load {label}: {error:#}");
+            T::default()
+        }
+    }
 }
 
 fn save_index(path: &Path, index: &ChatIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(index)?)?;
-    Ok(())
+    persistence::write_json(path, index)
 }
 
 fn save_local_deletions(path: &Path, index: &LocalDeletionIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(index)?)?;
-    Ok(())
+    persistence::write_json(path, index)
 }
 
 fn save_reliable_control(path: &Path, index: &ReliableControlIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(index)?)?;
-    Ok(())
+    persistence::write_json(path, index)
 }
 
 #[cfg(test)]
@@ -4345,30 +4463,47 @@ mod tests {
 
     async fn wait_for_attachment(
         service: &mut ChatService,
+        conversation_id: &str,
         message_id: &str,
+        expected_hash: &str,
         expected: &[u8],
     ) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(20), async {
+            let mut requested = false;
             loop {
-                if let ChatNotification::Conversation { messages, .. } =
-                    service.next_notification().await
-                {
-                    if messages.iter().any(|message| {
-                        message.message_id == message_id
-                            && message.attachments.iter().any(|attachment| {
-                                attachment
-                                    .data
-                                    .as_deref()
-                                    .is_some_and(|data| data.as_slice() == expected)
+                match service.next_notification().await {
+                    ChatNotification::Conversation { messages, .. } if !requested => {
+                        if let Some(attachment) = messages
+                            .iter()
+                            .find(|message| message.message_id == message_id)
+                            .and_then(|message| {
+                                message
+                                    .attachments
+                                    .iter()
+                                    .find(|attachment| attachment.hash == expected_hash)
                             })
-                    }) {
-                        return;
+                        {
+                            service
+                                .load_attachment_data(
+                                    conversation_id,
+                                    &attachment.hash,
+                                    attachment.byte_len,
+                                )
+                                .await?;
+                            requested = true;
+                        }
                     }
+                    ChatNotification::AttachmentData { hash, data }
+                        if hash == expected_hash && data.as_slice() == expected =>
+                    {
+                        return Result::<_>::Ok(());
+                    }
+                    _ => {}
                 }
             }
         })
         .await
-        .context("timed out waiting for replicated chat image")?;
+        .context("timed out waiting for replicated chat image")??;
         Ok(())
     }
 
@@ -4723,7 +4858,14 @@ mod tests {
         let message_id = message.message_id.clone();
         left.send_message(conversation_id.clone(), message).await;
 
-        wait_for_attachment(&mut right, &message_id, &image).await?;
+        wait_for_attachment(
+            &mut right,
+            &conversation_id,
+            &message_id,
+            &image_hash,
+            &image,
+        )
+        .await?;
         wait_for_attachment_ack(&mut left, &conversation_id, &image_hash).await?;
 
         left_router.shutdown().await?;
@@ -4905,6 +5047,7 @@ mod tests {
                 if let ChatNotification::Conversation {
                     conversation,
                     messages,
+                    ..
                 } = service.next_notification().await
                 {
                     if conversation.id == conversation_id
