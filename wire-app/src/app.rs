@@ -3891,22 +3891,12 @@ impl AppState {
                             if let Some(volume) = self.volumes.get(&node_id).cloned() {
                                 peer_volume_slider(
                                     ui,
+                                    pal,
                                     &volume,
-                                    48.0,
+                                    112.0,
                                     PARTICIPANT_ACTION_HEIGHT,
                                     "Voice volume",
                                 );
-                            }
-                            if is_streaming {
-                                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                                    peer_volume_slider(
-                                        ui,
-                                        &volume,
-                                        48.0,
-                                        PARTICIPANT_ACTION_HEIGHT,
-                                        "Stream volume",
-                                    );
-                                }
                             }
                             if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
                                 .on_hover_text("End call with this peer")
@@ -4413,12 +4403,7 @@ impl AppState {
                             );
                         }
                         if let Some(volume) = self.volumes.get(&node_id).cloned() {
-                            peer_volume_slider(ui, &volume, 56.0, 18.0, "Voice volume");
-                        }
-                        if self.video_frames.contains_key(&node_id) {
-                            if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                                peer_volume_slider(ui, &volume, 56.0, 18.0, "Stream volume");
-                            }
+                            peer_volume_slider(ui, pal, &volume, 56.0, 18.0, "Voice volume");
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if action_button(ui, pal, "End", ButtonTone::Danger).clicked() {
@@ -4937,23 +4922,9 @@ impl AppState {
                         if matches!(state, CallState::Active) {
                             if let Some(volume) = self.volumes.get(&node_id).cloned() {
                                 ui.horizontal(|ui| {
-                                    ui.label("Voice");
-                                    peer_volume_slider(ui, &volume, 120.0, 18.0, "Voice volume");
+                                    ui.label("Volume");
+                                    peer_volume_slider(ui, &pal, &volume, 120.0, 18.0, "Voice volume");
                                 });
-                            }
-                            if self.video_frames.contains_key(&node_id) {
-                                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Stream");
-                                        peer_volume_slider(
-                                            ui,
-                                            &volume,
-                                            120.0,
-                                            18.0,
-                                            "Stream volume",
-                                        );
-                                    });
-                                }
                             }
                             if let Some(rtt) = self.rtts.get(&node_id) {
                                 ui.label(rtt_label(*rtt));
@@ -5555,34 +5526,15 @@ impl AppState {
             }
 
             if let StreamSource::Remote(node_id) = source {
-                if tile_rect.width() >= 240.0 {
-                    if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                        const MARGIN: f32 = 8.0;
-                        let slider_size = Vec2::new(118.0, 26.0);
-                        let slider_rect = egui::Rect::from_min_size(
-                            tile_rect.right_bottom()
-                                + egui::vec2(-slider_size.x - MARGIN, -slider_size.y - MARGIN),
-                            slider_size,
-                        );
-                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(slider_rect), |ui| {
-                            ui.painter().rect(
-                                slider_rect,
-                                CornerRadius::same(8),
-                                overlay_fill,
-                                Stroke::new(1.0_f32, pal.line_br),
-                                egui::StrokeKind::Inside,
-                            );
-                            ui.horizontal(|ui| {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(char::from(Icon::Volume2))
-                                        .font(lucide(13.0))
-                                        .color(pal.text2),
-                                );
-                                peer_volume_slider(ui, &volume, 84.0, 18.0, "Stream volume");
-                            });
-                        });
-                    }
+                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                    stream_volume_badge(
+                        ui,
+                        pal,
+                        overlay_fill,
+                        &volume,
+                        ui.id().with(("stream_volume", node_id)),
+                        tile_rect,
+                    );
                 }
             }
         }
@@ -5966,24 +5918,16 @@ impl AppState {
                                     });
 
                                 ui.add_space(8.0);
-                                let ui_sound_percent =
-                                    format!("{:.0}%", self.ui_sound_volume * 100.0);
-                                settings_field_label(
+                                settings_field_label(ui, &pal, "UI sounds", None);
+                                if painted_volume_slider(
                                     ui,
                                     &pal,
-                                    "UI sounds",
-                                    Some(&ui_sound_percent),
-                                );
-                                let volume_changed = ui
-                                    .add(
-                                        egui::Slider::new(
-                                            &mut self.ui_sound_volume,
-                                            0.0..=1.0,
-                                        )
-                                        .show_value(false),
-                                    )
-                                    .changed();
-                                if volume_changed {
+                                    &mut self.ui_sound_volume,
+                                    1.0,
+                                    (ui.available_width() - 14.0).max(40.0),
+                                    26.0,
+                                    "UI sound volume",
+                                ) {
                                     if let Some(sounds) = &mut self.sounds {
                                         sounds.set_volume(self.ui_sound_volume);
                                     }
@@ -6834,22 +6778,206 @@ fn capture_picker_layout(viewport: Vec2) -> (f32, f32, bool) {
 
 fn peer_volume_slider(
     ui: &mut Ui,
+    pal: &Palette,
     volume: &VolumeHandle,
     width: f32,
     height: f32,
     hover: &str,
 ) {
     let mut value = f32::from_bits(volume.load(Ordering::Relaxed));
-    if ui
-        .add_sized(
-            [width, height],
-            egui::Slider::new(&mut value, 0.0..=2.0).show_value(false),
-        )
-        .on_hover_text(hover)
-        .changed()
-    {
+    if painted_volume_slider(ui, pal, &mut value, 2.0, width, height, hover) {
         volume.store(value.to_bits(), Ordering::Relaxed);
     }
+}
+
+fn painted_volume_slider(
+    ui: &mut Ui,
+    pal: &Palette,
+    value: &mut f32,
+    max: f32,
+    width: f32,
+    height: f32,
+    hover: &str,
+) -> bool {
+    const TRACK_H: f32 = 3.0;
+    const KNOB: f32 = 6.5;
+    let max = max.max(0.001);
+
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
+    let response = response
+        .on_hover_text(hover)
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+    let track = egui::Rect::from_center_size(
+        rect.center(),
+        Vec2::new((rect.width() - KNOB * 2.0).max(8.0), TRACK_H),
+    );
+    let mut next = value.clamp(0.0, max);
+    let mut changed = false;
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            next = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0) * max;
+            changed = true;
+        }
+    }
+    *value = next;
+
+    paint_volume_track(
+        ui,
+        pal,
+        track,
+        next / max,
+        next,
+        VolumeKnob {
+            radius: KNOB,
+            fill: pal.bg,
+            border: Some((1.15, pal.text)),
+        },
+        response.hovered() || response.dragged(),
+    );
+    changed
+}
+
+#[derive(Clone, Copy)]
+struct VolumeKnob {
+    radius: f32,
+    fill: Color32,
+    border: Option<(f32, Color32)>,
+}
+
+fn paint_volume_track(
+    ui: &Ui,
+    pal: &Palette,
+    track: egui::Rect,
+    fill: f32,
+    display_value: f32,
+    knob: VolumeKnob,
+    show_value: bool,
+) {
+    let fill = fill.clamp(0.0, 1.0);
+    ui.painter()
+        .rect_filled(track, CornerRadius::same(2), pal.line_br);
+    let filled_w = track.width() * fill;
+    if filled_w > 0.0 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(track.min, Vec2::new(filled_w, track.height())),
+            CornerRadius::same(2),
+            pal.accent,
+        );
+    }
+    let knob_pos = egui::pos2(track.left() + filled_w, track.center().y);
+    ui.painter()
+        .circle_filled(knob_pos, knob.radius, knob.fill);
+    if let Some((width, color)) = knob.border {
+        ui.painter()
+            .circle_stroke(knob_pos, knob.radius, Stroke::new(width, color));
+    }
+    if show_value {
+        paint_volume_value(ui, pal, knob_pos, knob.radius, display_value);
+    }
+}
+
+fn paint_volume_value(ui: &Ui, pal: &Palette, knob_pos: egui::Pos2, knob_radius: f32, value: f32) {
+    let text = format!("{:.0}%", (value * 100.0).round());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, sans(10.0), pal.text);
+    let pad = Vec2::new(5.0, 2.0);
+    let badge_size = galley.size() + pad * 2.0;
+    let badge_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            knob_pos.x,
+            knob_pos.y - knob_radius - 3.0 - badge_size.y * 0.5,
+        ),
+        badge_size,
+    );
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        ui.id().with("volume-value"),
+    ));
+    painter.rect_filled(badge_rect, CornerRadius::same(5), pal.bg);
+    painter.rect_stroke(
+        badge_rect,
+        CornerRadius::same(5),
+        Stroke::new(1.0_f32, pal.line_br),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        badge_rect.min + pad,
+        galley,
+        pal.text,
+    );
+}
+
+fn stream_volume_badge(
+    ui: &mut Ui,
+    pal: &Palette,
+    fill: Color32,
+    volume: &VolumeHandle,
+    id: egui::Id,
+    tile_rect: egui::Rect,
+) {
+    const HEIGHT: f32 = 26.0;
+    const MARGIN: f32 = 8.0;
+    const PAD: f32 = 8.0;
+    const ICON: f32 = 13.0;
+    const GAP: f32 = 7.0;
+    const TRACK_W: f32 = 68.0;
+    const TRACK_H: f32 = 3.0;
+    const KNOB: f32 = 5.0;
+
+    let width = PAD + ICON + GAP + TRACK_W + PAD;
+    if tile_rect.width() < width + MARGIN * 2.0 + 80.0 {
+        return;
+    }
+
+    let rect = egui::Rect::from_min_size(
+        tile_rect.right_bottom() + egui::vec2(-width - MARGIN, -HEIGHT - MARGIN),
+        Vec2::new(width, HEIGHT),
+    );
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .on_hover_text("Stream volume")
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(8), fill);
+
+    let muted = f32::from_bits(volume.load(Ordering::Relaxed)) <= 0.001;
+    ui.painter().text(
+        egui::pos2(rect.left() + PAD + ICON * 0.5, rect.center().y),
+        Align2::CENTER_CENTER,
+        char::from(if muted { Icon::VolumeX } else { Icon::Volume2 }),
+        lucide(ICON),
+        pal.text2,
+    );
+
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - PAD - TRACK_W * 0.5, rect.center().y),
+        Vec2::new(TRACK_W, TRACK_H),
+    );
+    let mut value = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            value = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0) * 2.0;
+            volume.store(value.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    paint_volume_track(
+        ui,
+        pal,
+        track,
+        value / 2.0,
+        value,
+        VolumeKnob {
+            radius: KNOB,
+            fill: Color32::WHITE,
+            border: None,
+        },
+        response.hovered() || response.dragged(),
+    );
 }
 
 fn system_audio_share_row(ui: &mut Ui, pal: &Palette, enabled: &mut bool) {
