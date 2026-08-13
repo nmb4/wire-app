@@ -187,6 +187,7 @@ struct AppState {
     ended_video_stream_generations: BTreeMap<NodeId, u64>,
     stopped_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
+    volume_open: BTreeSet<NodeId>,
     sharing_active: bool,
     share_system_audio: bool,
     system_audio_active: bool,
@@ -658,6 +659,7 @@ impl App {
             ended_video_stream_generations: Default::default(),
             stopped_video_stream_generations: Default::default(),
             focused_stream: None,
+            volume_open: BTreeSet::new(),
             sharing_active: false,
             share_system_audio: settings.share_system_audio,
             system_audio_active: false,
@@ -1118,6 +1120,7 @@ impl AppState {
                         self.video_stream_generations.remove(&node_id);
                         self.ended_video_stream_generations.remove(&node_id);
                         self.stopped_video_stream_generations.remove(&node_id);
+                        self.volume_open.remove(&node_id);
                         if self.focused_stream == Some(StreamSource::Remote(node_id)) {
                             self.focused_stream = None;
                         }
@@ -3753,18 +3756,16 @@ impl AppState {
             .fill(chat_surface(pal))
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
             .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
-            .inner_margin(egui::Margin::symmetric(10, 0))
+            .inner_margin(CHIP_INNER_MARGIN)
             .show(ui, |ui| {
                 ui.set_height(PARTICIPANT_CHIP_HEIGHT);
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
-                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     circle_avatar(ui, pal, "Y", PARTICIPANT_AVATAR_SIZE);
-                    ui.label(
-                        RichText::new("You")
-                            .color(pal.text2)
-                            .size(ui_font_size(12.0)),
-                    );
+                    ui.add_space(CHIP_IDENTITY_GAP);
+                    chip_name_label(ui, "You", pal.text2);
+                    ui.add_space(CHIP_IDENTITY_GAP);
                     let level = self
                         .local_audio_level
                         .as_ref()
@@ -3776,7 +3777,13 @@ impl AppState {
                         "Your microphone level"
                     });
                     if self.sharing_active {
-                        dot(ui, pal.ok, 6.0);
+                        ui.add_space(CHIP_IDENTITY_GAP);
+                        chip_status_icon(
+                            ui,
+                            pal.ok,
+                            Icon::ScreenShare,
+                            "You are sharing your screen",
+                        );
                     }
                 });
             })
@@ -3824,47 +3831,47 @@ impl AppState {
             .fill(fill)
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
             .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
-            .inner_margin(egui::Margin::symmetric(10, 0))
+            .inner_margin(CHIP_INNER_MARGIN)
             .show(ui, |ui| {
-                // Fixed chip height keeps avatar / name / actions on one midline.
                 ui.set_height(PARTICIPANT_CHIP_HEIGHT);
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
-                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     circle_avatar(
                         ui,
                         pal,
                         &self.peer_initial(node_id),
                         PARTICIPANT_AVATAR_SIZE,
                     );
-
-                    ui.label(
-                        RichText::new(self.peer_display_name(node_id))
-                            .color(if is_active { pal.text } else { pal.text2 })
-                            .size(ui_font_size(12.0)),
+                    ui.add_space(CHIP_IDENTITY_GAP);
+                    chip_name_label(
+                        ui,
+                        &ellipsize(&self.peer_display_name(node_id), 16),
+                        if is_active { pal.text } else { pal.text2 },
                     );
-
+                    ui.add_space(CHIP_IDENTITY_GAP);
                     voice_level_meter(ui, pal, voice_level)
                         .on_hover_text("Voice received from this participant");
 
                     if stopped_watching {
-                        ui.label(
-                            RichText::new("stream paused")
-                                .color(pal.dim)
-                                .size(ui_font_size(11.0)),
-                        );
+                        ui.add_space(CHIP_IDENTITY_GAP);
+                        chip_status_label(ui, "paused", pal.dim);
                     } else if is_streaming {
-                        dot(ui, pal.ok, 5.0);
-                    } else if let Some(status) = status_label {
-                        ui.label(
-                            RichText::new(status)
-                                .color(status_color)
-                                .size(ui_font_size(11.0)),
+                        ui.add_space(CHIP_IDENTITY_GAP);
+                        chip_status_icon(
+                            ui,
+                            pal.ok,
+                            Icon::ScreenShare,
+                            "This participant is sharing their screen",
                         );
+                    } else if let Some(status) = status_label {
+                        ui.add_space(CHIP_IDENTITY_GAP);
+                        chip_status_label(ui, status, status_color);
                     }
 
                     match state {
                         CallState::Incoming => {
+                            ui.add_space(CHIP_ACTION_GAP);
                             if compact_chip_button(ui, pal, "Accept", ButtonTone::Primary).clicked()
                             {
                                 self.cmd(Command::HandleIncoming {
@@ -3872,6 +3879,7 @@ impl AppState {
                                     accept: true,
                                 });
                             }
+                            ui.add_space(6.0);
                             if compact_chip_button(ui, pal, "Decline", ButtonTone::Danger).clicked()
                             {
                                 self.cmd(Command::HandleIncoming {
@@ -3881,6 +3889,7 @@ impl AppState {
                             }
                         }
                         CallState::Calling | CallState::Active => {
+                            ui.add_space(CHIP_ACTION_GAP);
                             if stopped_watching
                                 && compact_chip_button(ui, pal, "Watch", ButtonTone::Primary)
                                     .on_hover_text("Resume watching this screen share")
@@ -3889,15 +3898,48 @@ impl AppState {
                                 self.resume_watching(node_id);
                             }
                             if let Some(volume) = self.volumes.get(&node_id).cloned() {
-                                peer_volume_slider(
+                                if stopped_watching {
+                                    ui.add_space(6.0);
+                                }
+                                let open = self.volume_open.contains(&node_id);
+                                let open_t = ui.ctx().animate_bool_with_time(
+                                    ui.id().with(("volume-open", node_id)),
+                                    open,
+                                    0.14,
+                                );
+                                if chip_icon_button(
                                     ui,
                                     pal,
-                                    &volume,
-                                    112.0,
-                                    PARTICIPANT_ACTION_HEIGHT,
-                                    "Voice volume",
-                                );
+                                    Icon::Volume2,
+                                    open,
+                                    if open {
+                                        "Hide voice volume"
+                                    } else {
+                                        "Voice volume"
+                                    },
+                                )
+                                .clicked()
+                                {
+                                    if open {
+                                        self.volume_open.remove(&node_id);
+                                    } else {
+                                        self.volume_open.insert(node_id);
+                                    }
+                                }
+                                let slider_w = 112.0 * open_t;
+                                if slider_w > 4.0 {
+                                    ui.add_space(6.0 * open_t);
+                                    peer_volume_slider(
+                                        ui,
+                                        pal,
+                                        &volume,
+                                        slider_w,
+                                        PARTICIPANT_ACTION_HEIGHT,
+                                        "Voice volume",
+                                    );
+                                }
                             }
+                            ui.add_space(8.0);
                             if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
                                 .on_hover_text("End call with this peer")
                                 .clicked()
@@ -5523,18 +5565,18 @@ impl AppState {
                         self.stop_watching(node_id);
                     }
                 }
-            }
 
-            if let StreamSource::Remote(node_id) = source {
-                if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                    stream_volume_badge(
-                        ui,
-                        pal,
-                        overlay_fill,
-                        &volume,
-                        ui.id().with(("stream_volume", node_id)),
-                        tile_rect,
-                    );
+                if let StreamSource::Remote(node_id) = source {
+                    if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                        stream_volume_badge(
+                            ui,
+                            pal,
+                            overlay_fill,
+                            &volume,
+                            ui.id().with(("stream_volume", node_id)),
+                            tile_rect,
+                        );
+                    }
                 }
             }
         }
@@ -6521,6 +6563,98 @@ const CHROME_SIDE_INSET: i8 = 14;
 const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
 const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
 const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
+const CHIP_IDENTITY_GAP: f32 = 8.0;
+const CHIP_ACTION_GAP: f32 = 12.0;
+const CHIP_NAME_OPTICAL_Y: f32 = 1.5;
+const CHIP_INNER_MARGIN: egui::Margin = egui::Margin {
+    left: 10,
+    right: 7,
+    top: 0,
+    bottom: 0,
+};
+
+fn chip_name_label(ui: &mut Ui, text: &str, color: Color32) {
+    chip_optical_label(ui, text, color, 12.0);
+}
+
+fn chip_status_label(ui: &mut Ui, text: &str, color: Color32) {
+    chip_optical_label(ui, text, color, 11.0);
+}
+
+fn chip_status_icon(ui: &mut Ui, color: Color32, icon: Icon, tooltip: &str) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    response.on_hover_text(tooltip);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(14.0),
+        color,
+    );
+}
+
+fn chip_optical_label(ui: &mut Ui, text: &str, color: Color32, size: f32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), sans(size), color);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x, PARTICIPANT_CHIP_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.left(),
+            rect.center().y - galley.size().y * 0.5 + CHIP_NAME_OPTICAL_Y,
+        ),
+        galley,
+        color,
+    );
+}
+
+fn chip_icon_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    icon: Icon,
+    selected: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::splat(PARTICIPANT_ACTION_HEIGHT),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_text(tooltip);
+    let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
+    let (fill, stroke, icon_color) = if selected {
+        (
+            pal.accent_dim,
+            Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.8)),
+            pal.accent,
+        )
+    } else {
+        button_tone_style(pal, ButtonTone::Secondary, hot)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(CHROME_INNER_RADIUS),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        char::from(icon),
+        lucide(13.0),
+        if selected {
+            icon_color
+        } else if hot {
+            pal.text
+        } else {
+            pal.text2
+        },
+    );
+    response
+}
 
 fn load_audio_level(level: &AudioLevelHandle) -> f32 {
     f32::from_bits(level.load(Ordering::Relaxed)).clamp(0.0, 1.0)
@@ -6580,16 +6714,38 @@ fn compact_chip_button(
     label: &str,
     tone: ButtonTone,
 ) -> egui::Response {
-    painted_text_button(
-        ui,
-        pal,
-        label,
-        tone,
-        None,
+    let font = sans(11.0);
+    let measure = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE);
+    let size = Vec2::new(
+        (measure.size().x + 16.0).max(PARTICIPANT_ACTION_HEIGHT),
         PARTICIPANT_ACTION_HEIGHT,
-        ui_font_size(11.0),
-        CHROME_INNER_RADIUS,
-    )
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
+    let (fill, stroke, text_color) = button_tone_style(pal, tone, hot);
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(CHROME_INNER_RADIUS),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, text_color);
+    ui.painter().galley(
+        Align2::CENTER_CENTER
+            .anchor_size(
+                rect.center() + egui::vec2(0.0, CHIP_NAME_OPTICAL_Y),
+                galley.size(),
+            )
+            .min,
+        galley,
+        text_color,
+    );
+    response
 }
 
 #[allow(dead_code)]
