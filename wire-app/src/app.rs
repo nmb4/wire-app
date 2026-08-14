@@ -5471,16 +5471,17 @@ impl AppState {
         if show_overlays {
             let overlay_fill =
                 Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), 190);
+            let hovered = ui.rect_contains_pointer(tile_rect);
             let left_overlay_width = paint_stream_info_badges(
                 ui,
                 pal,
                 tile_rect,
                 &label,
-                quality.as_deref(),
+                hovered.then_some(quality.as_deref()).flatten(),
                 overlay_fill,
             );
 
-            if ui.rect_contains_pointer(tile_rect) {
+            if hovered {
                 // Compact overlay control group (focus + optional stop).
                 const BTN: f32 = 22.0;
                 const GAP: f32 = 2.0;
