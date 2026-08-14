@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use wire::net::bind_endpoint;
 use clap::Parser;
 use futures_concurrency::future::TryJoin;
 use iroh::{endpoint::Connection, NodeId};
 use iroh_roq::{Session, VarInt, ALPN};
 use n0_future::TryFutureExt;
 use tracing::{info, trace, warn};
+use wire::net::bind_endpoint;
 
 #[derive(Debug, Parser)]
 struct Args {

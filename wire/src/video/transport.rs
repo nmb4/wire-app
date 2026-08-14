@@ -3,9 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const VIDEO_PROTOCOL_MAGIC: [u8; 2] = *b"WV";
-const VIDEO_PROTOCOL_VERSION: u8 = 1;
+const VIDEO_PROTOCOL_VERSION: u8 = 2;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
-const VIDEO_FRAME_HEADER_LEN: usize = 20;
+const VIDEO_FRAME_HEADER_LEN: usize = 26;
 const MAX_VIDEO_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,15 +13,28 @@ pub struct EncodedVideoFrame {
     pub sequence: u64,
     pub sent_at_micros: u64,
     pub keyframe: bool,
+    pub width: u16,
+    pub height: u16,
+    pub fps: u16,
     pub data: Vec<u8>,
 }
 
 impl EncodedVideoFrame {
-    pub fn new(sequence: u64, keyframe: bool, data: Vec<u8>) -> Self {
+    pub fn new(
+        sequence: u64,
+        keyframe: bool,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Self {
         Self {
             sequence,
             sent_at_micros: now_micros(),
             keyframe,
+            width: width.min(u32::from(u16::MAX)) as u16,
+            height: height.min(u32::from(u16::MAX)) as u16,
+            fps: fps.min(u32::from(u16::MAX)) as u16,
             data,
         }
     }
@@ -76,6 +89,9 @@ pub async fn send_frame<S: AsyncWrite + Unpin>(
     .await?;
     send.write_all(&frame.sequence.to_be_bytes()).await?;
     send.write_all(&frame.sent_at_micros.to_be_bytes()).await?;
+    send.write_all(&frame.width.to_be_bytes()).await?;
+    send.write_all(&frame.height.to_be_bytes()).await?;
+    send.write_all(&frame.fps.to_be_bytes()).await?;
     send.write_all(&frame.data).await?;
     Ok(())
 }
@@ -104,12 +120,18 @@ pub async fn recv_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<Enc
     }
     let sequence = u64::from_be_bytes(header[4..12].try_into().unwrap());
     let sent_at_micros = u64::from_be_bytes(header[12..20].try_into().unwrap());
+    let width = u16::from_be_bytes(header[20..22].try_into().unwrap());
+    let height = u16::from_be_bytes(header[22..24].try_into().unwrap());
+    let fps = u16::from_be_bytes(header[24..26].try_into().unwrap());
     let mut data = vec![0u8; len - VIDEO_FRAME_HEADER_LEN];
     recv.read_exact(&mut data).await?;
     Ok(Some(EncodedVideoFrame {
         sequence,
         sent_at_micros,
         keyframe: header[3] & VIDEO_FLAG_KEYFRAME != 0,
+        width,
+        height,
+        fps,
         data,
     }))
 }
@@ -141,6 +163,9 @@ mod tests {
             sequence: 42,
             sent_at_micros: 123_456,
             keyframe: true,
+            width: 1920,
+            height: 1080,
+            fps: 60,
             data: vec![1, 2, 3, 4],
         };
         send_frame(&mut writer, &expected).await.unwrap();
@@ -169,6 +194,9 @@ mod tests {
             sequence: 8,
             sent_at_micros: 0,
             keyframe: false,
+            width: 1920,
+            height: 1080,
+            fps: 60,
             data: vec![],
         };
         let idr = EncodedVideoFrame {

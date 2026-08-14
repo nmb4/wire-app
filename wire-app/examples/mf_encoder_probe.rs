@@ -3,9 +3,9 @@
 
 use std::time::Instant;
 
+use tracing_subscriber::EnvFilter;
 use wire::video::{VideoConfig, VideoResolution};
 use wire_app::win_mf_codec::MfH264Encoder;
-use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

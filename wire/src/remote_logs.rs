@@ -160,8 +160,7 @@ pub async fn fetch_latest_logs(
     if meta.sent_bytes != body_len {
         warn!(
             meta_sent = meta.sent_bytes,
-            body_len,
-            "log meta sent_bytes mismatch; using body length"
+            body_len, "log meta sent_bytes mismatch; using body length"
         );
     }
     Ok(FetchedLogs { meta, bytes })
@@ -180,7 +179,12 @@ async fn serve_logs_stream(
         .clamp(1, HARD_MAX_BYTES);
 
     let Some(path) = resolve_latest_log_path() else {
-        write_error_meta(send, our_node_id, "no local wire-app log file found".to_owned()).await?;
+        write_error_meta(
+            send,
+            our_node_id,
+            "no local wire-app log file found".to_owned(),
+        )
+        .await?;
         return Ok(());
     };
 
@@ -192,9 +196,7 @@ async fn serve_logs_stream(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned()),
         path: Some(path.display().to_string()),
-        node_id: our_node_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        node_id: our_node_id.map(|id| id.to_string()).unwrap_or_default(),
         pid: std::process::id(),
         total_file_bytes,
         sent_bytes: bytes.len() as u64,
@@ -225,9 +227,7 @@ async fn write_error_meta(
         error: Some(error),
         file_name: None,
         path: None,
-        node_id: our_node_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        node_id: our_node_id.map(|id| id.to_string()).unwrap_or_default(),
         pid: std::process::id(),
         total_file_bytes: 0,
         sent_bytes: 0,
@@ -239,15 +239,13 @@ async fn write_error_meta(
     Ok(())
 }
 
-async fn write_json<T: Serialize>(
-    send: &mut iroh::endpoint::SendStream,
-    value: &T,
-) -> Result<()> {
+async fn write_json<T: Serialize>(send: &mut iroh::endpoint::SendStream, value: &T) -> Result<()> {
     let payload = serde_json::to_vec(value)?;
     if payload.len() > MAX_REQUEST_BYTES {
         bail!("logs protocol JSON exceeds safety cap");
     }
-    send.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    send.write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     send.write_all(&payload).await?;
     Ok(())
 }
@@ -303,8 +301,8 @@ pub fn resolve_latest_log_path() -> Option<PathBuf> {
 }
 
 fn read_log_tail(path: &Path, max_bytes: u64) -> Result<(u64, bool, Vec<u8>)> {
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("open log file {}", path.display()))?;
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open log file {}", path.display()))?;
     let total = file.metadata()?.len();
     if total == 0 {
         return Ok((0, false, Vec::new()));

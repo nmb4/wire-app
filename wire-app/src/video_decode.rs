@@ -26,6 +26,8 @@ pub struct DecodedFrame {
     pub data: DecodedFrameData,
     pub width: u32,
     pub height: u32,
+    pub source_height: u32,
+    pub source_fps: u32,
 }
 
 pub enum DecodedFrameData {
@@ -59,6 +61,8 @@ impl FrameDecoder for OpenH264Decoder {
                 data: DecodedFrameData::Rgba(Arc::new(rgba)),
                 width,
                 height,
+                source_height: 0,
+                source_fps: 0,
             }]
         })
     }
@@ -109,6 +113,8 @@ struct EncodedPacket {
     data: Vec<u8>,
     keyframe: bool,
     generation: u64,
+    source_height: u32,
+    source_fps: u32,
 }
 
 impl VideoDecodeWorker {
@@ -145,7 +151,14 @@ impl VideoDecodeWorker {
     /// sequence of H.264 pictures. If the decoder is slower than the network,
     /// this blocks the caller (the QUIC receive task), which backpressures the
     /// sender through QUIC flow control instead of dropping frames.
-    pub fn submit(&self, data: Vec<u8>, keyframe: bool, generation: u64) {
+    pub fn submit(
+        &self,
+        data: Vec<u8>,
+        keyframe: bool,
+        generation: u64,
+        source_height: u32,
+        source_fps: u32,
+    ) {
         let Some(packet_tx) = &self.packet_tx else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -154,6 +167,8 @@ impl VideoDecodeWorker {
             data,
             keyframe,
             generation,
+            source_height,
+            source_fps,
         }) {
             Ok(()) => {
                 self.submitted.fetch_add(1, Ordering::Relaxed);
@@ -238,10 +253,12 @@ where
                 window_decode_ms += decode_ms;
                 decode_samples_ms.push(decode_ms);
                 decode_errors = 0;
-                for frame in frames {
+                for mut frame in frames {
                     decoded += 1;
                     window_decoded += 1;
                     window_bytes += packet_len;
+                    frame.source_height = packet.source_height;
+                    frame.source_fps = packet.source_fps;
                     if decoded == 1 {
                         info!(
                             "decoded first video frame ({}x{})",

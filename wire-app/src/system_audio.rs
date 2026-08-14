@@ -38,12 +38,12 @@ impl SystemAudioShare {
 
         let thread = std::thread::Builder::new()
             .name("wire-system-audio".into())
-            .spawn(move || {
-                match run_capture_loop(encoder, stop_for_thread, ready_tx) {
+            .spawn(
+                move || match run_capture_loop(encoder, stop_for_thread, ready_tx) {
                     Ok(()) => {}
                     Err(error) => warn!("system audio capture ended: {error:#}"),
-                }
-            })
+                },
+            )
             .context("failed to start system audio thread")?;
 
         match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
@@ -143,8 +143,7 @@ mod windows {
 
     use anyhow::{anyhow, Context, Result};
     use tracing::{info, warn};
-    use windows::core::{Interface, Ref, IUnknown};
-    use windows_core::implement;
+    use windows::core::{IUnknown, Interface, Ref};
     use windows::Win32::Media::Audio::{
         eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
         IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -163,6 +162,7 @@ mod windows {
         CoCreateInstance, CoInitializeEx, BLOB, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
     use windows::Win32::System::Variant::VT_BLOB;
+    use windows_core::implement;
     use wire::codec::opus::MediaTrackOpusEncoder;
 
     use super::push_samples;
@@ -230,10 +230,9 @@ mod windows {
             Err(error) => warn!("process loopback pcm16 init failed: {error:#}"),
         }
 
-        let autoconvert =
-            AUDCLNT_STREAMFLAGS_LOOPBACK
-                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        let autoconvert = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         match try_device_loopback(&float, autoconvert, 32, true, "WASAPI device loopback") {
             Ok(opened) => return Ok(opened),
             Err(error) => warn!("device loopback autoconvert init failed: {error:#}"),
@@ -286,23 +285,14 @@ mod windows {
     }
 
     fn initialize_client(client: &IAudioClient, flags: u32, format: &WAVEFORMATEX) -> Result<()> {
-        unsafe {
-            client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                flags,
-                BUFFER_HNS,
-                0,
-                format,
-                None,
-            )
-        }
-        .map_err(|error| {
-            if error.code().0 as u32 == AUDCLNT_E_INVALID_STREAM_FLAG {
-                anyhow!("{error} (AUDCLNT_E_INVALID_STREAM_FLAG; flags={flags:#x})")
-            } else {
-                anyhow!("{error}")
-            }
-        })
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, BUFFER_HNS, 0, format, None) }
+            .map_err(|error| {
+                if error.code().0 as u32 == AUDCLNT_E_INVALID_STREAM_FLAG {
+                    anyhow!("{error} (AUDCLNT_E_INVALID_STREAM_FLAG; flags={flags:#x})")
+                } else {
+                    anyhow!("{error}")
+                }
+            })
     }
 
     fn finish_open(
@@ -312,8 +302,8 @@ mod windows {
         is_float: bool,
         description: &str,
     ) -> Result<OpenedCapture> {
-        let capture: IAudioCaptureClient = unsafe { client.GetService() }
-            .context("failed to open system audio capture client")?;
+        let capture: IAudioCaptureClient =
+            unsafe { client.GetService() }.context("failed to open system audio capture client")?;
         info!(
             "{description} ready ({}ch, {}-bit {}, 48 kHz)",
             channels,

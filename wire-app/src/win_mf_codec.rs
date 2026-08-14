@@ -2067,6 +2067,8 @@ impl MfH264Decoder {
                             data: crate::video_decode::DecodedFrameData::D3d11(frame),
                             width: display_width,
                             height: display_height,
+                            source_height: 0,
+                            source_fps: 0,
                         }));
                     }
                     Ok(None) => {
@@ -2096,6 +2098,8 @@ impl MfH264Decoder {
             data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(out)),
             width: display_width,
             height: display_height,
+            source_height: 0,
+            source_fps: 0,
         }))
     }
 

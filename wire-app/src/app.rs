@@ -436,6 +436,8 @@ struct VideoFrameState {
     height: u32,
     stream_generation: u64,
     generation: u64,
+    source_height: u32,
+    source_fps: u32,
     data: DecodedFrameData,
     texture: Option<egui::TextureHandle>,
     uploaded_generation: u64,
@@ -1269,6 +1271,8 @@ impl AppState {
                                 height: 0,
                                 stream_generation: generation,
                                 generation: 0,
+                                source_height: 0,
+                                source_fps: 0,
                                 data: DecodedFrameData::Rgba(Arc::new(Vec::new())),
                                 texture: None,
                                 uploaded_generation: 0,
@@ -1281,6 +1285,8 @@ impl AppState {
                     state.stream_generation = generation;
                     state.width = frame.width;
                     state.height = frame.height;
+                    state.source_height = frame.source_height;
+                    state.source_fps = frame.source_fps;
                     state.data = frame.data;
                     #[cfg(windows)]
                     if matches!(&state.data, DecodedFrameData::D3d11(_)) {
@@ -1563,11 +1569,10 @@ impl AppState {
                     .find(|attachment| attachment.hash == hash)
                     .cloned();
                 if let Some(attachment) = attachment {
-                    let _ = self.chat.attachment_textures.insert_data(
-                        ctx,
-                        &attachment,
-                        data,
-                    );
+                    let _ = self
+                        .chat
+                        .attachment_textures
+                        .insert_data(ctx, &attachment, data);
                 }
             }
             ChatNotification::Delivery {
@@ -4965,7 +4970,14 @@ impl AppState {
                             if let Some(volume) = self.volumes.get(&node_id).cloned() {
                                 ui.horizontal(|ui| {
                                     ui.label("Volume");
-                                    peer_volume_slider(ui, &pal, &volume, 120.0, 18.0, "Voice volume");
+                                    peer_volume_slider(
+                                        ui,
+                                        &pal,
+                                        &volume,
+                                        120.0,
+                                        18.0,
+                                        "Voice volume",
+                                    );
                                 });
                             }
                             if let Some(rtt) = self.rtts.get(&node_id) {
@@ -5319,8 +5331,7 @@ impl AppState {
         ui.painter()
             .rect_filled(tile_rect, corner_radius, Color32::BLACK);
         let show_overlays = tile_rect.width() >= 90.0 && tile_rect.height() >= 44.0;
-        let max_label_chars = ((tile_rect.width() / 8.0) as usize).saturating_sub(12);
-        let label = ellipsize(&self.stream_label(source), max_label_chars.clamp(8, 30));
+        let label = self.stream_label(source);
         let content_rect = tile_rect;
         let (width, height) = match source {
             StreamSource::Local => self
@@ -5333,6 +5344,16 @@ impl AppState {
                 .map(|frame| (frame.width, frame.height)),
         }
         .unwrap_or_default();
+        let quality = match source {
+            StreamSource::Local => format_stream_quality(
+                self.video_config.resolution.height(),
+                self.video_config.framerate,
+            ),
+            StreamSource::Remote(node_id) => self
+                .video_frames
+                .get(&node_id)
+                .and_then(|frame| format_stream_quality(frame.source_height, frame.source_fps)),
+        };
         if width == 0 || height == 0 {
             return;
         }
@@ -5450,20 +5471,13 @@ impl AppState {
         if show_overlays {
             let overlay_fill =
                 Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), 190);
-            let galley = ui
-                .painter()
-                .layout_no_wrap(label, sans(12.0), Color32::WHITE);
-            let badge_size = Vec2::new(galley.size().x + 20.0, 26.0);
-            let badge_rect = egui::Rect::from_min_size(
-                tile_rect.left_bottom() + egui::vec2(8.0, -badge_size.y - 8.0),
-                badge_size,
-            );
-            ui.painter()
-                .rect_filled(badge_rect, CornerRadius::same(8), overlay_fill);
-            ui.painter().galley(
-                badge_rect.left_center() + egui::vec2(10.0, -galley.size().y * 0.5),
-                galley,
-                Color32::WHITE,
+            let left_overlay_width = paint_stream_info_badges(
+                ui,
+                pal,
+                tile_rect,
+                &label,
+                quality.as_deref(),
+                overlay_fill,
             );
 
             if ui.rect_contains_pointer(tile_rect) {
@@ -5478,8 +5492,7 @@ impl AppState {
                     StreamSource::Local => None,
                 };
                 let local_audio = matches!(source, StreamSource::Local);
-                let button_count =
-                    1 + usize::from(stop_node.is_some()) + usize::from(local_audio);
+                let button_count = 1 + usize::from(stop_node.is_some()) + usize::from(local_audio);
                 let group_size = Vec2::new(
                     PAD * 2.0
                         + BTN * button_count as f32
@@ -5575,6 +5588,7 @@ impl AppState {
                             &volume,
                             ui.id().with(("stream_volume", node_id)),
                             tile_rect,
+                            left_overlay_width,
                         );
                     }
                 }
@@ -6618,10 +6632,8 @@ fn chip_icon_button(
     selected: bool,
     tooltip: &str,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::splat(PARTICIPANT_ACTION_HEIGHT),
-        egui::Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(PARTICIPANT_ACTION_HEIGHT), egui::Sense::click());
     let response = response.on_hover_text(tooltip);
     let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
     let (fill, stroke, icon_color) = if selected {
@@ -7023,8 +7035,7 @@ fn paint_volume_track(
         );
     }
     let knob_pos = egui::pos2(track.left() + filled_w, track.center().y);
-    ui.painter()
-        .circle_filled(knob_pos, knob.radius, knob.fill);
+    ui.painter().circle_filled(knob_pos, knob.radius, knob.fill);
     if let Some((width, color)) = knob.border {
         ui.painter()
             .circle_stroke(knob_pos, knob.radius, Stroke::new(width, color));
@@ -7036,9 +7047,7 @@ fn paint_volume_track(
 
 fn paint_volume_value(ui: &Ui, pal: &Palette, knob_pos: egui::Pos2, knob_radius: f32, value: f32) {
     let text = format!("{:.0}%", (value * 100.0).round());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, sans(10.0), pal.text);
+    let galley = ui.painter().layout_no_wrap(text, sans(10.0), pal.text);
     let pad = Vec2::new(5.0, 2.0);
     let badge_size = galley.size() + pad * 2.0;
     let badge_rect = egui::Rect::from_center_size(
@@ -7059,11 +7068,7 @@ fn paint_volume_value(ui: &Ui, pal: &Palette, knob_pos: egui::Pos2, knob_radius:
         Stroke::new(1.0_f32, pal.line_br),
         egui::StrokeKind::Inside,
     );
-    painter.galley(
-        badge_rect.min + pad,
-        galley,
-        pal.text,
-    );
+    painter.galley(badge_rect.min + pad, galley, pal.text);
 }
 
 fn stream_volume_badge(
@@ -7073,6 +7078,7 @@ fn stream_volume_badge(
     volume: &VolumeHandle,
     id: egui::Id,
     tile_rect: egui::Rect,
+    occupied_left: f32,
 ) {
     const HEIGHT: f32 = 26.0;
     const MARGIN: f32 = 8.0;
@@ -7084,7 +7090,7 @@ fn stream_volume_badge(
     const KNOB: f32 = 5.0;
 
     let width = PAD + ICON + GAP + TRACK_W + PAD;
-    if tile_rect.width() < width + MARGIN * 2.0 + 80.0 {
+    if tile_rect.width() < width + MARGIN * 2.0 + occupied_left {
         return;
     }
 
@@ -7097,8 +7103,7 @@ fn stream_volume_badge(
         .on_hover_text("Stream volume")
         .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
 
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(8), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
 
     let muted = f32::from_bits(volume.load(Ordering::Relaxed)) <= 0.001;
     ui.painter().text(
@@ -7191,15 +7196,8 @@ fn system_audio_share_row(ui: &mut Ui, pal: &Palette, enabled: &mut bool) {
                     ui.painter().rect(
                         check_rect,
                         CornerRadius::same(5),
-                        if *enabled {
-                            pal.accent
-                        } else {
-                            pal.panel
-                        },
-                        Stroke::new(
-                            1.0_f32,
-                            if *enabled { pal.accent } else { pal.line_br },
-                        ),
+                        if *enabled { pal.accent } else { pal.panel },
+                        Stroke::new(1.0_f32, if *enabled { pal.accent } else { pal.line_br }),
                         egui::StrokeKind::Inside,
                     );
                     if *enabled {
@@ -7855,6 +7853,98 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     shortened
 }
 
+const STREAM_OVERLAY_BADGE_HEIGHT: f32 = 26.0;
+const STREAM_OVERLAY_BADGE_PAD_X: f32 = 10.0;
+const STREAM_OVERLAY_BADGE_GAP: f32 = 6.0;
+const STREAM_OVERLAY_MARGIN: f32 = 8.0;
+
+fn format_stream_quality(height: u32, fps: u32) -> Option<String> {
+    (height > 0 && fps > 0).then(|| format!("{height}p@{fps}"))
+}
+
+fn stream_info_badge_width(text: &str, measure: impl Fn(&str) -> f32) -> f32 {
+    measure(text) + STREAM_OVERLAY_BADGE_PAD_X * 2.0
+}
+
+/// Name plus an optional quality badge (`1080p@60`) that fit in `available_width`.
+///
+/// The name is kept intact when possible. The quality badge is dropped if the
+/// tile is too narrow. The name is only ellipsized when it does not fit alone.
+fn fit_stream_info_badges(
+    name: &str,
+    quality: Option<&str>,
+    available_width: f32,
+    measure: impl Fn(&str) -> f32,
+) -> Vec<String> {
+    let badge_w = |text: &str| stream_info_badge_width(text, &measure);
+    let name_width = badge_w(name);
+    if let Some(quality) = quality {
+        let extras_width = badge_w(quality) + STREAM_OVERLAY_BADGE_GAP;
+        if name_width + extras_width <= available_width {
+            return vec![name.to_owned(), quality.to_owned()];
+        }
+    }
+    if name_width <= available_width {
+        return vec![name.to_owned()];
+    }
+
+    let mut label = name.to_owned();
+    let mut chars = label.chars().count();
+    while chars > 1 && badge_w(&label) > available_width {
+        chars -= 1;
+        label = ellipsize(name, chars);
+    }
+    vec![label]
+}
+
+fn paint_stream_info_badges(
+    ui: &mut Ui,
+    pal: &Palette,
+    tile_rect: egui::Rect,
+    name: &str,
+    quality: Option<&str>,
+    fill: Color32,
+) -> f32 {
+    let available = (tile_rect.width() - STREAM_OVERLAY_MARGIN * 2.0).max(0.0);
+    let measure = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), sans(12.0), Color32::WHITE)
+            .size()
+            .x
+    };
+    let badges = fit_stream_info_badges(name, quality, available, measure);
+    if badges.is_empty() {
+        return 0.0;
+    }
+
+    let mut x = tile_rect.left() + STREAM_OVERLAY_MARGIN;
+    let y = tile_rect.bottom() - STREAM_OVERLAY_MARGIN - STREAM_OVERLAY_BADGE_HEIGHT;
+    for (index, text) in badges.iter().enumerate() {
+        let color = if index == 0 {
+            Color32::WHITE
+        } else {
+            pal.text2
+        };
+        let galley = ui.painter().layout_no_wrap(text.clone(), sans(12.0), color);
+        let badge_size = Vec2::new(
+            galley.size().x + STREAM_OVERLAY_BADGE_PAD_X * 2.0,
+            STREAM_OVERLAY_BADGE_HEIGHT,
+        );
+        let badge_rect = egui::Rect::from_min_size(egui::pos2(x, y), badge_size);
+        ui.painter()
+            .rect_filled(badge_rect, CornerRadius::same(8), fill);
+        ui.painter().galley(
+            badge_rect.left_center()
+                + egui::vec2(STREAM_OVERLAY_BADGE_PAD_X, -galley.size().y * 0.5),
+            galley,
+            color,
+        );
+        x = badge_rect.right() + STREAM_OVERLAY_BADGE_GAP;
+    }
+
+    x - STREAM_OVERLAY_BADGE_GAP - tile_rect.left()
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -7925,6 +8015,40 @@ mod layout_tests {
     fn long_stream_names_are_clipped_cleanly() {
         assert_eq!(ellipsize("Ada", 8), "Ada");
         assert_eq!(ellipsize("Long display name", 8), "Long di…");
+    }
+
+    #[test]
+    fn stream_overlay_formats_quality_as_height_and_fps() {
+        assert_eq!(format_stream_quality(1080, 60).as_deref(), Some("1080p@60"));
+        assert_eq!(format_stream_quality(720, 30).as_deref(), Some("720p@30"));
+        assert_eq!(format_stream_quality(0, 60), None);
+        assert_eq!(format_stream_quality(1080, 0), None);
+    }
+
+    #[test]
+    fn stream_overlay_keeps_quality_beside_the_name() {
+        let measure = |text: &str| text.chars().count() as f32 * 8.0;
+        assert_eq!(
+            fit_stream_info_badges("Ada", Some("1080p@60"), 400.0, measure),
+            ["Ada", "1080p@60"]
+        );
+    }
+
+    #[test]
+    fn stream_overlay_drops_quality_when_the_tile_is_narrow() {
+        let measure = |text: &str| text.chars().count() as f32 * 8.0;
+        assert_eq!(
+            fit_stream_info_badges("Long display name", Some("1080p@60"), 180.0, measure),
+            ["Long display name"]
+        );
+        assert_eq!(
+            fit_stream_info_badges("Ada", Some("1080p@60"), 80.0, measure),
+            ["Ada"]
+        );
+        assert_eq!(
+            fit_stream_info_badges("Long display name", None, 80.0, measure),
+            ["Long d…"]
+        );
     }
 
     #[test]
@@ -10076,7 +10200,13 @@ async fn recv_video_on_stream(
                     max_age_ms = 0.0;
                     age_samples.clear();
                 }
-                worker.submit(frame.data, frame.keyframe, generation);
+                worker.submit(
+                    frame.data,
+                    frame.keyframe,
+                    generation,
+                    u32::from(frame.height),
+                    u32::from(frame.fps),
+                );
             }
             Ok(None) => break,
             Err(e) => {

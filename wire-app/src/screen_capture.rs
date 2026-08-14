@@ -905,7 +905,14 @@ fn run_encode_loop(
                     info!("encoded first video frame ({} bytes)", encoded.len());
                 }
                 let keyframe = contains_idr(&encoded);
-                let frame = EncodedVideoFrame::new(next_sequence, keyframe, encoded);
+                let frame = EncodedVideoFrame::new(
+                    next_sequence,
+                    keyframe,
+                    encoded,
+                    config.resolution.width(),
+                    config.resolution.height(),
+                    config.framerate,
+                );
                 next_sequence = next_sequence.wrapping_add(1);
                 // receiver_count was checked immediately before encoding. A peer can still
                 // disconnect during an encode; in that case dropping this completed frame is safe.
