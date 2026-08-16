@@ -1129,7 +1129,7 @@ impl AppState {
                             self.play_sound(Sound::Success);
                             self.notifications.dismiss_key(&call_key);
                             if !matches!(previous, Some(CallState::Active)) {
-                                self.notifications.success(
+                                self.notifications.success_with_body(
                                     format!("call-connected:{node_id}"),
                                     "Call connected",
                                     self.peer_display_name(node_id),
@@ -1380,19 +1380,15 @@ impl AppState {
                         self.capture_error = None;
                         self.notifications.success(
                             "screen-sharing",
-                            "Screen sharing started",
                             if system_audio {
-                                "Your screen and computer sound are now in the call."
+                                "Sharing screen and sound"
                             } else {
-                                "Your screen is now visible to the call."
+                                "Screen sharing started"
                             },
                         );
                     } else {
-                        self.notifications.info(
-                            "screen-sharing",
-                            "Screen sharing stopped",
-                            "Your screen is no longer being shared.",
-                        );
+                        self.notifications
+                            .info("screen-sharing", "Screen sharing stopped");
                     }
                     if !active {
                         self.preview = None;

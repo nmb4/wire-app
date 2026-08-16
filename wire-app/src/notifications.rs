@@ -31,6 +31,43 @@ const LEAVE_TIME: Duration = Duration::from_millis(320);
 const GROUP_WINDOW: Duration = Duration::from_secs(30);
 const MAX_VISIBLE: usize = 4;
 const MAX_FUSED_ROWS: usize = 4;
+const TITLE_ONLY_HEIGHT: f32 = 58.0;
+const TITLE_BODY_HEIGHT: f32 = 78.0;
+const TITLE_ONLY_WITH_BUTTONS_HEIGHT: f32 = 90.0;
+const TITLE_BODY_WITH_BUTTONS_HEIGHT: f32 = 108.0;
+const INCOMING_CALL_TITLE_ONLY_HEIGHT: f32 = 100.0;
+const INCOMING_CALL_HEIGHT: f32 = 118.0;
+
+fn body_is_visible(body: &str) -> bool {
+    !body.trim().is_empty()
+}
+
+fn estimated_single_height(kind: NotificationKind, body: &str, has_buttons: bool) -> f32 {
+    let has_body = body_is_visible(body);
+    match kind {
+        NotificationKind::IncomingCall => {
+            if has_body {
+                INCOMING_CALL_HEIGHT
+            } else {
+                INCOMING_CALL_TITLE_ONLY_HEIGHT
+            }
+        }
+        _ if has_buttons => {
+            if has_body {
+                TITLE_BODY_WITH_BUTTONS_HEIGHT
+            } else {
+                TITLE_ONLY_WITH_BUTTONS_HEIGHT
+            }
+        }
+        _ => {
+            if has_body {
+                TITLE_BODY_HEIGHT
+            } else {
+                TITLE_ONLY_HEIGHT
+            }
+        }
+    }
+}
 
 fn notification_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("wire-notification-overlay")
@@ -133,11 +170,12 @@ impl NotificationGroup {
             30.0 + self.entries.len() as f32 * 45.0
                 + if self.hidden_entries > 0 { 22.0 } else { 0.0 }
         } else {
-            match self.kind {
-                NotificationKind::IncomingCall => 118.0,
-                _ if self.buttons.is_empty() => 78.0,
-                _ => 108.0,
-            }
+            let body = self
+                .entries
+                .front()
+                .map(|entry| entry.body.as_str())
+                .unwrap_or("");
+            estimated_single_height(self.kind, body, !self.buttons.is_empty())
         }
     }
 
@@ -231,11 +269,8 @@ impl NotificationStore {
             }
         }
 
-        let estimated_height = match spec.kind {
-            NotificationKind::IncomingCall => 118.0,
-            _ if spec.buttons.is_empty() => 78.0,
-            _ => 108.0,
-        };
+        let estimated_height =
+            estimated_single_height(spec.kind, &spec.body, !spec.buttons.is_empty());
         let group = NotificationGroup {
             id: self.next_id,
             key: spec.group_key,
@@ -441,7 +476,7 @@ impl NotificationService {
             group_key: Some(format!("call:{node_id}")),
             kind: NotificationKind::IncomingCall,
             title: peer_name,
-            body: "Wants to start a voice call".to_owned(),
+            body: String::new(),
             action: Some(NotificationAction::OpenCalls),
             buttons: vec![
                 ActionButton {
@@ -469,7 +504,18 @@ impl NotificationService {
         });
     }
 
-    pub(crate) fn success(
+    pub(crate) fn success(&self, key: impl Into<String>, title: impl Into<String>) {
+        self.push(NotificationSpec {
+            group_key: Some(key.into()),
+            kind: NotificationKind::Success,
+            title: title.into(),
+            body: String::new(),
+            action: None,
+            buttons: Vec::new(),
+        });
+    }
+
+    pub(crate) fn success_with_body(
         &self,
         key: impl Into<String>,
         title: impl Into<String>,
@@ -485,17 +531,12 @@ impl NotificationService {
         });
     }
 
-    pub(crate) fn info(
-        &self,
-        key: impl Into<String>,
-        title: impl Into<String>,
-        body: impl Into<String>,
-    ) {
+    pub(crate) fn info(&self, key: impl Into<String>, title: impl Into<String>) {
         self.push(NotificationSpec {
             group_key: Some(key.into()),
             kind: NotificationKind::Info,
             title: title.into(),
-            body: body.into(),
+            body: String::new(),
             action: None,
             buttons: Vec::new(),
         });
@@ -946,14 +987,16 @@ fn render_single_group(
             )
             .truncate(),
         );
-        ui.add(
-            egui::Label::new(
-                RichText::new(&entry.body)
-                    .size(ui_font_size(11.0))
-                    .color(tint(pal.text2)),
-            )
-            .truncate(),
-        );
+        if body_is_visible(&entry.body) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&entry.body)
+                        .size(ui_font_size(11.0))
+                        .color(tint(pal.text2)),
+                )
+                .truncate(),
+            );
+        }
         if !group.buttons.is_empty() {
             ui.add_space(7.0);
             ui.horizontal_top(|ui| {
@@ -1042,14 +1085,16 @@ fn render_fused_group(
                         )
                         .truncate(),
                     );
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&entry.body)
-                                .size(ui_font_size(10.5))
-                                .color(tint(pal.text2)),
-                        )
-                        .truncate(),
-                    );
+                    if body_is_visible(&entry.body) {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&entry.body)
+                                    .size(ui_font_size(10.5))
+                                    .color(tint(pal.text2)),
+                            )
+                            .truncate(),
+                        );
+                    }
                     ui.add_space(4.0);
                 })
                 .response
@@ -1156,7 +1201,7 @@ mod tests {
     #[test]
     fn overlay_can_render_in_an_embedded_viewport() {
         let service = NotificationService::default();
-        service.info("preview", "Wire", "Notification preview");
+        service.info("preview", "Notification preview");
         let context = egui::Context::default();
         context.set_embed_viewports(true);
         let _ = context.run(egui::RawInput::default(), |ctx| {
@@ -1167,14 +1212,68 @@ mod tests {
     #[test]
     fn notification_sounds_coalesce_until_consumed() {
         let service = NotificationService::default();
-        service.info("first", "Wire", "First notification");
-        service.info("second", "Wire", "Second notification");
+        service.info("first", "First notification");
+        service.info("second", "Second notification");
 
         assert!(service.take_sound_request());
         assert!(!service.take_sound_request());
 
-        service.info("third", "Wire", "Third notification");
+        service.info("third", "Third notification");
         assert!(service.take_sound_request());
+    }
+
+    #[test]
+    fn notifications_with_a_body_keep_the_taller_card() {
+        let now = Instant::now();
+        let mut store = NotificationStore::default();
+        store.push(
+            NotificationSpec {
+                group_key: Some("call-connected".to_owned()),
+                kind: NotificationKind::Success,
+                title: "Call connected".to_owned(),
+                body: "Ada".to_owned(),
+                action: None,
+                buttons: Vec::new(),
+            },
+            now,
+        );
+
+        assert_eq!(store.visible[0].estimated_height(), TITLE_BODY_HEIGHT);
+        assert_eq!(store.host_height(), TITLE_BODY_HEIGHT + OUTER_PADDING * 2.0);
+    }
+
+    #[test]
+    fn title_only_notifications_estimate_a_shorter_card() {
+        let now = Instant::now();
+        let mut store = NotificationStore::default();
+        store.push(
+            NotificationSpec {
+                group_key: Some("screen-sharing".to_owned()),
+                kind: NotificationKind::Info,
+                title: "Screen sharing stopped".to_owned(),
+                body: String::new(),
+                action: None,
+                buttons: Vec::new(),
+            },
+            now,
+        );
+
+        assert_eq!(store.visible[0].estimated_height(), TITLE_ONLY_HEIGHT);
+        assert_eq!(store.host_height(), TITLE_ONLY_HEIGHT + OUTER_PADDING * 2.0);
+    }
+
+    #[test]
+    fn incoming_calls_do_not_repeat_the_kind_as_a_description() {
+        let service = NotificationService::default();
+        service.incoming_call("node".to_owned(), "Ada".to_owned());
+        let mut runtime = service.runtime.lock().unwrap();
+        runtime.apply_commands(Instant::now());
+
+        let group = &runtime.store.visible[0];
+        assert_eq!(group.kind, NotificationKind::IncomingCall);
+        assert_eq!(group.entries[0].title, "Ada");
+        assert!(group.entries[0].body.is_empty());
+        assert_eq!(group.estimated_height(), INCOMING_CALL_TITLE_ONLY_HEIGHT);
     }
 
     #[test]
@@ -1182,19 +1281,22 @@ mod tests {
         let service = NotificationService::default();
         assert!(!service.active.load(Ordering::Acquire));
 
-        service.info("first", "Wire", "First notification");
+        service.info("first", "First notification");
 
         assert!(service.active.load(Ordering::Acquire));
         let mut runtime = service.runtime.lock().unwrap();
         runtime.apply_commands(Instant::now());
         assert_eq!(runtime.store.visible.len(), 1);
-        assert_eq!(runtime.store.host_height(), 94.0);
+        assert_eq!(
+            runtime.store.host_height(),
+            TITLE_ONLY_HEIGHT + OUTER_PADDING * 2.0
+        );
     }
 
     #[test]
     fn native_notification_viewport_prepaints_offscreen_at_final_size() {
         let service = NotificationService::default();
-        service.info("first", "Wire", "First notification");
+        service.info("first", "First notification");
         let context = egui::Context::default();
         context.set_embed_viewports(false);
         let output = context.run(egui::RawInput::default(), |ctx| {
@@ -1214,7 +1316,10 @@ mod tests {
         assert_eq!(viewport.builder.position, Some(staging_position()));
         assert_eq!(
             viewport.builder.inner_size,
-            Some(Vec2::new(HOST_WIDTH, 94.0))
+            Some(Vec2::new(
+                HOST_WIDTH,
+                TITLE_ONLY_HEIGHT + OUTER_PADDING * 2.0
+            ))
         );
     }
 
@@ -1222,16 +1327,25 @@ mod tests {
     #[test]
     fn windows_region_contains_only_the_card_bounds() {
         let service = NotificationService::default();
-        service.info("first", "Wire", "First notification");
+        service.info("first", "First notification");
         let mut runtime = service.runtime.lock().unwrap();
         let now = Instant::now();
         runtime.apply_commands(now);
         runtime.store.layout(now);
 
-        assert_eq!(
-            windows_region_rects(&runtime.store, 1.5, now),
-            vec![[522, -30, 1020, 88]]
-        );
+        let group = &runtime.store.visible[0];
+        let scale = 1.5;
+        let x = OUTER_PADDING + windows_slide_offset(group.opacity(now));
+        let expected = [[
+            (x * scale).floor() as i32,
+            (group.render_y * scale).floor() as i32,
+            ((x + CARD_WIDTH) * scale).ceil() as i32,
+            ((group.render_y + group.height()) * scale).ceil() as i32,
+        ]];
+        assert_eq!(windows_region_rects(&runtime.store, scale, now), expected);
+        assert_eq!(group.height(), TITLE_ONLY_HEIGHT);
+        assert!(expected[0][2] - expected[0][0] > 0);
+        assert!(expected[0][3] - expected[0][1] > 0);
     }
 
     #[cfg(windows)]
