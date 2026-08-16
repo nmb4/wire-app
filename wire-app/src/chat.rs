@@ -871,6 +871,10 @@ impl ChatService {
         let blob_downloader = blobs.downloader().clone();
         let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
         let docs = Docs::persistent(docs_path).spawn(&blobs, &gossip).await?;
+        // Docs entries store their values in the shared blob store. Register
+        // those hashes before starting GC or message bodies will be collected
+        // while their document metadata remains intact.
+        blobs.add_protected(docs.protect_cb())?;
         blobs.start_gc(GcConfig {
             period: Duration::from_secs(30 * 60),
             done_callback: None,
