@@ -443,9 +443,9 @@ fn init_capture_source(
             // xcap uses CoreGraphics' real window bounds and capture API instead.
             return init_xcap_source(target_w, target_h, target);
         }
-        Ok(CaptureSource::Scap(Box::new(ScapCapturer::try_new(
+        Ok(CaptureSource::Scap(ScapCapturer::try_new(
             target_w, target_h, framerate, target,
-        )?)))
+        )?))
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
