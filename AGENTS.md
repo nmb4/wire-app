@@ -1,5 +1,121 @@
 # AGENTS.md
 
+## Foresight
+
+Work iteratively. The goal is not to one-shot tasks; the goal is to make them right.
+
+Before changing code, spend a small amount of time connecting the task to the surrounding system. Think ahead far enough to catch likely interactions, common states, and user/developer friction, but do not turn every task into a heavyweight specification exercise.
+
+### Before implementation
+
+For any non-trivial task:
+
+1. Understand the requested change and the code paths it touches.
+2. Identify the closest connected behavior, state, or subsystem.
+3. Ask what common real-world situations become possible because of this change.
+4. Decide where it makes sense to stop for a checkpoint or manual test.
+5. Then implement.
+
+Keep this lightweight. A short markdown plan or task note is enough when writing the reasoning down helps. Do not create large specs unless the task genuinely requires one.
+
+### Think in connections, not tunnels
+
+Do not treat the requested feature as an isolated island.
+
+When adding or changing behavior, inspect the immediate neighboring cases. In particular, consider:
+
+- What can happen immediately before this state?
+- What can happen while this state is active?
+- What other common action can occur at the same time?
+- What happens when the action is repeated, interrupted, cancelled, replaced, or superseded?
+- Which existing state machines, resources, UI states, network flows, or lifecycle events interact with it?
+- Could the new behavior leave the application in a state that is difficult to recover from?
+
+Prioritize **common connected cases** over exhaustive edge-case hunting. A feature that works in isolation but breaks during an ordinary adjacent action is not complete.
+
+Do not spend disproportionate effort on extremely rare cases during the first pass. Refinement can happen later.
+
+### Foresight over hindsight
+
+Prefer preventing the next likely problem over preserving every historical behavior.
+
+This codebase may move quickly. Do not add compatibility layers, migrations, deprecated paths, or preservation logic merely because old behavior existed. Maintain backwards compatibility only when the project actually needs it or the task explicitly requires it.
+
+Use previous mistakes as information, not as a reason to accumulate defensive complexity.
+
+### Iterate deliberately
+
+Implementation should be a loop:
+
+**understand → foresee → implement → verify → checkpoint → refine**
+
+A checkpoint is useful when the next meaningful information can only come from running or manually using the software. Do not keep expanding the implementation based on increasingly speculative assumptions when a quick real-world check would provide better information.
+
+Likewise, do not stop after the narrow requested code compiles if one more closely related check can prevent an obvious follow-up bug.
+
+### User experience and developer experience both matter
+
+Evaluate changes from both sides.
+
+For the user:
+
+- Does the feature behave sensibly in normal use?
+- Are transitions and conflicting actions handled?
+- Can the user recover from interruption or failure?
+- Does the application expose confusing, impossible, or stale states?
+
+For the developer:
+
+- Is the behavior understandable from the code?
+- Are important states visible through useful logs or diagnostics?
+- Will the next change require fighting unnecessary complexity?
+- Can likely failures be reproduced and reasoned about?
+
+A technically correct implementation that creates a poor normal-use experience is incomplete.
+
+### Verification
+
+Use automated tests where they give strong signal cheaply, especially for deterministic state transitions, parsing, data transformations, protocol behavior, and regressions.
+
+Do not assume automated tests cover application experience. Some problems only become apparent during manual use, especially UI, audio/video, networking, timing, multi-client, and cross-platform behavior.
+
+Before considering a non-trivial feature complete, think through the manual scenarios a person is likely to try first. When useful, tell the developer exactly what should be manually checked at the next checkpoint.
+
+### Expensive feedback loops
+
+Be conscious of expensive build, compile, deployment, or reproduction cycles.
+
+For projects with slow feedback loops—such as large Rust builds—spending additional time reasoning through closely related behavior before compiling is often cheaper than discovering one predictable issue per build.
+
+This is not an excuse for speculative overengineering. Think further when the likely cost of another feedback cycle is higher than the cost of a short foresight pass.
+
+### Scope discipline
+
+Foresight does not mean expanding every task.
+
+When you notice a related issue:
+
+- Fix it now if it is a direct, common consequence of the requested change and the fix is small.
+- Include it in the current plan if the requested feature would otherwise be unsafe or obviously incomplete.
+- Record or mention it for later if it is useful but separable.
+- Ignore it if it is remote, speculative, or would derail the task.
+
+The purpose of foresight is to reduce avoidable follow-up work, not to create endless scope.
+
+### Completion standard
+
+Before finishing, ask:
+
+- Did I solve the requested problem rather than only its easiest interpretation?
+- Did I inspect the most closely connected common cases?
+- Did I create or preserve sensible behavior when states overlap?
+- Did I avoid unnecessary backwards-compatibility baggage?
+- Did I verify what can be verified automatically?
+- Did I identify what still needs manual verification?
+- Is this a good experience for both the user and the developer?
+
+If the answer to an important question is no, either address it or make the limitation explicit.
+
 ## Wire Kanban Board (kan.bn)
 
 The project's tasks live on a Kan board named **Wire**.
