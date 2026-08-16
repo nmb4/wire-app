@@ -262,6 +262,7 @@ struct ChatUiState {
     error: Option<String>,
     service_error: Option<String>,
     show_group_editor: bool,
+    show_group_members: bool,
     group_name: String,
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
@@ -1961,6 +1962,12 @@ impl AppState {
             .unwrap_or_else(|| "?".to_owned())
     }
 
+    fn group_members_for(&self, conversation: &ChatConversation) -> Vec<GroupMemberLabel> {
+        group_member_labels(&conversation.members, self.our_node_id, |node| {
+            self.friend_name(node).map(str::to_owned)
+        })
+    }
+
     fn set_stream_view_mode(&mut self, ctx: &egui::Context, mode: StreamViewMode) {
         if self.stream_view_mode == StreamViewMode::Fullscreen && mode != StreamViewMode::Fullscreen
         {
@@ -2306,6 +2313,9 @@ impl AppState {
         if self.chat.show_group_editor {
             self.ui_group_editor(ctx, pal);
         }
+        if self.chat.show_group_members {
+            self.ui_group_members(ctx, pal);
+        }
         if self.chat.friend_candidate.is_some() {
             self.ui_add_chat_friend(ctx, pal);
         }
@@ -2367,7 +2377,8 @@ impl AppState {
                             .is_some_and(|id| self.chat.selected.as_deref() == Some(id.as_str()));
                         let unseen = id.as_ref().is_some_and(|id| self.chat.unseen.contains(id));
                         let label = format!("{}   {}", self.peer_initial(peer), friend.name);
-                        if chat_navigation_button(ui, pal, &label, selected, unseen).clicked() {
+                        if chat_navigation_button(ui, pal, &label, None, selected, unseen).clicked()
+                        {
                             if let Some(id) = id {
                                 self.chat.selected = Some(id.clone());
                                 if !self.chat.conversations.contains_key(&id) {
@@ -2406,6 +2417,7 @@ impl AppState {
                             ui,
                             pal,
                             &label,
+                            None,
                             selected,
                             self.chat.unseen.contains(&id),
                         )
@@ -2436,13 +2448,17 @@ impl AppState {
                     }
                     for group in groups {
                         let selected = self.chat.selected.as_deref() == Some(group.id.as_str());
+                        let members = self.group_members_for(&group);
+                        let member_summary = format_group_member_summary(&members);
                         if chat_navigation_button(
                             ui,
                             pal,
                             &format!("#   {}", group.title),
+                            Some(&member_summary),
                             selected,
                             self.chat.unseen.contains(&group.id),
                         )
+                        .on_hover_text(&member_summary)
                         .clicked()
                         {
                             self.chat.selected = Some(group.id);
@@ -2589,24 +2605,47 @@ impl AppState {
                         .to_string(),
                     34.0,
                 );
+                let group_members = matches!(conversation.kind, ConversationKind::Group)
+                    .then(|| self.group_members_for(&conversation));
+                let group_member_summary = group_members
+                    .as_ref()
+                    .map(|members| format_group_member_summary(members));
                 ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&display_title)
-                            .color(pal.text)
-                            .size(ui_font_size(15.0)),
+                    ui.set_max_width((ui.available_width() - 160.0).max(80.0));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&display_title)
+                                .color(pal.text)
+                                .size(ui_font_size(15.0)),
+                        )
+                        .truncate(),
                     );
-                    ui.label(
-                        RichText::new(match &conversation.kind {
-                            ConversationKind::Direct { .. } => "Direct message".to_owned(),
-                            ConversationKind::Group => {
-                                format!("{} members", conversation.members.len())
-                            }
-                        })
-                        .color(pal.dim)
-                        .size(ui_font_size(11.5)),
+                    let subtitle = match &conversation.kind {
+                        ConversationKind::Direct { .. } => "Direct message".to_owned(),
+                        ConversationKind::Group => group_member_summary
+                            .clone()
+                            .unwrap_or_else(|| "No members".to_owned()),
+                    };
+                    let subtitle_response = ui.add(
+                        egui::Label::new(
+                            RichText::new(&subtitle)
+                                .color(pal.dim)
+                                .size(ui_font_size(11.5)),
+                        )
+                        .truncate()
+                        .sense(egui::Sense::click()),
                     );
+                    if matches!(conversation.kind, ConversationKind::Group) {
+                        let hover = group_member_summary
+                            .as_deref()
+                            .unwrap_or("Show group members");
+                        if subtitle_response.on_hover_text(hover).clicked() {
+                            self.chat.show_group_members = true;
+                        }
+                    }
                 });
                 let mut clear_history = false;
+                let mut open_members = false;
                 let direct_peer = conversation.direct_peer();
                 let peer_is_friend = direct_peer.is_some_and(|peer| self.is_friend(peer));
                 let mut friend_to_add = None;
@@ -2618,6 +2657,13 @@ impl AppState {
                                 .color(pal.text2),
                             |ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
+                                if matches!(conversation.kind, ConversationKind::Group)
+                                    && menu_item_button(ui, pal, Icon::Users, "Members", false)
+                                        .clicked()
+                                {
+                                    open_members = true;
+                                    ui.close();
+                                }
                                 if !show_call && !peer_is_friend {
                                     if let Some(peer) = direct_peer {
                                         if menu_item_button(
@@ -2669,6 +2715,9 @@ impl AppState {
                 if let Some(peer) = friend_to_add {
                     self.chat.friend_candidate = Some(peer);
                     self.chat.friend_candidate_name.clear();
+                }
+                if open_members {
+                    self.chat.show_group_members = true;
                 }
                 if clear_history {
                     self.clear_chat_history(&conversation.id);
@@ -3638,6 +3687,99 @@ impl AppState {
                 });
             });
         self.chat.show_group_editor &= open;
+    }
+
+    fn ui_group_members(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(conversation) = self
+            .chat
+            .selected
+            .as_ref()
+            .and_then(|id| self.chat.conversations.get(id))
+            .filter(|conversation| matches!(conversation.kind, ConversationKind::Group))
+            .cloned()
+        else {
+            self.chat.show_group_members = false;
+            return;
+        };
+        let members = self.group_members_for(&conversation);
+        let mut open = self.chat.show_group_members;
+        let mut friend_to_add = None;
+        egui::Window::new("Group members")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.label(
+                    RichText::new(&conversation.title)
+                        .color(pal.text)
+                        .size(ui_font_size(14.0)),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}",
+                        members.len(),
+                        if members.len() == 1 {
+                            "member"
+                        } else {
+                            "members"
+                        }
+                    ))
+                    .color(pal.dim)
+                    .size(ui_font_size(11.5)),
+                );
+                ui.add_space(10.0);
+                for member in &members {
+                    ui.horizontal(|ui| {
+                        let initial = member
+                            .text
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "?".to_owned());
+                        circle_avatar(ui, pal, &initial, 28.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&member.text)
+                                    .color(pal.text)
+                                    .size(ui_font_size(13.0)),
+                            );
+                            ui.label(
+                                RichText::new(match member.kind {
+                                    GroupMemberKind::You => "You",
+                                    GroupMemberKind::Friend => "Friend",
+                                    GroupMemberKind::Unknown => "Unknown ID",
+                                })
+                                .color(pal.dim)
+                                .size(ui_font_size(10.5)),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if let Some(node_id) = member.node_id {
+                                if chat_lucide_icon_button(ui, pal, Icon::Copy)
+                                    .on_hover_text("Copy node ID")
+                                    .clicked()
+                                {
+                                    copy_to_clipboard(&node_id.to_string());
+                                }
+                                if member.kind == GroupMemberKind::Unknown
+                                    && action_button(ui, pal, "Add friend", ButtonTone::Primary)
+                                        .on_hover_text("Save this member using their full node ID")
+                                        .clicked()
+                                {
+                                    friend_to_add = Some(node_id);
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+        self.chat.show_group_members = open;
+        if let Some(peer) = friend_to_add {
+            self.chat.friend_candidate = Some(peer);
+            self.chat.friend_candidate_name.clear();
+        }
     }
 
     fn ui_add_chat_friend(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -7645,11 +7787,13 @@ fn chat_navigation_button(
     ui: &mut Ui,
     pal: &Palette,
     label: &str,
+    subtitle: Option<&str>,
     selected: bool,
     unseen: bool,
 ) -> egui::Response {
+    let height = if subtitle.is_some() { 54.0 } else { 42.0 };
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(1.0), 42.0),
+        Vec2::new(ui.available_width().max(1.0), height),
         egui::Sense::click(),
     );
     let fill = if selected {
@@ -7668,13 +7812,45 @@ fn chat_navigation_button(
         ui.painter()
             .rect_filled(marker, CornerRadius::same(2), pal.accent);
     }
-    ui.painter().text(
-        rect.left_center() + Vec2::new(14.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        egui::FontId::new(ui_font_size(13.0), egui::FontFamily::Proportional),
-        if selected { pal.text } else { pal.text2 },
+    let text_right = if unseen {
+        rect.right() - 28.0
+    } else {
+        rect.right() - 12.0
+    };
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 14.0, rect.top() + 6.0),
+        egui::pos2(text_right, rect.bottom() - 6.0),
     );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.set_max_width(text_rect.width());
+            if subtitle.is_some() {
+                ui.add_space(2.0);
+            } else {
+                ui.add_space((text_rect.height() - 18.0).max(0.0) * 0.5);
+            }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(label)
+                        .color(if selected { pal.text } else { pal.text2 })
+                        .size(ui_font_size(13.0)),
+                )
+                .truncate()
+                .selectable(false),
+            );
+            if let Some(subtitle) = subtitle {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(subtitle)
+                            .color(pal.dim)
+                            .size(ui_font_size(10.5)),
+                    )
+                    .truncate()
+                    .selectable(false),
+                );
+            }
+        });
+    });
     if unseen {
         ui.painter()
             .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
@@ -7822,6 +7998,108 @@ fn should_mark_conversation_unseen(
     new_remote_messages: Option<&[ChatMessage]>,
 ) -> bool {
     !conversation_is_open && new_remote_messages.is_some_and(|messages| !messages.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupMemberKind {
+    You,
+    Friend,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupMemberLabel {
+    node_id: Option<NodeId>,
+    kind: GroupMemberKind,
+    text: String,
+}
+
+/// Resolve a group's stored member IDs into display labels.
+///
+/// Order is You, then named friends (A–Z), then unknown IDs (A–Z). Friends use
+/// their contact name; everyone else is `Peer {short id}` or a truncated raw
+/// string if the ID cannot be parsed.
+fn group_member_labels(
+    members: &[String],
+    our_node_id: Option<NodeId>,
+    friend_name: impl Fn(NodeId) -> Option<String>,
+) -> Vec<GroupMemberLabel> {
+    let mut you = None;
+    let mut friends = Vec::new();
+    let mut unknown = Vec::new();
+
+    for member in members {
+        let raw = member.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(node) = NodeId::from_str(raw) else {
+            unknown.push(GroupMemberLabel {
+                node_id: None,
+                kind: GroupMemberKind::Unknown,
+                text: ellipsize(raw, 16),
+            });
+            continue;
+        };
+        if our_node_id == Some(node) {
+            you = Some(GroupMemberLabel {
+                node_id: Some(node),
+                kind: GroupMemberKind::You,
+                text: "You".to_owned(),
+            });
+        } else if let Some(name) = friend_name(node) {
+            let name = name.trim();
+            if name.is_empty() {
+                unknown.push(GroupMemberLabel {
+                    node_id: Some(node),
+                    kind: GroupMemberKind::Unknown,
+                    text: format!("Peer {}", node.fmt_short()),
+                });
+            } else {
+                friends.push(GroupMemberLabel {
+                    node_id: Some(node),
+                    kind: GroupMemberKind::Friend,
+                    text: name.to_owned(),
+                });
+            }
+        } else {
+            unknown.push(GroupMemberLabel {
+                node_id: Some(node),
+                kind: GroupMemberKind::Unknown,
+                text: format!("Peer {}", node.fmt_short()),
+            });
+        }
+    }
+
+    friends.sort_by(|a, b| {
+        a.text
+            .to_ascii_lowercase()
+            .cmp(&b.text.to_ascii_lowercase())
+    });
+    unknown.sort_by(|a, b| {
+        a.text
+            .to_ascii_lowercase()
+            .cmp(&b.text.to_ascii_lowercase())
+    });
+
+    let mut labels = Vec::with_capacity(usize::from(you.is_some()) + friends.len() + unknown.len());
+    if let Some(you) = you {
+        labels.push(you);
+    }
+    labels.extend(friends);
+    labels.extend(unknown);
+    labels
+}
+
+fn format_group_member_summary(members: &[GroupMemberLabel]) -> String {
+    if members.is_empty() {
+        return "No members".to_owned();
+    }
+    members
+        .iter()
+        .map(|member| member.text.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn unknown_direct_conversations(
@@ -8123,6 +8401,60 @@ mod layout_tests {
             vec![("unknown-direct".to_owned(), peer)]
         );
         assert!(unknown_direct_conversations(&conversations, &BTreeSet::from([peer])).is_empty());
+    }
+
+    #[test]
+    fn group_members_label_friends_and_unknown_ids() {
+        let you = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let alice = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let bob = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let stranger = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let members = vec![
+            stranger.to_string(),
+            bob.to_string(),
+            you.to_string(),
+            alice.to_string(),
+            "not-a-node-id".to_owned(),
+        ];
+
+        let labels = group_member_labels(&members, Some(you), |node| {
+            if node == alice {
+                Some("Alice".to_owned())
+            } else if node == bob {
+                Some("Bob".to_owned())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(labels.len(), 5);
+        assert_eq!(labels[0].kind, GroupMemberKind::You);
+        assert_eq!(labels[0].text, "You");
+        assert_eq!(labels[0].node_id, Some(you));
+        assert_eq!(labels[1].kind, GroupMemberKind::Friend);
+        assert_eq!(labels[1].text, "Alice");
+        assert_eq!(labels[1].node_id, Some(alice));
+        assert_eq!(labels[2].kind, GroupMemberKind::Friend);
+        assert_eq!(labels[2].text, "Bob");
+        assert_eq!(labels[2].node_id, Some(bob));
+        assert_eq!(labels[3].kind, GroupMemberKind::Unknown);
+        assert_eq!(labels[3].text, "not-a-node-id");
+        assert_eq!(labels[3].node_id, None);
+        assert_eq!(labels[4].kind, GroupMemberKind::Unknown);
+        assert_eq!(labels[4].text, format!("Peer {}", stranger.fmt_short()));
+        assert_eq!(labels[4].node_id, Some(stranger));
+        assert_eq!(
+            format_group_member_summary(&labels),
+            format!(
+                "You, Alice, Bob, not-a-node-id, Peer {}",
+                stranger.fmt_short()
+            )
+        );
+    }
+
+    #[test]
+    fn group_member_summary_handles_an_empty_roster() {
+        assert_eq!(format_group_member_summary(&[]), "No members");
     }
 
     #[test]
