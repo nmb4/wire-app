@@ -9,7 +9,9 @@ use std::{
 
 use anyhow::Result;
 use cpal::{ChannelCount, SampleRate};
-use fixed_resample::{FixedResampler, ResampleQuality};
+use fixed_resample::FixedResampler;
+#[cfg(not(target_os = "macos"))]
+use fixed_resample::ResampleQuality;
 
 use self::{
     capture::AudioCapture, device::list_devices, playback::AudioPlayback,

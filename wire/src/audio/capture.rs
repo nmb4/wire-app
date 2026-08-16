@@ -14,6 +14,8 @@ use cpal::{
     Device, SampleFormat,
 };
 use fixed_resample::FixedResampler;
+#[cfg(target_os = "macos")]
+use ringbuf::traits::Observer as _;
 use ringbuf::{
     traits::{Consumer as _, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
