@@ -114,6 +114,29 @@ fn save_friends(friends: &[Friend]) {
     }
 }
 
+const SEEN_GROUP_CALL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+fn seen_group_calls_path() -> Option<PathBuf> {
+    wire::net::config_dir().map(|dir| dir.join("seen-group-calls.json"))
+}
+
+fn load_seen_group_calls() -> BTreeMap<String, i64> {
+    let mut seen: BTreeMap<String, i64> = seen_group_calls_path()
+        .and_then(|path| persistence::read_json(&path).ok().flatten())
+        .unwrap_or_default();
+    let cutoff = chat::now_millis() - SEEN_GROUP_CALL_RETENTION_MS;
+    seen.retain(|_, seen_at| *seen_at >= cutoff);
+    seen
+}
+
+fn save_seen_group_calls(seen: &BTreeMap<String, i64>) {
+    if let Some(path) = seen_group_calls_path() {
+        if let Err(error) = persistence::write_json(&path, seen) {
+            warn!(path = %path.display(), "could not save seen group calls: {error:#}");
+        }
+    }
+}
+
 fn settings_path() -> Option<PathBuf> {
     wire::net::config_dir().map(|dir| dir.join("settings.json"))
 }
@@ -200,6 +223,7 @@ struct AppState {
     friend_status: BTreeMap<NodeId, StatusUpdate>,
     group_call_reports: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
     local_group_call: Option<GroupCallAnnouncement>,
+    seen_group_calls: BTreeMap<String, i64>,
     new_friend_name: String,
     new_friend_id: String,
     theme: Theme,
@@ -677,6 +701,7 @@ impl App {
             friend_status: BTreeMap::new(),
             group_call_reports: BTreeMap::new(),
             local_group_call: None,
+            seen_group_calls: load_seen_group_calls(),
             new_friend_name: String::new(),
             new_friend_id: String::new(),
             theme: settings.theme,
@@ -1079,6 +1104,7 @@ impl AppState {
                     }
                 }
                 Event::GroupCallEntered(call) => {
+                    self.mark_group_call_seen(call.call_id.clone());
                     self.local_group_call = Some(call);
                     self.app_mode = AppMode::Calls;
                 }
@@ -1885,6 +1911,7 @@ impl AppState {
         let Some(our_node_id) = self.our_node_id else {
             return;
         };
+        self.acknowledge_missed_group_calls(&conversation.id);
         let members = conversation
             .members
             .iter()
@@ -1932,6 +1959,7 @@ impl AppState {
             })
             .collect();
         self.local_group_call = Some(call.clone());
+        self.mark_group_call_seen(call.call_id.clone());
         self.app_mode = AppMode::Calls;
         self.cmd(Command::EnterGroupCall {
             call,
@@ -1958,6 +1986,28 @@ impl AppState {
             })
             .unwrap_or_default();
         self.cmd(Command::LeaveGroupCall { notify });
+    }
+
+    fn acknowledge_missed_group_calls(&mut self, conversation_id: &str) {
+        let call_ids = self
+            .group_call_reports
+            .values()
+            .flatten()
+            .filter(|call| call.conversation_id == conversation_id && call.ended_at_ms.is_some())
+            .map(|call| call.call_id.clone())
+            .collect::<BTreeSet<_>>();
+        for call_id in call_ids {
+            self.mark_group_call_seen(call_id);
+        }
+    }
+
+    fn mark_group_call_seen(&mut self, call_id: String) {
+        let now = chat::now_millis();
+        self.seen_group_calls.insert(call_id, now);
+        let cutoff = now - SEEN_GROUP_CALL_RETENTION_MS;
+        self.seen_group_calls
+            .retain(|_, seen_at| *seen_at >= cutoff);
+        save_seen_group_calls(&self.seen_group_calls);
     }
 
     fn active_stream_sources(&self) -> Vec<StreamSource> {
@@ -2624,6 +2674,12 @@ impl AppState {
                             .values()
                             .flatten()
                             .filter(|call| call.conversation_id == group.id)
+                            .filter(|call| !self.seen_group_calls.contains_key(&call.call_id))
+                            .filter(|call| {
+                                self.our_node_id.is_none_or(|ours| {
+                                    !call.participants.contains(&ours.to_string())
+                                })
+                            })
                             .filter_map(|call| call.ended_at_ms.map(|ended| (ended, call)))
                             .filter(|(ended, _)| chat::now_millis() - *ended < 24 * 60 * 60 * 1000)
                             .max_by_key(|(ended, _)| *ended);
@@ -2653,6 +2709,7 @@ impl AppState {
                         .on_hover_text(&member_summary)
                         .clicked()
                         {
+                            self.acknowledge_missed_group_calls(&group.id);
                             self.chat.selected = Some(group.id);
                         }
                         ui.add_space(3.0);
@@ -10189,9 +10246,20 @@ impl Worker {
                 }
             }
             Command::LeaveGroupCall { notify } => {
-                let recently_ended = self.local_group_call.take().map(|mut call| {
+                let recently_ended = self.local_group_call.take().and_then(|mut call| {
+                    if call.initiator != self.endpoint.node_id().to_string() {
+                        return None;
+                    }
+                    for report in self.peer_group_calls.values().flatten() {
+                        if report.call_id == call.call_id {
+                            call.participants
+                                .extend(report.participants.iter().cloned());
+                        }
+                    }
+                    call.participants.sort();
+                    call.participants.dedup();
                     call.ended_at_ms = Some(chat::now_millis());
-                    call
+                    Some(call)
                 });
                 self.client_status
                     .set_active_group_calls(recently_ended.into_iter().collect());

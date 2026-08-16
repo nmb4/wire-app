@@ -5,9 +5,9 @@
 //! presence to chat messages or exposing protocol controls in the UI.
 
 use std::{
-    collections::BTreeSet,
-    sync::{Arc, RwLock},
-    time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -22,6 +22,50 @@ const MAX_PACKET_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const SHUTDOWN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const OFFLINE_AFTER_CONSECUTIVE_FAILURES: u8 = 3;
+const MISSED_GROUP_CALL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Default)]
+struct ProbeHealth {
+    generation: u64,
+    consecutive_failures: u8,
+    offline_emitted: bool,
+}
+
+impl ProbeHealth {
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.generation
+    }
+
+    fn succeeded(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.consecutive_failures = 0;
+        self.offline_emitted = false;
+        true
+    }
+
+    fn failed(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures < OFFLINE_AFTER_CONSECUTIVE_FAILURES || self.offline_emitted {
+            return false;
+        }
+        self.offline_emitted = true;
+        true
+    }
+
+    fn observed_inbound(&mut self) {
+        // Invalidate any outbound probe still racing this authoritative packet.
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.consecutive_failures = 0;
+        self.offline_emitted = false;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +148,7 @@ pub struct ClientStatusProtocol {
     update_tx: Sender<StatusUpdate>,
     update_rx: Receiver<StatusUpdate>,
     active_group_calls: Arc<RwLock<Vec<GroupCallAnnouncement>>>,
+    probe_health: Arc<Mutex<BTreeMap<NodeId, ProbeHealth>>>,
 }
 
 impl ClientStatusProtocol {
@@ -115,6 +160,7 @@ impl ClientStatusProtocol {
             update_tx,
             update_rx,
             active_group_calls: Arc::new(RwLock::new(Vec::new())),
+            probe_health: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -126,10 +172,14 @@ impl ClientStatusProtocol {
     }
 
     fn active_group_calls(&self) -> Vec<GroupCallAnnouncement> {
+        let now = now_millis();
         self.active_group_calls
             .read()
             .expect("client status call lock poisoned")
-            .clone()
+            .iter()
+            .filter(|call| group_call_is_advertisable(call, now))
+            .cloned()
+            .collect()
     }
 
     pub fn replace_peers(&self, peers: BTreeSet<NodeId>) {
@@ -148,32 +198,65 @@ impl ClientStatusProtocol {
             let endpoint = self.endpoint.clone();
             let update_tx = self.update_tx.clone();
             let active_group_calls = self.active_group_calls();
+            let probe_health = self.probe_health.clone();
+            let generation = probe_health
+                .lock()
+                .expect("client status probe lock poisoned")
+                .entry(peer)
+                .or_default()
+                .begin();
             tokio::spawn(async move {
-                let update = match exchange(
-                    &endpoint,
-                    peer,
-                    Availability::Online,
-                    active_group_calls,
-                )
-                .await
-                {
-                    Ok(packet) => StatusUpdate {
-                        peer,
-                        availability: packet.availability,
-                        client_version: Some(packet.client_version),
-                        active_group_calls: packet.active_group_calls,
-                    },
+                match exchange(&endpoint, peer, Availability::Online, active_group_calls).await {
+                    Ok(packet) => {
+                        let current = probe_health
+                            .lock()
+                            .expect("client status probe lock poisoned")
+                            .entry(peer)
+                            .or_default()
+                            .succeeded(generation);
+                        if !current {
+                            debug!(peer = %peer.fmt_short(), generation, "ignored stale client status response");
+                            return;
+                        }
+                        debug!(
+                            peer = %peer.fmt_short(),
+                            calls = packet.active_group_calls.len(),
+                            "client status probe succeeded"
+                        );
+                        let _ = update_tx
+                            .send(StatusUpdate {
+                                peer,
+                                availability: packet.availability,
+                                client_version: Some(packet.client_version),
+                                active_group_calls: packet.active_group_calls,
+                            })
+                            .await;
+                    }
                     Err(error) => {
                         debug!(peer = %peer.fmt_short(), "client status probe failed: {error:#}");
-                        StatusUpdate {
-                            peer,
-                            availability: Availability::Offline,
-                            client_version: None,
-                            active_group_calls: Vec::new(),
+                        let confirmed_offline = probe_health
+                            .lock()
+                            .expect("client status probe lock poisoned")
+                            .entry(peer)
+                            .or_default()
+                            .failed(generation);
+                        if confirmed_offline {
+                            debug!(
+                                peer = %peer.fmt_short(),
+                                failures = OFFLINE_AFTER_CONSECUTIVE_FAILURES,
+                                "peer considered offline after consecutive probe failures"
+                            );
+                            let _ = update_tx
+                                .send(StatusUpdate {
+                                    peer,
+                                    availability: Availability::Offline,
+                                    client_version: None,
+                                    active_group_calls: Vec::new(),
+                                })
+                                .await;
                         }
                     }
-                };
-                let _ = update_tx.send(update).await;
+                }
             });
         }
     }
@@ -231,6 +314,21 @@ impl ClientStatusProtocol {
     }
 }
 
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn group_call_is_advertisable(call: &GroupCallAnnouncement, now_ms: i64) -> bool {
+    call.ended_at_ms.is_none_or(|ended_at| {
+        ended_at > now_ms
+            || now_ms.saturating_sub(ended_at) < MISSED_GROUP_CALL_TTL.as_millis() as i64
+    })
+}
+
 impl ProtocolHandler for ClientStatusProtocol {
     fn accept(&self, connecting: iroh::endpoint::Connecting) -> BoxFuture<Result<()>> {
         let protocol = self.clone();
@@ -249,6 +347,13 @@ impl ProtocolHandler for ClientStatusProtocol {
             let (mut send, mut recv) = connection.accept_bi().await?;
             let packet: StatusPacket = read_packet(&mut recv).await?;
             packet.validate()?;
+            protocol
+                .probe_health
+                .lock()
+                .expect("client status probe lock poisoned")
+                .entry(peer)
+                .or_default()
+                .observed_inbound();
             protocol
                 .update_tx
                 .send(StatusUpdate {
@@ -354,5 +459,53 @@ mod tests {
         assert!(packet.validate().is_err());
         packet.active_group_calls[0].participants = vec!["peer".to_owned()];
         packet.validate().unwrap();
+    }
+
+    #[test]
+    fn transient_and_stale_probe_failures_do_not_withdraw_presence() {
+        let mut health = ProbeHealth::default();
+        let first = health.begin();
+        assert!(!health.failed(first));
+
+        let second = health.begin();
+        assert!(!health.failed(first), "stale completion must be ignored");
+        assert!(!health.failed(second));
+
+        let third = health.begin();
+        assert!(health.failed(third));
+        assert!(!health.failed(third), "offline is emitted only once");
+
+        let recovered = health.begin();
+        assert!(health.succeeded(recovered));
+        let after_recovery = health.begin();
+        assert!(!health.failed(after_recovery));
+    }
+
+    #[test]
+    fn inbound_heartbeat_invalidates_a_racing_failed_probe() {
+        let mut health = ProbeHealth::default();
+        let generation = health.begin();
+        health.observed_inbound();
+        assert!(!health.failed(generation));
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn missed_group_call_advertisements_expire() {
+        let now = 2 * MISSED_GROUP_CALL_TTL.as_millis() as i64;
+        let mut call = GroupCallAnnouncement {
+            call_id: "call".to_owned(),
+            conversation_id: "group".to_owned(),
+            title: "Group".to_owned(),
+            initiator: "peer".to_owned(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            participants: vec!["peer".to_owned()],
+        };
+        assert!(group_call_is_advertisable(&call, now));
+        call.ended_at_ms = Some(now - 1_000);
+        assert!(group_call_is_advertisable(&call, now));
+        call.ended_at_ms = Some(now - MISSED_GROUP_CALL_TTL.as_millis() as i64);
+        assert!(!group_call_is_advertisable(&call, now));
     }
 }
