@@ -4,7 +4,7 @@ set shell := ["powershell.exe", "-NoProfile", "-Command"]
 default: run
 
 build:
-    cargo b -r -p wire-app --no-default-features
+    cargo b -r -p wire-app
 
 run *args: build
     & ".\target\release\wire-app.exe" {{ args }}

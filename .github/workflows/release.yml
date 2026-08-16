@@ -20,7 +20,7 @@ on:
         default: "true"
 
 env:
-  BIN_NAME: callme-egui
+  BIN_NAME: wire-app
 
 jobs:
   create-release:
@@ -115,14 +115,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install libasound2-dev libdbus-1-dev musl-tools -y
 
-      - name: Set up Homebrew (macOS)
-        if: matrix.os == 'macOS-latest'
-        uses: Homebrew/actions/setup-homebrew@master
-
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macOS-latest'
-        run: brew install automake libtool
-
       - name: Build release binary
         shell: bash
         run: |
@@ -130,11 +122,7 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
             export CC=aarch64-linux-gnu-gcc
           fi
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cargo build -p callme-egui --no-default-features --verbose --release --target ${{ matrix.cargo_targets }}
-          else
-            cargo build -p callme-egui --verbose --release --target ${{ matrix.cargo_targets }}
-          fi
+          cargo build -p wire-app --verbose --release --target ${{ matrix.cargo_targets }}
 
       - name: Build archive
         shell: bash
@@ -193,7 +181,7 @@ jobs:
       - name: Build apk
         run: |
           keytool -genkey -v -keystore /tmp/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "C=US, O=Android, CN=Android Debug"
-          cargo apk build -p callme-egui --target aarch64-linux-android --lib --release
+          cargo apk build -p wire-app --target aarch64-linux-android --lib --release
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -206,7 +194,7 @@ jobs:
         shell: bash
         run: |
           filename="${{ env.BIN_NAME }}-${{ needs.create-release.outputs.release_version }}-android-aarch64.apk"
-          mv target/release/apk/callme-egui.apk "$filename"
+          mv target/release/apk/wire-app.apk "$filename"
           echo "ASSET=$filename" >> $GITHUB_ENV
 
       - name: Upload release archive

@@ -116,6 +116,19 @@ Before finishing, ask:
 
 If the answer to an important question is no, either address it or make the limitation explicit.
 
+## Current project infrastructure status
+
+- GitHub CI is not currently used for this project. Treat the workflow files as
+  dormant scaffolding, not as evidence that a change has been or will be
+  verified remotely. Run the relevant checks locally and report their results.
+- The Android workflow and packaging configuration were inherited from the
+  `callme` example repository that Wire was originally based on. Android is not
+  currently built, tested, released, or otherwise supported by the project.
+- An Android version remains a possible future direction, but the current egui
+  experience on Android is considered the main usability blocker. Do not expand
+  Android-specific code or workflow maintenance as part of unrelated work;
+  treat Android enablement as separately scoped product and platform work.
+
 ## Wire Kanban Board (kan.bn)
 
 The project's tasks live on a Kan board named **Wire**.

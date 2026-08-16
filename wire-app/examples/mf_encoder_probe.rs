@@ -5,11 +5,11 @@ use std::time::Instant;
 
 use tracing_subscriber::EnvFilter;
 use wire::video::{VideoConfig, VideoResolution};
-use wire_app::win_mf_codec::MfH264Encoder;
+use wire_app_lib::win_mf_codec::MfH264Encoder;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("info,wire_app=debug"))
+        .with_env_filter(EnvFilter::new("info,wire_app_lib=debug"))
         .init();
 
     let config = VideoConfig {

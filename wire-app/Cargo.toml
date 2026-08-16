@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -8,6 +8,7 @@ authors = { workspace = true }
 description = "make voicecalls over iroh (gui app)"
 
 [lib]
+name = "wire_app_lib"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]

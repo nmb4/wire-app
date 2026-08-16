@@ -365,10 +365,8 @@ fn start_playback_stream(
 ) -> Result<cpal::Stream> {
     let config = &stream_config.config;
     let format = stream_config.audio_format();
-    #[cfg(all(feature = "audio-processing", target_os = "macos"))]
+    #[cfg(feature = "audio-processing")]
     processor.init_playback(ENGINE_FORMAT.channel_count as usize)?;
-    #[cfg(all(feature = "audio-processing", not(target_os = "macos")))]
-    processor.init_playback(config.channels as usize)?;
     let resampler = device_resampler(
         NonZeroUsize::new(format.channel_count as usize).unwrap(),
         SAMPLE_RATE.0,

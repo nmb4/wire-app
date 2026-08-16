@@ -9,8 +9,8 @@ use std::time::Duration;
 use eframe::NativeOptions;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use wire_app::app::App;
-use wire_app::window_frame;
+use wire_app_lib::app::App;
+use wire_app_lib::window_frame;
 
 const LOG_DIR_NAME: &str = "wire";
 const LEGACY_LOG_DIR_NAME: &str = "callme";
@@ -192,18 +192,19 @@ fn cleanup_runaway_logs(root: &std::path::Path) {
 }
 
 fn init_logging(dev_pair: Option<(&str, usize)>) {
-    let mut filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,wire=info,wire_app=info,wire_app::chat=debug"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,wire=info,wire_app_lib=info,wire_app_lib::chat=debug")
+    });
     // Wire's own lifecycle and chat diagnostics must remain available even when
     // the surrounding shell sets a restrictive global filter such as `warn`.
     filter = filter
         .add_directive(
-            "wire_app=info"
+            "wire_app_lib=info"
                 .parse()
                 .expect("valid wire-app log directive"),
         )
         .add_directive(
-            "wire_app::chat=debug"
+            "wire_app_lib::chat=debug"
                 .parse()
                 .expect("valid Wire chat log directive"),
         );
@@ -309,7 +310,7 @@ fn main() -> Result<(), eframe::Error> {
             .as_deref()
             .map(|session| (session, launch.dev_peer_index)),
     );
-    info!(version = wire_app::APP_VERSION, "starting Wire");
+    info!(version = wire_app_lib::APP_VERSION, "starting Wire");
     if let Some(session) = launch.dev_pair_session.as_deref() {
         info!(
             "starting isolated dev-call instance '{}' (participant={})",

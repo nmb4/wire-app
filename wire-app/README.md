@@ -17,14 +17,11 @@ the Windows regression checklist are documented in
 
 On Linux, you need ALSA and DBUS development headers:
 ```
-apt-get install libasound2-dev libdbus-1-dev libtool automake
+apt-get install libasound2-dev libdbus-1-dev
 ```
 
-The crate includes a C dependency for echo cancellation (`webrtc-audio-processing`) that needs C build tools to be installed.
-On macOS these can be installed with homebrew:
-```
-brew install automake libtool
-```
+Echo cancellation uses the pure-Rust `sonora` audio processor and does not
+require a platform C/C++ toolchain.
 
 Screen sharing on macOS 12.3 or newer uses ScreenCaptureKit. The first time you
 share, allow Wire under **System Settings → Privacy & Security → Screen & System
@@ -34,13 +31,8 @@ instead of a newly rebuilt bare executable:
 
 ```
 cargo install cargo-bundle
-cargo bundle -p wire-app --release --no-default-features
+cargo bundle -p wire-app --release
 open target/release/bundle/osx/Wire.app
-```
-
-On Windows, or if the build fails, you can disable the audio processing entirely. You should only use Wire with headphones then.
-```
-cargo run -p wire-app --release --no-default-features
 ```
 
 ## Local three-instance group-call test
@@ -48,7 +40,7 @@ cargo run -p wire-app --release --no-default-features
 Run one command to start three isolated Wire windows:
 
 ```
-cargo run -p wire-app --release --no-default-features -- --dev-pair
+cargo run -p wire-app --release -- --dev-pair
 ```
 
 The first process spawns two more participants. All three use temporary, non-persisted node identities and automatically form a full mesh, so every window connects directly to the other two. Calls are accepted automatically. Screen sharing is not started automatically, so click **Share screen** in any window when ready to benchmark.
@@ -58,5 +50,5 @@ The title bars include the dev-session name. Logs are truncated per run and kept
 For a fully automatic benchmark run, explicitly add `--dev-auto-share`. Only the host starts capture after the call becomes active:
 
 ```
-cargo run -p wire-app --release --no-default-features -- --dev-pair --dev-auto-share
+cargo run -p wire-app --release -- --dev-pair --dev-auto-share
 ```

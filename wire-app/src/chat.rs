@@ -4624,7 +4624,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delete_for_everyone_is_pushed_over_sender_connection() -> Result<()> {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("wire_app=debug,iroh_docs=info")
+            .with_env_filter("wire_app_lib=debug,iroh_docs=info")
             .with_test_writer()
             .try_init();
         let temp = tempfile::tempdir()?;
@@ -4662,7 +4662,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_exchange_and_reload_messages_without_calls() -> Result<()> {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("wire_app=debug,iroh_docs=info")
+            .with_env_filter("wire_app_lib=debug,iroh_docs=info")
             .with_test_writer()
             .try_init();
         let temp = tempfile::tempdir()?;
@@ -4798,7 +4798,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn image_attachment_downloads_after_message_metadata_arrives() -> Result<()> {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("wire_app=debug,iroh_blobs=debug")
+            .with_env_filter("wire_app_lib=debug,iroh_blobs=debug")
             .with_test_writer()
             .try_init();
         let temp = tempfile::tempdir()?;
@@ -4935,7 +4935,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn history_clear_deletes_document_and_rotates_replicas() -> Result<()> {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("wire_app=debug,iroh_docs=info")
+            .with_env_filter("wire_app_lib=debug,iroh_docs=info")
             .with_test_writer()
             .try_init();
         let temp = tempfile::tempdir()?;
