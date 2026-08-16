@@ -629,6 +629,7 @@ fn platform_top_margin() -> f32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_overlay(
     ctx: &egui::Context,
     class: ViewportClass,
@@ -747,10 +748,8 @@ fn render_overlay(
             group.measured_height = measured_height;
             ctx.request_repaint();
         }
-        if area.response.hovered() {
-            if group.expires_at.is_some() && group.leaving_at.is_none() {
-                group.expires_at = group.kind.default_lifetime().map(|life| now + life);
-            }
+        if area.response.hovered() && group.expires_at.is_some() && group.leaving_at.is_none() {
+            group.expires_at = group.kind.default_lifetime().map(|life| now + life);
         }
         if area.inner {
             dismiss.push(group.id);
@@ -867,7 +866,7 @@ fn render_group(
     let tint = |color: Color32| color.gamma_multiply(opacity);
     let frame = Frame::new()
         .fill(tint(pal.panel))
-        .stroke(Stroke::new(1.0, tint(pal.line)))
+        .stroke(Stroke::new(1.0_f32, tint(pal.line)))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin {
             left: 14,
@@ -1034,7 +1033,7 @@ fn render_fused_group(
                 ui.painter().hline(
                     bounds.left()..=bounds.right(),
                     ui.cursor().top(),
-                    Stroke::new(1.0, tint(pal.line)),
+                    Stroke::new(1.0_f32, tint(pal.line)),
                 );
             }
             let response = ui
@@ -1089,7 +1088,7 @@ fn close_button(ui: &mut egui::Ui, pal: &Palette, opacity: f32) -> egui::Respons
     .gamma_multiply(opacity);
     let center = rect.center();
     let radius = 4.25;
-    let stroke = Stroke::new(1.25, color);
+    let stroke = Stroke::new(1.25_f32, color);
     ui.painter().line_segment(
         [
             center + egui::vec2(-radius, -radius),

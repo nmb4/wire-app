@@ -1,18 +1,15 @@
 use std::{ops::ControlFlow, time::Duration};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use ringbuf::{
-    traits::{Consumer as _, Observer, Producer as _, Split},
-    HeapCons as Consumer, HeapProd as Producer,
-};
+use ringbuf::{traits::Consumer as _, HeapCons as Consumer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tracing::{debug, info, trace};
 
 use super::Codec;
 use crate::{
-    audio::{AudioFormat, AudioSink, AudioSource, SAMPLE_RATE},
+    audio::{AudioFormat, AudioSink, AudioSource},
     rtc::{MediaFrame, MediaTrack, TrackKind},
 };
 
@@ -36,10 +33,11 @@ impl From<OpusChannels> for ::opus::Channels {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AudioQuality {
     Low,
     Medium,
+    #[default]
     High,
     Ultra,
 }
@@ -86,12 +84,6 @@ impl AudioQuality {
             AudioQuality::High => "High (80 kbps, stereo)",
             AudioQuality::Ultra => "Ultra (160 kbps, stereo)",
         }
-    }
-}
-
-impl Default for AudioQuality {
-    fn default() -> Self {
-        AudioQuality::High
     }
 }
 

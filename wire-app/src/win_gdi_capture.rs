@@ -105,15 +105,6 @@ pub fn capture_monitor_scaled(
     Ok(buffer)
 }
 
-fn bgra_to_rgba(buffer: &mut [u8]) {
-    for px in buffer.chunks_exact_mut(4) {
-        px.swap(0, 2);
-        if px[3] == 0 {
-            px[3] = 255;
-        }
-    }
-}
-
 pub fn primary_monitor_geometry() -> Result<(i32, i32, i32, i32)> {
     let monitors = xcap::Monitor::all().map_err(|e| anyhow::anyhow!("{e}"))?;
     let monitor = monitors

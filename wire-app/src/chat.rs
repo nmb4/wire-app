@@ -76,16 +76,11 @@ const CHAT_QUEUE_AFTER_FAILURES: u8 = 5;
 const CHAT_WAKE_PAYLOAD_BUDGET: usize = 200 * 1024;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionPolicy {
+    #[default]
     Unlimited,
     Days(u32),
-}
-
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        Self::Unlimited
-    }
 }
 
 impl RetentionPolicy {
@@ -153,6 +148,7 @@ pub enum DeleteScope {
 }
 
 impl ChatMessage {
+    #[cfg(test)]
     pub fn new(author_id: NodeId, body: String) -> Self {
         Self::new_with_attachments(author_id, body, Vec::new())
     }
@@ -825,7 +821,7 @@ struct ControlRetry {
 }
 
 pub(crate) enum ChatInput {
-    Invite(IncomingInvite),
+    Invite(Box<IncomingInvite>),
     Document(DocumentSignal),
     /// Background wake finished (send path does not block on dial/reuse).
     WakeFinished {
@@ -1028,9 +1024,9 @@ impl ChatService {
 
     pub(crate) async fn wait_input(&mut self) -> ChatInput {
         tokio::select! {
-            incoming = self.invite_rx.recv() => ChatInput::Invite(
+            incoming = self.invite_rx.recv() => ChatInput::Invite(Box::new(
                 incoming.expect("chat invitation protocol channel closed")
-            ),
+            )),
             changed = self.doc_event_rx.recv() => ChatInput::Document(
                 changed.expect("chat document event channel closed")
             ),
@@ -2111,27 +2107,6 @@ impl ChatService {
         self.spawn_doc_sync(conversation_id);
     }
 
-    /// Ask members to pull the current doc. Returns true if at least one other
-    /// member accepted the wake. Does **not** re-send invites — those are
-    /// reserved for create / clear / initialize (see `invite_members`).
-    async fn wake_members(&self, conversation_id: &str) -> bool {
-        let Some(stored) = self.index.conversations.get(conversation_id) else {
-            return false;
-        };
-        let ticket = refresh_share_ticket(&self.docs, stored, &self.endpoint)
-            .await
-            .ok()
-            .or_else(|| Some(stored.ticket.clone()));
-        wake_peers(
-            self.sessions.clone(),
-            self.other_members(stored),
-            conversation_id,
-            ticket.as_deref(),
-            self.wake_payload_for(conversation_id),
-        )
-        .await
-    }
-
     async fn apply_sync_request(&mut self, remote: NodeId, request: &SyncRequest) -> Result<()> {
         let carries_control_ack = !request.attachment_acks.is_empty()
             || !request.deletion_acks.is_empty()
@@ -2727,9 +2702,9 @@ impl ChatService {
                 let current_epoch = current.public.history_epoch;
                 if invite_epoch > current_epoch {
                     (true, true)
-                } else if invite_epoch < current_epoch {
-                    (false, false)
-                } else if invite.conversation.document_id == current.public.document_id {
+                } else if invite_epoch < current_epoch
+                    || invite.conversation.document_id == current.public.document_id
+                {
                     (false, false)
                 } else {
                     (

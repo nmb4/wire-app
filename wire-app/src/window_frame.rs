@@ -41,7 +41,7 @@ pub fn corner_radius(rounded: bool) -> CornerRadius {
 
 /// Clip rect for chrome painting, expanded for stroke anti-aliasing.
 pub fn clip_rect(ctx: &egui::Context) -> Rect {
-    ctx.screen_rect()
+    ctx.viewport_rect()
         .expand(ctx.style().visuals.clip_rect_margin)
 }
 

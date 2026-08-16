@@ -1,39 +1,36 @@
 use std::{
-    cmp::Ordering,
     num::NonZeroUsize,
     ops::ControlFlow,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
-use bytes::{Bytes, BytesMut};
+use anyhow::{anyhow, Context, Result};
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Device, SampleFormat,
 };
-use dasp_sample::ToSample;
 use fixed_resample::FixedResampler;
 use ringbuf::{
-    traits::{Consumer as _, Observer, Producer as _, Split},
+    traits::{Consumer as _, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{debug, error, info, span, trace, trace_span, warn, Level};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_input_stream_config, Direction, StreamConfigWithFormat},
     device_resampler,
     noise_suppression::RnnoiseSuppressor,
     update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor, DURATION_10MS,
-    DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
+    DURATION_20MS, ENGINE_FORMAT,
 };
 use crate::{
     codec::opus::{AudioQuality, MediaTrackOpusEncoder},
-    rtc::{MediaFrame, MediaTrack, TrackKind},
+    rtc::MediaTrack,
 };
 
 pub trait AudioSink: Send + 'static {

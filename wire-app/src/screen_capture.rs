@@ -166,14 +166,14 @@ const MF_EMPTY_FALLBACK: u32 = 8;
 
 enum FrameEncoder {
     #[cfg(windows)]
-    MediaFoundation(MfH264Encoder),
-    OpenH264(VideoEncoder),
+    MediaFoundation(Box<MfH264Encoder>),
+    OpenH264(Box<VideoEncoder>),
 }
 
 impl FrameEncoder {
     fn try_new(config: &VideoConfig) -> Result<Self> {
         info!("using OpenH264 software encoder");
-        Ok(Self::OpenH264(VideoEncoder::new(config)?))
+        Ok(Self::OpenH264(Box::new(VideoEncoder::new(config)?)))
     }
 
     #[cfg(windows)]
@@ -186,7 +186,7 @@ impl FrameEncoder {
                     "MF software"
                 };
                 info!("using {kind} encoder");
-                Ok(Self::MediaFoundation(enc))
+                Ok(Self::MediaFoundation(Box::new(enc)))
             }
             Err(e) => {
                 info!("MF encoder unavailable, using OpenH264: {e:?}");
@@ -246,7 +246,7 @@ impl FrameEncoder {
     ) -> Result<Self> {
         let encoder = MfH264Encoder::try_new_on_device(config, device)?;
         info!("using GPU-native WGC -> D3D11 processor -> MF encoder path");
-        Ok(Self::MediaFoundation(encoder))
+        Ok(Self::MediaFoundation(Box::new(encoder)))
     }
 
     #[cfg(windows)]
@@ -385,7 +385,7 @@ enum CaptureSource {
     #[cfg(windows)]
     Windows(WindowsCapturer),
     #[cfg(windows)]
-    Scap(ScapCapturer),
+    Scap(Box<ScapCapturer>),
     #[cfg(target_os = "macos")]
     Scap(ScapCapturer),
     #[cfg(windows)]
@@ -429,7 +429,7 @@ fn init_capture_source(
 
         // Prefer WGC: GDI StretchBlt blocks the desktop compositor and causes system-wide stutter.
         if let Ok(scap) = ScapCapturer::try_new(target_w, target_h, framerate, target) {
-            return Ok(CaptureSource::Scap(scap));
+            return Ok(CaptureSource::Scap(Box::new(scap)));
         }
         let (x, y, src_w, src_h) = crate::win_gdi_capture::primary_monitor_geometry()?;
         info!("capturing primary monitor {src_w}x{src_h} -> {target_w}x{target_h} (gdi fallback)");
@@ -443,9 +443,9 @@ fn init_capture_source(
             // xcap uses CoreGraphics' real window bounds and capture API instead.
             return init_xcap_source(target_w, target_h, target);
         }
-        Ok(CaptureSource::Scap(ScapCapturer::try_new(
+        Ok(CaptureSource::Scap(Box::new(ScapCapturer::try_new(
             target_w, target_h, framerate, target,
-        )?))
+        )?)))
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
@@ -594,7 +594,7 @@ pub(crate) fn resize_with_letterbox(
     // The encoder keeps a stable configured resolution. Center the source inside that
     // frame instead of stretching it, and make the unused pixels opaque black.
     let mut letterboxed = vec![0u8; (target_width * target_height * 4) as usize];
-    for pixel in letterboxed.chunks_exact_mut(4) {
+    for pixel in letterboxed.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     let offset_x = (target_width - fit_width) / 2;
@@ -637,6 +637,7 @@ pub(crate) fn aspect_fit_dimensions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     stop_flag: &AtomicBool,
     target_w: u32,
@@ -712,6 +713,7 @@ fn run_capture_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_encode_loop(
     stop_flag: &AtomicBool,
     config: VideoConfig,
@@ -920,7 +922,7 @@ fn run_encode_loop(
             }
             Some(Err(e)) => {
                 encode_errors += 1;
-                if encode_errors <= 5 || encode_errors % 60 == 0 {
+                if encode_errors <= 5 || encode_errors.is_multiple_of(60) {
                     warn!("video encode error (#{encode_errors}): {e:?}");
                 }
                 #[cfg(windows)]
@@ -977,7 +979,7 @@ fn run_encode_loop(
             preview_dropped = 0;
         }
 
-        if frame_count % preview_interval == 0 {
+        if frame_count.is_multiple_of(preview_interval) {
             #[cfg(windows)]
             let preview_source = match frame {
                 CaptureFrame::Cpu(data) => Some((data, target_w, target_h)),
@@ -1124,6 +1126,20 @@ fn make_preview(
         }
     }
     out
+}
+
+#[cfg(windows)]
+fn resize_bgra(
+    source: Vec<u8>,
+    src_w: u32,
+    src_h: u32,
+    resizer: &mut Resizer,
+    destination: &mut Image<'static>,
+) -> Result<Vec<u8>> {
+    let source = Image::from_vec_u8(src_w, src_h, source, PixelType::U8x4)
+        .map_err(|e| anyhow::anyhow!("invalid WGC readback buffer: {e}"))?;
+    resize_with_letterbox(&source, resizer, destination)
+        .map_err(|e| anyhow::anyhow!("WGC CPU fallback resize failed: {e}"))
 }
 
 #[cfg(test)]
@@ -1326,18 +1342,4 @@ mod preview_tests {
             "capture memory did not approach a plateau: {stopped_memory:?}"
         );
     }
-}
-
-#[cfg(windows)]
-fn resize_bgra(
-    source: Vec<u8>,
-    src_w: u32,
-    src_h: u32,
-    resizer: &mut Resizer,
-    destination: &mut Image<'static>,
-) -> Result<Vec<u8>> {
-    let source = Image::from_vec_u8(src_w, src_h, source, PixelType::U8x4)
-        .map_err(|e| anyhow::anyhow!("invalid WGC readback buffer: {e}"))?;
-    resize_with_letterbox(&source, resizer, destination)
-        .map_err(|e| anyhow::anyhow!("WGC CPU fallback resize failed: {e}"))
 }

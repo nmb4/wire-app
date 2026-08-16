@@ -289,21 +289,19 @@ impl WindowsCapturer {
             return Ok(frame);
         }
 
-        loop {
-            let frame = self
-                .rx
-                .recv()
-                .context("direct WGC capture channel closed")?;
-            if frame.width != self.src_w || frame.height != self.src_h {
-                info!(
-                    "direct WGC target resized from {}x{} to {}x{}",
-                    self.src_w, self.src_h, frame.width, frame.height
-                );
-                self.src_w = frame.width;
-                self.src_h = frame.height;
-            }
-            return Ok(frame);
+        let frame = self
+            .rx
+            .recv()
+            .context("direct WGC capture channel closed")?;
+        if frame.width != self.src_w || frame.height != self.src_h {
+            info!(
+                "direct WGC target resized from {}x{} to {}x{}",
+                self.src_w, self.src_h, frame.width, frame.height
+            );
+            self.src_w = frame.width;
+            self.src_h = frame.height;
         }
+        Ok(frame)
     }
 }
 
@@ -427,7 +425,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped += 1;
-                if self.dropped <= 5 || self.dropped % 120 == 0 {
+                if self.dropped <= 5 || self.dropped.is_multiple_of(120) {
                     warn!(
                         "direct WGC capture queue full, dropped {} frame(s)",
                         self.dropped

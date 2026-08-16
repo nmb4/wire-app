@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 pub mod audio;
 pub mod codec;
 pub mod net;
@@ -17,20 +15,25 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use futures_concurrency::future::{Join, TryJoin};
+    use futures_concurrency::future::TryJoin;
     use iroh::protocol::Router;
     use testresult::TestResult;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     use crate::{
         audio::{AudioSink, AudioSource, ENGINE_FORMAT},
         codec::opus::{AudioQuality, MediaTrackOpusDecoder, MediaTrackOpusEncoder},
-        net::bind_endpoint,
-        rtc::{MediaTrack, RtcProtocol},
+        net::generate_ephemeral_secret_key,
+        rtc::RtcProtocol,
     };
 
     async fn build() -> TestResult<(Router, RtcProtocol)> {
-        let endpoint = bind_endpoint().await?;
+        let endpoint = iroh::Endpoint::builder()
+            .secret_key(generate_ephemeral_secret_key())
+            .discovery_n0()
+            .alpns(vec![RtcProtocol::ALPN.to_vec()])
+            .bind()
+            .await?;
         let proto = RtcProtocol::new(endpoint.clone());
         let router = Router::builder(endpoint)
             .accept(RtcProtocol::ALPN, proto.clone())

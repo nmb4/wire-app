@@ -3,11 +3,9 @@ use std::str::FromStr;
 use std::sync::Once;
 
 use anyhow::{Context, Result};
-use iroh::{Endpoint, NodeAddr, SecretKey};
+use iroh::{Endpoint, SecretKey};
 pub use iroh_roq::ALPN;
 use tracing::warn;
-
-use crate::rtc::RtcConnection;
 
 const CONFIG_DIR_NAME: &str = "wire";
 const LEGACY_CONFIG_DIR_NAME: &str = "callme";

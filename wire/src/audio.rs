@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::Result;
-use bytes::Bytes;
 use cpal::{ChannelCount, SampleRate};
 use fixed_resample::{FixedResampler, ResampleQuality};
 
@@ -201,7 +200,7 @@ mod ringbuf_pipe {
 
     use anyhow::Result;
     use ringbuf::{
-        traits::{Consumer as _, Observer, Producer as _, Split},
+        traits::{Consumer as _, Producer as _, Split},
         HeapCons as Consumer, HeapProd as Producer,
     };
     use tracing::warn;

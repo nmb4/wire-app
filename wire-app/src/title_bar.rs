@@ -15,6 +15,7 @@ pub const HEIGHT: f32 = 32.0;
 const ICON_SIZE: f32 = 14.0;
 const BUTTON_SIZE: f32 = HEIGHT;
 
+#[allow(clippy::too_many_arguments)]
 pub fn ui(
     ui: &mut Ui,
     title_bar_rect: egui::Rect,

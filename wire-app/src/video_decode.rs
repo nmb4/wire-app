@@ -192,19 +192,6 @@ impl Drop for VideoDecodeWorker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_worker_shutdown_does_not_wait_for_another_packet() {
-        let worker = VideoDecodeWorker::spawn(|_, _| {}).unwrap();
-        let started = Instant::now();
-        drop(worker);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-}
-
 fn run_decode_loop<F>(
     packet_rx: mpsc::Receiver<EncodedPacket>,
     submitted: Arc<AtomicU64>,
@@ -270,7 +257,7 @@ where
             }
             Err(e) => {
                 decode_errors += 1;
-                if decode_errors <= 5 || decode_errors % 60 == 0 {
+                if decode_errors <= 5 || decode_errors.is_multiple_of(60) {
                     warn!("video decode error (#{decode_errors}): {e:?}");
                 }
                 #[cfg(windows)]
@@ -331,4 +318,17 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_worker_shutdown_does_not_wait_for_another_packet() {
+        let worker = VideoDecodeWorker::spawn(|_, _| {}).unwrap();
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }

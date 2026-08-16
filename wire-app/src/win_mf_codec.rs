@@ -1,6 +1,9 @@
 //! Windows Media Foundation hardware H.264 encoder/decoder.
 
-use std::sync::{mpsc, Once};
+use std::{
+    rc::Rc,
+    sync::{mpsc, Arc, Once},
+};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
@@ -10,8 +13,6 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BOOL, VT_I4, VT_UI4};
 use wire::video::VideoConfig;
-
-use std::sync::Arc;
 
 use crate::win_mf_d3d::{
     enumerate_adapters, GpuNv12Frames, GpuVideoProcessor, GpuVideoProcessorOutput, MfD3d,
@@ -144,7 +145,7 @@ impl Drop for D3d11VideoFrame {
 }
 
 struct DecoderPresentationPool {
-    d3d: Arc<MfD3d>,
+    d3d: Rc<MfD3d>,
     return_tx: mpsc::Sender<ReturnedVideoTexture>,
     return_rx: mpsc::Receiver<ReturnedVideoTexture>,
     available: Vec<ID3D11Texture2D>,
@@ -158,7 +159,7 @@ struct DecoderPresentationPool {
 }
 
 impl DecoderPresentationPool {
-    fn new(d3d: Arc<MfD3d>, width: u32, height: u32, display_rect: RECT, generation: u64) -> Self {
+    fn new(d3d: Rc<MfD3d>, width: u32, height: u32, display_rect: RECT, generation: u64) -> Self {
         let (return_tx, return_rx) = mpsc::channel();
         Self {
             d3d,
@@ -1065,7 +1066,7 @@ fn read_sample_topdown(
     let out_len = if is_nv12 { w * h * 3 / 2 } else { w * h * 4 };
     let mut out = vec![0u8; out_len];
 
-    if let Ok(buf2d) = unsafe { buffer.cast::<IMF2DBuffer>() } {
+    if let Ok(buf2d) = buffer.cast::<IMF2DBuffer>() {
         let mut ptr = std::ptr::null_mut();
         let mut stride: i32 = 0;
         unsafe {
@@ -1073,9 +1074,7 @@ fn read_sample_topdown(
         }
         let bottom_up = stride < 0;
         let stride = stride.unsigned_abs() as usize;
-        let src = unsafe {
-            std::slice::from_raw_parts(ptr as *const u8, ((h + h / 2) * stride) as usize)
-        };
+        let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, (h + h / 2) * stride) };
         if is_nv12 {
             for y in 0..h {
                 let src_row = if bottom_up {
@@ -1267,7 +1266,7 @@ pub struct MfH264Encoder {
     hardware: bool,
     async_mode: bool,
     pending_input: u32,
-    d3d: Option<Arc<MfD3d>>,
+    d3d: Option<Rc<MfD3d>>,
     gpu_nv12: Option<GpuNv12Frames>,
     // The MF allocator's textures are encoder inputs and are not guaranteed to have
     // D3D11_BIND_RENDER_TARGET. Render into our own NV12 target, then copy into the
@@ -1346,7 +1345,7 @@ impl MfH264Encoder {
         let width = config.resolution.width();
         let height = config.resolution.height();
         let bitrate = config.effective_bitrate();
-        let d3d = Arc::new(MfD3d::from_device(device)?);
+        let d3d = Rc::new(MfD3d::from_device(device)?);
         let mut last_err = None;
         for candidate in enumerate_video_encoders(true)? {
             if candidate.name.to_ascii_lowercase().contains("dx12") {
@@ -1413,16 +1412,15 @@ impl MfH264Encoder {
                     }
                 }
                 if prefer_hardware {
-                    let mut candidate_err = None;
-                    let mut d3d_targets: Vec<Result<Arc<MfD3d>, anyhow::Error>> = Vec::new();
+                    let mut d3d_targets: Vec<Result<Rc<MfD3d>, anyhow::Error>> = Vec::new();
                     if let Some(luid) = candidate.adapter_luid {
-                        d3d_targets.push(MfD3d::try_new(Some(luid)).map(Arc::new));
+                        d3d_targets.push(MfD3d::try_new(Some(luid)).map(Rc::new));
                     } else if let Ok(adapters) = enumerate_adapters() {
                         for adapter in adapters {
-                            d3d_targets.push(MfD3d::try_new_with_adapter(&adapter).map(Arc::new));
+                            d3d_targets.push(MfD3d::try_new_with_adapter(&adapter).map(Rc::new));
                         }
                     } else {
-                        d3d_targets.push(MfD3d::try_new(None).map(Arc::new));
+                        d3d_targets.push(MfD3d::try_new(None).map(Rc::new));
                     }
                     for d3d in d3d_targets {
                         match d3d {
@@ -1430,7 +1428,10 @@ impl MfH264Encoder {
                                 let transform = match activate_transform(&candidate.activate) {
                                     Ok(t) => t,
                                     Err(e) => {
-                                        candidate_err = Some(e);
+                                        warn!(
+                                            "failed to activate MF hardware H.264 encoder '{}': {e:#}",
+                                            candidate.name
+                                        );
                                         continue;
                                     }
                                 };
@@ -1449,11 +1450,13 @@ impl MfH264Encoder {
                                             "MF hardware H.264 encoder '{}' failed on one adapter: {e:#}",
                                             candidate.name
                                         );
-                                        candidate_err = Some(e);
                                     }
                                 }
                             }
-                            Err(e) => candidate_err = Some(e),
+                            Err(e) => warn!(
+                                "failed to create D3D target for MF hardware H.264 encoder '{}': {e:#}",
+                                candidate.name
+                            ),
                         }
                     }
                     match activate_transform(&candidate.activate).and_then(|transform| {
@@ -1465,12 +1468,9 @@ impl MfH264Encoder {
                                 "MF hardware H.264 encoder '{}' failed with system-memory samples: {e:#}",
                                 candidate.name
                             );
-                            candidate_err = Some(e);
+                            warn!("MF {label} H.264 encoder candidate failed: {e:#}");
+                            last_err = Some(e);
                         }
-                    }
-                    if let Some(e) = candidate_err {
-                        warn!("MF {label} H.264 encoder candidate failed: {e:#}");
-                        last_err = Some(e);
                     }
                 } else {
                     let transform = activate_transform(&candidate.activate)?;
@@ -1492,7 +1492,7 @@ impl MfH264Encoder {
 
     fn build_with_d3d(
         transform: IMFTransform,
-        d3d: Option<Arc<MfD3d>>,
+        d3d: Option<Rc<MfD3d>>,
         config: &VideoConfig,
         width: u32,
         height: u32,
@@ -1873,7 +1873,7 @@ fn fallback_display_rect(width: u32, height: u32) -> RECT {
     // negotiated stream sizes are 16:9, so trim a sub-macroblock bottom pad such
     // as 1920x1088 back to its 1920x1080 display area when no aperture is given.
     let expected_height = width.saturating_mul(9) / 16;
-    let display_height = if width.saturating_mul(9) % 16 == 0
+    let display_height = if width.saturating_mul(9).is_multiple_of(16)
         && height >= expected_height
         && height - expected_height < 16
     {
@@ -1904,7 +1904,7 @@ pub struct MfH264Decoder {
     native_output_failed: bool,
     frame_index: i64,
     frame_duration: i64,
-    _d3d: Option<Arc<MfD3d>>,
+    _d3d: Option<Rc<MfD3d>>,
 }
 
 impl MfH264Decoder {
@@ -1937,7 +1937,7 @@ impl MfH264Decoder {
         }
         let d3d = match MfD3d::try_new(None) {
             Ok(d3d) => {
-                let d3d = Arc::new(d3d);
+                let d3d = Rc::new(d3d);
                 match d3d.attach_to_transform(&transform) {
                     Ok(()) => {
                         info!("MF decoder attached to a D3D11 device manager");

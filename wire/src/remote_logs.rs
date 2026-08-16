@@ -16,7 +16,6 @@ use anyhow::{bail, Context, Result};
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint, NodeAddr, NodeId};
 use n0_future::{boxed::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 pub const LOGS_ALPN: &[u8] = b"wire/logs/1";

@@ -3,12 +3,12 @@ use std::{
     ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Device, Sample, SampleFormat,
@@ -18,7 +18,7 @@ use ringbuf::{
     traits::{Consumer as _, Observer as _, Producer as _, Split},
     HeapCons as Consumer, HeapProd as Producer,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, trace_span, warn, Level};
 
 use super::{
@@ -26,10 +26,7 @@ use super::{
     device_resampler, update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor,
     DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
-use crate::{
-    codec::opus::MediaTrackOpusDecoder,
-    rtc::{MediaFrame, MediaTrack},
-};
+use crate::{codec::opus::MediaTrackOpusDecoder, rtc::MediaTrack};
 
 #[cfg(target_os = "macos")]
 const PLAYBACK_PREBUFFER_CHUNKS: usize = 3;

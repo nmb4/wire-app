@@ -2348,7 +2348,7 @@ impl AppState {
                         #[cfg(windows)]
                         parent_hwnd,
                     );
-                    window_frame::resize_edges(ui, ctx.screen_rect());
+                    window_frame::resize_edges(ui, ctx.viewport_rect());
                 });
             });
     }
@@ -2372,9 +2372,11 @@ impl AppState {
         let top_height = TOP_BAR_HEIGHT.min(body.height());
         let dock_top = (body.max.y - DOCK_HEIGHT).max(body.min.y + top_height);
         let participant_space = (dock_top - (body.min.y + top_height)).max(0.0);
-        let participant_bar_height = show_participants
-            .then(|| participant_bar_height(body.width(), self.calls.len() + 1, participant_space))
-            .unwrap_or(0.0);
+        let participant_bar_height = if show_participants {
+            participant_bar_height(body.width(), self.calls.len() + 1, participant_space)
+        } else {
+            0.0
+        };
 
         let top_rect =
             egui::Rect::from_min_max(body.min, egui::pos2(body.max.x, body.min.y + top_height));
@@ -2388,7 +2390,7 @@ impl AppState {
             egui::pos2(body.max.x, participant_rect.min.y),
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(stage_rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(stage_rect), |ui| {
             let frame = if immersive {
                 Frame::NONE
             } else {
@@ -2405,7 +2407,7 @@ impl AppState {
             });
         });
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
             Frame::new()
                 .fill(pal.bg)
                 .inner_margin(egui::Margin::symmetric(14, 6))
@@ -2414,7 +2416,7 @@ impl AppState {
 
         if show_participants {
             // Rounded strip matching window bg — no hard separators / panel band.
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(participant_rect), |ui| {
                 Frame::new()
                     .fill(pal.bg)
                     .outer_margin(egui::Margin {
@@ -2434,7 +2436,7 @@ impl AppState {
         }
 
         // Paint the fixed call controls last so scrollable content never covers them.
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
             Frame::new()
                 .fill(pal.bg)
                 .outer_margin(egui::Margin {
@@ -2508,7 +2510,7 @@ impl AppState {
             content.max,
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(top), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(top));
             Frame::new()
                 .fill(pal.bg)
@@ -2517,11 +2519,11 @@ impl AppState {
         });
         paint_chat_card(ui, sidebar, pal, 18);
         let sidebar_inner = sidebar.shrink2(Vec2::new(12.0, 12.0));
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(sidebar_inner), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_inner), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(sidebar_inner));
             self.ui_chat_sidebar(ui, pal);
         });
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(main), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(main), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(main));
             Frame::new()
                 .fill(pal.bg)
@@ -2557,7 +2559,7 @@ impl AppState {
             ),
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(list));
             ui.horizontal(|ui| {
                 ui.label(
@@ -2725,7 +2727,7 @@ impl AppState {
             );
             paint_chat_card(ui, footer, pal, 14);
             let footer_inner = footer.shrink2(Vec2::new(11.0, 8.0));
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
                 ui.set_clip_rect(footer);
                 ui.horizontal(|ui| {
                     circle_avatar(ui, pal, "Y", 32.0);
@@ -2839,7 +2841,7 @@ impl AppState {
 
         paint_chat_card(ui, header, pal, 18);
         let header_inner = header.shrink2(Vec2::new(18.0, 12.0));
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_inner), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(header_inner), |ui| {
             ui.set_clip_rect(header);
             let show_call = ui.available_width() >= 430.0;
             ui.horizontal(|ui| {
@@ -3003,7 +3005,7 @@ impl AppState {
             });
         });
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(messages), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(messages), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(messages));
             Frame::new()
                 .fill(pal.bg)
@@ -3072,7 +3074,7 @@ impl AppState {
         });
 
         if !self.chat.draft_attachments.is_empty() {
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(previews), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(previews), |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(previews));
                 egui::ScrollArea::horizontal()
                     .id_salt("chat-draft-images")
@@ -3109,7 +3111,7 @@ impl AppState {
 
         paint_chat_card(ui, composer, pal, 22);
         let composer_inner = composer.shrink2(Vec2::new(14.0, 10.0));
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(composer_inner), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(composer_inner), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(composer_inner));
             let edit = ui.add_sized(
                 [ui.available_width(), editor_height],
@@ -3634,6 +3636,7 @@ impl AppState {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ui_message_attachments(
         &mut self,
         ui: &mut Ui,
@@ -4496,7 +4499,7 @@ impl AppState {
                     if let Some(release) = available_update {
                         if action_button(
                             ui,
-                            &pal,
+                            pal,
                             &format!("Update v{}", release.version),
                             ButtonTone::Primary,
                         )
@@ -4639,7 +4642,7 @@ impl AppState {
             ),
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(controls_rect));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -5596,7 +5599,7 @@ impl AppState {
             .filter(|source| streams.contains(source))
         {
             let tile_rect = aspect_fit_rect(area, self.stream_aspect_ratio(focused));
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
                 self.ui_stream_tile(
                     ui,
                     &pal,
@@ -5629,7 +5632,7 @@ impl AppState {
                 Vec2::new(cell_w, cell_h),
             );
             let tile_rect = aspect_fit_rect(cell_rect, self.stream_aspect_ratio(*source));
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tile_rect), |ui| {
                 self.ui_stream_tile(
                     ui,
                     &pal,
@@ -5690,7 +5693,7 @@ impl AppState {
         let block_size = Vec2::new((area.width() - 24.0).min(440.0), block_height);
         let block_rect = egui::Rect::from_center_size(area.center(), block_size);
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(block_rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(block_rect), |ui| {
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 let (icon_rect, _) =
                     ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
@@ -5738,7 +5741,7 @@ impl AppState {
                 );
 
                 if roomy {
-                    let detail = self.capture_error.as_deref().unwrap_or_else(|| {
+                    let detail = self.capture_error.as_deref().unwrap_or({
                         if self.sharing_active {
                             "Preparing the first frame. This usually takes a moment."
                         } else if showing_stopped {
@@ -6113,20 +6116,20 @@ impl AppState {
             }
         }
 
-        if compact && self.stream_view_mode != StreamViewMode::Normal {
-            if toolbar_ghost_icon_button(ui, &pal, Icon::Minimize2, false)
+        if compact
+            && self.stream_view_mode != StreamViewMode::Normal
+            && toolbar_ghost_icon_button(ui, &pal, Icon::Minimize2, false)
                 .on_hover_text("Return to normal layout (Esc)")
                 .clicked()
-            {
-                self.set_stream_view_mode(ctx, StreamViewMode::Normal);
-            }
+        {
+            self.set_stream_view_mode(ctx, StreamViewMode::Normal);
         }
     }
 
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
         let can_close = self.configured;
         let pal = Palette::for_theme(self.theme);
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         let dialog_width = (screen_rect.width() - 40.0).clamp(420.0, 500.0);
         // Reserve enough vertical space for the dialog chrome plus a visible
         // inset above and below the centered window.
@@ -6344,7 +6347,7 @@ impl AppState {
                                     .selected_text(image_limit_label(self.max_image_bytes))
                                     .show_ui(ui, |ui| {
                                         for limit in [
-                                            Some(1 * 1024 * 1024),
+                                            Some(1024 * 1024),
                                             Some(5 * 1024 * 1024),
                                             Some(10 * 1024 * 1024),
                                             Some(25 * 1024 * 1024),
@@ -7698,6 +7701,7 @@ fn system_audio_share_row(ui: &mut Ui, pal: &Palette, enabled: &mut bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_target_column(
     ui: &mut Ui,
     pal: &Palette,
@@ -7848,6 +7852,7 @@ fn capture_target_row(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_rgba_texture(
     ui: &Ui,
     id: &str,
@@ -8155,7 +8160,7 @@ fn chat_navigation_button(
         egui::pos2(rect.left() + 14.0, rect.top() + 6.0),
         egui::pos2(text_right, rect.bottom() - 6.0),
     );
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             ui.set_max_width(text_rect.width());
             if subtitle.is_some() {
@@ -8708,7 +8713,7 @@ mod layout_tests {
 
         assert!(should_mark_conversation_unseen(
             false,
-            Some(&[message.clone()])
+            Some(std::slice::from_ref(&message))
         ));
         assert!(!should_mark_conversation_unseen(true, Some(&[message])));
         assert!(!should_mark_conversation_unseen(false, Some(&[])));
@@ -9813,8 +9818,8 @@ impl Worker {
     async fn send_system_audio_track(&self, track: &MediaTrack) -> Result<()> {
         let active: Vec<_> = self
             .active_calls
-            .iter()
-            .filter_map(|(_, info)| match info {
+            .values()
+            .filter_map(|info| match info {
                 CallInfo::Active(conn) => Some(conn.clone()),
                 _ => None,
             })

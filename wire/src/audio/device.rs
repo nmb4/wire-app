@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use cpal::{
     traits::{DeviceTrait, HostTrait},
-    BufferSize, Device, Host, SampleFormat, StreamConfig,
+    BufferSize, Device, SampleFormat, StreamConfig,
     SupportedBufferSize::{Range, Unknown},
     SupportedStreamConfig, SupportedStreamConfigRange,
 };
 use tracing::{debug, info};
 
-use super::{AudioFormat, SAMPLE_RATE};
-use crate::audio::{DURATION_10MS, DURATION_20MS, ENGINE_FORMAT};
+use super::AudioFormat;
+use crate::audio::DURATION_20MS;
 use crate::codec::opus::AudioQuality;
 
 #[derive(Debug, Clone)]

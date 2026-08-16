@@ -38,7 +38,6 @@ pub struct MfD3d {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     pub manager: IMFDXGIDeviceManager,
-    reset_token: u32,
 }
 
 pub fn enumerate_adapters() -> Result<Vec<IDXGIAdapter1>> {
@@ -94,7 +93,6 @@ impl MfD3d {
             device: device.clone(),
             context,
             manager,
-            reset_token,
         })
     }
 
@@ -166,7 +164,6 @@ impl MfD3d {
             device,
             context,
             manager,
-            reset_token: reset_token,
         })
     }
 

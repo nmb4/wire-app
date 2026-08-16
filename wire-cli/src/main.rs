@@ -7,8 +7,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use wire::{
     audio::{AudioConfig, AudioContext, AudioQuality},
-    net,
-    remote_logs,
+    net, remote_logs,
     rtc::{handle_connection_with_audio_context, RtcConnection, RtcProtocol},
     NodeId,
 };
@@ -175,13 +174,16 @@ async fn main() -> anyhow::Result<()> {
                     max_bytes,
                     "fetching remote Wire logs"
                 );
-                let fetched =
-                    remote_logs::fetch_latest_logs(&endpoint, node_id, max_bytes).await?;
+                let fetched = remote_logs::fetch_latest_logs(&endpoint, node_id, max_bytes).await?;
                 let output = output.unwrap_or_else(|| {
                     PathBuf::from(format!("wire-remote-{}.log", node_id.fmt_short()))
                 });
                 std::fs::write(&output, &fetched.bytes)?;
-                println!("wrote {} bytes to {}", fetched.bytes.len(), output.display());
+                println!(
+                    "wrote {} bytes to {}",
+                    fetched.bytes.len(),
+                    output.display()
+                );
                 if let Some(name) = &fetched.meta.file_name {
                     println!("remote file: {name}");
                 }

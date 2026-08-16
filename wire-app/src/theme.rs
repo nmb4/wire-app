@@ -39,18 +39,13 @@ pub fn lucide(size: f32) -> FontId {
 }
 
 // -- palette --
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
+    #[default]
     Amber,
     Terminal,
     DiscordOled,
     Slate,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self::Amber
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -448,6 +443,7 @@ pub fn button_tone_style(pal: &Palette, tone: ButtonTone, hot: bool) -> (Color32
 }
 
 /// Paint a filled text button without hover expansion (mute/deafen-style feedback).
+#[allow(clippy::too_many_arguments)]
 pub fn painted_text_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -802,9 +798,7 @@ pub fn dock_icon_btn(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool)
     let enabled = ui.is_enabled();
     let fill = if !enabled {
         pal.panel.gamma_multiply(0.55)
-    } else if response.hovered() {
-        pal.panel2
-    } else if active {
+    } else if response.hovered() || active {
         pal.panel2
     } else {
         pal.panel

@@ -1,23 +1,14 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
 };
 
-use anyhow::{anyhow, bail, Result};
-use bytes::Bytes;
-use iroh::{endpoint::Connection, protocol::ProtocolHandler};
-use iroh_roq::{
-    rtp::{self, codecs::opus::OpusPayloader, packetizer::Packetizer},
-    Session, VarInt,
-};
-use n0_future::{task, Stream};
+use anyhow::{bail, Result};
+use iroh::endpoint::Connection;
+use iroh_roq::Session;
+use n0_future::task;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
-use webrtc_media::io::sample_builder::SampleBuilder;
 
 pub use self::{
     protocol_handler::RtcProtocol,

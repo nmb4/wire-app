@@ -93,7 +93,7 @@ fn run_capture_loop(
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        return windows::run(encoder, stop, ready_tx);
+        windows::run(encoder, stop, ready_tx)
     }
     #[cfg(not(windows))]
     {
