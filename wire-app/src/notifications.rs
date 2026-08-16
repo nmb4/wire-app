@@ -9,10 +9,11 @@ use std::{
 
 use egui::{
     epaint::Shadow, Align, Color32, CornerRadius, Frame, Id, Layout, Margin, RichText, Stroke,
-    Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, WindowLevel,
+    Vec2, ViewportClass, ViewportCommand, ViewportId,
 };
 use tracing::info;
 
+use crate::overlay_window;
 use crate::theme::{
     button_tone_style, sans, ui_font_size, visuals_for, ButtonTone, Palette, Theme,
 };
@@ -568,12 +569,7 @@ impl NotificationService {
             )
         };
         let viewport_ready = self.viewport_ready.load(Ordering::Acquire);
-        let mut builder = ViewportBuilder::default()
-            .with_title(notification_window_title())
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_active(false)
+        let mut builder = overlay_window::independent_builder(notification_window_title())
             // Hidden native windows do not receive deferred paint callbacks on
             // Windows. Keep the viewport renderable but stage it off-screen
             // until its transparent surface has completed prepaint.
@@ -582,9 +578,7 @@ impl NotificationService {
                 target_position
             } else {
                 staging_position()
-            })
-            .with_taskbar(false)
-            .with_window_level(WindowLevel::AlwaysOnTop);
+            });
         if first_creation {
             // Supplying the final estimated size at creation avoids exposing
             // the native window's opaque backing store during its first resize.
@@ -612,9 +606,12 @@ impl NotificationService {
                 );
             },
         );
-        // Keep an explicit repaint request for platforms that do not issue an
-        // initial redraw when creating the off-screen deferred viewport.
-        ctx.request_repaint_of(notification_viewport_id());
+        // Some platforms do not issue an initial redraw for a newly-created,
+        // off-screen deferred viewport. Wake that viewport once at creation;
+        // after that its callback owns all animation and lifetime scheduling.
+        if first_creation {
+            ctx.request_repaint_of(notification_viewport_id());
+        }
     }
 }
 
@@ -666,7 +663,6 @@ fn render_overlay(
         active.store(false, Ordering::Release);
         viewport_created.store(false, Ordering::Release);
         viewport_ready.store(false, Ordering::Release);
-        ctx.request_repaint_of(ViewportId::ROOT);
         return;
     }
     store.advance(now);
@@ -678,7 +674,7 @@ fn render_overlay(
         viewport_ready.store(false, Ordering::Release);
         *resize_target = None;
         *settled_frames = 0;
-        ctx.request_repaint_of(ViewportId::ROOT);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
         return;
     }
 
@@ -705,14 +701,12 @@ fn render_overlay(
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired_size));
             *settled_frames = 0;
             ctx.request_repaint();
-            ctx.request_repaint_of(ViewportId::ROOT);
         } else if *settled_frames == 0 {
             *settled_frames = 1;
             ctx.request_repaint();
         } else if !viewport_ready.swap(true, Ordering::AcqRel) {
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(target_position));
             info!("notification viewport revealed after off-screen transparent prepaint");
-            ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
 
@@ -1212,6 +1206,11 @@ mod tests {
             .get(&notification_viewport_id())
             .expect("notification viewport should be requested");
         assert_eq!(viewport.builder.visible, Some(true));
+        assert_eq!(viewport.builder.active, Some(false));
+        assert_eq!(
+            viewport.builder.window_level,
+            Some(egui::WindowLevel::AlwaysOnTop)
+        );
         assert_eq!(viewport.builder.position, Some(staging_position()));
         assert_eq!(
             viewport.builder.inner_size,

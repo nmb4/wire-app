@@ -6,6 +6,7 @@ mod dev_pair;
 #[cfg(windows)]
 mod global_hotkeys;
 mod notifications;
+mod overlay_window;
 mod persistence;
 mod resource_monitor;
 mod sounds;
