@@ -990,10 +990,7 @@ impl AppState {
                 }
                 NotificationAction::AcceptCall(node_id) => {
                     if let Ok(node_id) = NodeId::from_str(&node_id) {
-                        self.cmd(Command::HandleIncoming {
-                            node_id,
-                            accept: true,
-                        });
+                        self.accept_incoming_call(node_id);
                     }
                     self.app_mode = AppMode::Calls;
                     self.show_settings = false;
@@ -2210,6 +2207,35 @@ impl AppState {
         self.play_sound(Sound::Whoosh1);
         self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
         self.cmd(Command::Abort { node_id });
+    }
+
+    fn incoming_belongs_to_local_group(&self, node_id: NodeId) -> bool {
+        !incoming_call_requires_group_switch(
+            self.local_group_call.as_ref(),
+            self.group_call_reports.get(&node_id).map(Vec::as_slice),
+        ) && self.local_group_call.is_some()
+    }
+
+    fn accept_incoming_call(&mut self, node_id: NodeId) {
+        let switches_away_from_group =
+            self.local_group_call.is_some() && !self.incoming_belongs_to_local_group(node_id);
+        if switches_away_from_group {
+            let current_peers = self
+                .calls
+                .keys()
+                .copied()
+                .filter(|peer| *peer != node_id)
+                .collect::<Vec<_>>();
+            for peer in current_peers {
+                self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
+                self.cmd(Command::Abort { node_id: peer });
+            }
+            self.leave_group_call();
+        }
+        self.cmd(Command::HandleIncoming {
+            node_id,
+            accept: true,
+        });
     }
 
     fn ui_with_chrome(
@@ -4140,6 +4166,9 @@ impl AppState {
         state: CallState,
     ) -> egui::Response {
         let is_active = matches!(state, CallState::Active);
+        let call_waiting = matches!(state, CallState::Incoming)
+            && self.local_group_call.is_some()
+            && !self.incoming_belongs_to_local_group(node_id);
         let is_streaming = self
             .video_frames
             .get(&node_id)
@@ -4153,6 +4182,7 @@ impl AppState {
                     .is_some_and(|current| current == stopped)
             });
         let (status_label, status_color) = match state {
+            CallState::Incoming if call_waiting => (Some("call waiting"), pal.accent),
             CallState::Incoming => (Some("incoming"), pal.accent),
             CallState::Calling => (Some("connecting"), pal.accent),
             CallState::Active => (None, pal.ok),
@@ -4214,12 +4244,20 @@ impl AppState {
                     match state {
                         CallState::Incoming => {
                             ui.add_space(CHIP_ACTION_GAP);
-                            if compact_chip_button(ui, pal, "Accept", ButtonTone::Primary).clicked()
+                            let accept_label = if call_waiting {
+                                "End & accept"
+                            } else {
+                                "Accept"
+                            };
+                            if compact_chip_button(ui, pal, accept_label, ButtonTone::Primary)
+                                .on_hover_text(if call_waiting {
+                                    "Leave the group call and answer this call"
+                                } else {
+                                    "Answer this call"
+                                })
+                                .clicked()
                             {
-                                self.cmd(Command::HandleIncoming {
-                                    node_id,
-                                    accept: true,
-                                });
+                                self.accept_incoming_call(node_id);
                             }
                             ui.add_space(6.0);
                             if compact_chip_button(ui, pal, "Decline", ButtonTone::Danger).clicked()
@@ -4433,6 +4471,18 @@ impl AppState {
     /// Compact summary for the chrome top bar: label, accent color, hover detail.
     fn active_call_indicator(&self, pal: &Palette) -> Option<(String, Color32, String)> {
         if let Some(call) = &self.local_group_call {
+            if let Some(waiting) = self.calls.iter().find_map(|(node_id, state)| {
+                (matches!(state, CallState::Incoming)
+                    && !self.incoming_belongs_to_local_group(*node_id))
+                .then_some(*node_id)
+            }) {
+                let name = self.peer_display_name(waiting);
+                return Some((
+                    format!("Call waiting · {name}"),
+                    Color32::from_rgb(255, 200, 80),
+                    format!("{name} is calling while you are in {}", call.title),
+                ));
+            }
             let participants = call.participants.len().max(
                 self.calls
                     .values()
@@ -4779,11 +4829,15 @@ impl AppState {
                 ui.add_space(7.0);
                 ui.horizontal(|ui| match state {
                     CallState::Incoming => {
-                        if action_button(ui, pal, "Accept", ButtonTone::Primary).clicked() {
-                            self.cmd(Command::HandleIncoming {
-                                node_id,
-                                accept: true,
-                            });
+                        let call_waiting = self.local_group_call.is_some()
+                            && !self.incoming_belongs_to_local_group(node_id);
+                        let accept_label = if call_waiting {
+                            "End & accept"
+                        } else {
+                            "Accept"
+                        };
+                        if action_button(ui, pal, accept_label, ButtonTone::Primary).clicked() {
+                            self.accept_incoming_call(node_id);
                         }
                         if action_button(ui, pal, "Decline", ButtonTone::Danger).clicked() {
                             self.cmd(Command::HandleIncoming {
@@ -5266,9 +5320,12 @@ impl AppState {
                 return;
             }
 
-            let calls: Vec<_> = self.calls.iter().collect();
+            let calls: Vec<_> = self
+                .calls
+                .iter()
+                .map(|(node_id, state)| (*node_id, *state))
+                .collect();
             for (node_id, state) in calls {
-                let node_id = *node_id;
                 let peer_name = self.peer_display_name(node_id);
                 Frame::new()
                     .fill(ui.visuals().widgets.noninteractive.bg_fill)
@@ -5288,19 +5345,29 @@ impl AppState {
                             )
                             .on_hover_text(format!("Node {}…", node_id.fmt_short()));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                call_state_badge(ui, state);
+                                call_state_badge(ui, &state);
                             });
                         });
 
                         ui.add_space(4.0);
                         ui.horizontal(|ui| match state {
                             CallState::Incoming => {
-                                if action_button(ui, &pal, "Accept", ButtonTone::Primary).clicked()
+                                let call_waiting = self.local_group_call.is_some()
+                                    && !self.incoming_belongs_to_local_group(node_id);
+                                let accept_label = if call_waiting {
+                                    "End & accept"
+                                } else {
+                                    "Accept"
+                                };
+                                if action_button(ui, &pal, accept_label, ButtonTone::Primary)
+                                    .on_hover_text(if call_waiting {
+                                        "Leave the group call and answer this call"
+                                    } else {
+                                        "Answer this call"
+                                    })
+                                    .clicked()
                                 {
-                                    self.cmd(Command::HandleIncoming {
-                                        node_id,
-                                        accept: true,
-                                    });
+                                    self.accept_incoming_call(node_id);
                                 }
                                 if action_button(ui, &pal, "Decline", ButtonTone::Danger).clicked()
                                 {
@@ -8718,6 +8785,39 @@ mod layout_tests {
     }
 
     #[test]
+    fn unrelated_incoming_call_requires_leaving_the_group_first() {
+        let local = GroupCallAnnouncement {
+            call_id: "room-a".to_owned(),
+            conversation_id: "group-a".to_owned(),
+            title: "Friends".to_owned(),
+            initiator: "alice".to_owned(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            participants: vec!["alice".to_owned()],
+        };
+        let same_room = GroupCallAnnouncement {
+            participants: vec!["bob".to_owned()],
+            ..local.clone()
+        };
+        let other_room = GroupCallAnnouncement {
+            call_id: "room-b".to_owned(),
+            conversation_id: "group-b".to_owned(),
+            ..same_room.clone()
+        };
+
+        assert!(!incoming_call_requires_group_switch(
+            Some(&local),
+            Some(&[same_room]),
+        ));
+        assert!(incoming_call_requires_group_switch(
+            Some(&local),
+            Some(&[other_room]),
+        ));
+        assert!(incoming_call_requires_group_switch(Some(&local), None));
+        assert!(!incoming_call_requires_group_switch(None, None));
+    }
+
+    #[test]
     fn recognizes_only_the_reserved_video_replacement_reset() {
         assert!(is_video_stream_replacement_error(&anyhow::anyhow!(
             "stream reset by peer: error 81"
@@ -8817,6 +8917,19 @@ enum CallState {
     Calling,
     Active,
     Aborted,
+}
+
+fn incoming_call_requires_group_switch(
+    local: Option<&GroupCallAnnouncement>,
+    remote_calls: Option<&[GroupCallAnnouncement]>,
+) -> bool {
+    let Some(local) = local else {
+        return false;
+    };
+    !remote_calls
+        .into_iter()
+        .flatten()
+        .any(|remote| remote.call_id == local.call_id && remote.ended_at_ms.is_none())
 }
 
 fn friend_call_enabled(state: Option<&CallState>) -> bool {
