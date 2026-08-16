@@ -32,8 +32,8 @@ use crate::{
         DeleteScope, DeliveryState, MessageDeletion, RetentionPolicy,
     },
     client_status::{
-        Availability, ClientStatusProtocol, StatusUpdate, CLIENT_STATUS_ALPN,
-        PRESENCE_REFRESH_INTERVAL,
+        Availability, ClientStatusProtocol, GroupCallAnnouncement, StatusUpdate,
+        CLIENT_STATUS_ALPN, PRESENCE_REFRESH_INTERVAL,
     },
     dev_pair::DevPairState,
     notifications::{NotificationAction, NotificationService},
@@ -198,6 +198,8 @@ struct AppState {
     preview: Option<PreviewState>,
     friends: Vec<Friend>,
     friend_status: BTreeMap<NodeId, StatusUpdate>,
+    group_call_reports: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
+    local_group_call: Option<GroupCallAnnouncement>,
     new_friend_name: String,
     new_friend_id: String,
     theme: Theme,
@@ -673,6 +675,8 @@ impl App {
             preview: None,
             friends: load_friends(),
             friend_status: BTreeMap::new(),
+            group_call_reports: BTreeMap::new(),
+            local_group_call: None,
             new_friend_name: String::new(),
             new_friend_id: String::new(),
             theme: settings.theme,
@@ -1057,6 +1061,12 @@ impl AppState {
                 }
                 Event::ClientStatus(update) => {
                     let peer = update.peer;
+                    if matches!(update.availability, Availability::Online) {
+                        self.group_call_reports
+                            .insert(peer, update.active_group_calls.clone());
+                    } else {
+                        self.group_call_reports.remove(&peer);
+                    }
                     #[cfg(windows)]
                     let peer_is_newer = update.client_version.as_deref().is_some_and(|version| {
                         update::is_version_newer(version, crate::APP_VERSION)
@@ -1070,6 +1080,10 @@ impl AppState {
                         );
                         self.start_update_check(ctx);
                     }
+                }
+                Event::GroupCallEntered(call) => {
+                    self.local_group_call = Some(call);
+                    self.app_mode = AppMode::Calls;
                 }
                 Event::InitialChatLoaded => self.chat_notifications_ready = true,
                 Event::SetCallState(node_id, call_state) => {
@@ -1436,6 +1450,7 @@ impl AppState {
                 has_more,
             } => {
                 let id = conversation.id.clone();
+                let conversation_is_new = !self.chat.conversations.contains_key(&id);
                 let known_messages = self.chat.timelines.get(&id).map(|timeline| {
                     timeline
                         .iter()
@@ -1484,6 +1499,9 @@ impl AppState {
                     new_remote_messages.as_deref(),
                 );
                 self.chat.conversations.insert(id.clone(), conversation);
+                if conversation_is_new {
+                    self.sync_friends_with_worker();
+                }
                 let mut by_id: BTreeMap<_, _> = messages
                     .into_iter()
                     .map(|message| (message.message_id.clone(), message))
@@ -1831,12 +1849,118 @@ impl AppState {
     }
 
     fn has_visible_call(&self) -> bool {
-        self.calls.values().any(|state| {
-            matches!(
-                state,
-                CallState::Incoming | CallState::Calling | CallState::Active
-            )
-        })
+        self.local_group_call.is_some()
+            || self.calls.values().any(|state| {
+                matches!(
+                    state,
+                    CallState::Incoming | CallState::Calling | CallState::Active
+                )
+            })
+    }
+
+    fn group_call_for(&self, conversation_id: &str) -> Option<GroupCallAnnouncement> {
+        let mut merged = self
+            .local_group_call
+            .iter()
+            .chain(self.group_call_reports.values().flatten())
+            .filter(|call| call.conversation_id == conversation_id && call.ended_at_ms.is_none())
+            .max_by_key(|call| call.started_at_ms)
+            .cloned()?;
+        let call_id = merged.call_id.clone();
+        let mut participants = merged.participants.into_iter().collect::<BTreeSet<_>>();
+        for call in self
+            .local_group_call
+            .iter()
+            .chain(self.group_call_reports.values().flatten())
+            .filter(|call| call.call_id == call_id)
+        {
+            participants.extend(call.participants.iter().cloned());
+        }
+        merged.participants = participants.into_iter().collect();
+        Some(merged)
+    }
+
+    fn enter_group_call(
+        &mut self,
+        conversation: &ChatConversation,
+        existing: Option<GroupCallAnnouncement>,
+    ) {
+        let Some(our_node_id) = self.our_node_id else {
+            return;
+        };
+        let members = conversation
+            .members
+            .iter()
+            .filter_map(|member| NodeId::from_str(member).ok())
+            .filter(|member| *member != our_node_id)
+            .collect::<Vec<_>>();
+        let mut call = existing.unwrap_or_else(|| GroupCallAnnouncement {
+            call_id: format!(
+                "{}:{}:{}",
+                conversation.id,
+                our_node_id.fmt_short(),
+                chat::now_millis()
+            ),
+            conversation_id: conversation.id.clone(),
+            title: conversation.title.clone(),
+            initiator: our_node_id.to_string(),
+            started_at_ms: chat::now_millis(),
+            ended_at_ms: None,
+            participants: Vec::new(),
+        });
+        if !call
+            .participants
+            .iter()
+            .any(|peer| peer == &our_node_id.to_string())
+        {
+            call.participants.push(our_node_id.to_string());
+        }
+        call.participants.sort();
+        call.participants.dedup();
+
+        let advertised = call
+            .participants
+            .iter()
+            .filter_map(|peer| NodeId::from_str(peer).ok())
+            .collect::<BTreeSet<_>>();
+        let targets = members
+            .iter()
+            .copied()
+            .filter(|peer| {
+                advertised.contains(peer)
+                    || self
+                        .friend_status
+                        .get(peer)
+                        .is_some_and(|status| matches!(status.availability, Availability::Online))
+            })
+            .collect();
+        self.local_group_call = Some(call.clone());
+        self.app_mode = AppMode::Calls;
+        self.cmd(Command::EnterGroupCall {
+            call,
+            targets,
+            notify: members,
+        });
+    }
+
+    fn leave_group_call(&mut self) {
+        let Some(call) = self.local_group_call.take() else {
+            return;
+        };
+        let notify = self
+            .chat
+            .conversations
+            .get(&call.conversation_id)
+            .map(|conversation| {
+                conversation
+                    .members
+                    .iter()
+                    .filter_map(|member| NodeId::from_str(member).ok())
+                    .filter(|member| Some(*member) != self.our_node_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.cmd(Command::LeaveGroupCall { notify });
     }
 
     fn active_stream_sources(&self) -> Vec<StreamSource> {
@@ -2012,10 +2136,20 @@ impl AppState {
     }
 
     fn friend_node_ids(&self) -> BTreeSet<NodeId> {
-        self.friends
+        let mut peers = self
+            .friends
             .iter()
             .filter_map(|friend| NodeId::from_str(friend.node_id.trim()).ok())
-            .collect()
+            .collect::<BTreeSet<_>>();
+        peers.extend(
+            self.chat
+                .conversations
+                .values()
+                .flat_map(|conversation| conversation.members.iter())
+                .filter_map(|member| NodeId::from_str(member).ok())
+                .filter(|member| Some(*member) != self.our_node_id),
+        );
+        peers
     }
 
     fn sync_friends_with_worker(&self) {
@@ -2260,7 +2394,15 @@ impl AppState {
                         self.app_mode = AppMode::Text;
                     }
                     let calls_active = self.app_mode == AppMode::Calls;
-                    if chat_segment_button(ui, pal, "Voice calls", calls_active, false).clicked() {
+                    let call_available = self.local_group_call.is_some()
+                        || self
+                            .group_call_reports
+                            .values()
+                            .flatten()
+                            .any(|call| call.ended_at_ms.is_none());
+                    if chat_segment_button(ui, pal, "Voice calls", calls_active, call_available)
+                        .clicked()
+                    {
                         self.app_mode = AppMode::Calls;
                     }
                 });
@@ -2450,11 +2592,35 @@ impl AppState {
                         let selected = self.chat.selected.as_deref() == Some(group.id.as_str());
                         let members = self.group_members_for(&group);
                         let member_summary = format_group_member_summary(&members);
+                        let active_call = self.group_call_for(&group.id);
+                        let missed_call = self
+                            .group_call_reports
+                            .values()
+                            .flatten()
+                            .filter(|call| call.conversation_id == group.id)
+                            .filter_map(|call| call.ended_at_ms.map(|ended| (ended, call)))
+                            .filter(|(ended, _)| chat::now_millis() - *ended < 24 * 60 * 60 * 1000)
+                            .max_by_key(|(ended, _)| *ended);
+                        let sidebar_summary = active_call
+                            .as_ref()
+                            .map(|call| {
+                                format!(
+                                    "● Active call · {} {}",
+                                    call.participants.len().max(1),
+                                    if call.participants.len() == 1 {
+                                        "participant"
+                                    } else {
+                                        "participants"
+                                    }
+                                )
+                            })
+                            .or_else(|| missed_call.map(|_| "Missed group call".to_owned()))
+                            .unwrap_or_else(|| member_summary.clone());
                         if chat_navigation_button(
                             ui,
                             pal,
                             &format!("#   {}", group.title),
-                            Some(&member_summary),
+                            Some(&sidebar_summary),
                             selected,
                             self.chat.unseen.contains(&group.id),
                         )
@@ -2647,6 +2813,9 @@ impl AppState {
                 let mut clear_history = false;
                 let mut open_members = false;
                 let direct_peer = conversation.direct_peer();
+                let active_group_call = matches!(conversation.kind, ConversationKind::Group)
+                    .then(|| self.group_call_for(&conversation.id))
+                    .flatten();
                 let peer_is_friend = direct_peer.is_some_and(|peer| self.is_friend(peer));
                 let mut friend_to_add = None;
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2708,6 +2877,32 @@ impl AppState {
                                 .clicked()
                             {
                                 friend_to_add = Some(peer);
+                            }
+                        } else if matches!(conversation.kind, ConversationKind::Group) {
+                            let already_joined = self
+                                .local_group_call
+                                .as_ref()
+                                .is_some_and(|call| call.conversation_id == conversation.id);
+                            let label = if already_joined {
+                                "Open call"
+                            } else if active_group_call.is_some() {
+                                "Join call"
+                            } else {
+                                "Start call"
+                            };
+                            if action_button(ui, pal, label, ButtonTone::Primary)
+                                .on_hover_text(if active_group_call.is_some() {
+                                    "Join the active group call"
+                                } else {
+                                    "Ring group members who are currently online"
+                                })
+                                .clicked()
+                            {
+                                if already_joined {
+                                    self.app_mode = AppMode::Calls;
+                                } else {
+                                    self.enter_group_call(&conversation, active_group_call.clone());
+                                }
                             }
                         }
                     }
@@ -4237,6 +4432,20 @@ impl AppState {
 
     /// Compact summary for the chrome top bar: label, accent color, hover detail.
     fn active_call_indicator(&self, pal: &Palette) -> Option<(String, Color32, String)> {
+        if let Some(call) = &self.local_group_call {
+            let participants = call.participants.len().max(
+                self.calls
+                    .values()
+                    .filter(|state| matches!(state, CallState::Active))
+                    .count()
+                    + 1,
+            );
+            return Some((
+                format!("In group call · {}", call.title),
+                pal.ok,
+                format!("{} · {participants} in call", call.title),
+            ));
+        }
         if self.calls.is_empty() {
             return None;
         }
@@ -4306,7 +4515,7 @@ impl AppState {
             .values()
             .filter(|state| matches!(state, CallState::Active))
             .count();
-        let in_call = active_calls > 0;
+        let in_call = active_calls > 0 || self.local_group_call.is_some();
 
         // Keep the control cluster centered at every window width.
         let desired_controls_width: f32 = if in_call { 245.0 } else { 142.0 };
@@ -4396,6 +4605,7 @@ impl AppState {
                             self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
                             self.cmd(Command::Abort { node_id });
                         }
+                        self.leave_group_call();
                     }
                 }
             });
@@ -8550,6 +8760,7 @@ mod layout_tests {
 enum Event {
     EndpointBound(NodeId),
     ClientStatus(StatusUpdate),
+    GroupCallEntered(GroupCallAnnouncement),
     InitialChatLoaded,
     Chat(ChatNotification),
     WorkerFailed(String),
@@ -8674,6 +8885,14 @@ enum Command {
     Call {
         node_id: NodeId,
     },
+    EnterGroupCall {
+        call: GroupCallAnnouncement,
+        targets: Vec<NodeId>,
+        notify: Vec<NodeId>,
+    },
+    LeaveGroupCall {
+        notify: Vec<NodeId>,
+    },
     HandleIncoming {
         node_id: NodeId,
         accept: bool,
@@ -8781,6 +9000,8 @@ struct Worker {
     deafened: bool,
     chat: chat::ChatService,
     client_status: ClientStatusProtocol,
+    local_group_call: Option<GroupCallAnnouncement>,
+    peer_group_calls: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
 }
 
 struct WorkerHandle {
@@ -8912,6 +9133,8 @@ impl Worker {
             connect_aborts: BTreeMap::new(),
             call_generations: BTreeMap::new(),
             next_call_generation: 0,
+            local_group_call: None,
+            peer_group_calls: BTreeMap::new(),
             endpoint,
             handler,
             _router,
@@ -9040,7 +9263,14 @@ impl Worker {
                     }
                 }
                 status = self.client_status.next_update() => {
-                    self.emit(Event::ClientStatus(status?)).await?;
+                    let status = status?;
+                    if matches!(status.availability, Availability::Online) {
+                        self.peer_group_calls
+                            .insert(status.peer, status.active_group_calls.clone());
+                    } else {
+                        self.peer_group_calls.remove(&status.peer);
+                    }
+                    self.emit(Event::ClientStatus(status)).await?;
                 }
                 failure = self.capture_failure_rx.recv() => {
                     if let Ok(message) = failure {
@@ -9060,6 +9290,21 @@ impl Worker {
             return Ok(());
         }
         let generation = self.begin_call(node_id);
+        let same_group_room = self.local_group_call.as_ref().is_some_and(|local| {
+            self.peer_group_calls.get(&node_id).is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|remote| remote.call_id == local.call_id && remote.ended_at_ms.is_none())
+            })
+        });
+        if same_group_room {
+            info!(
+                node = %node_id.fmt_short(),
+                "automatically accepting participant joining our group call"
+            );
+            self.accept_from_accept(conn, generation).await?;
+            return Ok(());
+        }
         info!("incoming connection from {}", node_id.fmt_short());
         let monitor = conn.clone();
         self.incoming_tasks.spawn(async move {
@@ -9799,6 +10044,46 @@ impl Worker {
                     .spawn(async move { (node_id, generation, handler.connect(node_id).await) });
                 self.connect_aborts.insert(node_id, (generation, abort));
             }
+            Command::EnterGroupCall {
+                call,
+                targets,
+                notify,
+            } => {
+                self.local_group_call = Some(call.clone());
+                self.client_status
+                    .set_active_group_calls(vec![call.clone()]);
+                // This immediate beat is the ring/catch-up signal. The regular
+                // heartbeat keeps the room discoverable for members who start
+                // later and withdraws it when we leave.
+                self.client_status.announce_online(notify);
+                for node_id in targets {
+                    if self.active_calls.contains_key(&node_id) {
+                        continue;
+                    }
+                    let generation = self.begin_call(node_id);
+                    self.active_calls.insert(node_id, CallInfo::Calling);
+                    self.emit(Event::SetCallState(node_id, CallState::Calling))
+                        .await?;
+                    let handler = self.handler.clone();
+                    let abort = self.connect_tasks.spawn(async move {
+                        // Give the lightweight room advertisement a short head
+                        // start so peers already in this call can recognize and
+                        // auto-accept a Join instead of showing another ring.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        (node_id, generation, handler.connect(node_id).await)
+                    });
+                    self.connect_aborts.insert(node_id, (generation, abort));
+                }
+            }
+            Command::LeaveGroupCall { notify } => {
+                let recently_ended = self.local_group_call.take().map(|mut call| {
+                    call.ended_at_ms = Some(chat::now_millis());
+                    call
+                });
+                self.client_status
+                    .set_active_group_calls(recently_ended.into_iter().collect());
+                self.client_status.announce_online(notify);
+            }
             Command::HandleIncoming { node_id, accept } => {
                 let Some(CallInfo::Incoming(conn)) = self.active_calls.remove(&node_id) else {
                     return Ok(());
@@ -9808,6 +10093,31 @@ impl Worker {
                     return Ok(());
                 };
                 if accept {
+                    if self.local_group_call.is_none() {
+                        if let Some(mut call) = self
+                            .peer_group_calls
+                            .get(&node_id)
+                            .and_then(|calls| {
+                                calls
+                                    .iter()
+                                    .filter(|call| call.ended_at_ms.is_none())
+                                    .max_by_key(|call| call.started_at_ms)
+                            })
+                            .cloned()
+                        {
+                            let us = self.endpoint.node_id().to_string();
+                            if !call.participants.contains(&us) {
+                                call.participants.push(us);
+                                call.participants.sort();
+                                call.participants.dedup();
+                            }
+                            self.local_group_call = Some(call.clone());
+                            self.client_status
+                                .set_active_group_calls(vec![call.clone()]);
+                            self.client_status.refresh_allowed_peers();
+                            self.emit(Event::GroupCallEntered(call)).await?;
+                        }
+                    }
                     self.accept_from_accept(conn, generation).await?;
                 } else {
                     self.call_generations.remove(&node_id);

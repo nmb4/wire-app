@@ -17,8 +17,8 @@ use n0_future::{boxed::BoxFuture, FutureExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
-pub const CLIENT_STATUS_ALPN: &[u8] = b"wire/client-status/1";
-const MAX_PACKET_BYTES: usize = 4 * 1024;
+pub const CLIENT_STATUS_ALPN: &[u8] = b"wire/client-status/2";
+const MAX_PACKET_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const SHUTDOWN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -36,6 +36,21 @@ pub struct StatusUpdate {
     pub availability: Availability,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub client_version: Option<String>,
+    pub active_group_calls: Vec<GroupCallAnnouncement>,
+}
+
+/// Ephemeral group-call room state replicated during the existing presence
+/// heartbeat. This lets a client that was offline discover and join a call as
+/// soon as it comes back without requiring a server or a durable chat message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallAnnouncement {
+    pub call_id: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub initiator: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub participants: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,19 +58,21 @@ struct StatusPacket {
     protocol_version: u8,
     availability: Availability,
     client_version: String,
+    active_group_calls: Vec<GroupCallAnnouncement>,
 }
 
 impl StatusPacket {
-    fn new(availability: Availability) -> Self {
+    fn new(availability: Availability, active_group_calls: Vec<GroupCallAnnouncement>) -> Self {
         Self {
-            protocol_version: 1,
+            protocol_version: 2,
             availability,
             client_version: crate::APP_VERSION.to_owned(),
+            active_group_calls,
         }
     }
 
     fn validate(&self) -> Result<()> {
-        if self.protocol_version != 1 {
+        if self.protocol_version != 2 {
             bail!(
                 "unsupported client status protocol version {}",
                 self.protocol_version
@@ -63,6 +80,18 @@ impl StatusPacket {
         }
         if self.client_version.len() > 64 {
             bail!("client version exceeds safety limit");
+        }
+        if self.active_group_calls.len() > 32
+            || self.active_group_calls.iter().any(|call| {
+                call.call_id.len() > 160
+                    || call.conversation_id.len() > 512
+                    || call.title.len() > 256
+                    || call.initiator.len() > 128
+                    || call.participants.len() > 64
+                    || call.participants.iter().any(|peer| peer.len() > 128)
+            })
+        {
+            bail!("group call advertisement exceeds safety limit");
         }
         Ok(())
     }
@@ -74,6 +103,7 @@ pub struct ClientStatusProtocol {
     allowed_peers: Arc<RwLock<BTreeSet<NodeId>>>,
     update_tx: Sender<StatusUpdate>,
     update_rx: Receiver<StatusUpdate>,
+    active_group_calls: Arc<RwLock<Vec<GroupCallAnnouncement>>>,
 }
 
 impl ClientStatusProtocol {
@@ -84,7 +114,22 @@ impl ClientStatusProtocol {
             allowed_peers: Arc::new(RwLock::new(BTreeSet::new())),
             update_tx,
             update_rx,
+            active_group_calls: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn set_active_group_calls(&self, calls: Vec<GroupCallAnnouncement>) {
+        *self
+            .active_group_calls
+            .write()
+            .expect("client status call lock poisoned") = calls;
+    }
+
+    fn active_group_calls(&self) -> Vec<GroupCallAnnouncement> {
+        self.active_group_calls
+            .read()
+            .expect("client status call lock poisoned")
+            .clone()
     }
 
     pub fn replace_peers(&self, peers: BTreeSet<NodeId>) {
@@ -102,12 +147,21 @@ impl ClientStatusProtocol {
         for peer in peers {
             let endpoint = self.endpoint.clone();
             let update_tx = self.update_tx.clone();
+            let active_group_calls = self.active_group_calls();
             tokio::spawn(async move {
-                let update = match exchange(&endpoint, peer, Availability::Online).await {
+                let update = match exchange(
+                    &endpoint,
+                    peer,
+                    Availability::Online,
+                    active_group_calls,
+                )
+                .await
+                {
                     Ok(packet) => StatusUpdate {
                         peer,
                         availability: packet.availability,
                         client_version: Some(packet.client_version),
+                        active_group_calls: packet.active_group_calls,
                     },
                     Err(error) => {
                         debug!(peer = %peer.fmt_short(), "client status probe failed: {error:#}");
@@ -115,6 +169,7 @@ impl ClientStatusProtocol {
                             peer,
                             availability: Availability::Offline,
                             client_version: None,
+                            active_group_calls: Vec::new(),
                         }
                     }
                 };
@@ -148,7 +203,9 @@ impl ClientStatusProtocol {
             for peer in peers {
                 let endpoint = endpoint.clone();
                 tasks.spawn(async move {
-                    if let Err(error) = exchange(&endpoint, peer, Availability::Offline).await {
+                    if let Err(error) =
+                        exchange(&endpoint, peer, Availability::Offline, Vec::new()).await
+                    {
                         debug!(
                             peer = %peer.fmt_short(),
                             "offline status announcement failed: {error:#}"
@@ -198,10 +255,15 @@ impl ProtocolHandler for ClientStatusProtocol {
                     peer,
                     availability: packet.availability,
                     client_version: Some(packet.client_version),
+                    active_group_calls: packet.active_group_calls,
                 })
                 .await?;
 
-            write_packet(&mut send, &StatusPacket::new(Availability::Online)).await?;
+            write_packet(
+                &mut send,
+                &StatusPacket::new(Availability::Online, protocol.active_group_calls()),
+            )
+            .await?;
             send.finish()?;
             Ok(())
         }
@@ -217,6 +279,7 @@ async fn exchange(
     endpoint: &Endpoint,
     peer: NodeId,
     availability: Availability,
+    active_group_calls: Vec<GroupCallAnnouncement>,
 ) -> Result<StatusPacket> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         let connection: Connection = endpoint
@@ -224,7 +287,11 @@ async fn exchange(
             .await
             .with_context(|| format!("connect to {} for client status", peer.fmt_short()))?;
         let (mut send, mut recv) = connection.open_bi().await?;
-        write_packet(&mut send, &StatusPacket::new(availability)).await?;
+        write_packet(
+            &mut send,
+            &StatusPacket::new(availability, active_group_calls),
+        )
+        .await?;
         send.finish()?;
         let response: StatusPacket = read_packet(&mut recv).await?;
         response.validate()?;
@@ -265,8 +332,27 @@ mod tests {
 
     #[test]
     fn status_packet_rejects_unknown_protocol_versions() {
-        let mut packet = StatusPacket::new(Availability::Online);
-        packet.protocol_version = 2;
+        let mut packet = StatusPacket::new(Availability::Online, Vec::new());
+        packet.protocol_version = 1;
         assert!(packet.validate().is_err());
+    }
+
+    #[test]
+    fn status_packet_bounds_group_call_metadata() {
+        let mut packet = StatusPacket::new(
+            Availability::Online,
+            vec![GroupCallAnnouncement {
+                call_id: "call".to_owned(),
+                conversation_id: "group".to_owned(),
+                title: "Group".to_owned(),
+                initiator: "peer".to_owned(),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                participants: vec!["x".repeat(129)],
+            }],
+        );
+        assert!(packet.validate().is_err());
+        packet.active_group_calls[0].participants = vec!["peer".to_owned()];
+        packet.validate().unwrap();
     }
 }
