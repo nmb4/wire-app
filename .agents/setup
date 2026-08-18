@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+started_at=$SECONDS
+echo "[setup] Preparing Wire development environment"
+
+if [[ "$(uname -s)" == "Linux" ]] && command -v apt-get >/dev/null; then
+  packages=(
+    build-essential
+    ca-certificates
+    curl
+    libasound2-dev
+    libdbus-1-dev
+    pkg-config
+  )
+  missing_packages=()
+
+  for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+      missing_packages+=("$package")
+    fi
+  done
+
+  if ((${#missing_packages[@]})); then
+    echo "[setup] Installing system packages: ${missing_packages[*]}"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+  else
+    echo "[setup] System packages already installed"
+  fi
+fi
+
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
+if ! command -v rustup >/dev/null; then
+  echo "[setup] Installing rustup and the stable Rust toolchain"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain stable
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
+if ! rustup toolchain list | grep -q '^stable'; then
+  echo "[setup] Installing the stable Rust toolchain"
+  rustup toolchain install stable --profile minimal
+fi
+
+echo "[setup] Selecting stable Rust and installing developer components"
+rustup override set stable
+rustup component add --toolchain stable clippy rustfmt
+
+profile_marker="# Wire Rust toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  echo "[setup] Adding Rust to non-interactive login shells"
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+if [[ -f "$HOME/.cargo/env" ]]; then
+  source "$HOME/.cargo/env"
+fi
+EOF
+fi
+
+echo "[setup] Fetching locked Cargo dependencies"
+cargo fetch --locked
+
+echo "[setup] Complete in $((SECONDS - started_at))s"
