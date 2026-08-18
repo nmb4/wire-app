@@ -1,5 +1,6 @@
 SANDBOX
 /target
+/.amp/portals/*
 /mcps/
 /terminals/
 /dist/
