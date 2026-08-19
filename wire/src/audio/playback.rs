@@ -23,8 +23,8 @@ use tracing::{debug, error, info, trace, trace_span, warn, Level};
 
 use super::{
     device::{find_device, find_output_stream_config, Direction, StreamConfigWithFormat},
-    device_resampler, update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor,
-    DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
+    device_resampler, update_audio_level, AudioActivityHandle, AudioFormat, AudioLevelHandle,
+    WebrtcAudioProcessor, DURATION_10MS, DURATION_20MS, ENGINE_FORMAT, SAMPLE_RATE,
 };
 use crate::{codec::opus::MediaTrackOpusDecoder, rtc::MediaTrack};
 
@@ -42,21 +42,29 @@ pub struct GainSource {
     inner: Box<dyn AudioSource>,
     volume: VolumeHandle,
     level: Option<AudioLevelHandle>,
+    activity: Option<AudioActivityHandle>,
 }
 
 impl AudioSource for GainSource {
     fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>> {
-        let result = self.inner.tick(buf)?;
-        if let ControlFlow::Continue(count) = &result {
-            if let Some(level) = &self.level {
-                update_audio_level(level, &buf[..*count]);
+        let result = self.inner.tick(buf);
+        match &result {
+            Ok(ControlFlow::Continue(count)) => {
+                if let Some(level) = &self.level {
+                    update_audio_level(level, &buf[..*count]);
+                }
+                let gain = f32::from_bits(self.volume.load(Ordering::Relaxed));
+                for sample in buf[..*count].iter_mut() {
+                    *sample *= gain;
+                }
             }
-            let gain = f32::from_bits(self.volume.load(Ordering::Relaxed));
-            for sample in buf[..*count].iter_mut() {
-                *sample *= gain;
+            Ok(ControlFlow::Break(())) | Err(_) => {
+                if let Some(activity) = &self.activity {
+                    activity.store(false, Ordering::Relaxed);
+                }
             }
         }
-        Ok(result)
+        result
     }
 }
 
@@ -140,6 +148,23 @@ impl AudioPlayback {
             inner: Box::new(decoder),
             volume,
             level: None,
+            activity: None,
+        })
+        .await
+    }
+
+    pub async fn add_track_with_volume_and_activity(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+        activity: AudioActivityHandle,
+    ) -> Result<()> {
+        let decoder = MediaTrackOpusDecoder::new(track)?;
+        self.add_source(GainSource {
+            inner: Box::new(decoder),
+            volume,
+            level: None,
+            activity: Some(activity),
         })
         .await
     }
@@ -155,6 +180,7 @@ impl AudioPlayback {
             inner: Box::new(decoder),
             volume,
             level: Some(level),
+            activity: None,
         })
         .await
     }

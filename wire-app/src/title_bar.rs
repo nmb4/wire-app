@@ -24,7 +24,7 @@ pub fn ui(
     resources: ResourceUsage,
     show_system_usage: bool,
     always_on_top: &mut bool,
-    rounded: bool,
+    controls_rounded: bool,
 ) {
     let painter = ui.painter();
 
@@ -77,13 +77,13 @@ pub fn ui(
             .layout(Layout::right_to_left(Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            window_controls(ui, pal, always_on_top, rounded);
+            window_controls(ui, pal, always_on_top, controls_rounded);
         },
     );
 }
 
-fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded: bool) {
-    if title_bar_icon_button(ui, pal, Icon::X, false, true, rounded)
+fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, controls_rounded: bool) {
+    if title_bar_icon_button(ui, pal, Icon::X, false, true, controls_rounded)
         .on_hover_text("Close")
         .clicked()
     {
@@ -97,7 +97,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
         Icon::Maximize
     };
     let maximize_hint = if is_maximized { "Restore" } else { "Maximize" };
-    if title_bar_icon_button(ui, pal, maximize_icon, false, false, rounded)
+    if title_bar_icon_button(ui, pal, maximize_icon, false, false, controls_rounded)
         .on_hover_text(maximize_hint)
         .clicked()
     {
@@ -105,7 +105,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
             .send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
     }
 
-    if title_bar_icon_button(ui, pal, Icon::Minus, false, false, rounded)
+    if title_bar_icon_button(ui, pal, Icon::Minus, false, false, controls_rounded)
         .on_hover_text("Minimize")
         .clicked()
     {
@@ -117,7 +117,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
     } else {
         "Keep on top"
     };
-    if title_bar_icon_button(ui, pal, Icon::Pin, *always_on_top, false, rounded)
+    if title_bar_icon_button(ui, pal, Icon::Pin, *always_on_top, false, controls_rounded)
         .on_hover_text(pin_hint)
         .clicked()
     {

@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
 pub const CHAT_ALPN: &[u8] = b"wire/chat-invite/1";
+pub const MISSED_CALL_MESSAGE_BODY: &str = "Missed call";
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENT_PUSH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -181,6 +182,19 @@ impl ChatMessage {
             attachments,
             deletion: None,
         }
+    }
+
+    /// Build the durable chat record used when an outgoing call reaches an
+    /// offline peer. It intentionally remains an ordinary chat message so the
+    /// existing Docs replication, queued delivery, restart recovery, and
+    /// recipient receipt acknowledgement all apply without a second control
+    /// protocol.
+    pub fn missed_call(author_id: NodeId) -> Self {
+        Self::new_with_attachments(author_id, MISSED_CALL_MESSAGE_BODY.to_owned(), Vec::new())
+    }
+
+    pub fn is_missed_call(&self) -> bool {
+        self.body == MISSED_CALL_MESSAGE_BODY && self.attachments.is_empty()
     }
 
     pub fn entry_key(&self) -> String {
@@ -1173,6 +1187,27 @@ impl ChatService {
     }
 
     pub async fn ensure_direct(&mut self, peer: NodeId, title: String) -> Result<String> {
+        self.ensure_direct_inner(peer, title, true).await
+    }
+
+    /// Ensure a direct conversation exists without waiting for the peer to
+    /// accept the initial invitation. This is used by durable system messages
+    /// created specifically because the peer is offline: the invite and the
+    /// message are both persisted and retried by the normal chat worker.
+    pub async fn ensure_direct_for_delivery(
+        &mut self,
+        peer: NodeId,
+        title: String,
+    ) -> Result<String> {
+        self.ensure_direct_inner(peer, title, false).await
+    }
+
+    async fn ensure_direct_inner(
+        &mut self,
+        peer: NodeId,
+        title: String,
+        wait_for_invite: bool,
+    ) -> Result<String> {
         let id = direct_conversation_id(self.our_node_id, peer);
         if !self.index.conversations.contains_key(&id) {
             let members = sorted_members([self.our_node_id, peer]);
@@ -1197,9 +1232,38 @@ impl ChatService {
             );
             // Await invite so an immediate first send's SyncRequest is not
             // ignored as non-member on the peer.
-            self.invite_members_wait(&id).await;
+            if wait_for_invite {
+                self.invite_members_wait(&id).await;
+            } else {
+                self.register_invite_delivery(&id);
+                self.send_pending_invites(&id);
+            }
         }
         Ok(id)
+    }
+
+    /// Queue a missed-call record in the direct conversation with `peer`.
+    /// The message is committed locally before any delivery attempt, so an
+    /// offline callee receives it after a later presence/connection transition
+    /// and a restart cannot lose the pending record.
+    pub async fn send_missed_call(&mut self, peer: NodeId, title: String) {
+        let message = ChatMessage::missed_call(self.our_node_id);
+        let message_id = message.message_id.clone();
+        match self.ensure_direct_for_delivery(peer, title).await {
+            Ok(conversation_id) => self.send_message(conversation_id, message).await,
+            Err(error) => {
+                warn!(
+                    peer = %peer.fmt_short(),
+                    message = %log_id(&message_id),
+                    "could not create direct chat for missed call: {error:#}"
+                );
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id,
+                    state: DeliveryState::Failed,
+                    detail: Some(error.to_string()),
+                });
+            }
+        }
     }
 
     pub async fn create_group(&mut self, title: String, members: Vec<NodeId>) -> Result<String> {
@@ -4226,6 +4290,19 @@ mod tests {
     }
 
     #[test]
+    fn missed_call_is_a_receiptable_durable_message() {
+        let message = ChatMessage::missed_call(node(1));
+        assert!(message.is_missed_call());
+        assert_eq!(message.body, MISSED_CALL_MESSAGE_BODY);
+        assert!(message.attachments.is_empty());
+        assert!(message.validate().is_ok());
+        let encoded = serde_json::to_vec(&message).unwrap();
+        assert!(String::from_utf8(encoded)
+            .unwrap()
+            .contains(MISSED_CALL_MESSAGE_BODY));
+    }
+
+    #[test]
     fn deletion_state_is_never_embedded_in_the_message_blob() {
         let mut message = ChatMessage::new(node(1), "sensitive text".to_owned());
         message.deletion = Some(MessageDeletion::Local);
@@ -4438,6 +4515,40 @@ mod tests {
         .await
         .context("timed out waiting for replicated chat message")?;
         Ok(())
+    }
+
+    async fn wait_for_missed_call_delivery(
+        sender: &mut ChatService,
+        recipient: &mut ChatService,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut received_message_id = None;
+            let mut delivered = BTreeSet::new();
+            loop {
+                tokio::select! {
+                    notification = sender.next_notification() => {
+                        if let ChatNotification::Delivery { message_id, state: DeliveryState::Delivered, .. } = notification {
+                            delivered.insert(message_id);
+                        }
+                    }
+                    notification = recipient.next_notification() => {
+                        if let ChatNotification::Conversation { messages, .. } = notification {
+                            if let Some(message) = messages.into_iter().find(ChatMessage::is_missed_call) {
+                                received_message_id = Some(message.message_id);
+                            }
+                        }
+                    }
+                }
+                if received_message_id
+                    .as_ref()
+                    .is_some_and(|message_id| delivered.contains(message_id))
+                {
+                    return Result::<()>::Ok(());
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for missed-call delivery and recipient receipt")?
     }
 
     async fn wait_for_attachment(
@@ -4790,6 +4901,36 @@ mod tests {
                 .is_some_and(|message_ids| message_ids.contains(&later_id)),
             "restoring a message must remove its persisted local tombstone"
         );
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn missed_call_uses_direct_delivery_and_recipient_receipt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let left_secret = SecretKey::from_bytes(&[111; 32]);
+        let right_secret = SecretKey::from_bytes(&[112; 32]);
+        let right_node_id = right_secret.public();
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&temp.path().join("left"), left_secret).await?;
+
+        // Queue the record while the callee has no endpoint. Starting the
+        // second service afterwards exercises the same queued-delivery path as
+        // an offline peer returning to the network.
+        left.send_missed_call(right_node_id, "Right".to_owned())
+            .await;
+
+        let (right_endpoint, right_router, mut right) =
+            spawn_test_node(&temp.path().join("right"), right_secret).await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+
+        // Both services must keep processing their retry ticks. The desktop
+        // worker continuously polls this loop in production; driving both
+        // sides here verifies the offline invite retry and the return receipt.
+        wait_for_missed_call_delivery(&mut left, &mut right).await?;
+
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())

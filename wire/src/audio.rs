@@ -1,7 +1,7 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -47,6 +47,14 @@ const DURATION_20MS: Duration = Duration::from_millis(20);
 
 /// Shared, normalized audio level for UI meters. Stored as `f32::to_bits()`.
 pub type AudioLevelHandle = Arc<AtomicU32>;
+
+/// Shared state for an optional audio source such as screen-share audio.
+///
+/// The handle is set by the receiver when a track is accepted and cleared by
+/// playback when that track reaches EOF. Keeping this alongside the source
+/// lets the UI distinguish an allocated volume control from an actually
+/// active stream.
+pub type AudioActivityHandle = Arc<AtomicBool>;
 
 fn update_audio_level(level: &AudioLevelHandle, samples: &[f32]) {
     let rms = if samples.is_empty() {
@@ -153,6 +161,18 @@ impl AudioContext {
         volume: VolumeHandle,
     ) -> Result<()> {
         self.playback.add_track_with_volume(track, volume).await?;
+        Ok(())
+    }
+
+    pub async fn play_track_with_volume_and_activity(
+        &self,
+        track: MediaTrack,
+        volume: VolumeHandle,
+        activity: AudioActivityHandle,
+    ) -> Result<()> {
+        self.playback
+            .add_track_with_volume_and_activity(track, volume, activity)
+            .await?;
         Ok(())
     }
 

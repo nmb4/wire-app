@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc,
     },
     time::Duration,
@@ -20,7 +20,10 @@ use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, info, warn};
 use wire::{
-    audio::{AudioConfig, AudioContext, AudioLevelHandle, AudioQuality, VolumeHandle},
+    audio::{
+        AudioActivityHandle, AudioConfig, AudioContext, AudioLevelHandle, AudioQuality,
+        VolumeHandle,
+    },
     rtc::{MediaTrack, RtcConnection, RtcProtocol, TrackKind},
     video::{transport, BitratePreset, StreamPreset, VideoConfig},
 };
@@ -59,6 +62,8 @@ pub struct App {
     always_on_top: bool,
     viewport_transparent: Option<bool>,
     state: AppState,
+    #[cfg(windows)]
+    root_was_focused: bool,
     #[cfg(windows)]
     global_hotkeys: Option<crate::global_hotkeys::GlobalHotkeys>,
 }
@@ -179,13 +184,90 @@ impl StreamViewMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum StreamSource {
     Local,
     Remote(NodeId),
 }
 
 const STREAM_GRID_GAP: f32 = 6.0;
+const STREAM_POPOUT_DEFAULT_SIZE: Vec2 = Vec2::new(640.0, 360.0);
+const STREAM_POPOUT_MIN_SIZE: Vec2 = Vec2::new(160.0, 90.0);
+const STREAM_POPOUT_RESIZE_SCALE: f32 = 0.5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamPopoutGesture {
+    Move,
+    Resize,
+}
+
+struct StreamPopoutState {
+    size: Vec2,
+    gesture: Option<StreamPopoutGesture>,
+    resize_start_size: Vec2,
+    resize_start_pointer: Option<egui::Pos2>,
+    pinned: bool,
+    texture: Option<egui::TextureHandle>,
+    uploaded_generation: u64,
+    upload_stats: TextureUploadStats,
+    #[cfg(windows)]
+    native_window_state: Option<StreamPopoutNativeWindowState>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamPopoutNativeWindowState {
+    hwnd: windows::Win32::Foundation::HWND,
+    width: i32,
+    height: i32,
+    rounded: bool,
+}
+
+impl Default for StreamPopoutState {
+    fn default() -> Self {
+        Self {
+            size: STREAM_POPOUT_DEFAULT_SIZE,
+            gesture: None,
+            resize_start_size: STREAM_POPOUT_DEFAULT_SIZE,
+            resize_start_pointer: None,
+            pinned: false,
+            texture: None,
+            uploaded_generation: 0,
+            upload_stats: TextureUploadStats::default(),
+            #[cfg(windows)]
+            native_window_state: None,
+        }
+    }
+}
+
+impl StreamPopoutState {
+    fn handle_pointer_button(
+        &mut self,
+        button: egui::PointerButton,
+        pressed: bool,
+        position: egui::Pos2,
+    ) -> Option<StreamPopoutGesture> {
+        match (button, pressed, self.gesture) {
+            (egui::PointerButton::Primary, true, None) => {
+                self.gesture = Some(StreamPopoutGesture::Move);
+                self.gesture
+            }
+            (egui::PointerButton::Secondary, true, None) => {
+                self.gesture = Some(StreamPopoutGesture::Resize);
+                self.resize_start_size = self.size;
+                self.resize_start_pointer = Some(position);
+                self.gesture
+            }
+            (egui::PointerButton::Primary, false, Some(StreamPopoutGesture::Move))
+            | (egui::PointerButton::Secondary, false, Some(StreamPopoutGesture::Resize)) => {
+                self.gesture = None;
+                self.resize_start_pointer = None;
+                None
+            }
+            _ => None,
+        }
+    }
+}
 
 struct AppState {
     configured: bool,
@@ -202,6 +284,7 @@ struct AppState {
     calls: BTreeMap<NodeId, CallState>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
     stream_volumes: BTreeMap<NodeId, VolumeHandle>,
+    stream_audio_enabled: BTreeMap<NodeId, AudioActivityHandle>,
     local_audio_level: Option<AudioLevelHandle>,
     remote_audio_levels: BTreeMap<NodeId, AudioLevelHandle>,
     rtts: BTreeMap<NodeId, Duration>,
@@ -210,6 +293,8 @@ struct AppState {
     ended_video_stream_generations: BTreeMap<NodeId, u64>,
     stopped_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
+    stream_popouts: BTreeMap<StreamSource, StreamPopoutState>,
+    stream_popouts_translucent: bool,
     volume_open: BTreeSet<NodeId>,
     sharing_active: bool,
     share_system_audio: bool,
@@ -279,6 +364,13 @@ struct ChatUiState {
     delivery: BTreeMap<String, (DeliveryState, Option<String>)>,
     selected: Option<String>,
     unseen: BTreeSet<String>,
+    // Drafts are intentionally in-memory, matching the existing composer
+    // lifetime. Each conversation owns its text and attachment selection.
+    drafts: BTreeMap<String, ChatDraft>,
+    draft_conversation: Option<String>,
+    // Keep the sent snapshot separate from the editable draft so a receipt can
+    // clear only the content that was actually sent.
+    pending_drafts: BTreeMap<String, PendingChatDraft>,
     composer: String,
     draft_attachments: Vec<ChatAttachment>,
     attachment_textures: AttachmentTextureCache,
@@ -293,6 +385,125 @@ struct ChatUiState {
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
     friend_candidate_name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChatDraft {
+    composer: String,
+    attachments: Vec<ChatAttachment>,
+}
+
+struct PendingChatDraft {
+    conversation_id: String,
+    draft: ChatDraft,
+}
+
+impl ChatUiState {
+    fn active_draft(&self) -> Option<ChatDraft> {
+        self.draft_conversation.as_ref().map(|_| ChatDraft {
+            composer: self.composer.clone(),
+            attachments: self.draft_attachments.clone(),
+        })
+    }
+
+    fn save_active_draft(&mut self) {
+        let Some(conversation_id) = self.draft_conversation.clone() else {
+            return;
+        };
+        let draft = self
+            .active_draft()
+            .expect("active draft has a conversation");
+        if draft.composer.is_empty() && draft.attachments.is_empty() {
+            self.drafts.remove(&conversation_id);
+        } else {
+            self.drafts.insert(conversation_id, draft);
+        }
+    }
+
+    fn activate_draft(&mut self, conversation_id: Option<&str>) {
+        if self.draft_conversation.as_deref() == conversation_id {
+            return;
+        }
+        self.save_active_draft();
+        let draft = conversation_id
+            .and_then(|id| self.drafts.get(id).cloned())
+            .unwrap_or_default();
+        self.composer = draft.composer;
+        self.draft_attachments = draft.attachments;
+        self.draft_conversation = conversation_id.map(str::to_owned);
+    }
+
+    fn draft_for(&self, conversation_id: &str) -> ChatDraft {
+        if self.draft_conversation.as_deref() == Some(conversation_id) {
+            self.active_draft().unwrap_or_default()
+        } else {
+            self.drafts
+                .get(conversation_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn remember_pending_draft(
+        &mut self,
+        message_id: String,
+        conversation_id: String,
+        draft: ChatDraft,
+    ) {
+        self.pending_drafts.insert(
+            message_id,
+            PendingChatDraft {
+                conversation_id,
+                draft,
+            },
+        );
+    }
+
+    fn resolve_pending_draft(&mut self, message_id: &str, state: DeliveryState) {
+        if !matches!(state, DeliveryState::Delivered | DeliveryState::Failed) {
+            return;
+        }
+        let Some(pending) = self.pending_drafts.remove(message_id) else {
+            return;
+        };
+        if state == DeliveryState::Failed {
+            self.restore_draft_if_empty(&pending.conversation_id, &pending.draft);
+        }
+    }
+
+    fn clear_draft_if_matches(&mut self, conversation_id: &str, expected: &ChatDraft) -> bool {
+        if self.draft_for(conversation_id) != expected.clone() {
+            return false;
+        }
+        self.drafts.remove(conversation_id);
+        if self.draft_conversation.as_deref() == Some(conversation_id) {
+            self.composer.clear();
+            self.draft_attachments.clear();
+            if self.image_preview.as_ref().is_some_and(|preview| {
+                preview.draft
+                    && expected
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.id == preview.attachment.id)
+            }) {
+                self.image_preview = None;
+            }
+        }
+        true
+    }
+
+    fn restore_draft_if_empty(&mut self, conversation_id: &str, draft: &ChatDraft) -> bool {
+        if self.draft_for(conversation_id) != ChatDraft::default() {
+            return false;
+        }
+        self.drafts
+            .insert(conversation_id.to_owned(), draft.clone());
+        if self.draft_conversation.as_deref() == Some(conversation_id) {
+            self.composer = draft.composer.clone();
+            self.draft_attachments = draft.attachments.clone();
+        }
+        true
+    }
 }
 
 const MAX_ATTACHMENT_TEXTURES: usize = 128;
@@ -605,6 +816,9 @@ impl eframe::App for App {
             match action {
                 crate::global_hotkeys::Action::ToggleMute => self.state.toggle_muted(),
                 crate::global_hotkeys::Action::ToggleDeafen => self.state.toggle_deafened(),
+                crate::global_hotkeys::Action::ToggleStreamOpacity => {
+                    self.state.toggle_stream_popout_opacity()
+                }
             }
         }
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -628,6 +842,13 @@ impl eframe::App for App {
 
         #[cfg(windows)]
         let parent_hwnd = native_parent_hwnd(_frame);
+        #[cfg(windows)]
+        let root_became_focused = {
+            let focused = ctx.input(|input| input.viewport().focused == Some(true));
+            let became_focused = focused && !self.root_was_focused;
+            self.root_was_focused = focused;
+            became_focused
+        };
         self.state.update(
             ctx,
             &mut self.always_on_top,
@@ -635,6 +856,12 @@ impl eframe::App for App {
             #[cfg(windows)]
             parent_hwnd,
         );
+        #[cfg(windows)]
+        if root_became_focused {
+            if let Some(parent_hwnd) = parent_hwnd {
+                self.state.raise_popouts_with_root(parent_hwnd);
+            }
+        }
     }
 }
 
@@ -680,6 +907,7 @@ impl App {
             calls: Default::default(),
             volumes: Default::default(),
             stream_volumes: Default::default(),
+            stream_audio_enabled: Default::default(),
             local_audio_level: None,
             remote_audio_levels: Default::default(),
             rtts: Default::default(),
@@ -688,6 +916,8 @@ impl App {
             ended_video_stream_generations: Default::default(),
             stopped_video_stream_generations: Default::default(),
             focused_stream: None,
+            stream_popouts: BTreeMap::new(),
+            stream_popouts_translucent: false,
             volume_open: BTreeSet::new(),
             sharing_active: false,
             share_system_audio: settings.share_system_audio,
@@ -758,6 +988,8 @@ impl App {
             is_first_update: true,
             always_on_top: false,
             viewport_transparent: Some(rounded),
+            #[cfg(windows)]
+            root_was_focused: false,
             #[cfg(windows)]
             global_hotkeys: None,
         };
@@ -899,6 +1131,7 @@ impl AppState {
             self.ui_update_prompt(ctx);
         }
         self.notifications.show(ctx, self.theme);
+        self.ui_stream_popouts(ctx);
         #[cfg(windows)]
         {
             let force_hide = self.show_settings
@@ -1001,7 +1234,7 @@ impl AppState {
             match action {
                 NotificationAction::OpenConversation(conversation_id) => {
                     if self.chat.conversations.contains_key(&conversation_id) {
-                        self.chat.selected = Some(conversation_id);
+                        self.select_chat(conversation_id);
                         self.app_mode = AppMode::Text;
                         self.show_settings = false;
                         self.set_stream_view_mode(ctx, StreamViewMode::Normal);
@@ -1154,6 +1387,7 @@ impl AppState {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
                         self.stream_volumes.remove(&node_id);
+                        self.stream_audio_enabled.remove(&node_id);
                         self.remote_audio_levels.remove(&node_id);
                         self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
@@ -1244,11 +1478,21 @@ impl AppState {
                     node_id,
                     volume,
                     stream_volume,
+                    stream_audio_enabled,
                     level,
                 } => {
                     self.volumes.insert(node_id, volume);
                     self.stream_volumes.insert(node_id, stream_volume);
+                    self.stream_audio_enabled
+                        .insert(node_id, stream_audio_enabled);
                     self.remote_audio_levels.insert(node_id, level);
+                }
+                Event::ParticipantStreamAudioHandle {
+                    node_id,
+                    stream_audio_enabled,
+                } => {
+                    self.stream_audio_enabled
+                        .insert(node_id, stream_audio_enabled);
                 }
                 Event::SetRtt(node_id, rtt) => {
                     self.rtts.insert(node_id, rtt);
@@ -1274,7 +1518,12 @@ impl AppState {
                         .get(&node_id)
                         .is_some_and(|stopped| generation > *stopped)
                     {
-                        self.stopped_video_stream_generations.remove(&node_id);
+                        // Stream replacement (for example after the sender
+                        // changes quality) creates a new generation. Keep a
+                        // receiver that explicitly stopped watching paused and
+                        // move its marker to the replacement generation.
+                        self.stopped_video_stream_generations
+                            .insert(node_id, generation);
                     }
                 }
                 Event::VideoFrame {
@@ -1455,6 +1704,18 @@ impl AppState {
                         "Wire is unavailable",
                         error.clone(),
                     );
+                    let pending_ids: Vec<_> = self.chat.pending_drafts.keys().cloned().collect();
+                    for message_id in pending_ids {
+                        self.chat
+                            .resolve_pending_draft(&message_id, DeliveryState::Failed);
+                        self.chat.delivery.insert(
+                            message_id,
+                            (
+                                DeliveryState::Failed,
+                                Some("Wire worker stopped".to_owned()),
+                            ),
+                        );
+                    }
                     self.chat.service_error = Some(error);
                 }
             }
@@ -1569,7 +1830,7 @@ impl AppState {
                     self.chat.conversations_with_older_messages.remove(&id);
                 }
                 if self.chat.selected.is_none() {
-                    self.chat.selected = Some(id.clone());
+                    self.select_chat(id.clone());
                 }
                 if !conversation_is_open {
                     if mark_unseen {
@@ -1618,6 +1879,7 @@ impl AppState {
                 state,
                 detail,
             } => {
+                self.chat.resolve_pending_draft(&message_id, state);
                 self.chat.delivery.insert(message_id, (state, detail));
             }
             ChatNotification::Error(error) => {
@@ -2006,7 +2268,7 @@ impl AppState {
         save_seen_group_calls(&self.seen_group_calls);
     }
 
-    fn active_stream_sources(&self) -> Vec<StreamSource> {
+    fn available_stream_sources(&self) -> Vec<StreamSource> {
         let mut sources = Vec::new();
         if self.local_stream_ready() {
             sources.push(StreamSource::Local);
@@ -2024,6 +2286,13 @@ impl AppState {
             }
         }
         sources
+    }
+
+    fn active_stream_sources(&self) -> Vec<StreamSource> {
+        self.available_stream_sources()
+            .into_iter()
+            .filter(|source| !self.stream_popouts.contains_key(source))
+            .collect()
     }
 
     fn stopped_stream_nodes(&self) -> Vec<NodeId> {
@@ -2073,6 +2342,44 @@ impl AppState {
         }
     }
 
+    fn stream_popout_window_title(&self, source: StreamSource) -> String {
+        match source {
+            StreamSource::Local => "Wire · Your screen share".to_owned(),
+            StreamSource::Remote(node_id) => format!(
+                "Wire · {} · {}",
+                self.peer_display_name(node_id),
+                node_id.fmt_short()
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    fn raise_popouts_with_root(&self, root: windows::Win32::Foundation::HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+
+        if self.stream_popouts.is_empty() {
+            return;
+        }
+        let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+        for (source, popout) in &self.stream_popouts {
+            if popout.pinned {
+                continue;
+            }
+            let title = self.stream_popout_window_title(*source);
+            if let Some(hwnd) = find_windows_window(&title) {
+                unsafe {
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags);
+                }
+            }
+        }
+        // Raise Wire last so unpinned pop-outs travel with the app but do not cover it.
+        unsafe {
+            let _ = SetWindowPos(root, Some(HWND_TOP), 0, 0, 0, 0, flags);
+        }
+    }
+
     fn stream_aspect_ratio(&self, source: StreamSource) -> f32 {
         let dimensions = match source {
             StreamSource::Local => self
@@ -2088,6 +2395,352 @@ impl AppState {
             .filter(|(width, height)| *width > 0 && *height > 0)
             .map(|(width, height)| width as f32 / height as f32)
             .unwrap_or(16.0 / 9.0)
+    }
+
+    fn toggle_stream_popout(&mut self, source: StreamSource) {
+        if self.stream_popouts.remove(&source).is_some() {
+            return;
+        }
+        self.stream_popouts
+            .insert(source, StreamPopoutState::default());
+    }
+
+    fn toggle_stream_popout_opacity(&mut self) {
+        if self.stream_popouts.is_empty() {
+            return;
+        }
+        self.stream_popouts_translucent = !self.stream_popouts_translucent;
+        info!(
+            translucent = self.stream_popouts_translucent,
+            "screen-share pop-out opacity toggled"
+        );
+        #[cfg(windows)]
+        if self.stream_popouts_translucent {
+            let native_remote_popouts = self
+                .stream_popouts
+                .keys()
+                .filter(|source| {
+                    let StreamSource::Remote(node_id) = source else {
+                        return false;
+                    };
+                    self.video_frames
+                        .get(node_id)
+                        .is_some_and(|frame| matches!(&frame.data, DecodedFrameData::D3d11(_)))
+                })
+                .count();
+            if native_remote_popouts > 0 {
+                info!(
+                    native_remote_popouts,
+                    "hardware-presented remote pop-outs remain opaque to preserve video performance"
+                );
+            }
+        }
+    }
+
+    fn ui_stream_popouts(&mut self, ctx: &egui::Context) {
+        let available: BTreeSet<_> = self.available_stream_sources().into_iter().collect();
+        self.stream_popouts
+            .retain(|source, _| available.contains(source));
+        if self.stream_popouts.is_empty() {
+            self.stream_popouts_translucent = false;
+        }
+        let sources: Vec<_> = self.stream_popouts.keys().copied().collect();
+        for source in sources {
+            let Some(mut popout) = self.stream_popouts.remove(&source) else {
+                continue;
+            };
+            let viewport_id = stream_popout_viewport_id(source);
+            let title = self.stream_popout_window_title(source);
+            let rounded = window_frame::style_wants_rounded(self.window_frame_style);
+            let builder = egui::ViewportBuilder::default()
+                .with_title(&title)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_transparent(true)
+                .with_taskbar(true)
+                .with_inner_size(popout.size)
+                .with_min_inner_size(STREAM_POPOUT_MIN_SIZE)
+                .with_window_level(if popout.pinned {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                });
+            let translucent = self.stream_popout_is_translucent(source);
+            let keep_open =
+                ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, _viewport_class| {
+                    #[cfg(windows)]
+                    let native_hwnd = sync_stream_popout_native_window(
+                        child_ctx,
+                        &title,
+                        rounded,
+                        &mut popout.native_window_state,
+                    );
+                    self.ui_stream_popout(
+                        child_ctx,
+                        source,
+                        &mut popout,
+                        translucent,
+                        rounded,
+                        #[cfg(windows)]
+                        native_hwnd,
+                    )
+                });
+            if keep_open {
+                self.stream_popouts.insert(source, popout);
+            }
+        }
+    }
+
+    fn stream_popout_is_translucent(&self, source: StreamSource) -> bool {
+        if !self.stream_popouts_translucent {
+            return false;
+        }
+
+        #[cfg(windows)]
+        if let StreamSource::Remote(node_id) = source {
+            // Hardware-decoded remote video is presented by a zero-copy D3D11
+            // child HWND, which cannot inherit egui's parent-surface alpha.
+            // Synchronously reading it back and re-uploading it every frame can
+            // stall the UI and exhaust the decoder's presentation surfaces.
+            if self
+                .video_frames
+                .get(&node_id)
+                .is_some_and(|frame| matches!(&frame.data, DecodedFrameData::D3d11(_)))
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn ui_stream_popout(
+        &mut self,
+        ctx: &egui::Context,
+        source: StreamSource,
+        popout: &mut StreamPopoutState,
+        translucent: bool,
+        rounded: bool,
+        #[cfg(windows)] native_hwnd: Option<windows::Win32::Foundation::HWND>,
+    ) -> bool {
+        let close_requested = ctx.input(|input| {
+            input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
+        });
+        if close_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return false;
+        }
+
+        if popout.gesture != Some(StreamPopoutGesture::Resize) {
+            if let Some(size) =
+                ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+            {
+                if size.x >= STREAM_POPOUT_MIN_SIZE.x && size.y >= STREAM_POPOUT_MIN_SIZE.y {
+                    popout.size = size;
+                }
+            }
+        }
+
+        let pointer_events = ctx.input(|input| input.events.clone());
+        for event in pointer_events {
+            let egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if popout.handle_pointer_button(button, pressed, pos) == Some(StreamPopoutGesture::Move)
+            {
+                // The state transition only returns Move on the owning button's first press.
+                if pressed && button == egui::PointerButton::Primary {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            }
+        }
+
+        if popout.gesture == Some(StreamPopoutGesture::Resize) {
+            if let (Some(start), Some(current)) = (
+                popout.resize_start_pointer,
+                ctx.input(|input| input.pointer.interact_pos()),
+            ) {
+                let delta = (current - start) * STREAM_POPOUT_RESIZE_SCALE;
+                let desired = stream_popout_resize_size(popout.resize_start_size, delta);
+                if desired != popout.size {
+                    popout.size = desired;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                }
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+
+        let can_toggle_pin = popout.gesture.is_none()
+            && ctx.input(|input| {
+                !input.pointer.primary_down()
+                    && !input.pointer.secondary_down()
+                    && input.pointer.button_clicked(egui::PointerButton::Middle)
+            });
+        if can_toggle_pin {
+            popout.pinned = !popout.pinned;
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if popout.pinned {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }));
+        }
+
+        let alpha = if translucent { 128 } else { 255 };
+        let panel_fill = Color32::from_black_alpha(alpha);
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let _ = ui.interact(
+                    rect,
+                    ui.id().with(("stream-popout-gesture", source)),
+                    egui::Sense::click_and_drag(),
+                );
+
+                let corner_radius = if rounded {
+                    CornerRadius::same(window_frame::CORNER_RADIUS)
+                } else {
+                    CornerRadius::ZERO
+                };
+                // A native video child HWND is always above egui's parent surface.
+                // Reserve a tiny strip while pinned so the persistent pin indicator
+                // remains visible without forcing every frame through CPU readback.
+                let video_bounds = if popout.pinned {
+                    rect.with_max_x((rect.max.x - 24.0).max(rect.min.x + 1.0))
+                } else {
+                    rect
+                };
+                #[cfg(windows)]
+                let mut native_presented = false;
+                #[cfg(not(windows))]
+                let native_presented = false;
+
+                let (width, height, generation, rgba) = match source {
+                    StreamSource::Local => {
+                        let Some(preview) = self.preview.as_ref() else {
+                            return;
+                        };
+                        (
+                            preview.width,
+                            preview.height,
+                            preview.generation,
+                            Some(preview.data.clone()),
+                        )
+                    }
+                    StreamSource::Remote(node_id) => {
+                        let Some(frame) = self.video_frames.get_mut(&node_id) else {
+                            return;
+                        };
+                        #[cfg(windows)]
+                        if !translucent && matches!(&frame.data, DecodedFrameData::D3d11(_)) {
+                            if let Some(hwnd) = native_hwnd {
+                                let image_rect = aspect_fit_rect(
+                                    video_bounds,
+                                    frame.width as f32 / frame.height.max(1) as f32,
+                                );
+                                let physical_rect =
+                                    physical_video_rect(image_rect, ui.ctx().pixels_per_point());
+                                match present_native_video(frame, Some(hwnd), physical_rect) {
+                                    Ok(presented) => native_presented = presented,
+                                    Err(error) => {
+                                        warn!("native pop-out video fallback failed: {error:#}")
+                                    }
+                                }
+                            }
+                        }
+                        if !native_presented {
+                            #[cfg(windows)]
+                            if let Some(presenter) = &mut frame.presenter {
+                                presenter.hide();
+                            }
+                        }
+                        let rgba = match &frame.data {
+                            DecodedFrameData::Rgba(data) => {
+                                (!native_presented).then(|| data.clone())
+                            }
+                            #[cfg(windows)]
+                            DecodedFrameData::D3d11(gpu_frame) => {
+                                if native_presented
+                                    || popout.uploaded_generation == frame.generation
+                                {
+                                    None
+                                } else {
+                                    match gpu_frame.to_rgba() {
+                                        Ok(data) => Some(Arc::new(data)),
+                                        Err(error) => {
+                                            warn!("pop-out video conversion failed: {error:#}");
+                                            None
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        (frame.width, frame.height, frame.generation, rgba)
+                    }
+                };
+
+                if let Some(rgba) = rgba {
+                    sync_rgba_texture(
+                        ui,
+                        &format!("stream-popout-{source:?}"),
+                        width,
+                        height,
+                        &rgba,
+                        generation,
+                        &mut popout.uploaded_generation,
+                        &mut popout.texture,
+                        &mut popout.upload_stats,
+                    );
+                }
+                if native_presented && popout.texture.take().is_some() {
+                    popout.uploaded_generation = 0;
+                }
+                let image_rect = aspect_fit_rect(video_bounds, width as f32 / height.max(1) as f32);
+                paint_letterbox(ui, rect, image_rect, panel_fill, corner_radius);
+                if native_presented {
+                    // The child swap chain paints `image_rect` after this egui pass.
+                } else if let Some(texture) = &popout.texture {
+                    ui.put(
+                        image_rect,
+                        egui::Image::new((texture.id(), image_rect.size()))
+                            .corner_radius(image_corner_radius(rect, image_rect, corner_radius))
+                            .tint(Color32::from_white_alpha(alpha)),
+                    );
+                } else {
+                    ui.painter().rect_filled(
+                        rect,
+                        if rounded {
+                            CornerRadius::same(window_frame::CORNER_RADIUS)
+                        } else {
+                            CornerRadius::ZERO
+                        },
+                        panel_fill,
+                    );
+                }
+
+                if popout.pinned {
+                    let pin_center = rect.right_top() + egui::vec2(-12.0, 12.0);
+                    ui.painter().circle_filled(
+                        pin_center,
+                        9.0,
+                        Color32::from_black_alpha((alpha as f32 * 0.72) as u8),
+                    );
+                    ui.painter().text(
+                        pin_center,
+                        Align2::CENTER_CENTER,
+                        char::from(Icon::Pin),
+                        lucide(11.0),
+                        Color32::from_white_alpha(alpha),
+                    );
+                }
+            });
+        true
     }
 
     fn friend_name(&self, node_id: NodeId) -> Option<&str> {
@@ -2201,9 +2854,12 @@ impl AppState {
         });
     }
 
-    fn cmd(&self, command: Command) {
+    fn cmd(&self, command: Command) -> bool {
         if self.worker.command_tx.try_send(command).is_err() {
             warn!("ignored command because the Wire worker is unavailable");
+            false
+        } else {
+            true
         }
     }
 
@@ -2306,6 +2962,10 @@ impl AppState {
                 ui.set_clip_rect(window_frame::clip_rect(ctx));
 
                 window_frame::show_panel(ui, pal, rounded, |ui, content_rect| {
+                    // The native frame must be square while maximized, but the custom
+                    // caption controls keep the user's configured corner style.
+                    let controls_rounded =
+                        window_frame::style_wants_rounded(self.window_frame_style);
                     let app_rect = window_frame::body_rect(content_rect, rounded);
                     let title_bar_rect = {
                         let mut rect = app_rect;
@@ -2331,7 +2991,7 @@ impl AppState {
                         self.resource_monitor.snapshot(),
                         self.show_system_usage,
                         always_on_top,
-                        rounded,
+                        controls_rounded,
                     );
 
                     let mut body_rect = app_rect;
@@ -2490,6 +3150,7 @@ impl AppState {
         pal: &Palette,
         body: egui::Rect,
     ) {
+        self.sync_chat_draft_selection();
         const TOP_HEIGHT: f32 = 54.0;
         let top =
             egui::Rect::from_min_max(body.min, egui::pos2(body.max.x, body.min.y + TOP_HEIGHT));
@@ -2535,6 +3196,16 @@ impl AppState {
         if self.chat.friend_candidate.is_some() {
             self.ui_add_chat_friend(ctx, pal);
         }
+    }
+
+    fn sync_chat_draft_selection(&mut self) {
+        let selected = self.chat.selected.clone();
+        self.chat.activate_draft(selected.as_deref());
+    }
+
+    fn select_chat(&mut self, conversation_id: String) {
+        self.chat.activate_draft(Some(&conversation_id));
+        self.chat.selected = Some(conversation_id);
     }
 
     fn ui_chat_sidebar(&mut self, ui: &mut Ui, pal: &Palette) {
@@ -2596,7 +3267,7 @@ impl AppState {
                         if chat_navigation_button(ui, pal, &label, None, selected, unseen).clicked()
                         {
                             if let Some(id) = id {
-                                self.chat.selected = Some(id.clone());
+                                self.select_chat(id.clone());
                                 if !self.chat.conversations.contains_key(&id) {
                                     self.cmd(Command::EnsureDirectChat {
                                         peer,
@@ -2640,7 +3311,7 @@ impl AppState {
                         .on_hover_text("Unknown sender · add them from the chat header")
                         .clicked()
                         {
-                            self.chat.selected = Some(id);
+                            self.select_chat(id);
                         }
                         ui.add_space(3.0);
                     }
@@ -2708,7 +3379,7 @@ impl AppState {
                         .clicked()
                         {
                             self.acknowledge_missed_group_calls(&group.id);
-                            self.chat.selected = Some(group.id);
+                            self.select_chat(group.id);
                         }
                         ui.add_space(3.0);
                     }
@@ -3140,6 +3811,7 @@ impl AppState {
             }
         });
         self.ui_image_preview(ui.ctx(), pal);
+        self.chat.save_active_draft();
     }
 
     fn ui_chat_message(
@@ -3476,15 +4148,28 @@ impl AppState {
         let body = self.chat.composer.trim().to_owned();
         if body.is_empty() && self.chat.draft_attachments.is_empty() {
             self.chat.composer.clear();
+            self.chat.save_active_draft();
             return;
         }
         let Some(author) = self.our_node_id else {
             self.chat.error = Some("Chat is still connecting to Iroh.".to_owned());
             return;
         };
-        self.chat.composer.clear();
-        let attachments = std::mem::take(&mut self.chat.draft_attachments);
+        let Some(draft) = self.chat.active_draft() else {
+            return;
+        };
+        let attachments = draft.attachments.clone();
         let message = ChatMessage::new_with_attachments(author, body, attachments);
+        self.chat.remember_pending_draft(
+            message.message_id.clone(),
+            conversation_id.to_owned(),
+            draft.clone(),
+        );
+        // Once the command is queued, the optimistic timeline owns this
+        // message. Free the composer immediately so offline delivery does not
+        // block composing another message; a local send failure restores this
+        // exact snapshot only if the user has not typed something new.
+        self.chat.clear_draft_if_matches(conversation_id, &draft);
         self.chat
             .delivery
             .insert(message.message_id.clone(), (DeliveryState::Pending, None));
@@ -3493,10 +4178,22 @@ impl AppState {
             .entry(conversation_id.to_owned())
             .or_default()
             .push(message.clone());
-        self.cmd(Command::SendChatMessage {
+        let queued = self.cmd(Command::SendChatMessage {
             conversation_id: conversation_id.to_owned(),
-            message,
+            message: message.clone(),
         });
+        if !queued {
+            self.chat
+                .resolve_pending_draft(&message.message_id, DeliveryState::Failed);
+            self.chat.delivery.insert(
+                message.message_id,
+                (
+                    DeliveryState::Failed,
+                    Some("Wire worker is unavailable".to_owned()),
+                ),
+            );
+            self.chat.error = Some("Could not send message: Wire is unavailable.".to_owned());
+        }
     }
 
     fn collect_chat_image_input(&mut self, ctx: &egui::Context) {
@@ -5558,6 +6255,12 @@ impl AppState {
                     } else {
                         format!("{} streams", streams.len())
                     })
+                } else if !self.stream_popouts.is_empty() {
+                    Some(if self.stream_popouts.len() == 1 {
+                        "1 stream popped out".to_string()
+                    } else {
+                        format!("{} streams popped out", self.stream_popouts.len())
+                    })
                 } else if self.sharing_active {
                     Some("starting share…".to_string())
                 } else {
@@ -5666,9 +6369,12 @@ impl AppState {
 
         let roomy = area.height() >= 150.0;
         let has_capture_error = self.capture_error.is_some();
+        let showing_popouts = !has_capture_error && !self.stream_popouts.is_empty();
         let stopped_streams = self.stopped_stream_nodes();
-        let showing_stopped =
-            !has_capture_error && !self.sharing_active && !stopped_streams.is_empty();
+        let showing_stopped = !has_capture_error
+            && !showing_popouts
+            && !self.sharing_active
+            && !stopped_streams.is_empty();
         let stopped_title = if stopped_streams.len() == 1 {
             format!(
                 "{}'s stream is paused",
@@ -5705,6 +6411,8 @@ impl AppState {
                     Align2::CENTER_CENTER,
                     if has_capture_error {
                         ph::WARNING
+                    } else if showing_popouts {
+                        ph::ARROW_SQUARE_OUT
                     } else if self.sharing_active {
                         ph::SPINNER_GAP
                     } else if showing_stopped {
@@ -5713,7 +6421,7 @@ impl AppState {
                         ph::MONITOR
                     },
                     sans(17.0),
-                    if self.sharing_active {
+                    if self.sharing_active || showing_popouts {
                         pal.accent
                     } else if has_capture_error {
                         pal.err
@@ -5725,6 +6433,12 @@ impl AppState {
                 ui.label(
                     RichText::new(if has_capture_error {
                         "Screen sharing needs access"
+                    } else if showing_popouts {
+                        if self.stream_popouts.len() == 1 {
+                            "Stream is open in a pop-out"
+                        } else {
+                            "Streams are open in pop-outs"
+                        }
                     } else if self.sharing_active {
                         "Starting your screen share"
                     } else if showing_stopped {
@@ -5738,7 +6452,9 @@ impl AppState {
 
                 if roomy {
                     let detail = self.capture_error.as_deref().unwrap_or({
-                        if self.sharing_active {
+                        if showing_popouts {
+                            "Use the Wire taskbar previews, or return the streams to this window."
+                        } else if self.sharing_active {
                             "Preparing the first frame. This usually takes a moment."
                         } else if showing_stopped {
                             "Video data is paused. Resume whenever you want to watch again."
@@ -5764,7 +6480,9 @@ impl AppState {
                     {
                         open_screen_recording_settings();
                     }
-                    let (label, tone) = if showing_stopped {
+                    let (label, tone) = if showing_popouts {
+                        ("Return to Wire", ButtonTone::Secondary)
+                    } else if showing_stopped {
                         ("Resume watching", ButtonTone::Primary)
                     } else if self.sharing_active {
                         ("Stop sharing", ButtonTone::Secondary)
@@ -5772,7 +6490,9 @@ impl AppState {
                         ("Share your screen", ButtonTone::Primary)
                     };
                     if action_button(ui, pal, label, tone).clicked() {
-                        if showing_stopped {
+                        if showing_popouts {
+                            self.stream_popouts.clear();
+                        } else if showing_stopped {
                             for node_id in stopped_streams.iter().copied() {
                                 self.resume_watching(node_id);
                             }
@@ -5957,7 +6677,7 @@ impl AppState {
             );
 
             if hovered {
-                // Compact overlay control group (focus + optional stop).
+                // Compact overlay control group (focus + pop-out + optional stream actions).
                 const BTN: f32 = 22.0;
                 const GAP: f32 = 2.0;
                 const PAD: f32 = 3.0;
@@ -5968,7 +6688,7 @@ impl AppState {
                     StreamSource::Local => None,
                 };
                 let local_audio = matches!(source, StreamSource::Local);
-                let button_count = 1 + usize::from(stop_node.is_some()) + usize::from(local_audio);
+                let button_count = 2 + usize::from(stop_node.is_some()) + usize::from(local_audio);
                 let group_size = Vec2::new(
                     PAD * 2.0
                         + BTN * button_count as f32
@@ -6011,6 +6731,26 @@ impl AppState {
                 .clicked()
                 {
                     self.focused_stream = if expanded { None } else { Some(source) };
+                }
+
+                origin.x += BTN + GAP;
+                let popout_rect = egui::Rect::from_min_size(origin, Vec2::splat(BTN));
+                let popped_out = self.stream_popouts.contains_key(&source);
+                if stream_tile_group_icon_button(
+                    ui,
+                    pal,
+                    popout_rect,
+                    ui.id().with(("stream_tile_popout", source)),
+                    Icon::PictureInPicture2,
+                    if popped_out {
+                        "Close this stream's pop-out"
+                    } else {
+                        "Pop out this stream"
+                    },
+                )
+                .clicked()
+                {
+                    self.toggle_stream_popout(source);
                 }
 
                 if local_audio {
@@ -6056,16 +6796,22 @@ impl AppState {
                 }
 
                 if let StreamSource::Remote(node_id) = source {
-                    if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
-                        stream_volume_badge(
-                            ui,
-                            pal,
-                            overlay_fill,
-                            &volume,
-                            ui.id().with(("stream_volume", node_id)),
-                            tile_rect,
-                            left_overlay_width,
-                        );
+                    let audio_enabled = self
+                        .stream_audio_enabled
+                        .get(&node_id)
+                        .is_some_and(|enabled| enabled.load(Ordering::Relaxed));
+                    if audio_enabled {
+                        if let Some(volume) = self.stream_volumes.get(&node_id).cloned() {
+                            stream_volume_badge(
+                                ui,
+                                pal,
+                                overlay_fill,
+                                &volume,
+                                ui.id().with(("stream_volume", node_id)),
+                                tile_rect,
+                                left_overlay_width,
+                            );
+                        }
                     }
                 }
             }
@@ -7355,11 +8101,9 @@ fn present_native_video(
             DecodedFrameData::Rgba(_) => return Ok(()),
         };
         let parent = parent.context("eframe did not expose a Win32 parent handle")?;
-        if frame
-            .presenter
-            .as_ref()
-            .is_some_and(|presenter| !presenter.uses_device(gpu_frame))
-        {
+        if frame.presenter.as_ref().is_some_and(|presenter| {
+            !presenter.uses_device(gpu_frame) || !presenter.uses_parent(parent)
+        }) {
             frame.presenter = None;
         }
         if frame.presenter.is_none() {
@@ -7411,6 +8155,187 @@ fn aspect_fit_rect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
     egui::Rect::from_center_size(
         bounds.center(),
         video_display_size(bounds.size(), aspect, false),
+    )
+}
+
+fn paint_letterbox(
+    ui: &Ui,
+    outer: egui::Rect,
+    inner: egui::Rect,
+    color: Color32,
+    radius: CornerRadius,
+) {
+    let bars = [
+        (
+            egui::Rect::from_min_max(outer.min, egui::pos2(outer.max.x, inner.min.y)),
+            CornerRadius {
+                nw: radius.nw,
+                ne: radius.ne,
+                sw: 0,
+                se: 0,
+            },
+        ),
+        (
+            egui::Rect::from_min_max(egui::pos2(outer.min.x, inner.max.y), outer.max),
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: radius.sw,
+                se: radius.se,
+            },
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(outer.min.x, inner.min.y),
+                egui::pos2(inner.min.x, inner.max.y),
+            ),
+            CornerRadius {
+                nw: if nearly_equal(inner.top(), outer.top()) {
+                    radius.nw
+                } else {
+                    0
+                },
+                ne: 0,
+                sw: if nearly_equal(inner.bottom(), outer.bottom()) {
+                    radius.sw
+                } else {
+                    0
+                },
+                se: 0,
+            },
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(inner.max.x, inner.min.y),
+                egui::pos2(outer.max.x, inner.max.y),
+            ),
+            CornerRadius {
+                nw: 0,
+                ne: if nearly_equal(inner.top(), outer.top()) {
+                    radius.ne
+                } else {
+                    0
+                },
+                sw: 0,
+                se: if nearly_equal(inner.bottom(), outer.bottom()) {
+                    radius.se
+                } else {
+                    0
+                },
+            },
+        ),
+    ];
+    for (bar, bar_radius) in bars.into_iter().filter(|(bar, _)| bar.is_positive()) {
+        ui.painter().rect_filled(bar, bar_radius, color);
+    }
+}
+
+fn image_corner_radius(outer: egui::Rect, image: egui::Rect, radius: CornerRadius) -> CornerRadius {
+    CornerRadius {
+        nw: if nearly_equal(image.left(), outer.left()) && nearly_equal(image.top(), outer.top()) {
+            radius.nw
+        } else {
+            0
+        },
+        ne: if nearly_equal(image.right(), outer.right()) && nearly_equal(image.top(), outer.top())
+        {
+            radius.ne
+        } else {
+            0
+        },
+        sw: if nearly_equal(image.left(), outer.left())
+            && nearly_equal(image.bottom(), outer.bottom())
+        {
+            radius.sw
+        } else {
+            0
+        },
+        se: if nearly_equal(image.right(), outer.right())
+            && nearly_equal(image.bottom(), outer.bottom())
+        {
+            radius.se
+        } else {
+            0
+        },
+    }
+}
+
+fn nearly_equal(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 0.5
+}
+
+#[cfg(windows)]
+fn sync_stream_popout_native_window(
+    ctx: &egui::Context,
+    title: &str,
+    rounded: bool,
+    previous: &mut Option<StreamPopoutNativeWindowState>,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_HWNDPARENT};
+
+    let Some(size) = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size())) else {
+        return previous.map(|state| state.hwnd);
+    };
+    let pixels_per_point = ctx.pixels_per_point();
+    let width = (size.x * pixels_per_point).round().max(1.0) as i32;
+    let height = (size.y * pixels_per_point).round().max(1.0) as i32;
+    if let Some(state) = previous {
+        if state.width == width && state.height == height && state.rounded == rounded {
+            return Some(state.hwnd);
+        }
+    }
+
+    let Some(hwnd) = find_windows_window(title) else {
+        return None;
+    };
+    let current = StreamPopoutNativeWindowState {
+        hwnd,
+        width,
+        height,
+        rounded,
+    };
+
+    // Keep pop-outs independent: Win32-owned windows are forced above their owner.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+    }
+    if rounded {
+        let diameter = (f32::from(window_frame::CORNER_RADIUS) * 2.0 * pixels_per_point)
+            .round()
+            .max(1.0) as i32;
+        let region = unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter) };
+        if unsafe { SetWindowRgn(hwnd, Some(region), true) } == 0 {
+            unsafe {
+                let _ = DeleteObject(region.into());
+            }
+            return Some(hwnd);
+        }
+    } else if unsafe { SetWindowRgn(hwnd, None, true) } == 0 {
+        return Some(hwnd);
+    }
+    *previous = Some(current);
+    Some(hwnd)
+}
+
+#[cfg(windows)]
+fn find_windows_window(title: &str) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let mut wide_title: Vec<u16> = title.encode_utf16().collect();
+    wide_title.push(0);
+    unsafe { FindWindowW(None, PCWSTR(wide_title.as_ptr())) }.ok()
+}
+
+fn stream_popout_viewport_id(source: StreamSource) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("stream-popout", source))
+}
+
+fn stream_popout_resize_size(start_size: Vec2, scaled_delta: Vec2) -> Vec2 {
+    Vec2::new(
+        (start_size.x + scaled_delta.x).max(STREAM_POPOUT_MIN_SIZE.x),
+        (start_size.y + scaled_delta.y).max(STREAM_POPOUT_MIN_SIZE.y),
     )
 }
 
@@ -8247,6 +9172,7 @@ fn chat_message_body_text(message: &ChatMessage, pal: &Palette, opacity: f32) ->
     let body = RichText::new(match message.deletion {
         Some(MessageDeletion::Local) => "You deleted this message",
         Some(MessageDeletion::Everyone) => "This message was deleted",
+        None if message.is_missed_call() => chat::MISSED_CALL_MESSAGE_BODY,
         None => message.body.as_str(),
     })
     .color(pal.text.gamma_multiply(opacity))
@@ -8610,6 +9536,92 @@ mod layout_tests {
     }
 
     #[test]
+    fn video_config_restart_only_happens_for_a_real_change() {
+        let current = VideoConfig::default();
+        assert!(!video_config_differs(current, current));
+
+        let changed = VideoConfig {
+            framerate: 60,
+            ..current
+        };
+        assert!(video_config_differs(current, changed));
+    }
+
+    #[test]
+    fn stream_popout_first_pressed_button_owns_the_gesture() {
+        let mut popout = StreamPopoutState::default();
+        assert_eq!(
+            popout.handle_pointer_button(
+                egui::PointerButton::Primary,
+                true,
+                egui::pos2(10.0, 10.0)
+            ),
+            Some(StreamPopoutGesture::Move)
+        );
+        assert_eq!(
+            popout.handle_pointer_button(
+                egui::PointerButton::Secondary,
+                true,
+                egui::pos2(12.0, 12.0)
+            ),
+            None
+        );
+        assert_eq!(popout.gesture, Some(StreamPopoutGesture::Move));
+
+        popout.handle_pointer_button(egui::PointerButton::Primary, false, egui::pos2(12.0, 12.0));
+        assert_eq!(
+            popout.handle_pointer_button(
+                egui::PointerButton::Secondary,
+                true,
+                egui::pos2(12.0, 12.0)
+            ),
+            Some(StreamPopoutGesture::Resize)
+        );
+        assert_eq!(
+            popout.handle_pointer_button(
+                egui::PointerButton::Primary,
+                true,
+                egui::pos2(14.0, 14.0)
+            ),
+            None
+        );
+        assert_eq!(popout.gesture, Some(StreamPopoutGesture::Resize));
+    }
+
+    #[test]
+    fn stream_popout_resize_is_half_speed_and_clamped() {
+        let pointer_delta = Vec2::new(100.0, -40.0);
+        assert_eq!(
+            stream_popout_resize_size(
+                STREAM_POPOUT_DEFAULT_SIZE,
+                pointer_delta * STREAM_POPOUT_RESIZE_SCALE
+            ),
+            Vec2::new(690.0, 340.0)
+        );
+        assert_eq!(
+            stream_popout_resize_size(Vec2::new(200.0, 100.0), Vec2::new(-200.0, -200.0)),
+            STREAM_POPOUT_MIN_SIZE
+        );
+    }
+
+    #[test]
+    fn full_video_event_queue_still_wakes_the_ui() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(1_u8).unwrap();
+        let full = tx.try_send(2_u8);
+        assert!(matches!(full, Err(async_channel::TrySendError::Full(2))));
+        assert!(video_enqueue_needs_repaint(&full));
+
+        drop(rx);
+        let closed = tx.try_send(3_u8);
+        assert!(matches!(
+            closed,
+            Err(async_channel::TrySendError::Closed(3))
+        ));
+        assert!(!video_enqueue_needs_repaint(&closed));
+    }
+
+    #[test]
     fn capture_picker_adapts_to_compact_viewports() {
         assert_eq!(
             capture_picker_layout(Vec2::new(1200.0, 900.0)),
@@ -8801,6 +9813,79 @@ mod layout_tests {
     }
 
     #[test]
+    fn chat_drafts_are_independent_per_conversation() {
+        let mut chat = ChatUiState::default();
+        chat.activate_draft(Some("chat-a"));
+        chat.composer = "draft for A".to_owned();
+        chat.draft_attachments.push(ChatAttachment {
+            id: "image-a".to_owned(),
+            name: "a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            byte_len: 1,
+            width: 1,
+            height: 1,
+            hash: "image-a".to_owned(),
+            data: None,
+        });
+        chat.save_active_draft();
+
+        chat.activate_draft(Some("chat-b"));
+        chat.composer = "draft for B".to_owned();
+        chat.save_active_draft();
+
+        chat.activate_draft(Some("chat-a"));
+        assert_eq!(chat.composer, "draft for A");
+        assert_eq!(chat.draft_attachments.len(), 1);
+        chat.activate_draft(Some("chat-b"));
+        assert_eq!(chat.composer, "draft for B");
+        assert!(chat.draft_attachments.is_empty());
+    }
+
+    #[test]
+    fn failed_send_restores_an_empty_draft_and_delivery_leaves_it_cleared() {
+        let mut chat = ChatUiState::default();
+        chat.activate_draft(Some("chat-a"));
+        chat.composer = "retry me".to_owned();
+        chat.save_active_draft();
+        let draft = chat.active_draft().unwrap();
+
+        chat.remember_pending_draft(
+            "failed-message".to_owned(),
+            "chat-a".to_owned(),
+            draft.clone(),
+        );
+        assert!(chat.clear_draft_if_matches("chat-a", &draft));
+        chat.resolve_pending_draft("failed-message", DeliveryState::Failed);
+        assert_eq!(chat.draft_for("chat-a"), draft);
+
+        assert!(chat.clear_draft_if_matches("chat-a", &draft));
+        chat.remember_pending_draft("delivered-message".to_owned(), "chat-a".to_owned(), draft);
+        chat.resolve_pending_draft("delivered-message", DeliveryState::Delivered);
+        assert_eq!(chat.draft_for("chat-a"), ChatDraft::default());
+        assert!(chat.drafts.get("chat-a").is_none());
+    }
+
+    #[test]
+    fn failed_send_does_not_overwrite_text_typed_after_send() {
+        let mut chat = ChatUiState::default();
+        chat.activate_draft(Some("chat-a"));
+        chat.composer = "already sent".to_owned();
+        let sent = chat.active_draft().unwrap();
+        chat.remember_pending_draft(
+            "failed-message".to_owned(),
+            "chat-a".to_owned(),
+            sent.clone(),
+        );
+        assert!(chat.clear_draft_if_matches("chat-a", &sent));
+        chat.composer = "new draft".to_owned();
+        chat.save_active_draft();
+
+        chat.resolve_pending_draft("failed-message", DeliveryState::Failed);
+        assert_eq!(chat.composer, "new draft");
+        assert_eq!(chat.draft_for("chat-a").composer, "new draft");
+    }
+
+    #[test]
     fn old_settings_default_to_bubble_chat() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.chat_style, ChatStyle::Bubbles);
@@ -8928,7 +10013,12 @@ enum Event {
         node_id: NodeId,
         volume: VolumeHandle,
         stream_volume: VolumeHandle,
+        stream_audio_enabled: AudioActivityHandle,
         level: AudioLevelHandle,
+    },
+    ParticipantStreamAudioHandle {
+        node_id: NodeId,
+        stream_audio_enabled: AudioActivityHandle,
     },
     SetRtt(NodeId, Duration),
     VideoStreamAccepted {
@@ -9148,6 +10238,7 @@ struct Worker {
     incoming_tasks: JoinSet<(NodeId, u64)>,
     connect_aborts: BTreeMap<NodeId, (u64, tokio::task::AbortHandle)>,
     call_generations: BTreeMap<NodeId, u64>,
+    direct_call_generations: BTreeMap<NodeId, u64>,
     next_call_generation: u64,
     _router: Router,
     audio_context: Option<AudioContext>,
@@ -9303,6 +10394,7 @@ impl Worker {
             incoming_tasks: JoinSet::new(),
             connect_aborts: BTreeMap::new(),
             call_generations: BTreeMap::new(),
+            direct_call_generations: BTreeMap::new(),
             next_call_generation: 0,
             local_group_call: None,
             peer_group_calls: BTreeMap::new(),
@@ -9488,15 +10580,24 @@ impl Worker {
         Ok(())
     }
 
+    async fn queue_missed_call(&mut self, node_id: NodeId) {
+        let title = format!("Direct chat · {}", node_id.fmt_short());
+        self.chat.send_missed_call(node_id, title).await;
+    }
+
     async fn handle_quic_connected(
         &mut self,
         node_id: NodeId,
         generation: u64,
         conn: Result<RtcConnection>,
     ) -> Result<()> {
+        let direct_call = self.direct_call_generations.get(&node_id) == Some(&generation);
         if !self.call_is_current(node_id, generation)
             || !matches!(self.active_calls.get(&node_id), Some(CallInfo::Calling))
         {
+            if direct_call {
+                self.direct_call_generations.remove(&node_id);
+            }
             if let Ok(conn) = conn {
                 conn.transport().close(0u32.into(), b"stale call attempt");
             }
@@ -9505,6 +10606,7 @@ impl Worker {
         }
         match conn {
             Ok(conn) => {
+                self.direct_call_generations.remove(&node_id);
                 info!("quic connected to {}", node_id.fmt_short());
                 self.active_calls
                     .insert(node_id, CallInfo::Connecting(conn.clone()));
@@ -9525,6 +10627,14 @@ impl Worker {
                 self.volumes.remove(&node_id);
                 self.stream_volumes.remove(&node_id);
                 self.cleanup_after_call_end().await;
+                // `RtcProtocol::connect` fails before the callee's incoming
+                // call state exists, so this is the caller's durable missed
+                // call transition. Chat delivery retries until the peer is
+                // reachable and a recipient receipt retires the message.
+                self.direct_call_generations.remove(&node_id);
+                if direct_call {
+                    self.queue_missed_call(node_id).await;
+                }
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
             }
@@ -9572,6 +10682,7 @@ impl Worker {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let stream_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let stream_audio_enabled = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
         self.stream_volumes.insert(node_id, stream_volume.clone());
@@ -9579,6 +10690,7 @@ impl Worker {
             node_id,
             volume: volume.clone(),
             stream_volume: stream_volume.clone(),
+            stream_audio_enabled,
             level: level.clone(),
         })
         .await?;
@@ -9595,6 +10707,8 @@ impl Worker {
         let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
+        let event_tx = self.event_tx.clone();
+        let update_callback = self.update_callback.clone();
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
 
@@ -9615,9 +10729,27 @@ impl Worker {
                     );
                     match remote_track.kind() {
                         TrackKind::Audio => {
-                            audio_context
-                                .play_track_with_volume(remote_track, stream_volume.clone())
+                            let stream_audio_enabled = Arc::new(AtomicBool::new(true));
+                            event_tx
+                                .send(Event::ParticipantStreamAudioHandle {
+                                    node_id,
+                                    stream_audio_enabled: stream_audio_enabled.clone(),
+                                })
                                 .await?;
+                            if let Some(callback) = &update_callback {
+                                callback();
+                            }
+                            if let Err(error) = audio_context
+                                .play_track_with_volume_and_activity(
+                                    remote_track,
+                                    stream_volume.clone(),
+                                    stream_audio_enabled.clone(),
+                                )
+                                .await
+                            {
+                                stream_audio_enabled.store(false, Ordering::Relaxed);
+                                return Err(error);
+                            }
                         }
                         TrackKind::Video => {
                             warn!(
@@ -9640,6 +10772,7 @@ impl Worker {
         let node_id = conn.transport().remote_node_id()?;
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let stream_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let stream_audio_enabled = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         self.volumes.insert(node_id, volume.clone());
         self.stream_volumes.insert(node_id, stream_volume.clone());
@@ -9647,6 +10780,7 @@ impl Worker {
             node_id,
             volume: volume.clone(),
             stream_volume: stream_volume.clone(),
+            stream_audio_enabled,
             level: level.clone(),
         })
         .await?;
@@ -9663,6 +10797,8 @@ impl Worker {
         let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
+        let event_tx = self.event_tx.clone();
+        let update_callback = self.update_callback.clone();
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
 
@@ -9692,9 +10828,27 @@ impl Worker {
                                     )
                                     .await?;
                             } else {
-                                audio_context
-                                    .play_track_with_volume(remote_track, stream_volume.clone())
+                                let stream_audio_enabled = Arc::new(AtomicBool::new(true));
+                                event_tx
+                                    .send(Event::ParticipantStreamAudioHandle {
+                                        node_id,
+                                        stream_audio_enabled: stream_audio_enabled.clone(),
+                                    })
                                     .await?;
+                                if let Some(callback) = &update_callback {
+                                    callback();
+                                }
+                                if let Err(error) = audio_context
+                                    .play_track_with_volume_and_activity(
+                                        remote_track,
+                                        stream_volume.clone(),
+                                        stream_audio_enabled.clone(),
+                                    )
+                                    .await
+                                {
+                                    stream_audio_enabled.store(false, Ordering::Relaxed);
+                                    return Err(error);
+                                }
                             }
                         }
                         // Video uses the dedicated framed transport below. A
@@ -9978,6 +11132,11 @@ impl Worker {
             failure_task.abort();
             let _ = failure_task.await;
         }
+        // The capture thread is joined before its forwarding task is aborted,
+        // so any failure already queued here belongs to the pipeline we just
+        // stopped. Do not let it tear down a replacement started for a new
+        // stream-quality configuration.
+        while self.capture_failure_rx.try_recv().is_ok() {}
         info!("screen capture pipeline fully stopped");
     }
 
@@ -10043,7 +11202,8 @@ impl Worker {
                 self.audio_context = Some(audio_context);
             }
             Command::SetVideoConfig { video_config } => {
-                let restart_capture = self.sharing_active;
+                let restart_capture =
+                    self.sharing_active && video_config_differs(self.video_config, video_config);
                 if restart_capture {
                     self.stop_capture_pipeline().await;
                 }
@@ -10056,6 +11216,15 @@ impl Worker {
                         self.capture_target = None;
                         self.finish_all_video_send().await;
                         self.emit(Event::SharingFailed(error.to_string())).await?;
+                    } else {
+                        // A new encoder starts a fresh sequence and may change the
+                        // coded dimensions. Replace each per-peer video stream at
+                        // the capture restart boundary so receivers wait for the
+                        // new stream's keyframe instead of decoding a stale/P-frame
+                        // from the previous configuration. The RTC call itself is
+                        // left untouched.
+                        self.attach_video_to_active_calls().await;
+                        let _ = self.keyframe_tx.send(());
                     }
                 }
             }
@@ -10205,6 +11374,7 @@ impl Worker {
                     return Ok(());
                 }
                 let generation = self.begin_call(node_id);
+                self.direct_call_generations.insert(node_id, generation);
                 self.active_calls.insert(node_id, CallInfo::Calling);
                 self.emit(Event::SetCallState(node_id, CallState::Calling))
                     .await?;
@@ -10313,6 +11483,7 @@ impl Worker {
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     let generation = self.call_generations.remove(&node_id);
+                    self.direct_call_generations.remove(&node_id);
                     if let Some((task_generation, abort)) = self.connect_aborts.remove(&node_id) {
                         if generation == Some(task_generation) {
                             abort.abort();
@@ -10666,6 +11837,10 @@ async fn run_video_recv(
     let mut next_generation = 0u64;
     let mut active_generation = None;
     let mut pending_end: Option<(u64, VideoStreamEndReason)> = None;
+    // A quality restart replaces the QUIC video stream, but it must not undo a
+    // receiver's explicit "stop watching" choice. Carry that subscription
+    // state across stream generations and re-send it on the replacement.
+    let mut watching = true;
     loop {
         let accept = conn.transport().accept_bi();
         tokio::select! {
@@ -10757,6 +11932,7 @@ async fn run_video_recv(
                             worker.as_ref().expect("video decoder was initialized"),
                             &mut control_send,
                             &mut control_rx,
+                            &mut watching,
                         )
                         .await;
                         match stream_result {
@@ -10841,19 +12017,24 @@ fn spawn_video_decode_worker(
     callback: Option<UpdateCallback>,
 ) -> Result<VideoDecodeWorker> {
     VideoDecodeWorker::spawn(move |frame, generation| {
-        if event_tx
-            .try_send(Event::VideoFrame {
-                node_id,
-                generation,
-                frame,
-            })
-            .is_ok()
-        {
-            if let Some(callback) = &callback {
-                callback();
-            }
+        let result = event_tx.try_send(Event::VideoFrame {
+            node_id,
+            generation,
+            frame,
+        });
+        if video_enqueue_needs_repaint(&result) {
+            // A full event queue means the UI is behind and needs waking most of all.
+            // Only repainting after a successful send can deadlock presentation until
+            // an unrelated OS event (such as hide/show) wakes the root viewport.
+            callback.as_ref().inspect(|callback| callback());
         }
     })
+}
+
+fn video_enqueue_needs_repaint<T>(
+    result: &std::result::Result<(), async_channel::TrySendError<T>>,
+) -> bool {
+    !matches!(result, Err(async_channel::TrySendError::Closed(_)))
 }
 
 async fn notify_video_stream_accepted(
@@ -10902,6 +12083,10 @@ fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {
         && (message.contains("error 81") || message.contains("error 0x51"))
 }
 
+fn video_config_differs(current: VideoConfig, requested: VideoConfig) -> bool {
+    current != requested
+}
+
 async fn recv_video_on_stream(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     node_id: NodeId,
@@ -10909,6 +12094,7 @@ async fn recv_video_on_stream(
     worker: &VideoDecodeWorker,
     control_send: &mut (impl tokio::io::AsyncWrite + Unpin),
     control_rx: &mut tokio::sync::mpsc::UnboundedReceiver<VideoReceiveControl>,
+    watching: &mut bool,
 ) -> Result<()> {
     let mut received = 0u64;
     let mut received_bytes = 0u64;
@@ -10917,8 +12103,12 @@ async fn recv_video_on_stream(
     let mut age_samples = Vec::with_capacity(300);
     let mut last_sequence: Option<u64> = None;
     let mut last_stats_log = std::time::Instant::now();
-    let mut watching = true;
-    let mut waiting_for_keyframe = false;
+    let mut waiting_for_keyframe = *watching;
+    if !*watching {
+        // The sender starts each replacement as subscribed. Restore the
+        // receiver's prior pause state before allowing any frame through.
+        tokio::io::AsyncWriteExt::write_all(control_send, &[VIDEO_CONTROL_PAUSE]).await?;
+    }
 
     loop {
         let frame = loop {
@@ -10928,7 +12118,7 @@ async fn recv_video_on_stream(
                     let Some(control) = control else {
                         continue;
                     };
-                    if control.generation != generation || control.watching == watching {
+                    if control.generation != generation || control.watching == *watching {
                         continue;
                     }
                     let value = if control.watching {
@@ -10937,12 +12127,12 @@ async fn recv_video_on_stream(
                         VIDEO_CONTROL_PAUSE
                     };
                     tokio::io::AsyncWriteExt::write_all(control_send, &[value]).await?;
-                    watching = control.watching;
-                    waiting_for_keyframe = watching;
+                    *watching = control.watching;
+                    waiting_for_keyframe = *watching;
                     info!(
                         node = %node_id.fmt_short(),
                         generation,
-                        watching,
+                        watching = *watching,
                         "updated video subscription"
                     );
                 }
@@ -10950,7 +12140,7 @@ async fn recv_video_on_stream(
         };
         match frame {
             Ok(Some(frame)) => {
-                if !watching {
+                if !*watching {
                     continue;
                 }
                 if waiting_for_keyframe {

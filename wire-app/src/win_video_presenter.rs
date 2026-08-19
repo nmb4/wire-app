@@ -32,8 +32,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPSIBLINGS,
+    CreateWindowExW, DestroyWindow, IsWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE,
+    WS_EX_TRANSPARENT,
 };
 
 use crate::win_mf_codec::D3d11VideoFrame;
@@ -74,6 +75,7 @@ impl Default for PresentStats {
 }
 
 pub(crate) struct NativeVideoPresenter {
+    parent: HWND,
     child: HWND,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -99,7 +101,7 @@ impl NativeVideoPresenter {
         }
         let child = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                 w!("STATIC"),
                 w!(""),
                 WS_CHILD | WS_CLIPSIBLINGS,
@@ -115,7 +117,7 @@ impl NativeVideoPresenter {
             .context("creating native video child window")?
         };
 
-        let result = Self::create_for_child(child, frame, rect);
+        let result = Self::create_for_child(parent, child, frame, rect);
         if result.is_err() {
             unsafe {
                 let _ = DestroyWindow(child);
@@ -125,6 +127,7 @@ impl NativeVideoPresenter {
     }
 
     fn create_for_child(
+        parent: HWND,
         child: HWND,
         frame: &D3d11VideoFrame,
         rect: PhysicalVideoRect,
@@ -162,6 +165,7 @@ impl NativeVideoPresenter {
             rect.width, rect.height
         );
         Ok(Self {
+            parent,
             child,
             device,
             context,
@@ -179,6 +183,10 @@ impl NativeVideoPresenter {
 
     pub(crate) fn uses_device(&self, frame: &D3d11VideoFrame) -> bool {
         Interface::as_raw(&self.device) == Interface::as_raw(frame.device())
+    }
+
+    pub(crate) fn uses_parent(&self, parent: HWND) -> bool {
+        self.parent == parent && unsafe { IsWindow(Some(self.child)).as_bool() }
     }
 
     pub(crate) fn mark_unused(&mut self) {
@@ -438,6 +446,12 @@ impl NativeVideoPresenter {
 
 impl Drop for NativeVideoPresenter {
     fn drop(&mut self) {
+        // Windows destroys child HWNDs with their parent. An egui viewport can
+        // therefore invalidate this handle one update before the presenter is
+        // dropped; that is normal teardown, not a presentation error.
+        if !unsafe { IsWindow(Some(self.child)).as_bool() } {
+            return;
+        }
         unsafe {
             let _ = DestroyWindow(self.child).map_err(|error| {
                 warn!("failed to destroy native video child window: {error}");

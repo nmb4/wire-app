@@ -697,13 +697,15 @@ fn render_overlay(
         ..
     } = &mut *runtime;
     if close_requested {
-        info!("notification viewport close requested");
+        if active.swap(false, Ordering::AcqRel) {
+            info!("notification viewport close requested");
+        }
         store.clear();
         #[cfg(windows)]
         window_region.clear();
-        active.store(false, Ordering::Release);
         viewport_created.store(false, Ordering::Release);
         viewport_ready.store(false, Ordering::Release);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
         return;
     }
     store.advance(now);
