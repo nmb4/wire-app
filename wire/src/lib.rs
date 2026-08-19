@@ -118,4 +118,73 @@ mod tests {
         router2.shutdown().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn ending_one_track_closes_its_remote_flow_without_closing_the_call() -> TestResult {
+        let (router1, rtc1) = build().await?;
+        let (router2, rtc2) = build().await?;
+        let addr1 = router1.endpoint().node_addr().await?;
+        let (conn1, conn2) = (rtc2.connect(addr1), rtc1.accept()).try_join().await?;
+        let conn2 = conn2.unwrap();
+
+        let (mut encoder, local_track) =
+            MediaTrackOpusEncoder::new(4, ENGINE_FORMAT, AudioQuality::Ultra)?;
+        conn1.send_track(local_track).await?;
+        let sample_count = ENGINE_FORMAT.sample_count(Duration::from_millis(20));
+        let _ = encoder.tick(&vec![0.25; sample_count])?;
+        let remote_track = tokio::time::timeout(Duration::from_secs(2), conn2.recv_track())
+            .await??
+            .expect("audio flow ended before its first packet");
+
+        // System-audio toggling drops its encoder while leaving the RTC call
+        // alive. The remote decoder must still observe this individual flow's
+        // EOF instead of waiting forever on an orphaned iroh-roq flow.
+        drop(encoder);
+        let mut decoder = MediaTrackOpusDecoder::new(remote_track)?;
+        let mut out = vec![0.; sample_count];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(decoder.tick(&mut out)?, ControlFlow::Break(())) {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+
+        assert!(conn1.transport().close_reason().is_none());
+        assert!(conn2.transport().close_reason().is_none());
+
+        // A rapid system-audio off/on must be able to allocate the next flow
+        // immediately. The ended flow must not retain late datagrams or block
+        // the RoQ session dispatcher for the replacement track.
+        let (mut replacement_encoder, replacement_track) =
+            MediaTrackOpusEncoder::new(4, ENGINE_FORMAT, AudioQuality::Ultra)?;
+        conn1.send_track(replacement_track).await?;
+        let replacement_sample_count = ENGINE_FORMAT.sample_count(Duration::from_millis(20));
+        for _ in 0..4 {
+            let _ = replacement_encoder.tick(&vec![0.125; replacement_sample_count])?;
+        }
+        let replacement_remote_track =
+            tokio::time::timeout(Duration::from_secs(2), conn2.recv_track())
+                .await??
+                .expect("replacement track was not discovered after the ended flow");
+        let mut replacement_decoder = MediaTrackOpusDecoder::new(replacement_remote_track)?;
+        let mut replacement_out = vec![0.; replacement_sample_count];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(replacement_decoder.tick(&mut replacement_out)?, ControlFlow::Continue(n) if n > 0)
+                {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+
+        conn1.transport().close(0u32.into(), b"test complete");
+        router1.shutdown().await?;
+        router2.shutdown().await?;
+        Ok(())
+    }
 }

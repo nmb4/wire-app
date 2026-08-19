@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use iroh_roq::{
     rtp,
     rtp::{
         codecs::opus::OpusPayloader,
+        packet::Packet as RtpPacket,
         packetizer::{new_packetizer, Packetizer},
         sequence::Sequencer,
     },
@@ -11,7 +13,7 @@ use iroh_roq::{
 use tokio::sync::broadcast::error::RecvError;
 use tracing::trace;
 
-use super::{MediaFrame, MediaTrack};
+use super::{MediaFrame, MediaTrack, TRACK_END_PAYLOAD};
 use crate::codec::Codec;
 
 #[derive(Debug)]
@@ -26,6 +28,34 @@ pub(crate) const CLOCK_RATE: u32 = crate::audio::SAMPLE_RATE.0;
 
 impl RtpMediaTrackSender {
     pub(crate) async fn run(mut self) -> Result<()> {
+        let result = self.run_inner().await;
+        let end_packet = RtpPacket {
+            header: rtp::header::Header {
+                payload_type: self.track.codec().rtp_payload_type(),
+                marker: true,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(TRACK_END_PAYLOAD),
+        };
+        // Ordinary audio uses QUIC datagrams, but track termination must not
+        // be lossy or the remote volume UI can remain active forever. Send the
+        // single end marker over an iroh-roq reliable stream for this flow.
+        let end_result = async {
+            let mut stream = self.send_flow.new_send_stream().await?;
+            stream.send_rtp(&end_packet).await
+        }
+        .await;
+        // Prevent any later datagrams from being emitted on this flow after
+        // the reliable marker. The receiver closes its matching flow as soon
+        // as it processes the marker.
+        self.send_flow.close();
+        match result {
+            Ok(()) => end_result,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn run_inner(&mut self) -> Result<()> {
         let ssrc = 0;
         let sequencer: Box<dyn Sequencer + Send + Sync> =
             Box::new(rtp::sequence::new_random_sequencer());

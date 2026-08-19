@@ -22,6 +22,8 @@ mod rtp_receiver;
 mod rtp_sender;
 mod track;
 
+pub(crate) const TRACK_END_PAYLOAD: &[u8] = b"wire/rtp-track-end/1";
+
 #[derive(Debug, Clone)]
 pub struct RtcConnection {
     conn: Connection,

@@ -7,7 +7,10 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::{trace, warn};
 use webrtc_media::io::sample_builder::SampleBuilder;
 
-use crate::{codec::Codec, rtc::MediaFrame};
+use crate::{
+    codec::Codec,
+    rtc::{MediaFrame, TRACK_END_PAYLOAD},
+};
 
 pub(crate) struct RtpMediaTrackReceiver {
     pub(crate) recv_flow: ReceiveFlow,
@@ -17,13 +20,18 @@ pub(crate) struct RtpMediaTrackReceiver {
 
 impl RtpMediaTrackReceiver {
     pub async fn run(mut self) {
-        if let Err(err) = self.run_inner().await {
+        let result = self.run_inner().await;
+        if let Err(err) = result {
             let id: u64 = self.recv_flow.flow_id().into();
             warn!(%id, "rtp receive flow failed: {err}");
             if let Some(tx) = self.init_tx.take() {
                 tx.send(Err(err)).ok();
             }
         }
+        // A track ending is scoped to this RoQ flow. Cancel the flow even
+        // after a normal end marker so datagrams that raced the reliable
+        // marker are discarded instead of accumulating in the session queue.
+        self.recv_flow.close();
     }
 
     async fn run_inner(&mut self) -> Result<()> {
@@ -50,6 +58,11 @@ impl RtpMediaTrackReceiver {
         let mut sample_builder = SampleBuilder::new(16, depacketizer, sample_rate);
         let mut packet = first_packet;
         loop {
+            if packet.header.marker && packet.payload.as_ref() == TRACK_END_PAYLOAD {
+                trace!(flow_id = %self.recv_flow.flow_id(), "received RTP track end marker");
+                self.recv_flow.close();
+                return Ok(());
+            }
             trace!(
                 "recv packet len {} seq {} ts {}",
                 packet.payload.len(),

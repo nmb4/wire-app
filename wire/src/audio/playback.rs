@@ -45,6 +45,14 @@ pub struct GainSource {
     activity: Option<AudioActivityHandle>,
 }
 
+impl Drop for GainSource {
+    fn drop(&mut self) {
+        if let Some(activity) = &self.activity {
+            activity.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 impl AudioSource for GainSource {
     fn tick(&mut self, buf: &mut [f32]) -> Result<ControlFlow<(), usize>> {
         let result = self.inner.tick(buf);

@@ -9548,6 +9548,45 @@ mod layout_tests {
     }
 
     #[test]
+    fn cancelling_an_unconnected_direct_call_records_a_missed_call() {
+        assert!(aborted_call_needs_missed_call(
+            &CallInfo::Calling,
+            Some(7),
+            Some(7)
+        ));
+        assert!(!aborted_call_needs_missed_call(
+            &CallInfo::Calling,
+            Some(8),
+            Some(7)
+        ));
+        assert!(!aborted_call_needs_missed_call(
+            &CallInfo::Calling,
+            None,
+            Some(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopping_stream_audio_wakes_the_ui() {
+        let activity = Arc::new(AtomicBool::new(true));
+        let repaint_count = Arc::new(AtomicU32::new(0));
+        let repaint_count_for_callback = repaint_count.clone();
+        let callback: UpdateCallback = Arc::new(move || {
+            repaint_count_for_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        repaint_when_audio_stops(activity.clone(), Some(callback));
+        activity.store(false, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while repaint_count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stream audio shutdown did not wake the UI");
+    }
+
+    #[test]
     fn stream_popout_first_pressed_button_owns_the_gesture() {
         let mut popout = StreamPopoutState::default();
         assert_eq!(
@@ -10133,6 +10172,28 @@ struct VideoReceiveControl {
 
 type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
 
+fn repaint_when_audio_stops(activity: AudioActivityHandle, callback: Option<UpdateCallback>) {
+    let Some(callback) = callback else {
+        return;
+    };
+    tokio::spawn(async move {
+        while activity.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        callback();
+    });
+}
+
+fn aborted_call_needs_missed_call(
+    state: &CallInfo,
+    direct_generation: Option<u64>,
+    generation: Option<u64>,
+) -> bool {
+    matches!(state, CallInfo::Calling)
+        && direct_generation.is_some()
+        && direct_generation == generation
+}
+
 enum Command {
     SetUpdateCallback {
         callback: UpdateCallback,
@@ -10530,6 +10591,7 @@ impl Worker {
                     if matches!(status.availability, Availability::Online) {
                         self.peer_group_calls
                             .insert(status.peer, status.active_group_calls.clone());
+                        self.chat.peer_online(status.peer).await;
                     } else {
                         self.peer_group_calls.remove(&status.peer);
                     }
@@ -10739,6 +10801,10 @@ impl Worker {
                             if let Some(callback) = &update_callback {
                                 callback();
                             }
+                            repaint_when_audio_stops(
+                                stream_audio_enabled.clone(),
+                                update_callback.clone(),
+                            );
                             if let Err(error) = audio_context
                                 .play_track_with_volume_and_activity(
                                     remote_track,
@@ -10838,6 +10904,10 @@ impl Worker {
                                 if let Some(callback) = &update_callback {
                                     callback();
                                 }
+                                repaint_when_audio_stops(
+                                    stream_audio_enabled.clone(),
+                                    update_callback.clone(),
+                                );
                                 if let Err(error) = audio_context
                                     .play_track_with_volume_and_activity(
                                         remote_track,
@@ -11483,7 +11553,9 @@ impl Worker {
             Command::Abort { node_id } => {
                 if let Some(state) = self.active_calls.remove(&node_id) {
                     let generation = self.call_generations.remove(&node_id);
-                    self.direct_call_generations.remove(&node_id);
+                    let direct_generation = self.direct_call_generations.remove(&node_id);
+                    let queue_missed_call =
+                        aborted_call_needs_missed_call(&state, direct_generation, generation);
                     if let Some((task_generation, abort)) = self.connect_aborts.remove(&node_id) {
                         if generation == Some(task_generation) {
                             abort.abort();
@@ -11504,6 +11576,9 @@ impl Worker {
                         CallInfo::Incoming(conn) => {
                             conn.transport().close(0u32.into(), b"bye");
                         }
+                    }
+                    if queue_missed_call {
+                        self.queue_missed_call(node_id).await;
                     }
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
                         .await?;

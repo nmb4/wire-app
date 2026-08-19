@@ -1340,6 +1340,10 @@ impl ChatService {
                     detail: Some("delivering".to_owned()),
                 });
                 self.spawn_doc_sync(&conversation_id);
+                // A pending direct invitation for a missed-call record turns
+                // this into an empty reachability probe in wake_payload_for.
+                // Ordinary direct messages still use the established invite
+                // ordering and retain their normal fast path.
                 self.spawn_wake(&conversation_id);
                 if let Err(error) = self.publish_timeline(&conversation_id).await {
                     warn!(
@@ -1576,6 +1580,32 @@ impl ChatService {
                 .is_some_and(|entry| !entry.pending_peers.is_empty())
     }
 
+    fn direct_invite_pending(&self, conversation_id: &str) -> bool {
+        let Some(stored) = self.index.conversations.get(conversation_id) else {
+            return false;
+        };
+        let Some(peer) = stored.public.direct_peer() else {
+            return false;
+        };
+        self.reliable_control
+            .invites
+            .get(conversation_id)
+            .is_some_and(|pending| pending.pending_peers.contains(&peer.to_string()))
+    }
+
+    fn direct_missed_call_invite_pending(&self, conversation_id: &str) -> bool {
+        if !self.direct_invite_pending(conversation_id) {
+            return false;
+        }
+        self.pending_deliveries.iter().any(|(message_id, pending)| {
+            pending == conversation_id
+                && self
+                    .pending_outbound
+                    .get(message_id)
+                    .is_some_and(ChatMessage::is_missed_call)
+        })
+    }
+
     fn conversation_peer_strings(&self, conversation_id: &str) -> BTreeSet<String> {
         self.index
             .conversations
@@ -1692,9 +1722,15 @@ impl ChatService {
         }
     }
 
-    fn apply_control_acks(&mut self, conversation_id: &str, remote: NodeId, request: &SyncRequest) {
+    fn apply_control_acks(
+        &mut self,
+        conversation_id: &str,
+        remote: NodeId,
+        request: &SyncRequest,
+    ) -> bool {
         let remote = remote.to_string();
         let mut changed = false;
+        let mut invite_accepted = false;
         if let Some(entries) = self.reliable_control.attachments.get_mut(conversation_id) {
             for hash in &request.attachment_acks {
                 if let Some(entry) = entries.get_mut(hash) {
@@ -1716,7 +1752,8 @@ impl ChatService {
             self.reliable_control.invites.get_mut(conversation_id),
         ) {
             if invite.history_epoch == epoch {
-                changed |= invite.pending_peers.remove(&remote);
+                invite_accepted = invite.pending_peers.remove(&remote);
+                changed |= invite_accepted;
             }
         }
         if changed {
@@ -1725,9 +1762,17 @@ impl ChatService {
                 self.control_retries.remove(conversation_id);
             }
         }
+        invite_accepted
     }
 
     fn wake_payload_for(&self, conversation_id: &str) -> WakePayload {
+        // A missed-call record created while offline uses a nonblocking
+        // invitation. Keep its wake as an empty reachability probe while the
+        // invite is pending so delivery can still reach Queued, but never
+        // send that system message before the peer imports the conversation.
+        if self.direct_missed_call_invite_pending(conversation_id) {
+            return WakePayload::default();
+        }
         let mut messages = Vec::new();
         let mut used = 0usize;
         for (message_id, pending_conversation) in &self.pending_deliveries {
@@ -1934,6 +1979,16 @@ impl ChatService {
             for message_id in &pending {
                 self.schedule_delivery_retry(conversation_id, message_id, false);
             }
+            if self.direct_missed_call_invite_pending(conversation_id) {
+                // This was only an empty reachability probe. The peer may
+                // still be processing the invitation, so do not hammer chat
+                // ALPN while the control retry/ack path completes.
+                if let Some(state) = self.retry_state.get_mut(conversation_id) {
+                    state.next_attempt = tokio::time::Instant::now()
+                        + delivery_retry_delay(conversation_id, state.attempts, true);
+                }
+                return;
+            }
             // Do not publish_timeline here — that re-entered doc events and
             // spawned more wakes. Receipts arrive via InsertRemote / ALPN.
             self.spawn_doc_sync(conversation_id);
@@ -2102,6 +2157,20 @@ impl ChatService {
 
     async fn resume_deliveries_for_peer(&mut self, peer: NodeId) {
         let peer_s = peer.to_string();
+        // Direct conversations created while the peer was offline need their
+        // invitation before a message wake can be accepted as a member.
+        let control_ids: Vec<_> = self
+            .index
+            .conversations
+            .iter()
+            .filter(|(_, stored)| stored.public.members.iter().any(|member| member == &peer_s))
+            .map(|(id, _)| id.clone())
+            .filter(|id| self.conversation_has_pending_control(id))
+            .collect();
+        for conversation_id in control_ids {
+            self.schedule_control_retry(&conversation_id, true);
+            self.send_pending_invites(&conversation_id);
+        }
         let conversation_ids: Vec<_> = self
             .index
             .conversations
@@ -2117,17 +2186,14 @@ impl ChatService {
         for conversation_id in conversation_ids {
             self.resume_queued_deliveries(&conversation_id).await;
         }
-        let control_ids: Vec<_> = self
-            .index
-            .conversations
-            .iter()
-            .filter(|(_, stored)| stored.public.members.iter().any(|member| member == &peer_s))
-            .map(|(id, _)| id.clone())
-            .filter(|id| self.conversation_has_pending_control(id))
-            .collect();
-        for conversation_id in control_ids {
-            self.schedule_control_retry(&conversation_id, true);
-        }
+    }
+
+    /// Wake durable message and invite delivery as soon as presence confirms
+    /// that a previously unreachable peer is back. The normal retry loop still
+    /// owns backoff; this only pulls genuinely queued work out of its offline
+    /// delay and avoids waiting for the next long retry window.
+    pub async fn peer_online(&mut self, peer: NodeId) {
+        self.resume_deliveries_for_peer(peer).await;
     }
 
     async fn resume_queued_deliveries(&mut self, conversation_id: &str) {
@@ -2140,10 +2206,13 @@ impl ChatService {
         if message_ids.is_empty() {
             return;
         }
-        // Already probing or waking — a remote insert just means pull docs;
-        // publish_timeline in the caller handles that. Extra resume/wake here
-        // was flooding the peer (~20 wakes/sec in logs) and delaying receipts.
-        if self.retry_state.contains_key(conversation_id)
+        if self.direct_missed_call_invite_pending(conversation_id) {
+            return;
+        }
+        // Presence heartbeats repeat while a peer is online. Only override the
+        // retry schedule after this conversation was actually parked as
+        // offline, and never stack a second dial over one already in flight.
+        if !self.conversation_is_queued(conversation_id)
             || self
                 .wake_inflight
                 .get(conversation_id)
@@ -2167,6 +2236,44 @@ impl ChatService {
                 detail: Some("peer online; delivering".to_owned()),
             });
         }
+        if let Some(state) = self.retry_state.get_mut(conversation_id) {
+            state.attempts = 0;
+            state.next_attempt = tokio::time::Instant::now();
+        }
+        self.spawn_wake(conversation_id);
+        self.spawn_doc_sync(conversation_id);
+    }
+
+    async fn resume_pending_after_invite(&mut self, conversation_id: &str) {
+        let message_ids: Vec<_> = self
+            .pending_deliveries
+            .iter()
+            .filter(|(_, pending_conversation)| *pending_conversation == conversation_id)
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        if message_ids.is_empty()
+            || self.direct_invite_pending(conversation_id)
+            || self
+                .wake_inflight
+                .get(conversation_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            return;
+        }
+        let was_queued = self.conversation_is_queued(conversation_id);
+        self.wake_failures.remove(conversation_id);
+        for message_id in &message_ids {
+            self.schedule_delivery_retry(conversation_id, message_id, true);
+            if was_queued {
+                self.queued.push_back(ChatNotification::Delivery {
+                    message_id: message_id.clone(),
+                    state: DeliveryState::Pending,
+                    detail: Some("chat invitation accepted; delivering".to_owned()),
+                });
+            }
+        }
         self.spawn_wake(conversation_id);
         self.spawn_doc_sync(conversation_id);
     }
@@ -2175,7 +2282,7 @@ impl ChatService {
         let carries_control_ack = !request.attachment_acks.is_empty()
             || !request.deletion_acks.is_empty()
             || request.accepted_history_epoch.is_some();
-        self.apply_control_acks(&request.conversation_id, remote, request);
+        let invite_accepted = self.apply_control_acks(&request.conversation_id, remote, request);
         let remote_s = remote.to_string();
         let mut accepted_messages = 0u32;
         for message in &request.messages {
@@ -2253,6 +2360,10 @@ impl ChatService {
                 peer = %remote.fmt_short(),
                 "docs pull after chat ALPN wake failed: {error:#}"
             );
+        }
+        if invite_accepted {
+            self.resume_pending_after_invite(&request.conversation_id)
+                .await;
         }
         Ok(())
     }
@@ -4551,6 +4662,23 @@ mod tests {
         .context("timed out waiting for missed-call delivery and recipient receipt")?
     }
 
+    async fn wait_for_queued_missed_call(service: &mut ChatService) -> Result<String> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Delivery {
+                    message_id,
+                    state: DeliveryState::Queued,
+                    ..
+                } = service.next_notification().await
+                {
+                    return Result::<String>::Ok(message_id);
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for missed call to enter the offline queue")?
+    }
+
     async fn wait_for_attachment(
         service: &mut ChatService,
         conversation_id: &str,
@@ -4920,16 +5048,19 @@ mod tests {
         // an offline peer returning to the network.
         left.send_missed_call(right_node_id, "Right".to_owned())
             .await;
+        let queued_message_id = wait_for_queued_missed_call(&mut left).await?;
 
         let (right_endpoint, right_router, mut right) =
             spawn_test_node(&temp.path().join("right"), right_secret).await?;
         left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
         right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+        left.peer_online(right_node_id).await;
 
         // Both services must keep processing their retry ticks. The desktop
         // worker continuously polls this loop in production; driving both
         // sides here verifies the offline invite retry and the return receipt.
         wait_for_missed_call_delivery(&mut left, &mut right).await?;
+        assert!(!left.pending_deliveries.contains_key(&queued_message_id));
 
         left_router.shutdown().await?;
         right_router.shutdown().await?;
