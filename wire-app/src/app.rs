@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use async_channel::{Receiver, Sender};
 use eframe::NativeOptions;
-use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
+use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, Rect, RichText, Stroke, Ui, Vec2};
 use egui_phosphor::regular as ph;
 use iroh::{endpoint::VarInt, protocol::Router, Endpoint, KeyParsingError, NodeId};
 use lucide_icons::Icon;
@@ -191,6 +191,9 @@ struct AppState {
     configured: bool,
     show_settings: bool,
     show_contacts: bool,
+    /// Last seen healthy viewport rect; floating panes are constrained to it
+    /// so degenerate minimize/restore frames cannot shrink their geometry.
+    pane_viewport: Rect,
     stream_view_mode: StreamViewMode,
     remote_node_id: Option<Result<NodeId, KeyParsingError>>,
     remote_node_input: String,
@@ -669,6 +672,7 @@ impl App {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
             show_contacts: false,
+            pane_viewport: Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0)),
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
             remote_node_input: String::new(),
@@ -788,6 +792,22 @@ impl App {
     }
 }
 impl AppState {
+    /// Remember the current viewport when it can host floating panes.
+    fn track_pane_viewport(&mut self, ctx: &egui::Context) {
+        let content = ctx.content_rect();
+        let tracked = track_pane_viewport(self.pane_viewport, content);
+        if tracked != self.pane_viewport {
+            // The viewport settled after a minimize/restore transition; make
+            // sure a fresh frame paints the panes at the recovered size.
+            self.pane_viewport = tracked;
+            ctx.request_repaint();
+        }
+    }
+
+    fn pane_constrain_rect(&self) -> Rect {
+        self.pane_viewport
+    }
+
     fn update(
         &mut self,
         ctx: &egui::Context,
@@ -802,6 +822,7 @@ impl AppState {
         if self.has_visible_call() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+        self.track_pane_viewport(ctx);
         #[cfg(windows)]
         self.process_update_events(ctx);
         self.process_autostart_events();
@@ -1733,13 +1754,14 @@ impl AppState {
         let mut refresh = false;
         let mut share_system_audio = self.share_system_audio;
         let (picker_width, picker_body_height, use_columns) =
-            capture_picker_layout(ctx.content_rect().size());
+            capture_picker_layout(self.pane_constrain_rect().size());
 
         egui::Window::new("Share a screen or window")
             .id(egui::Id::new("capture-target-picker"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
+            .constrain_to(self.pane_constrain_rect())
             .default_width(picker_width)
             .min_width(picker_width)
             .max_width(picker_width)
@@ -3760,6 +3782,7 @@ impl AppState {
         let Some(preview) = self.chat.image_preview.clone() else {
             return;
         };
+        let pane_rect = self.pane_constrain_rect();
         let mut action = None;
         match preview.mode {
             ImagePreviewMode::Floating => {
@@ -3769,7 +3792,10 @@ impl AppState {
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(true)
-                    .default_size(Vec2::new(720.0, 560.0))
+                    .constrain_to(pane_rect)
+                    .min_size(IMAGE_PREVIEW_MIN_SIZE)
+                    .default_size(image_preview_default_size(pane_rect.size()))
+                    .default_pos(pane_rect.center())
                     .show(ctx, |ui| {
                         action = image_preview_panel(
                             ui,
@@ -3920,6 +3946,9 @@ impl AppState {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .constrain_to(self.pane_constrain_rect())
+            .min_width(340.0)
             .show(ctx, |ui| {
                 ui.label("Group name");
                 ui.add(
@@ -3985,6 +4014,9 @@ impl AppState {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .constrain_to(self.pane_constrain_rect())
+            .min_width(340.0)
             .show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.label(
@@ -4070,6 +4102,9 @@ impl AppState {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .constrain_to(self.pane_constrain_rect())
+            .min_width(340.0)
             .show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.label(
@@ -4968,15 +5003,16 @@ impl AppState {
 
     fn ui_contacts_window(&mut self, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
-        let screen_rect = ctx.content_rect();
-        let dialog_width = (screen_rect.width() - 32.0).clamp(340.0, 560.0);
-        let scroll_height = (screen_rect.height() - 190.0).clamp(220.0, 720.0);
+        let pane_rect = self.pane_constrain_rect();
+        let dialog_width = (pane_rect.width() - 32.0).clamp(340.0, 560.0);
+        let scroll_height = (pane_rect.height() - 190.0).clamp(220.0, 720.0);
         let can_close = self.has_active_call();
 
         egui::Window::new("contacts-dialog")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .constrain_to(pane_rect)
             .default_width(dialog_width)
             .min_width(dialog_width)
             .max_width(dialog_width)
@@ -6125,15 +6161,16 @@ impl AppState {
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
         let can_close = self.configured;
         let pal = Palette::for_theme(self.theme);
-        let screen_rect = ctx.content_rect();
-        let dialog_width = (screen_rect.width() - 40.0).clamp(420.0, 500.0);
+        let pane_rect = self.pane_constrain_rect();
+        let dialog_width = (pane_rect.width() - 40.0).clamp(420.0, 500.0);
         // Reserve enough vertical space for the dialog chrome plus a visible
         // inset above and below the centered window.
-        let scroll_height = (screen_rect.height() - 230.0).clamp(220.0, 700.0);
+        let scroll_height = (pane_rect.height() - 230.0).clamp(220.0, 700.0);
         egui::Window::new("settings-dialog")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .constrain_to(pane_rect)
             .default_width(dialog_width)
             .min_width(dialog_width)
             .max_width(dialog_width)
@@ -6756,7 +6793,8 @@ impl AppState {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .constrain_to(self.pane_constrain_rect())
             .show(ctx, |ui| {
                 ui.label(format!(
                     "Wire v{} is available. You are running v{}.",
@@ -7412,6 +7450,37 @@ fn aspect_fit_rect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
         bounds.center(),
         video_display_size(bounds.size(), aspect, false),
     )
+}
+
+/// Smallest native window size Wire allows (`with_min_inner_size` in main.rs).
+const MIN_WINDOW_SIZE: Vec2 = Vec2::new(460.0, 500.0);
+
+/// Smallest image preview window size once the user can resize it.
+const IMAGE_PREVIEW_MIN_SIZE: Vec2 = Vec2::new(320.0, 220.0);
+
+/// Viewport rect that floating panes may be laid out in.
+///
+/// egui clamps the remembered size of every shown [`egui::Window`] to the
+/// viewport each frame and persists that clamp, so minimize/restore frames
+/// reporting transient degenerate sizes (0×0/1×1 on Windows, shrinking frames
+/// in the macOS animation) would permanently shrink open panes to a minimal
+/// size. Panes are therefore pinned to the last seen healthy viewport via
+/// [`egui::Window::constrain_to`] instead of trusting the live rect.
+fn track_pane_viewport(current: Rect, candidate: Rect) -> Rect {
+    let healthy = candidate.width() >= MIN_WINDOW_SIZE.x && candidate.height() >= MIN_WINDOW_SIZE.y;
+    if healthy {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// Opening size for the floating image preview: never larger than 90% of the
+/// viewport so it fits without re-clamping, never below its resize floor.
+fn image_preview_default_size(viewport: Vec2) -> Vec2 {
+    Vec2::new(720.0, 560.0)
+        .min(viewport * 0.9)
+        .max(IMAGE_PREVIEW_MIN_SIZE)
 }
 
 fn capture_picker_layout(viewport: Vec2) -> (f32, f32, bool) {
@@ -8622,6 +8691,105 @@ mod layout_tests {
         assert_eq!(
             capture_picker_layout(Vec2::new(420.0, 360.0)),
             (364.0, 160.0, false)
+        );
+    }
+
+    #[test]
+    fn pane_viewport_tracker_ignores_degenerate_viewports() {
+        let healthy = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0));
+        assert_eq!(track_pane_viewport(healthy, healthy), healthy);
+
+        // A larger healthy viewport updates the tracker.
+        let grown = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        assert_eq!(track_pane_viewport(healthy, grown), grown);
+
+        // Transient minimize/restore sizes below Wire's minimum never shrink
+        // or move the tracked rect.
+        assert_eq!(
+            track_pane_viewport(
+                grown,
+                Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0))
+            ),
+            grown
+        );
+        assert_eq!(
+            track_pane_viewport(
+                grown,
+                Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(300.0, 480.0))
+            ),
+            grown
+        );
+
+        // The enforced minimum itself is still considered healthy.
+        let minimum = Rect::from_min_size(egui::Pos2::ZERO, MIN_WINDOW_SIZE);
+        assert_eq!(track_pane_viewport(grown, minimum), minimum);
+    }
+
+    #[test]
+    fn image_preview_default_fits_small_viewports_without_dipping_below_floor() {
+        assert_eq!(
+            image_preview_default_size(Vec2::new(1600.0, 900.0)),
+            Vec2::new(720.0, 560.0)
+        );
+        assert_eq!(
+            image_preview_default_size(Vec2::new(460.0, 500.0)),
+            Vec2::new(414.0, 450.0)
+        );
+        assert_eq!(
+            image_preview_default_size(Vec2::new(200.0, 200.0)),
+            IMAGE_PREVIEW_MIN_SIZE
+        );
+    }
+
+    #[test]
+    fn constrained_panes_lay_out_fully_through_degenerate_frames() {
+        let ctx = egui::Context::default();
+        let healthy = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0));
+        let degenerate = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0));
+        let pane_size = Vec2::new(720.0, 560.0);
+        let pass = |pinned: bool, screen: Rect| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            ctx.begin_pass(input);
+            let mut shown = None;
+            let mut window = egui::Window::new("pane")
+                .id(egui::Id::new("test-pane"))
+                .fixed_pos(egui::Pos2::ZERO)
+                .resizable(false)
+                .default_size(pane_size);
+            if pinned {
+                window = window.constrain_to(healthy);
+            }
+            window.show(&ctx, |ui| {
+                ui.set_min_size(pane_size);
+                shown = Some(ui.clip_rect());
+            });
+            ctx.end_pass();
+            shown.unwrap_or(healthy)
+        };
+
+        // A pane pinned to the tracked viewport keeps laying out at full size
+        // with a sane clip rect while the live viewport reports transient
+        // minimize/restore sizes...
+        let established = pass(true, healthy);
+        assert!(established.size().x >= pane_size.x && established.size().y >= pane_size.y);
+        let clipped = pass(true, degenerate);
+        assert!(
+            clipped.width() >= pane_size.x && clipped.height() >= pane_size.y,
+            "pinning must keep the pane's layout intact, got {clipped:?}"
+        );
+
+        // ...while an unpinned pane is clipped into the degenerate viewport,
+        // collapsing content-driven layout for those frames.
+        let unpinned_established = pass(false, healthy);
+        assert!(
+            unpinned_established.size().x >= pane_size.x
+                && unpinned_established.size().y >= pane_size.y
+        );
+        let unpinned_clipped = pass(false, degenerate);
+        assert!(
+            unpinned_clipped.width() < pane_size.x || unpinned_clipped.height() < pane_size.y,
+            "unpinned panes get clipped into the degenerate viewport"
         );
     }
 
