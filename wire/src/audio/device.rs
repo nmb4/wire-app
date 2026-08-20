@@ -5,7 +5,7 @@ use cpal::{
     SupportedBufferSize::{Range, Unknown},
     SupportedStreamConfig, SupportedStreamConfigRange,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::AudioFormat;
 use crate::audio::DURATION_20MS;
@@ -97,12 +97,25 @@ pub fn find_device(host: &cpal::Host, direction: Direction, name: Option<&str>) 
     };
 
     let device = match &name {
-        Some(device) => iter()?.find(|x| x.name().map(|y| &y == device).unwrap_or(false)),
+        Some(device) => match iter()?.find(|x| x.name().map(|y| &y == device).unwrap_or(false)) {
+            Some(device) => Some(device),
+            None => {
+                // A saved device name can go stale at any time (unplugged
+                // headset, removed virtual device). Fail over to the default
+                // device instead of leaving the whole audio context broken.
+                warn!("audio device `{device}` not found, falling back to the system default");
+                default()?
+            }
+        },
         None => default()?,
+    };
+    let direction = match direction {
+        Direction::Capture => "input",
+        Direction::Playback => "output",
     };
     device.with_context(|| {
         format!(
-            "could not find input audio device `{}`",
+            "could not find {direction} audio device `{}`",
             name.unwrap_or("default")
         )
     })
