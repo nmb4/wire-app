@@ -3,6 +3,7 @@ Use lua because bash and powershell both suck.
 Tasks that take parameters read them from env vars:
 - run: `WIRE_RUN_ARGS="extra args"`
 - dev-pair: `WIRE_DEV_SESSION="session-name"`
+- mic-probe: `WIRE_PROBE_DEVICE="device name"` (optional input device)
 - bump-version: `WIRE_BUMP_PART=minor` (default: patch)
 - upload: `WIRE_DRY_RUN=--dry-run`
 - release: `WIRE_BUMP_PART=minor WIRE_DRY_RUN=--dry-run`
@@ -28,6 +29,25 @@ local IS_WIN = (package.config:sub(1, 1) == "\\") or (os.getenv("OS") or ""):mat
 local exe = IS_WIN and "target\\release\\wire-app.exe" or "./target/release/wire-app"
 local session = os.getenv("WIRE_DEV_SESSION") or ""
 os.execute(exe .. " --dev-pair" .. (session ~= "" and (" " .. session) or ""))
+```
+
+```lua [name:mic-probe]
+-- Run the mic-level-probe example: prints the normalized mic capture level
+-- ten times per second for five seconds. Healthy capture shows non-zero
+-- levels while you speak; flat 0.0000 means the input device is silent
+-- (wrong device, muted hardware, or denied microphone permission).
+--
+--   upmd up.md --block mic-probe --yes
+--   WIRE_PROBE_DEVICE="BlackHole 2ch" upmd up.md --block mic-probe --yes
+local IS_WIN = (package.config:sub(1, 1) == "\\") or (os.getenv("OS") or ""):match("Windows") ~= nil
+local device = os.getenv("WIRE_PROBE_DEVICE") or ""
+local ok = os.execute("cargo build -p wire --example mic-level-probe")
+if ok ~= true and ok ~= 0 then os.exit(1) end
+local args = ""
+if device ~= "" then
+  args = IS_WIN and string.format(' "%s"', device) or string.format(" '%s'", device)
+end
+os.execute("./target/debug/examples/mic-level-probe" .. args)
 ```
 
 ```lua [name:bump-version]
