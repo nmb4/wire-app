@@ -152,14 +152,36 @@ pub async fn fetch_latest_logs(
     if body_len > HARD_MAX_BYTES {
         bail!("remote log body exceeds safety cap ({body_len} bytes)");
     }
-    let mut bytes = vec![0u8; body_len as usize];
-    if body_len > 0 {
-        recv.read_exact(&mut bytes).await?;
+    let mut bytes = Vec::with_capacity(body_len as usize);
+    while bytes.len() < body_len as usize {
+        let remaining = body_len as usize - bytes.len();
+        let mut chunk = vec![0u8; remaining.min(64 * 1024)];
+        match recv.read(&mut chunk).await {
+            Ok(Some(0)) => break,
+            Ok(Some(read)) => bytes.extend_from_slice(&chunk[..read]),
+            Ok(None) => break,
+            Err(error) if bytes.is_empty() => return Err(error.into()),
+            Err(error) => {
+                warn!(
+                    expected_bytes = body_len,
+                    received_bytes = bytes.len(),
+                    "remote log stream closed early; preserving partial body: {error}"
+                );
+                break;
+            }
+        }
     }
     if meta.sent_bytes != body_len {
         warn!(
             meta_sent = meta.sent_bytes,
             body_len, "log meta sent_bytes mismatch; using body length"
+        );
+    }
+    if bytes.len() as u64 != body_len {
+        warn!(
+            expected_bytes = body_len,
+            received_bytes = bytes.len(),
+            "remote log fetch is incomplete"
         );
     }
     Ok(FetchedLogs { meta, bytes })
@@ -207,6 +229,12 @@ async fn serve_logs_stream(
         send.write_all(&bytes).await?;
     }
     send.finish()?;
+    // Keep the connection alive until QUIC confirms that the peer received the
+    // response. Dropping the handler immediately can reset bodies larger than
+    // the stream's initial flow-control window.
+    if let Err(error) = send.stopped().await {
+        warn!("remote log response was not acknowledged: {error}");
+    }
     info!(
         path = %path.display(),
         sent_bytes = meta.sent_bytes,

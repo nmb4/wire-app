@@ -641,6 +641,92 @@ impl eframe::App for App {
     }
 }
 
+fn wgpu_surface_error_action(
+    error: eframe::wgpu::SurfaceError,
+) -> eframe::egui_wgpu::SurfaceErrorAction {
+    use eframe::egui_wgpu::SurfaceErrorAction;
+    use eframe::wgpu::SurfaceError;
+
+    match error {
+        SurfaceError::Outdated => {
+            // Windows reports this while a window is minimized. The resize path
+            // configures the surface again once the window has a usable size.
+            debug!("skipping frame for outdated wgpu surface");
+            SurfaceErrorAction::SkipFrame
+        }
+        SurfaceError::Timeout => {
+            warn!("wgpu surface acquisition timed out; skipping frame");
+            SurfaceErrorAction::SkipFrame
+        }
+        SurfaceError::Lost => {
+            warn!("wgpu surface was lost; reconfiguring before the next frame");
+            SurfaceErrorAction::RecreateSurface
+        }
+        SurfaceError::Other => {
+            warn!("wgpu surface acquisition failed; reconfiguring before the next frame");
+            SurfaceErrorAction::RecreateSurface
+        }
+        SurfaceError::OutOfMemory => {
+            tracing::error!("wgpu could not acquire a surface texture because GPU memory is exhausted; skipping frame");
+            SurfaceErrorAction::SkipFrame
+        }
+    }
+}
+
+fn handle_uncaptured_wgpu_error(error: eframe::wgpu::Error) {
+    let kind = match &error {
+        eframe::wgpu::Error::OutOfMemory { .. } => "out-of-memory",
+        eframe::wgpu::Error::Validation { .. } => "validation",
+        eframe::wgpu::Error::Internal { .. } => "internal",
+    };
+    tracing::error!(
+        kind,
+        error = %error,
+        details = ?error,
+        "uncaptured wgpu device error; suppressing the default panic so the renderer can attempt recovery"
+    );
+}
+
+#[cfg(test)]
+mod wgpu_error_tests {
+    use super::*;
+    use eframe::{egui_wgpu::SurfaceErrorAction, wgpu::SurfaceError};
+
+    #[test]
+    fn reconfigures_surfaces_that_can_recover() {
+        assert!(matches!(
+            wgpu_surface_error_action(SurfaceError::Lost),
+            SurfaceErrorAction::RecreateSurface
+        ));
+        assert!(matches!(
+            wgpu_surface_error_action(SurfaceError::Other),
+            SurfaceErrorAction::RecreateSurface
+        ));
+    }
+
+    #[test]
+    fn skips_frames_for_transient_or_resource_errors() {
+        for error in [
+            SurfaceError::Outdated,
+            SurfaceError::Timeout,
+            SurfaceError::OutOfMemory,
+        ] {
+            assert!(matches!(
+                wgpu_surface_error_action(error),
+                SurfaceErrorAction::SkipFrame
+            ));
+        }
+    }
+
+    #[test]
+    fn uncaptured_device_errors_are_logged_without_panicking() {
+        handle_uncaptured_wgpu_error(eframe::wgpu::Error::Internal {
+            source: Box::new(std::io::Error::other("synthetic GPU error")),
+            description: "synthetic GPU error".to_owned(),
+        });
+    }
+}
+
 impl App {
     pub fn initial_window_frame_style() -> WindowFrameStyle {
         load_settings()
@@ -648,7 +734,8 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub fn run(options: NativeOptions) -> Result<(), eframe::Error> {
+    pub fn run(mut options: NativeOptions) -> Result<(), eframe::Error> {
+        options.wgpu_options.on_surface_error = Arc::new(wgpu_surface_error_action);
         let handle = Worker::spawn();
         let devices =
             wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
@@ -770,6 +857,9 @@ impl App {
             options,
             Box::new(move |cc| {
                 if let Some(render_state) = &cc.wgpu_render_state {
+                    render_state
+                        .device
+                        .on_uncaptured_error(Arc::new(handle_uncaptured_wgpu_error));
                     let adapter = render_state.adapter.get_info();
                     tracing::info!(
                         backend = ?adapter.backend,
