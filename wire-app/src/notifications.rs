@@ -704,10 +704,12 @@ fn render_overlay(
         active.store(false, Ordering::Release);
         viewport_created.store(false, Ordering::Release);
         viewport_ready.store(false, Ordering::Release);
+        ctx.request_repaint_of(ViewportId::ROOT);
         return;
     }
     store.advance(now);
     if !store.has_notifications() {
+        info!("notification viewport deactivated after final notification");
         active.store(false, Ordering::Release);
         #[cfg(windows)]
         window_region.clear();
@@ -715,7 +717,11 @@ fn render_overlay(
         viewport_ready.store(false, Ordering::Release);
         *resize_target = None;
         *settled_frames = 0;
-        ctx.send_viewport_cmd(ViewportCommand::Close);
+        // Deferred viewports are owned by their parent and are destroyed when
+        // the parent repaints without declaring them. Closing from the child
+        // only queues a close event and can leave the native render surface in
+        // limbo until an unrelated root-window event wakes the parent.
+        ctx.request_repaint_of(ViewportId::ROOT);
         return;
     }
 
@@ -1320,6 +1326,65 @@ mod tests {
                 HOST_WIDTH,
                 TITLE_ONLY_HEIGHT + OUTER_PADDING * 2.0
             ))
+        );
+    }
+
+    #[test]
+    fn empty_notification_viewport_wakes_root_for_parent_owned_cleanup() {
+        let service = NotificationService::default();
+        service.active.store(true, Ordering::Release);
+        service.viewport_created.store(true, Ordering::Release);
+        service.viewport_ready.store(true, Ordering::Release);
+
+        let context = egui::Context::default();
+        let repaint_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&repaint_requests);
+        context.set_request_repaint_callback(move |request| {
+            captured_requests.lock().unwrap().push(request.viewport_id);
+        });
+
+        let mut input = egui::RawInput {
+            viewport_id: notification_viewport_id(),
+            ..Default::default()
+        };
+        input.viewports.insert(
+            notification_viewport_id(),
+            egui::ViewportInfo {
+                parent: Some(ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        let output = context.run(input, |ctx| {
+            render_overlay(
+                ctx,
+                ViewportClass::Deferred,
+                &service.runtime,
+                &service.active,
+                &service.viewport_created,
+                &service.viewport_ready,
+                egui::Pos2::ZERO,
+                &service.action_tx,
+                Theme::Amber,
+            );
+        });
+
+        assert!(!service.active.load(Ordering::Acquire));
+        assert!(!service.viewport_created.load(Ordering::Acquire));
+        assert!(!service.viewport_ready.load(Ordering::Acquire));
+        assert!(
+            repaint_requests.lock().unwrap().contains(&ViewportId::ROOT),
+            "the parent must repaint to stop declaring and destroy the deferred viewport"
+        );
+        let commands = &output
+            .viewport_output
+            .get(&notification_viewport_id())
+            .expect("notification viewport output should exist")
+            .commands;
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, ViewportCommand::Close)),
+            "the deferred child must not try to close itself"
         );
     }
 
