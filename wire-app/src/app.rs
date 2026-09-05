@@ -213,7 +213,7 @@ struct AppState {
     ended_video_stream_generations: BTreeMap<NodeId, u64>,
     stopped_video_stream_generations: BTreeMap<NodeId, u64>,
     focused_stream: Option<StreamSource>,
-    volume_open: BTreeSet<NodeId>,
+    participant_controls_open: BTreeSet<NodeId>,
     sharing_active: bool,
     share_system_audio: bool,
     system_audio_active: bool,
@@ -692,7 +692,7 @@ impl App {
             ended_video_stream_generations: Default::default(),
             stopped_video_stream_generations: Default::default(),
             focused_stream: None,
-            volume_open: BTreeSet::new(),
+            participant_controls_open: BTreeSet::new(),
             sharing_active: false,
             share_system_audio: settings.share_system_audio,
             system_audio_active: false,
@@ -1181,7 +1181,7 @@ impl AppState {
                         self.video_stream_generations.remove(&node_id);
                         self.ended_video_stream_generations.remove(&node_id);
                         self.stopped_video_stream_generations.remove(&node_id);
-                        self.volume_open.remove(&node_id);
+                        self.participant_controls_open.remove(&node_id);
                         if self.focused_stream == Some(StreamSource::Remote(node_id)) {
                             self.focused_stream = None;
                         }
@@ -2391,7 +2391,20 @@ impl AppState {
         let dock_top = (body.max.y - DOCK_HEIGHT).max(body.min.y + top_height);
         let participant_space = (dock_top - (body.min.y + top_height)).max(0.0);
         let participant_bar_height = if show_participants {
-            participant_bar_height(body.width(), self.calls.len() + 1, participant_space)
+            participant_bar_height(
+                body.width(),
+                &self
+                    .calls
+                    .iter()
+                    .map(|(id, state)| {
+                        matches!(state, CallState::Incoming)
+                            || (matches!(state, CallState::Calling | CallState::Active)
+                                && self.participant_controls_open.contains(id))
+                    })
+                    .chain(std::iter::once(false))
+                    .collect::<Vec<_>>(),
+                participant_space,
+            )
         } else {
             0.0
         };
@@ -4166,42 +4179,37 @@ impl AppState {
             .max_height(bar_height)
             .show(ui, |ui| {
                 ui.set_min_width(bar_width);
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.vertical_centered(|ui| {
-                    let columns = participant_bar_columns(bar_width);
+                    // Use the same inner width for column counting and card sizing.
+                    let columns = participant_columns_for_inner_width(bar_width);
+                    let card_width = PARTICIPANT_CARD_SLOT_WIDTH.min(bar_width);
                     let item_count = calls.len() + 1;
                     for row_start in (0..item_count).step_by(columns) {
                         let row_end = (row_start + columns).min(item_count);
-                        let width_id = ui.id().with(("participant-row-width", row_start));
-                        let cached_width = ui
-                            .ctx()
-                            .data_mut(|data| data.get_temp::<f32>(width_id))
-                            .unwrap_or(0.0);
-                        let lead = ((bar_width - cached_width) * 0.5).max(0.0);
-                        let mut content_rect = egui::Rect::NOTHING;
+                        let row_width = (row_end - row_start) as f32 * card_width
+                            + (row_end - row_start - 1) as f32 * PARTICIPANT_GAP;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
-                            if lead > 0.0 {
-                                ui.add_space(lead);
-                            }
+                            ui.add_space(((bar_width - row_width) * 0.5).max(0.0));
                             for index in row_start..row_end {
-                                let response =
-                                    if let Some((node_id, state)) = calls.get(index).copied() {
-                                        self.ui_participant_chip(ui, pal, node_id, state)
-                                    } else {
-                                        self.ui_self_participant_chip(ui, pal)
-                                    };
-                                content_rect = content_rect.union(response.rect);
+                                ui.push_id(calls.get(index).map(|(id, _)| *id), |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(card_width, PARTICIPANT_CHIP_HEIGHT),
+                                        Layout::top_down(Align::Min),
+                                        |ui| {
+                                            if let Some((node_id, state)) =
+                                                calls.get(index).copied()
+                                            {
+                                                self.ui_participant_chip(ui, pal, node_id, state);
+                                            } else {
+                                                self.ui_self_participant_chip(ui, pal);
+                                            }
+                                        },
+                                    );
+                                });
                             }
                         });
-                        let measured_width = content_rect.width();
-                        if measured_width.is_finite() && measured_width > 0.0 {
-                            ui.ctx().data_mut(|data| {
-                                data.insert_temp(width_id, measured_width);
-                            });
-                            if (measured_width - cached_width).abs() > 0.5 {
-                                ui.ctx().request_repaint();
-                            }
-                        }
                         if row_end < item_count {
                             ui.add_space(PARTICIPANT_GAP);
                         }
@@ -4217,7 +4225,8 @@ impl AppState {
             .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
             .inner_margin(CHIP_INNER_MARGIN)
             .show(ui, |ui| {
-                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
+                ui.set_width((ui.available_width()).max(1.0));
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -4230,11 +4239,11 @@ impl AppState {
                         .as_ref()
                         .map(load_audio_level)
                         .unwrap_or(0.0);
-                    voice_level_meter(ui, pal, level).on_hover_text(if self.muted {
-                        "Microphone muted"
+                    if self.muted {
+                        chip_status_icon(ui, pal.err, Icon::MicOff, "Your microphone is muted");
                     } else {
-                        "Your microphone level"
-                    });
+                        voice_level_meter(ui, pal, level).on_hover_text("Your microphone level");
+                    }
                     if self.sharing_active {
                         ui.add_space(CHIP_IDENTITY_GAP);
                         chip_status_icon(
@@ -4290,13 +4299,17 @@ impl AppState {
             .map(load_audio_level)
             .unwrap_or(0.0);
 
+        let expanded = matches!(state, CallState::Incoming)
+            || (matches!(state, CallState::Calling | CallState::Active)
+                && self.participant_controls_open.contains(&node_id));
         Frame::new()
             .fill(fill)
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
             .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
             .inner_margin(CHIP_INNER_MARGIN)
             .show(ui, |ui| {
-                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
+                ui.set_width((ui.available_width()).max(1.0));
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -4307,31 +4320,110 @@ impl AppState {
                         PARTICIPANT_AVATAR_SIZE,
                     );
                     ui.add_space(CHIP_IDENTITY_GAP);
-                    chip_name_label(
-                        ui,
-                        &ellipsize(&self.peer_display_name(node_id), 16),
-                        if is_active { pal.text } else { pal.text2 },
+                    let name = self.peer_display_name(node_id);
+                    let status_width = status_label.map_or(25.0, |status| {
+                        ui.painter()
+                            .layout_no_wrap(status.to_owned(), sans(11.0), pal.text2)
+                            .size()
+                            .x
+                    });
+                    let share_width = if stopped_watching {
+                        26.0
+                    } else if is_streaming {
+                        16.0
+                    } else {
+                        0.0
+                    };
+                    let toggle_width = if matches!(state, CallState::Calling | CallState::Active) {
+                        30.0
+                    } else {
+                        0.0
+                    };
+                    let name_width = (ui.available_width()
+                        - status_width
+                        - share_width
+                        - toggle_width
+                        - CHIP_IDENTITY_GAP)
+                        .max(16.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_width, PARTICIPANT_CHIP_HEIGHT),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&name).font(sans(12.0)).color(if is_active {
+                                        pal.text
+                                    } else {
+                                        pal.text2
+                                    }),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&name);
+                        },
                     );
                     ui.add_space(CHIP_IDENTITY_GAP);
-                    voice_level_meter(ui, pal, voice_level)
-                        .on_hover_text("Voice received from this participant");
-
-                    if stopped_watching {
-                        ui.add_space(CHIP_IDENTITY_GAP);
-                        chip_status_label(ui, "paused", pal.dim);
-                    } else if is_streaming {
-                        ui.add_space(CHIP_IDENTITY_GAP);
-                        chip_status_icon(
-                            ui,
-                            pal.ok,
-                            Icon::ScreenShare,
-                            "This participant is sharing their screen",
-                        );
-                    } else if let Some(status) = status_label {
-                        ui.add_space(CHIP_IDENTITY_GAP);
+                    if let Some(status) = status_label {
                         chip_status_label(ui, status, status_color);
+                    } else if self.volumes.get(&node_id).is_some_and(|volume| {
+                        f32::from_bits(volume.load(Ordering::Relaxed)) <= 0.001
+                    }) {
+                        chip_status_icon(ui, pal.text2, Icon::VolumeX, "Silenced for you");
+                    } else {
+                        voice_level_meter(ui, pal, voice_level)
+                            .on_hover_text("Voice received from this participant");
                     }
-
+                    if stopped_watching {
+                        if chip_icon_button(
+                            ui,
+                            pal,
+                            Icon::ScreenShare,
+                            false,
+                            "Resume watching screen share",
+                        )
+                        .clicked()
+                        {
+                            self.resume_watching(node_id);
+                        }
+                    } else if is_streaming {
+                        chip_status_icon(ui, pal.ok, Icon::ScreenShare, "Sharing their screen");
+                    }
+                    if matches!(state, CallState::Calling | CallState::Active) {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if chip_icon_button(
+                                ui,
+                                pal,
+                                if expanded {
+                                    Icon::ChevronDown
+                                } else {
+                                    Icon::ChevronUp
+                                },
+                                expanded,
+                                if expanded {
+                                    "Hide participant controls"
+                                } else {
+                                    "Show participant controls"
+                                },
+                            )
+                            .clicked()
+                            {
+                                if expanded {
+                                    self.participant_controls_open.remove(&node_id);
+                                } else {
+                                    self.participant_controls_open.insert(node_id);
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        });
+                    }
+                });
+                if !expanded {
+                    return;
+                }
+                ui.separator();
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(PARTICIPANT_CONTROLS_HEIGHT - 6.0);
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     match state {
                         CallState::Incoming => {
                             ui.add_space(CHIP_ACTION_GAP);
@@ -4360,63 +4452,27 @@ impl AppState {
                             }
                         }
                         CallState::Calling | CallState::Active => {
-                            ui.add_space(CHIP_ACTION_GAP);
-                            if stopped_watching
-                                && compact_chip_button(ui, pal, "Watch", ButtonTone::Primary)
-                                    .on_hover_text("Resume watching this screen share")
-                                    .clicked()
-                            {
-                                self.resume_watching(node_id);
-                            }
                             if let Some(volume) = self.volumes.get(&node_id).cloned() {
-                                if stopped_watching {
-                                    ui.add_space(6.0);
-                                }
-                                let open = self.volume_open.contains(&node_id);
-                                let open_t = ui.ctx().animate_bool_with_time(
-                                    ui.id().with(("volume-open", node_id)),
-                                    open,
-                                    0.14,
-                                );
-                                if chip_icon_button(
+                                chip_status_icon(ui, pal.text2, Icon::Volume2, "Voice volume");
+                                peer_volume_slider(
                                     ui,
                                     pal,
-                                    Icon::Volume2,
-                                    open,
-                                    if open {
-                                        "Hide voice volume"
-                                    } else {
-                                        "Voice volume"
-                                    },
-                                )
-                                .clicked()
+                                    &volume,
+                                    (ui.available_width() - 82.0).max(40.0),
+                                    PARTICIPANT_ACTION_HEIGHT,
+                                    "Voice volume",
+                                );
+                            } else {
+                                chip_status_label(ui, "Connecting…", pal.dim);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if compact_chip_button(ui, pal, "End call", ButtonTone::Danger)
+                                    .on_hover_text("End call with this participant")
+                                    .clicked()
                                 {
-                                    if open {
-                                        self.volume_open.remove(&node_id);
-                                    } else {
-                                        self.volume_open.insert(node_id);
-                                    }
+                                    self.hang_up_call(node_id);
                                 }
-                                let slider_w = 112.0 * open_t;
-                                if slider_w > 4.0 {
-                                    ui.add_space(6.0 * open_t);
-                                    peer_volume_slider(
-                                        ui,
-                                        pal,
-                                        &volume,
-                                        slider_w,
-                                        PARTICIPANT_ACTION_HEIGHT,
-                                        "Voice volume",
-                                    );
-                                }
-                            }
-                            ui.add_space(8.0);
-                            if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
-                                .on_hover_text("End call with this peer")
-                                .clicked()
-                            {
-                                self.hang_up_call(node_id);
-                            }
+                            });
                         }
                         CallState::Aborted => {}
                     }
@@ -7089,6 +7145,7 @@ const CHROME_CONTROL_HEIGHT: f32 = 36.0;
 const CHROME_SIDE_INSET: i8 = 14;
 /// Fixed participant-chip metrics keep avatar, label, and actions on one midline.
 const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
+const PARTICIPANT_CONTROLS_HEIGHT: f32 = 36.0;
 const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
 const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
 const CHIP_IDENTITY_GAP: f32 = 8.0;
@@ -7148,6 +7205,9 @@ fn chip_icon_button(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(PARTICIPANT_ACTION_HEIGHT), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
     let response = response.on_hover_text(tooltip);
     let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
     let (fill, stroke, icon_color) = if selected {
@@ -7216,21 +7276,29 @@ const PARTICIPANT_GAP: f32 = 8.0;
 fn participant_bar_columns(width: f32) -> usize {
     let chrome_width = 2.0 * (f32::from(CHROME_SIDE_INSET) + 10.0);
     let inner_width = (width - chrome_width).max(1.0);
+    participant_columns_for_inner_width(inner_width)
+}
+
+fn participant_columns_for_inner_width(inner_width: f32) -> usize {
     ((inner_width + PARTICIPANT_GAP) / (PARTICIPANT_CARD_SLOT_WIDTH + PARTICIPANT_GAP))
         .floor()
         .max(1.0) as usize
 }
 
-fn participant_bar_height(width: f32, participant_count: usize, max_height: f32) -> f32 {
-    if participant_count == 0 || max_height <= 0.0 {
+fn participant_bar_height(width: f32, expanded: &[bool], max_height: f32) -> f32 {
+    if expanded.is_empty() || max_height <= 0.0 {
         return 0.0;
     }
-
     let columns = participant_bar_columns(width);
-    let rows = participant_count.div_ceil(columns);
-    let content_height =
-        rows as f32 * PARTICIPANT_CHIP_HEIGHT + rows.saturating_sub(1) as f32 * PARTICIPANT_GAP;
-    // Participant frame: 4/6 outer margin plus 8/8 inner margin.
+    let rows = expanded.len().div_ceil(columns);
+    let expanded_rows = expanded
+        .chunks(columns)
+        .filter(|row| row.iter().any(|open| *open))
+        .count();
+    // Each card has a one-point frame stroke above and below its content.
+    let content_height = rows as f32 * (PARTICIPANT_CHIP_HEIGHT + 2.0)
+        + expanded_rows as f32 * PARTICIPANT_CONTROLS_HEIGHT
+        + rows.saturating_sub(1) as f32 * PARTICIPANT_GAP;
     (content_height + 26.0).min(max_height)
 }
 
@@ -8641,10 +8709,32 @@ mod layout_tests {
 
     #[test]
     fn participant_bar_adds_rows_as_the_window_narrows() {
-        assert_eq!(participant_bar_height(900.0, 3, 500.0), 66.0);
-        assert_eq!(participant_bar_height(560.0, 3, 500.0), 114.0);
-        assert_eq!(participant_bar_height(320.0, 3, 500.0), 162.0);
-        assert_eq!(participant_bar_height(320.0, 3, 100.0), 100.0);
+        assert_eq!(participant_bar_height(900.0, &[false; 3], 500.0), 68.0);
+        assert_eq!(participant_bar_height(560.0, &[false; 3], 500.0), 118.0);
+        assert_eq!(participant_bar_height(320.0, &[false; 3], 500.0), 168.0);
+        assert_eq!(participant_bar_height(320.0, &[false; 3], 100.0), 100.0);
+    }
+
+    #[test]
+    fn participant_controls_expand_rows_without_changing_columns() {
+        assert_eq!(
+            participant_bar_height(900.0, &[true, false, false], 500.0),
+            104.0
+        );
+        assert_eq!(
+            participant_bar_height(900.0, &[true, true, false], 500.0),
+            104.0
+        );
+        assert_eq!(
+            participant_bar_height(560.0, &[true, false, true], 500.0),
+            190.0
+        );
+        assert_eq!(participant_bar_height(320.0, &[true; 3], 100.0), 100.0);
+        assert_eq!(participant_bar_height(320.0, &[], 100.0), 0.0);
+        assert_eq!(
+            participant_bar_columns(560.0),
+            participant_columns_for_inner_width(512.0)
+        );
     }
 
     #[test]
