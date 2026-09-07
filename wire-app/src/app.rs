@@ -207,7 +207,6 @@ struct AppState {
     stream_volumes: BTreeMap<NodeId, VolumeHandle>,
     local_audio_level: Option<AudioLevelHandle>,
     remote_audio_levels: BTreeMap<NodeId, AudioLevelHandle>,
-    rtts: BTreeMap<NodeId, Duration>,
     video_frames: BTreeMap<NodeId, VideoFrameState>,
     video_stream_generations: BTreeMap<NodeId, u64>,
     ended_video_stream_generations: BTreeMap<NodeId, u64>,
@@ -773,7 +772,6 @@ impl App {
             stream_volumes: Default::default(),
             local_audio_level: None,
             remote_audio_levels: Default::default(),
-            rtts: Default::default(),
             video_frames: Default::default(),
             video_stream_generations: Default::default(),
             ended_video_stream_generations: Default::default(),
@@ -1266,7 +1264,6 @@ impl AppState {
                         self.volumes.remove(&node_id);
                         self.stream_volumes.remove(&node_id);
                         self.remote_audio_levels.remove(&node_id);
-                        self.rtts.remove(&node_id);
                         self.video_frames.remove(&node_id);
                         self.video_stream_generations.remove(&node_id);
                         self.ended_video_stream_generations.remove(&node_id);
@@ -1360,9 +1357,6 @@ impl AppState {
                     self.volumes.insert(node_id, volume);
                     self.stream_volumes.insert(node_id, stream_volume);
                     self.remote_audio_levels.insert(node_id, level);
-                }
-                Event::SetRtt(node_id, rtt) => {
-                    self.rtts.insert(node_id, rtt);
                 }
                 Event::VideoStreamAccepted {
                     node_id,
@@ -3959,77 +3953,6 @@ impl AppState {
         }
     }
 
-    #[allow(dead_code)]
-    fn ui_image_preview_legacy(&mut self, ctx: &egui::Context, pal: &Palette) {
-        let Some(preview) = self.chat.image_preview.clone() else {
-            return;
-        };
-        let mut open = true;
-        let mut close = false;
-        let mut delete = false;
-        egui::Window::new("Image preview")
-            .id(egui::Id::new("chat-image-preview"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size(Vec2::new(720.0, 560.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} × {} · {}",
-                            preview.attachment.width,
-                            preview.attachment.height,
-                            format_bytes(preview.attachment.byte_len)
-                        ))
-                        .color(pal.dim),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if action_button(ui, pal, "Close", ButtonTone::Secondary).clicked() {
-                            close = true;
-                        }
-                        if preview.draft
-                            && action_button(ui, pal, "Delete", ButtonTone::Danger).clicked()
-                        {
-                            delete = true;
-                        }
-                        if action_button(ui, pal, "Download", ButtonTone::Secondary).clicked() {
-                            save_chat_attachment(&preview.attachment);
-                        }
-                    });
-                });
-                ui.separator();
-                if let Some(texture) = attachment_texture(
-                    ui.ctx(),
-                    &mut self.chat.attachment_textures,
-                    &preview.attachment,
-                ) {
-                    let available = ui.available_size().max(Vec2::splat(1.0));
-                    let scale = (available.x / preview.attachment.width as f32)
-                        .min(available.y / preview.attachment.height as f32);
-                    let size = Vec2::new(
-                        preview.attachment.width as f32 * scale,
-                        preview.attachment.height as f32 * scale,
-                    );
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new((texture.id(), size)).fit_to_exact_size(size));
-                    });
-                }
-            });
-        if delete {
-            self.chat
-                .draft_attachments
-                .retain(|attachment| attachment.id != preview.attachment.id);
-            open = false;
-        }
-        if close {
-            open = false;
-        }
-        if !open {
-            self.chat.image_preview = None;
-        }
-    }
-
     fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut open = self.chat.show_group_editor;
         egui::Window::new("Create group")
@@ -4873,196 +4796,6 @@ impl AppState {
             });
     }
 
-    #[allow(dead_code)]
-    fn ui_participant_strip(&mut self, ui: &mut Ui, pal: &Palette) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("PEERS")
-                    .family(kh_family())
-                    .color(pal.dim)
-                    .size(12.0),
-            );
-            ui.label(
-                RichText::new("live call status")
-                    .color(pal.dim2)
-                    .size(ui_font_size(12.0)),
-            );
-        });
-        ui.add_space(2.0);
-        if self.calls.is_empty() {
-            self.ui_empty_peer_tile(ui, pal);
-        } else {
-            let calls: Vec<_> = self
-                .calls
-                .iter()
-                .map(|(node_id, state)| (*node_id, *state))
-                .collect();
-            let column_count = participant_grid_columns(ui.available_width(), calls.len());
-            let tile_width =
-                participant_tile_width(ui.available_width(), column_count, PARTICIPANT_GRID_GAP);
-
-            for (row_index, row) in calls.chunks(column_count).enumerate() {
-                if row_index > 0 {
-                    ui.add_space(PARTICIPANT_GRID_GAP);
-                }
-                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                    ui.spacing_mut().item_spacing.x = PARTICIPANT_GRID_GAP;
-                    for &(node_id, state) in row {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(tile_width, 0.0),
-                            Layout::top_down(Align::Min),
-                            |ui| self.ui_peer_tile(ui, pal, node_id, state, tile_width),
-                        );
-                    }
-                });
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn ui_empty_peer_tile(&self, ui: &mut Ui, pal: &Palette) {
-        Frame::new()
-            .fill(pal.panel)
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(16, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let (icon_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(icon_rect.center(), 17.0, pal.panel2);
-                    ui.painter().circle_stroke(
-                        icon_rect.center(),
-                        17.0,
-                        Stroke::new(1.0_f32, pal.line_br),
-                    );
-                    ui.painter().text(
-                        icon_rect.center(),
-                        Align2::CENTER_CENTER,
-                        ph::USER_PLUS,
-                        sans(15.0),
-                        pal.dim,
-                    );
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("No one else is here")
-                                .color(pal.text2)
-                                .size(ui_font_size(13.0)),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Start a call from a saved contact or enter a node ID below.",
-                            )
-                            .color(pal.dim)
-                            .size(ui_font_size(11.5)),
-                        );
-                    });
-                });
-            });
-    }
-
-    #[allow(dead_code)]
-    fn ui_peer_tile(
-        &mut self,
-        ui: &mut Ui,
-        pal: &Palette,
-        node_id: NodeId,
-        state: CallState,
-        tile_width: f32,
-    ) {
-        Frame::new()
-            .fill(pal.panel)
-            .stroke(Stroke::new(
-                1.0_f32,
-                if matches!(state, CallState::Active) {
-                    pal.line_br
-                } else {
-                    pal.line
-                },
-            ))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.set_width((tile_width - 28.0).max(1.0));
-                let peer_name = self.peer_display_name(node_id);
-                let peer_initial = self.peer_initial(node_id);
-                ui.horizontal(|ui| {
-                    circle_avatar(ui, pal, &peer_initial, 28.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(peer_name)
-                                .color(pal.text)
-                                .size(ui_font_size(13.0)),
-                        )
-                        .on_hover_text(format!("Node {}…", node_id.fmt_short()));
-                        let (label, color) = match state {
-                            CallState::Incoming => ("incoming", pal.accent),
-                            CallState::Calling => ("connecting", pal.accent),
-                            CallState::Active => ("connected", pal.ok),
-                            CallState::Aborted => ("ended", pal.err),
-                        };
-                        ui.label(RichText::new(label).color(color).size(ui_font_size(11.5)));
-                    });
-                });
-                ui.add_space(7.0);
-                ui.horizontal(|ui| match state {
-                    CallState::Incoming => {
-                        let call_waiting = self.local_group_call.is_some()
-                            && !self.incoming_belongs_to_local_group(node_id);
-                        let accept_label = if call_waiting {
-                            "End & accept"
-                        } else {
-                            "Accept"
-                        };
-                        if action_button(ui, pal, accept_label, ButtonTone::Primary).clicked() {
-                            self.accept_incoming_call(node_id);
-                        }
-                        if action_button(ui, pal, "Decline", ButtonTone::Danger).clicked() {
-                            self.cmd(Command::HandleIncoming {
-                                node_id,
-                                accept: false,
-                            });
-                        }
-                    }
-                    CallState::Calling | CallState::Active => {
-                        if let Some(rtt) = self.rtts.get(&node_id) {
-                            ui.label(
-                                rtt_label(*rtt)
-                                    .color(pal.dim)
-                                    .monospace()
-                                    .size(ui_font_size(11.0)),
-                            );
-                        }
-                        if let Some(volume) = self.volumes.get(&node_id).cloned() {
-                            peer_volume_slider(ui, pal, &volume, 56.0, 18.0, "Voice volume");
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if action_button(ui, pal, "End", ButtonTone::Danger).clicked() {
-                                self.hang_up_call(node_id);
-                            }
-                        });
-                    }
-                    CallState::Aborted => {}
-                });
-            });
-    }
-
-    #[allow(dead_code)]
-    fn ui_sidebar(&mut self, ui: &mut Ui) {
-        self.ui_identity_card(ui);
-        ui.add_space(12.0);
-        self.ui_dial_card(ui);
-        ui.add_space(12.0);
-        self.ui_friends_card(ui);
-        ui.add_space(12.0);
-        self.ui_calls_card(ui);
-        ui.add_space(12.0);
-        self.ui_sharing_card(ui);
-    }
-
     /// Collapsed tools: one-off dial, copy own ID, add friend.
     fn ui_call_more_options(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
@@ -5491,153 +5224,6 @@ impl AppState {
             .sort_by(|left, right| left.name.cmp(&right.name));
         save_friends(&self.friends);
         self.sync_friends_with_worker();
-    }
-
-    #[allow(dead_code)]
-    fn ui_calls_card(&mut self, ui: &mut Ui) {
-        let pal = Palette::for_theme(self.theme);
-        section_card(ui, &pal, "Calls", |ui| {
-            if self.calls.is_empty() {
-                ui.label(RichText::new("No active calls").weak());
-                return;
-            }
-
-            let calls: Vec<_> = self
-                .calls
-                .iter()
-                .map(|(node_id, state)| (*node_id, *state))
-                .collect();
-            for (node_id, state) in calls {
-                let peer_name = self.peer_display_name(node_id);
-                Frame::new()
-                    .fill(ui.visuals().widgets.noninteractive.bg_fill)
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(10.0)
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        ui.visuals().widgets.noninteractive.bg_stroke.color,
-                    ))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(peer_name)
-                                    .color(pal.text)
-                                    .size(ui_font_size(13.0)),
-                            )
-                            .on_hover_text(format!("Node {}…", node_id.fmt_short()));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                call_state_badge(ui, &state);
-                            });
-                        });
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| match state {
-                            CallState::Incoming => {
-                                let call_waiting = self.local_group_call.is_some()
-                                    && !self.incoming_belongs_to_local_group(node_id);
-                                let accept_label = if call_waiting {
-                                    "End & accept"
-                                } else {
-                                    "Accept"
-                                };
-                                if action_button(ui, &pal, accept_label, ButtonTone::Primary)
-                                    .on_hover_text(if call_waiting {
-                                        "Leave the group call and answer this call"
-                                    } else {
-                                        "Answer this call"
-                                    })
-                                    .clicked()
-                                {
-                                    self.accept_incoming_call(node_id);
-                                }
-                                if action_button(ui, &pal, "Decline", ButtonTone::Danger).clicked()
-                                {
-                                    self.cmd(Command::HandleIncoming {
-                                        node_id,
-                                        accept: false,
-                                    });
-                                }
-                            }
-                            CallState::Calling | CallState::Active => {
-                                if action_button(ui, &pal, "End", ButtonTone::Danger).clicked() {
-                                    self.hang_up_call(node_id);
-                                }
-                            }
-                            CallState::Aborted => {}
-                        });
-
-                        if matches!(state, CallState::Active) {
-                            if let Some(volume) = self.volumes.get(&node_id).cloned() {
-                                ui.horizontal(|ui| {
-                                    ui.label("Volume");
-                                    peer_volume_slider(
-                                        ui,
-                                        &pal,
-                                        &volume,
-                                        120.0,
-                                        18.0,
-                                        "Voice volume",
-                                    );
-                                });
-                            }
-                            if let Some(rtt) = self.rtts.get(&node_id) {
-                                ui.label(rtt_label(*rtt));
-                            }
-                        }
-                    });
-                ui.add_space(8.0);
-            }
-        });
-    }
-
-    #[allow(dead_code)]
-    fn ui_sharing_card(&mut self, ui: &mut Ui) {
-        let pal = Palette::for_theme(self.theme);
-        section_card(ui, &pal, "Screen sharing", |ui| {
-            ui.horizontal(|ui| {
-                if self.sharing_active {
-                    if action_button(ui, &pal, "Stop sharing", ButtonTone::Danger).clicked() {
-                        self.stop_sharing_from_ui();
-                    }
-                    ui.label(RichText::new("Live").color(Color32::from_rgb(100, 200, 120)));
-                } else if action_button(ui, &pal, "Start sharing", ButtonTone::Primary).clicked() {
-                    self.open_capture_picker();
-                }
-            });
-
-            if let Some(preview) = &mut self.preview {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Outgoing preview").small().weak());
-                ui.horizontal(|ui| {
-                    ui.label(format!("{:.0}×{:.0}", preview.width, preview.height));
-                    ui.separator();
-                    ui.label(format!("{:.0} fps", preview.actual_fps));
-                    ui.separator();
-                    ui.label(format!("{:.0} ms encode", preview.encode_time_ms));
-                });
-                sync_rgba_texture(
-                    ui,
-                    "preview",
-                    preview.width,
-                    preview.height,
-                    &preview.data,
-                    preview.generation,
-                    &mut preview.uploaded_generation,
-                    &mut preview.texture,
-                    &mut preview.upload_stats,
-                );
-                if let Some(tex) = &preview.texture {
-                    let max_w = ui.available_width();
-                    let aspect = preview.width as f32 / preview.height as f32;
-                    ui.add(
-                        egui::Image::new(tex)
-                            .max_width(max_w)
-                            .max_height(max_w / aspect),
-                    );
-                }
-            }
-        });
     }
 
     fn ui_stream_panel(
@@ -7364,52 +6950,6 @@ fn compact_chip_button(
     response
 }
 
-#[allow(dead_code)]
-fn call_state_badge(ui: &mut Ui, state: &CallState) {
-    let (text, color) = match state {
-        CallState::Incoming => ("Incoming", Color32::from_rgb(255, 200, 80)),
-        CallState::Calling => ("Calling…", Color32::from_rgb(120, 170, 255)),
-        CallState::Active => ("Active", Color32::from_rgb(100, 200, 120)),
-        CallState::Aborted => ("Ended", Color32::GRAY),
-    };
-    ui.label(RichText::new(text).color(color).small());
-}
-
-#[allow(dead_code)]
-fn rtt_label(rtt: Duration) -> RichText {
-    let text = fmt_rtt(&rtt);
-    let color = if rtt.as_millis() < 100 {
-        Color32::GREEN
-    } else if rtt.as_millis() < 300 {
-        Color32::YELLOW
-    } else {
-        Color32::LIGHT_RED
-    };
-    RichText::new(text).color(color).small()
-}
-
-#[allow(dead_code)]
-const PARTICIPANT_TILE_MIN_WIDTH: f32 = 360.0;
-const PARTICIPANT_GRID_GAP: f32 = 10.0;
-
-#[allow(dead_code)]
-fn participant_grid_columns(available_width: f32, participant_count: usize) -> usize {
-    if participant_count == 0 {
-        return 1;
-    }
-    let fitting_columns = ((available_width + PARTICIPANT_GRID_GAP)
-        / (PARTICIPANT_TILE_MIN_WIDTH + PARTICIPANT_GRID_GAP))
-        .floor()
-        .max(1.0) as usize;
-    fitting_columns.min(participant_count).min(3)
-}
-
-#[allow(dead_code)]
-fn participant_tile_width(available_width: f32, columns: usize, gap: f32) -> f32 {
-    let columns = columns.max(1);
-    ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
-}
-
 fn stream_grid_dims(count: usize, available: Vec2) -> (usize, usize) {
     if count <= 1 || available.x <= 0.0 || available.y <= 0.0 {
         return (1, 1);
@@ -8092,11 +7632,6 @@ fn fmt_error(text: &str) -> RichText {
     egui::RichText::new(text).color(Color32::LIGHT_RED)
 }
 
-#[allow(dead_code)]
-fn fmt_rtt(dur: &Duration) -> String {
-    format!("{}ms", dur.as_millis())
-}
-
 fn mix_color(base: Color32, tint: Color32, amount: f32) -> Color32 {
     let amount = amount.clamp(0.0, 1.0);
     let channel =
@@ -8738,21 +8273,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn participant_grid_keeps_every_peer_on_screen() {
-        assert_eq!(participant_grid_columns(1570.0, 2), 2);
-        assert_eq!(participant_grid_columns(1570.0, 3), 3);
-        assert_eq!(participant_grid_columns(700.0, 2), 1);
-
-        let width = participant_tile_width(1570.0, 2, PARTICIPANT_GRID_GAP);
-        assert!((width - 780.0).abs() < f32::EPSILON);
-        assert_eq!(
-            width * 2.0 + PARTICIPANT_GRID_GAP,
-            1570.0,
-            "tiles and gap must consume exactly the visible width"
-        );
-    }
-
-    #[test]
     fn video_fit_preserves_aspect_ratio() {
         let wide = video_display_size(Vec2::new(1000.0, 400.0), 16.0 / 9.0, false);
         assert!((wide.x - 711.1111).abs() < 0.01);
@@ -9190,7 +8710,6 @@ enum Event {
         stream_volume: VolumeHandle,
         level: AudioLevelHandle,
     },
-    SetRtt(NodeId, Duration),
     VideoStreamAccepted {
         node_id: NodeId,
         generation: u64,
@@ -9411,7 +8930,6 @@ struct Worker {
     next_call_generation: u64,
     _router: Router,
     audio_context: Option<AudioContext>,
-    rtt_interval: time::Interval,
     presence_interval: time::Interval,
     video_config: VideoConfig,
     video_frame_tx: tokio::sync::broadcast::Sender<Arc<wire::video::transport::EncodedVideoFrame>>,
@@ -9571,7 +9089,6 @@ impl Worker {
             _router,
             audio_context: None,
             update_callback: None,
-            rtt_interval: time::interval(Duration::from_secs(1)),
             presence_interval: time::interval(PRESENCE_REFRESH_INTERVAL),
             video_config: VideoConfig::default(),
             video_frame_tx,
@@ -9681,9 +9198,6 @@ impl Worker {
                         self.active_calls.remove(&node_id);
                         self.emit(Event::SetCallState(node_id, CallState::Aborted)).await?;
                     }
-                }
-                _ = self.rtt_interval.tick() => {
-                    self.query_rtts().await?;
                 }
                 _ = self.presence_interval.tick() => {
                     self.client_status.refresh_allowed_peers();
@@ -10120,18 +9634,6 @@ impl Worker {
         if self.active_calls.is_empty() && self.sharing_active {
             self.stop_capture().await;
         }
-    }
-
-    async fn query_rtts(&mut self) -> Result<()> {
-        for (node_id, info) in &self.active_calls {
-            if let Some(rtt) = match info {
-                CallInfo::Active(conn) => Some(conn.transport().rtt()),
-                _ => None,
-            } {
-                self.emit(Event::SetRtt(*node_id, rtt)).await?;
-            }
-        }
-        Ok(())
     }
 
     fn close_active_call_transports(&self) {
