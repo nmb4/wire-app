@@ -9,6 +9,7 @@ mod notifications;
 mod overlay_window;
 mod persistence;
 mod resource_monitor;
+mod runtime;
 mod sounds;
 mod system_audio;
 mod title_bar;
