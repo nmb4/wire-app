@@ -8838,8 +8838,10 @@ mod layout_tests {
         let degenerate = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0));
         let pane_size = Vec2::new(720.0, 560.0);
         let pass = |pinned: bool, screen: Rect| {
-            let mut input = egui::RawInput::default();
-            input.screen_rect = Some(screen);
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
             ctx.begin_pass(input);
             let mut shown = None;
             let mut window = egui::Window::new("pane")
@@ -8854,7 +8856,7 @@ mod layout_tests {
                 ui.set_min_size(pane_size);
                 shown = Some(ui.clip_rect());
             });
-            ctx.end_pass();
+            let _ = ctx.end_pass();
             shown.unwrap_or(healthy)
         };
 
