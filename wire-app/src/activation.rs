@@ -19,16 +19,23 @@ pub(crate) struct ActivationWatcher {
 }
 
 impl ActivationWatcher {
-    pub(crate) fn start(path: PathBuf, ctx: Context, hwnd: Option<isize>) -> Self {
+    pub(crate) fn start(
+        path: PathBuf,
+        ctx: Context,
+        hwnd: Option<isize>,
+        hidden: Arc<AtomicBool>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(Mutex::new(hwnd));
         let thread_stop = stop.clone();
         let thread_hwnd = hwnd.clone();
+        let thread_hidden = hidden.clone();
         let join = thread::Builder::new()
             .name("wire-activation-watch".to_owned())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     if path.exists() {
+                        thread_hidden.store(false, Ordering::Release);
                         show_native_window(&thread_hwnd);
                         ctx.request_repaint();
                     }

@@ -6,6 +6,7 @@ mod client_status;
 mod dev_pair;
 #[cfg(windows)]
 mod global_hotkeys;
+mod hidden_event_loop;
 pub mod host;
 mod notifications;
 mod overlay_window;

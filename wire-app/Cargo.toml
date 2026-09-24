@@ -49,6 +49,7 @@ eframe = { version = "0.33.3", default-features = false, features = [
     "wayland",
     "wgpu",
 ] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 arboard = { version = "3.4.1", features = ["wl-clipboard-rs"] }
 rfd = "0.15"
 sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }

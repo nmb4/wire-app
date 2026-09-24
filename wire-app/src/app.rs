@@ -24,6 +24,7 @@ use crate::{
     },
     client_status::{Availability, GroupCallAnnouncement, StatusUpdate},
     dev_pair::DevPairState,
+    hidden_event_loop,
     host::ServiceClient,
     notifications::{NotificationAction, NotificationService},
     persistence,
@@ -44,7 +45,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc,
     },
     time::Duration,
@@ -64,6 +65,7 @@ pub struct App {
     close_to_tray: bool,
     quit_requested: bool,
     window_visible: bool,
+    window_hidden: Arc<AtomicBool>,
     hidden_video_nodes: BTreeSet<NodeId>,
     activation_watcher: Option<ActivationWatcher>,
     state: AppState,
@@ -614,12 +616,6 @@ impl eframe::App for App {
             self.show_window(ctx);
         }
         self.handle_close_request(ctx);
-        if !self.window_visible {
-            // tray-icon wakes egui when possible; this low-frequency fallback
-            // also covers window systems that do not deliver repaint requests
-            // while the native window is hidden.
-            ctx.request_repaint_after(Duration::from_millis(250));
-        }
         #[cfg(windows)]
         while let Some(action) = self
             .global_hotkeys
@@ -655,6 +651,7 @@ impl eframe::App for App {
                     self.state.service.activation_path(),
                     ctx.clone(),
                     hwnd,
+                    self.window_hidden.clone(),
                 ));
             }
             #[cfg(windows)]
@@ -708,6 +705,7 @@ impl App {
             return;
         }
         self.window_visible = false;
+        self.window_hidden.store(true, Ordering::Release);
         self.state.service.set_presenter_active(false);
         self.hidden_video_nodes = self.state.pause_remote_video_for_hidden_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -717,6 +715,7 @@ impl App {
         info!("showing Wire from the system tray");
         if !self.window_visible {
             self.window_visible = true;
+            self.window_hidden.store(false, Ordering::Release);
             let discarded = self.state.service.discard_buffered_media_events();
             if discarded > 0 {
                 debug!(
@@ -964,6 +963,7 @@ impl App {
         state.sync_friends_with_worker();
 
         let rounded = window_frame::style_wants_rounded(state.window_frame_style);
+        let window_hidden = Arc::new(AtomicBool::new(start_hidden));
         let app = App {
             state,
             is_first_update: true,
@@ -972,6 +972,7 @@ impl App {
             close_to_tray: false,
             quit_requested: false,
             window_visible: !start_hidden,
+            window_hidden: window_hidden.clone(),
             hidden_video_nodes: BTreeSet::new(),
             activation_watcher: None,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -979,7 +980,7 @@ impl App {
             #[cfg(windows)]
             global_hotkeys: None,
         };
-        eframe::run_native(
+        hidden_event_loop::run(
             "wire",
             options,
             Box::new(move |cc| {
@@ -1006,7 +1007,7 @@ impl App {
                 let mut app = app;
                 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 if !dev_fixture {
-                    match TrayController::new(&cc.egui_ctx) {
+                    match TrayController::new(&cc.egui_ctx, app.window_hidden.clone()) {
                         Ok(tray) => {
                             app.tray = Some(tray);
                             app.close_to_tray = true;
@@ -1026,6 +1027,7 @@ impl App {
                 }
                 Ok(Box::new(app))
             }),
+            window_hidden,
         )
     }
 }

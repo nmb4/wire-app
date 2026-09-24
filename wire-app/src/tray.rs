@@ -1,6 +1,7 @@
 //! System-tray integration for the process-owned desktop shell.
 
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
     Arc, Mutex,
 };
@@ -33,7 +34,7 @@ pub(crate) struct TrayController {
 }
 
 impl TrayController {
-    pub(crate) fn new(ctx: &egui::Context) -> Result<Self> {
+    pub(crate) fn new(ctx: &egui::Context, hidden: Arc<AtomicBool>) -> Result<Self> {
         let icon = load_icon()?;
         let menu = Menu::new();
         let open = MenuItem::with_id(OPEN_MENU_ID, "Open Wire", true, None);
@@ -60,6 +61,7 @@ impl TrayController {
         let wake_window = Arc::new(Mutex::new(None));
         let icon_signal_tx = signal_tx.clone();
         let icon_wake_window = wake_window.clone();
+        let icon_hidden = hidden.clone();
         let repaint_ctx = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
             if matches!(
@@ -80,6 +82,7 @@ impl TrayController {
             );
             let _ = icon_signal_tx.send(TraySignal::Icon(event));
             if activate {
+                icon_hidden.store(false, Ordering::Release);
                 show_native_window(&icon_wake_window);
             } else {
                 wake_native_event_loop(&icon_wake_window);
@@ -89,11 +92,13 @@ impl TrayController {
         let repaint_ctx = ctx.clone();
         let menu_signal_tx = signal_tx;
         let menu_wake_window = wake_window.clone();
+        let menu_hidden = hidden.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             tracing::debug!(id = event.id.as_ref(), "received tray menu event");
             let _ = menu_signal_tx.send(TraySignal::Menu(event));
             // Menu events can arrive while the root window is hidden. Reveal it
             // before waking egui so Open and Quit are both delivered reliably.
+            menu_hidden.store(false, Ordering::Release);
             show_native_window(&menu_wake_window);
             repaint_ctx.request_repaint();
         }));
