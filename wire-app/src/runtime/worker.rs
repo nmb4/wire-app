@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use iroh::{protocol::Router, Endpoint, NodeId};
 use tokio::{task::JoinSet, time};
 use tracing::{debug, info, warn};
@@ -17,6 +17,15 @@ use wire::{
     video::VideoConfig,
 };
 
+#[cfg(target_os = "windows")]
+use super::trim_process_working_set;
+use super::{
+    video::{
+        await_video_send_stop, request_video_send_stop, run_video_recv, run_video_send,
+        stop_video_send, VideoPeerTasks, VideoReceiveControl, VideoSendCommand,
+    },
+    CallState, Command, Event, EventPublisher, ServiceClient, WorkerHandle,
+};
 use crate::{
     chat,
     client_status::{
@@ -24,14 +33,6 @@ use crate::{
         PRESENCE_REFRESH_INTERVAL,
     },
 };
-
-#[cfg(target_os = "windows")]
-use super::trim_process_working_set;
-use super::video::{
-    await_video_send_stop, request_video_send_stop, run_video_recv, run_video_send,
-    stop_video_send, VideoPeerTasks, VideoReceiveControl, VideoSendCommand,
-};
-use super::{CallState, Command, Event, UpdateCallback, WorkerHandle};
 
 enum CallInfo {
     Calling,
@@ -42,11 +43,10 @@ enum CallInfo {
 
 pub(super) struct Worker {
     command_rx: Receiver<Command>,
-    event_tx: Sender<Event>,
+    event_tx: EventPublisher,
     active_calls: BTreeMap<NodeId, CallInfo>,
     volumes: BTreeMap<NodeId, VolumeHandle>,
     stream_volumes: BTreeMap<NodeId, VolumeHandle>,
-    update_callback: Option<UpdateCallback>,
     endpoint: Endpoint,
     handler: RtcProtocol,
     call_tasks: JoinSet<(NodeId, u64, Result<()>)>,
@@ -93,11 +93,12 @@ impl Worker {
         self.call_generations.get(&node_id) == Some(&generation)
     }
 
-    pub(super) fn spawn() -> WorkerHandle {
-        // UI actions must never block the egui thread while the worker is busy
+    pub(super) fn spawn() -> (WorkerHandle, ServiceClient) {
+        // UI actions must never block the presenter while the worker is busy
         // stopping capture, dialing, or reconciling chat state.
         let (command_tx, command_rx) = async_channel::unbounded();
-        let (event_tx, event_rx) = async_channel::bounded(64);
+        let (event_tx, event_rx) = EventPublisher::new();
+        let thread_event_tx = event_tx.clone();
         let thread = std::thread::spawn(move || {
             info!("Wire worker thread starting");
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -108,17 +109,17 @@ impl Worker {
                 Err(error) => {
                     let detail = format!("Could not start the background runtime: {error}");
                     warn!("{detail}");
-                    let _ = event_tx.send_blocking(Event::WorkerFailed(detail));
+                    thread_event_tx.send_blocking(Event::WorkerFailed(detail));
                     return;
                 }
             };
             rt.block_on(async move {
-                let mut worker = match Worker::start(event_tx.clone(), command_rx).await {
+                let mut worker = match Worker::start(thread_event_tx.clone(), command_rx).await {
                     Ok(worker) => worker,
                     Err(error) => {
                         let detail = format!("Could not start Wire networking: {error:#}");
                         warn!("worker failed to start: {error:#}");
-                        let _ = event_tx.send(Event::WorkerFailed(detail)).await;
+                        thread_event_tx.send(Event::WorkerFailed(detail)).await;
                         return;
                     }
                 };
@@ -129,23 +130,27 @@ impl Worker {
                 }
             });
         });
-        WorkerHandle {
+        let client = ServiceClient {
+            command_tx: command_tx.clone(),
             event_rx,
-            command_tx,
-            thread: Some(thread),
-        }
+            event_publisher: event_tx,
+        };
+        (
+            WorkerHandle {
+                command_tx,
+                thread: Some(thread),
+            },
+            client,
+        )
     }
 
     async fn emit(&self, event: Event) -> Result<()> {
-        self.event_tx.send(event).await?;
-        if let Some(callback) = &self.update_callback {
-            callback();
-        }
+        self.event_tx.publish(event);
         Ok(())
     }
 
     async fn start(
-        event_tx: async_channel::Sender<Event>,
+        event_tx: EventPublisher,
         command_rx: async_channel::Receiver<Command>,
     ) -> Result<Self> {
         info!("binding Wire networking endpoint");
@@ -198,7 +203,6 @@ impl Worker {
             handler,
             _router,
             audio_context: None,
-            update_callback: None,
             presence_interval: time::interval(PRESENCE_REFRESH_INTERVAL),
             video_config: VideoConfig::default(),
             video_frame_tx,
@@ -237,17 +241,20 @@ impl Worker {
             }
             tokio::select! {
                 command = self.command_rx.recv() => {
-                    let Ok(command) = command else {
-                        info!("app command channel closed; stopping worker");
-                        self.client_status.broadcast_offline().await;
-                        self.close_active_call_transports();
-                        if self.sharing_active {
-                            self.stop_capture().await;
+                    match command {
+                        Err(_) => {
+                            info!("application command channel closed; stopping worker");
+                            break;
                         }
-                        break;
-                    };
-                    if let Err(err) = self.handle_command(command).await {
-                        warn!("command failed: {err}");
+                        Ok(Command::Shutdown) => {
+                            info!("application requested worker shutdown");
+                            break;
+                        }
+                        Ok(command) => {
+                            if let Err(err) = self.handle_command(command).await {
+                                warn!("command failed: {err}");
+                            }
+                        }
                     }
                 }
                 conn = self.handler.accept() => {
@@ -333,6 +340,12 @@ impl Worker {
                     }
                 }
             }
+        }
+        info!("Wire worker runtime is stopping");
+        self.client_status.broadcast_offline().await;
+        self.close_active_call_transports();
+        if self.sharing_active {
+            self.stop_capture().await;
         }
         Ok(())
     }
@@ -616,11 +629,10 @@ impl Worker {
         if recv_dead {
             let recv_conn = conn.clone();
             let event_tx = self.event_tx.clone();
-            let callback = self.update_callback.clone();
             let nid = node_id;
             let (recv_control_tx, recv_control_rx) = tokio::sync::mpsc::unbounded_channel();
             let handle = tokio::spawn(async move {
-                run_video_recv(recv_conn, nid, event_tx, callback, recv_control_rx).await;
+                run_video_recv(recv_conn, nid, event_tx, recv_control_rx).await;
             });
             let entry = self
                 .video_peers
@@ -778,7 +790,6 @@ impl Worker {
         let (preview_tx, preview_rx) =
             async_channel::bounded::<crate::screen_capture::PreviewUpdate>(4);
         let event_tx = self.event_tx.clone();
-        let callback = self.update_callback.clone();
         if let Some(stale_task) = self.capture_preview_task.take() {
             stale_task.abort();
         }
@@ -814,9 +825,6 @@ impl Worker {
                         encode_time_ms: update.encode_time_ms,
                     })
                     .await;
-                if let Some(cb) = &callback {
-                    cb();
-                }
             }
         }));
         info!(
@@ -903,9 +911,7 @@ impl Worker {
 
     async fn handle_command(&mut self, command: Command) -> Result<()> {
         match command {
-            Command::SetUpdateCallback { callback } => {
-                self.update_callback = Some(callback);
-            }
+            Command::Shutdown => {}
             Command::SetAudioConfig { audio_config } => {
                 let audio_context = AudioContext::new(audio_config).await?;
                 audio_context.set_muted(self.muted);

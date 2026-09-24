@@ -9,7 +9,7 @@ use wire::{rtc::RtcConnection, video::transport};
 
 #[cfg(target_os = "windows")]
 use super::trim_process_working_set;
-use super::{Event, UpdateCallback, VideoStreamEndReason};
+use super::{Event, EventPublisher, VideoStreamEndReason};
 use crate::video_decode::VideoDecodeWorker;
 
 const VIDEO_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x51);
@@ -342,8 +342,7 @@ async fn read_video_controls(
 pub(super) async fn run_video_recv(
     conn: RtcConnection,
     node_id: NodeId,
-    event_tx: async_channel::Sender<Event>,
-    callback: Option<UpdateCallback>,
+    event_tx: EventPublisher,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<VideoReceiveControl>,
 ) {
     const DECODER_IDLE_GRACE: Duration = Duration::from_secs(5);
@@ -374,13 +373,7 @@ pub(super) async fn run_video_recv(
             }
             _ = wait_until_optional(decoder_idle_deadline) => {
                 if let Some((generation, reason)) = pending_end.take() {
-                    notify_video_stream_ended(
-                        &event_tx,
-                        callback.as_ref(),
-                        node_id,
-                        generation,
-                        reason,
-                    );
+                    notify_video_stream_ended(&event_tx, node_id, generation, reason);
                     // Avoid a duplicate ConnectionClosed end for the same gen
                     // if the recv task later exits without a newer stream.
                     if active_generation == Some(generation) {
@@ -420,19 +413,9 @@ pub(super) async fn run_video_recv(
                             generation,
                             "accepted video receive stream"
                         );
-                        notify_video_stream_accepted(
-                            &event_tx,
-                            callback.as_ref(),
-                            node_id,
-                            generation,
-                        )
-                        .await;
+                        notify_video_stream_accepted(&event_tx, node_id, generation).await;
                         if worker.is_none() {
-                            match spawn_video_decode_worker(
-                                node_id,
-                                event_tx.clone(),
-                                callback.clone(),
-                            ) {
+                            match spawn_video_decode_worker(node_id, event_tx.clone()) {
                                 Ok(new_worker) => worker = Some(new_worker),
                                 Err(error) => {
                                     warn!(
@@ -462,7 +445,6 @@ pub(super) async fn run_video_recv(
                                 );
                                 notify_video_stream_ended(
                                     &event_tx,
-                                    callback.as_ref(),
                                     node_id,
                                     generation,
                                     VideoStreamEndReason::CleanEof,
@@ -489,7 +471,6 @@ pub(super) async fn run_video_recv(
                                 );
                                 notify_video_stream_ended(
                                     &event_tx,
-                                    callback.as_ref(),
                                     node_id,
                                     generation,
                                     VideoStreamEndReason::ReceiveError,
@@ -509,11 +490,10 @@ pub(super) async fn run_video_recv(
         }
     }
     if let Some((generation, reason)) = pending_end {
-        notify_video_stream_ended(&event_tx, callback.as_ref(), node_id, generation, reason);
+        notify_video_stream_ended(&event_tx, node_id, generation, reason);
     } else if let Some(generation) = active_generation {
         notify_video_stream_ended(
             &event_tx,
-            callback.as_ref(),
             node_id,
             generation,
             VideoStreamEndReason::ConnectionClosed,
@@ -530,45 +510,28 @@ async fn wait_until_optional(deadline: Option<tokio::time::Instant>) {
 
 fn spawn_video_decode_worker(
     node_id: NodeId,
-    event_tx: async_channel::Sender<Event>,
-    callback: Option<UpdateCallback>,
+    event_tx: EventPublisher,
 ) -> Result<VideoDecodeWorker> {
     VideoDecodeWorker::spawn(move |frame, generation| {
-        if event_tx
-            .try_send(Event::VideoFrame {
-                node_id,
-                generation,
-                frame,
-            })
-            .is_ok()
-        {
-            if let Some(callback) = &callback {
-                callback();
-            }
-        }
+        event_tx.try_send(Event::VideoFrame {
+            node_id,
+            generation,
+            frame,
+        });
     })
 }
 
-async fn notify_video_stream_accepted(
-    event_tx: &async_channel::Sender<Event>,
-    callback: Option<&UpdateCallback>,
-    node_id: NodeId,
-    generation: u64,
-) {
-    let _ = event_tx
+async fn notify_video_stream_accepted(event_tx: &EventPublisher, node_id: NodeId, generation: u64) {
+    event_tx
         .send(Event::VideoStreamAccepted {
             node_id,
             generation,
         })
         .await;
-    if let Some(callback) = callback {
-        callback();
-    }
 }
 
 fn notify_video_stream_ended(
-    event_tx: &async_channel::Sender<Event>,
-    callback: Option<&UpdateCallback>,
+    event_tx: &EventPublisher,
     node_id: NodeId,
     generation: u64,
     reason: VideoStreamEndReason,
@@ -579,14 +542,11 @@ fn notify_video_stream_ended(
         reason = ?reason,
         "video receive stream ended"
     );
-    let _ = event_tx.try_send(Event::VideoStreamEnded {
+    event_tx.try_send(Event::VideoStreamEnded {
         node_id,
         generation,
         reason,
     });
-    if let Some(callback) = callback {
-        callback();
-    }
 }
 
 fn is_video_stream_replacement_error(error: &anyhow::Error) -> bool {

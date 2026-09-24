@@ -5,10 +5,17 @@
 mod video;
 mod worker;
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
+};
 
 use async_channel::{Receiver, Sender};
 use iroh::NodeId;
+use tracing::warn;
 use wire::{
     audio::{AudioConfig, AudioLevelHandle, VolumeHandle},
     video::VideoConfig,
@@ -83,10 +90,136 @@ pub(crate) enum CallState {
 
 type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
 
+const EVENT_BUFFER_CAPACITY: usize = 1_024;
+
+#[derive(Clone)]
+pub(super) struct EventPublisher {
+    sender: Sender<Event>,
+    update_callback: Arc<RwLock<Option<UpdateCallback>>>,
+    presenter_active: Arc<AtomicBool>,
+    dropped_events: Arc<AtomicUsize>,
+}
+
+impl EventPublisher {
+    fn new() -> (Self, Receiver<Event>) {
+        let (sender, receiver) = async_channel::bounded(EVENT_BUFFER_CAPACITY);
+        (
+            Self {
+                sender,
+                update_callback: Arc::new(RwLock::new(None)),
+                presenter_active: Arc::new(AtomicBool::new(true)),
+                dropped_events: Arc::new(AtomicUsize::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    pub(super) fn publish(&self, event: Event) {
+        // A presenter is optional. Publishing must never backpressure or terminate
+        // the service when no client is attached or a client has fallen behind.
+        let should_wake_presenter = self.presenter_active.load(Ordering::Acquire)
+            && !matches!(
+                &event,
+                Event::VideoFrame { .. } | Event::PreviewFrame { .. }
+            );
+        if let Err(async_channel::TrySendError::Full(_)) = self.sender.try_send(event) {
+            let dropped = self.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 5 || dropped.is_power_of_two() {
+                warn!(
+                    dropped,
+                    capacity = EVENT_BUFFER_CAPACITY,
+                    "presenter event queue is full; dropping a service event"
+                );
+            }
+        }
+        if !should_wake_presenter {
+            return;
+        }
+        let callback = self
+            .update_callback
+            .read()
+            .ok()
+            .and_then(|callback| callback.clone());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
+    pub(super) async fn send(&self, event: Event) {
+        self.publish(event);
+    }
+
+    pub(super) fn try_send(&self, event: Event) {
+        self.publish(event);
+    }
+
+    pub(super) fn send_blocking(&self, event: Event) {
+        self.publish(event);
+    }
+
+    fn set_update_callback(&self, callback: Option<UpdateCallback>) {
+        if let Ok(mut current) = self.update_callback.write() {
+            *current = callback;
+        }
+    }
+
+    fn set_presenter_active(&self, active: bool) {
+        self.presenter_active.store(active, Ordering::Release);
+    }
+}
+
+pub(crate) struct ServiceClient {
+    command_tx: Sender<Command>,
+    event_rx: Receiver<Event>,
+    event_publisher: EventPublisher,
+}
+
+impl ServiceClient {
+    pub(crate) fn command_sender(&self) -> &Sender<Command> {
+        &self.command_tx
+    }
+
+    pub(crate) fn set_update_callback(&self, callback: UpdateCallback) {
+        self.event_publisher.set_update_callback(Some(callback));
+    }
+
+    pub(crate) fn set_presenter_active(&self, active: bool) {
+        self.event_publisher.set_presenter_active(active);
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<Event, async_channel::TryRecvError> {
+        self.event_rx.try_recv()
+    }
+
+    pub(crate) fn discard_buffered_media_events(&self) -> usize {
+        let mut retained = Vec::new();
+        let mut discarded = 0;
+        while let Ok(event) = self.event_rx.try_recv() {
+            if matches!(
+                &event,
+                Event::VideoFrame { .. } | Event::PreviewFrame { .. }
+            ) {
+                discarded += 1;
+            } else {
+                retained.push(event);
+            }
+        }
+        for event in retained {
+            self.event_publisher.try_send(event);
+        }
+        discarded
+    }
+}
+
+impl Drop for ServiceClient {
+    fn drop(&mut self) {
+        self.event_publisher.set_presenter_active(false);
+        self.event_publisher.set_update_callback(None);
+    }
+}
+
 pub(crate) enum Command {
-    SetUpdateCallback {
-        callback: UpdateCallback,
-    },
+    Shutdown,
     SetAudioConfig {
         audio_config: AudioConfig,
     },
@@ -175,33 +308,34 @@ pub(crate) enum Command {
 
 pub(crate) struct WorkerHandle {
     command_tx: Sender<Command>,
-    event_rx: Receiver<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for WorkerHandle {
-    fn drop(&mut self) {
-        // Wake a worker that is blocked publishing into a full event queue before
-        // waiting for its thread. The UI no longer drains this receiver in Drop.
-        self.event_rx.close();
-        self.command_tx.close();
+impl WorkerHandle {
+    pub(crate) fn shutdown(mut self) {
+        let _ = self.command_tx.try_send(Command::Shutdown);
+        self.join();
+    }
+
+    fn join(&mut self) {
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                warn!("Wire worker thread panicked during shutdown");
+            }
         }
     }
 }
 
-impl WorkerHandle {
-    pub(crate) fn command_sender(&self) -> &Sender<Command> {
-        &self.command_tx
-    }
-
-    pub(crate) fn try_recv(&self) -> Result<Event, async_channel::TryRecvError> {
-        self.event_rx.try_recv()
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // Emergency cleanup for startup failures and unwinding. Normal lifecycle
+        // shutdown goes through the explicit Shutdown command first.
+        self.command_tx.close();
+        self.join();
     }
 }
 
-pub(crate) fn spawn() -> WorkerHandle {
+pub(crate) fn spawn() -> (WorkerHandle, ServiceClient) {
     worker::Worker::spawn()
 }
 
@@ -217,40 +351,57 @@ fn trim_process_working_set() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    };
 
-    use super::{Event, WorkerHandle};
+    use super::{Command, Event, EventPublisher, ServiceClient, WorkerHandle};
 
     #[test]
-    fn shutdown_closes_full_event_queue_and_commands_before_joining() {
+    fn publishing_without_a_presenter_never_blocks_or_stops_the_service() {
+        let (publisher, receiver) = EventPublisher::new();
+        drop(receiver);
+        for _ in 0..super::EVENT_BUFFER_CAPACITY * 2 {
+            publisher.publish(Event::InitialChatLoaded);
+        }
+    }
+
+    #[test]
+    fn presenter_callback_is_notified_without_owning_service_shutdown() {
+        let (publisher, _receiver) = EventPublisher::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        publisher.set_update_callback(Some(Arc::new(move || {
+            callback_calls.fetch_add(1, Ordering::Relaxed);
+        })));
+        publisher.publish(Event::InitialChatLoaded);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_shutdown_reaches_worker_while_presenter_client_is_alive() {
         let (command_tx, command_rx) = async_channel::unbounded();
-        let retained_sender = command_tx.clone();
-        let (event_tx, event_rx) = async_channel::bounded(1);
-        event_tx.try_send(Event::InitialChatLoaded).unwrap();
+        let (publisher, event_rx) = EventPublisher::new();
+        let client = ServiceClient {
+            command_tx: command_tx.clone(),
+            event_rx,
+            event_publisher: publisher,
+        };
         let (result_tx, result_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            // The UI has stopped draining events. Publishing must unblock when
-            // the handle closes, even if another caller retains a command sender.
-            let events_closed = event_tx.send_blocking(Event::InitialChatLoaded).is_err();
-            let commands_closed = command_rx.recv_blocking().is_err();
-            result_tx.send((events_closed, commands_closed)).unwrap();
+            let command = command_rx.recv_blocking().unwrap();
+            result_tx
+                .send(matches!(command, Command::Shutdown))
+                .unwrap();
         });
-        let handle = WorkerHandle {
+        let host = WorkerHandle {
             command_tx,
-            event_rx,
             thread: Some(thread),
         };
-        let (done_tx, done_rx) = mpsc::channel();
-        let shutdown = std::thread::spawn(move || {
-            drop(handle);
-            done_tx.send(()).unwrap();
-        });
 
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("shutdown must not wait for the UI to drain events");
-        shutdown.join().unwrap();
-        assert_eq!(result_rx.recv().unwrap(), (true, true));
-        assert!(retained_sender.is_closed());
+        assert!(!client.command_tx.is_closed());
+        host.shutdown();
+        assert!(result_rx.recv().unwrap());
     }
 }

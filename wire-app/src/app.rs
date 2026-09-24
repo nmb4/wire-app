@@ -11,9 +11,12 @@ mod widgets;
 #[cfg(windows)]
 use self::calls_ui::native_parent_hwnd;
 use self::widgets::{ellipsize, track_pane_viewport};
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+use crate::tray::{TrayAction, TrayController};
 #[cfg(windows)]
 use crate::update::{self, ReleaseInfo};
 use crate::{
+    activation::ActivationWatcher,
     autostart,
     chat::{
         self, ChatAttachment, ChatConversation, ChatMessage, ChatNotification, DeliveryState,
@@ -21,10 +24,11 @@ use crate::{
     },
     client_status::{Availability, GroupCallAnnouncement, StatusUpdate},
     dev_pair::DevPairState,
+    host::ServiceClient,
     notifications::{NotificationAction, NotificationService},
     persistence,
     resource_monitor::ResourceMonitor,
-    runtime::{self, CallState, Command, Event, WorkerHandle},
+    runtime::{CallState, Command, Event},
     sounds::{Sound, Sounds},
     theme::{ghost_icon_button, setup_fonts, visuals_for, Palette, Theme, WindowFrameStyle},
     video_decode::DecodedFrameData,
@@ -57,7 +61,14 @@ pub struct App {
     is_first_update: bool,
     always_on_top: bool,
     viewport_transparent: Option<bool>,
+    close_to_tray: bool,
+    quit_requested: bool,
+    window_visible: bool,
+    hidden_video_nodes: BTreeSet<NodeId>,
+    activation_watcher: Option<ActivationWatcher>,
     state: AppState,
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    tray: Option<TrayController>,
     #[cfg(windows)]
     global_hotkeys: Option<crate::global_hotkeys::GlobalHotkeys>,
 }
@@ -196,7 +207,7 @@ struct AppState {
     stream_view_mode: StreamViewMode,
     remote_node_id: Option<Result<NodeId, KeyParsingError>>,
     remote_node_input: String,
-    worker: WorkerHandle,
+    service: ServiceClient,
     our_node_id: Option<NodeId>,
     devices: wire::audio::Devices,
     audio_config: UiAudioConfig,
@@ -248,6 +259,7 @@ struct AppState {
     resource_monitor: ResourceMonitor,
     dev_pair: Option<DevPairState>,
     dev_auto_share: bool,
+    exit_requested: bool,
     app_mode: AppMode,
     chat: ChatUiState,
     chat_notifications_ready: bool,
@@ -595,8 +607,19 @@ impl eframe::App for App {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         ctx.style_mut(|style| style.interaction.selectable_labels = false);
+        self.process_tray(ctx);
+        if self.state.service.take_activation_request() {
+            self.show_window(ctx);
+        }
+        self.handle_close_request(ctx);
+        if !self.window_visible {
+            // tray-icon wakes egui when possible; this low-frequency fallback
+            // also covers window systems that do not deliver repaint requests
+            // while the native window is hidden.
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         #[cfg(windows)]
         while let Some(action) = self
             .global_hotkeys
@@ -615,7 +638,31 @@ impl eframe::App for App {
             self.is_first_update = false;
             let repaint_ctx = ctx.clone();
             let callback = Arc::new(move || repaint_ctx.request_repaint());
-            self.state.cmd(Command::SetUpdateCallback { callback });
+            self.state.service.set_update_callback(callback);
+            self.state.service.set_presenter_active(self.window_visible);
+            if self.activation_watcher.is_none() {
+                let hwnd = {
+                    #[cfg(windows)]
+                    {
+                        native_parent_hwnd(frame).map(|hwnd| hwnd.0 as isize)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        None
+                    }
+                };
+                self.activation_watcher = Some(ActivationWatcher::start(
+                    self.state.service.activation_path(),
+                    ctx.clone(),
+                    hwnd,
+                ));
+            }
+            #[cfg(windows)]
+            if let Some(tray) = self.tray.as_ref() {
+                if let Some(hwnd) = native_parent_hwnd(frame) {
+                    tray.set_wake_window(hwnd.0 as isize);
+                }
+            }
             #[cfg(windows)]
             if self.state.dev_pair.is_none() {
                 self.state.start_update_check(ctx);
@@ -628,14 +675,85 @@ impl eframe::App for App {
             .show(ctx, |_ui| {});
 
         #[cfg(windows)]
-        let parent_hwnd = native_parent_hwnd(_frame);
+        let parent_hwnd = native_parent_hwnd(frame);
+        #[cfg(windows)]
+        if let Some(watcher) = self.activation_watcher.as_ref() {
+            watcher.set_hwnd(parent_hwnd.map(|hwnd| hwnd.0 as isize));
+        }
         self.state.update(
             ctx,
             &mut self.always_on_top,
             &mut self.viewport_transparent,
+            self.window_visible,
             #[cfg(windows)]
             parent_hwnd,
         );
+        if self.state.exit_requested {
+            self.quit_requested = true;
+        }
+    }
+}
+
+impl App {
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.quit_requested || !self.close_to_tray {
+            return;
+        }
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        info!("Wire root viewport close requested; hiding to the system tray");
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if !self.window_visible {
+            return;
+        }
+        self.window_visible = false;
+        self.state.service.set_presenter_active(false);
+        self.hidden_video_nodes = self.state.pause_remote_video_for_hidden_window();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        info!("showing Wire from the system tray");
+        if !self.window_visible {
+            self.window_visible = true;
+            let discarded = self.state.service.discard_buffered_media_events();
+            if discarded > 0 {
+                debug!(
+                    discarded,
+                    "discarded stale events before restoring the window"
+                );
+            }
+            self.state.service.set_presenter_active(true);
+            let hidden_nodes = std::mem::take(&mut self.hidden_video_nodes);
+            self.state.resume_hidden_video(hidden_nodes);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        if self.quit_requested {
+            return;
+        }
+        self.quit_requested = true;
+        info!("quit requested from the system tray");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn process_tray(&mut self, ctx: &egui::Context) {
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        while let Some(action) = self.tray.as_ref().and_then(TrayController::try_recv) {
+            match action {
+                TrayAction::Show => self.show_window(ctx),
+                TrayAction::Quit => {
+                    self.quit(ctx);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -732,9 +850,13 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub fn run(mut options: NativeOptions) -> Result<(), eframe::Error> {
+    pub fn run(
+        options: NativeOptions,
+        service: ServiceClient,
+        start_hidden: bool,
+    ) -> Result<(), eframe::Error> {
+        let mut options = options;
         options.wgpu_options.on_surface_error = Arc::new(wgpu_surface_error_action);
-        let handle = runtime::spawn();
         let devices =
             wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
         let saved_settings = load_settings();
@@ -761,7 +883,7 @@ impl App {
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
             remote_node_input: String::new(),
-            worker: handle,
+            service,
             our_node_id: None,
             devices,
             audio_config: settings.audio,
@@ -813,6 +935,7 @@ impl App {
             resource_monitor: ResourceMonitor::start(),
             dev_pair: DevPairState::from_env(),
             dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
+            exit_requested: false,
             app_mode: AppMode::Text,
             chat: ChatUiState::default(),
             chat_notifications_ready: false,
@@ -846,6 +969,13 @@ impl App {
             is_first_update: true,
             always_on_top: false,
             viewport_transparent: Some(rounded),
+            close_to_tray: false,
+            quit_requested: false,
+            window_visible: !start_hidden,
+            hidden_video_nodes: BTreeSet::new(),
+            activation_watcher: None,
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            tray: None,
             #[cfg(windows)]
             global_hotkeys: None,
         };
@@ -865,8 +995,29 @@ impl App {
                     );
                 }
                 setup_fonts(&cc.egui_ctx);
+                if start_hidden {
+                    // Keep startup genuinely headless even on window systems
+                    // that create the native surface before applying the
+                    // ViewportBuilder visibility flag.
+                    cc.egui_ctx
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
                 #[allow(unused_mut)]
                 let mut app = app;
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+                if !dev_fixture {
+                    match TrayController::new(&cc.egui_ctx) {
+                        Ok(tray) => {
+                            app.tray = Some(tray);
+                            app.close_to_tray = true;
+                            info!("system tray icon is available");
+                        }
+                        Err(error) if start_hidden => {
+                            return Err(Box::new(std::io::Error::other(error.to_string())));
+                        }
+                        Err(error) => warn!("system tray icon could not be created: {error:#}"),
+                    }
+                }
                 #[cfg(windows)]
                 if !dev_fixture {
                     app.global_hotkeys = Some(crate::global_hotkeys::GlobalHotkeys::start(
@@ -900,13 +1051,14 @@ impl AppState {
         ctx: &egui::Context,
         always_on_top: &mut bool,
         viewport_transparent: &mut Option<bool>,
+        window_visible: bool,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
         if self.show_system_usage {
             // Keep the optional process resource readout current while the rest of the UI is idle.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
-        if self.has_visible_call() {
+        if window_visible && self.has_visible_call() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         self.track_pane_viewport(ctx);
@@ -1069,7 +1221,10 @@ impl AppState {
                 }
                 UpdateMessage::DownloadFinished(Ok(path)) => {
                     match update::relaunch_after_download(&path) {
-                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Ok(_) => {
+                            self.exit_requested = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                         Err(error) => {
                             self.update_status = UpdateStatus::Error(format!(
                                 "Downloaded the update, but could not relaunch it: {error}",
@@ -1145,7 +1300,7 @@ impl AppState {
     }
 
     fn process_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.worker.try_recv() {
+        while let Ok(event) = self.service.try_recv() {
             match event {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
@@ -1312,7 +1467,7 @@ impl AppState {
                             .and_then(|value| value.parse::<u32>().ok())
                             .filter(|cycles| *cycles > 0)
                         {
-                            let command_tx = self.worker.command_sender().clone();
+                            let command_tx = self.service.command_sender().clone();
                             std::thread::spawn(move || {
                                 for cycle in 0..cycles {
                                     std::thread::sleep(Duration::from_secs(2));
@@ -1998,6 +2153,35 @@ impl AppState {
             .collect()
     }
 
+    fn pause_remote_video_for_hidden_window(&mut self) -> BTreeSet<NodeId> {
+        let nodes: BTreeSet<_> = self
+            .video_stream_generations
+            .keys()
+            .copied()
+            .filter(|node_id| {
+                matches!(
+                    self.calls.get(node_id),
+                    Some(CallState::Incoming | CallState::Calling | CallState::Active)
+                ) && !self.stopped_video_stream_generations.contains_key(node_id)
+            })
+            .collect();
+        for node_id in &nodes {
+            self.stop_watching(*node_id);
+        }
+        self.preview = None;
+        nodes
+    }
+
+    fn resume_hidden_video(&mut self, nodes: BTreeSet<NodeId>) {
+        for node_id in nodes {
+            if matches!(self.calls.get(&node_id), Some(CallState::Active)) {
+                self.resume_watching(node_id);
+            } else {
+                self.stopped_video_stream_generations.remove(&node_id);
+            }
+        }
+    }
+
     fn stop_watching(&mut self, node_id: NodeId) {
         let Some(generation) = self.video_stream_generations.get(&node_id).copied() else {
             return;
@@ -2163,7 +2347,7 @@ impl AppState {
     }
 
     fn cmd(&self, command: Command) {
-        if self.worker.command_sender().try_send(command).is_err() {
+        if self.service.command_sender().try_send(command).is_err() {
             warn!("ignored command because the Wire worker is unavailable");
         }
     }

@@ -27,7 +27,7 @@ fn set_enabled_for(executable: &Path, enabled: bool) -> Result<()> {
     };
 
     if enabled {
-        let command = format!("\"{}\"", executable.display());
+        let command = format!("\"{}\" --background", executable.display());
         let output = reg_command()
             .args(["add", RUN_KEY, "/v", APP_NAME, "/t", "REG_SZ", "/d"])
             .arg(command)
@@ -90,7 +90,7 @@ fn set_enabled_for(executable: &Path, enabled: bool) -> Result<()> {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>live.stardive.wire</string>
-<key>ProgramArguments</key><array><string>{executable}</string></array>
+<key>ProgramArguments</key><array><string>{executable}</string><string>--background</string></array>
 <key>RunAtLoad</key><true/>
 </dict></plist>
 "#
@@ -126,7 +126,7 @@ fn set_enabled_for(executable: &Path, enabled: bool) -> Result<()> {
     std::fs::create_dir_all(&directory)?;
     let executable = desktop_exec_escape(&executable.to_string_lossy());
     let entry = format!(
-        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nExec=\"{executable}\"\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nExec=\"{executable}\" --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
     );
     std::fs::write(path, entry).context("could not write the Wire autostart entry")
 }

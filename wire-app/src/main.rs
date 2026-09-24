@@ -9,8 +9,11 @@ use std::time::Duration;
 use eframe::NativeOptions;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use wire_app_lib::app::App;
-use wire_app_lib::window_frame;
+use wire_app_lib::{
+    app::App,
+    host::{ApplicationHost, StartError},
+    window_frame,
+};
 
 const LOG_DIR_NAME: &str = "wire";
 const LEGACY_LOG_DIR_NAME: &str = "callme";
@@ -89,6 +92,7 @@ struct LaunchConfig {
     dev_pair_session: Option<String>,
     dev_peer_index: usize,
     dev_auto_share: bool,
+    start_hidden: bool,
 }
 
 impl LaunchConfig {
@@ -97,6 +101,7 @@ impl LaunchConfig {
         let mut dev_pair_session = None;
         let mut dev_peer_index = 0;
         let mut dev_auto_share = false;
+        let mut start_hidden = false;
         while let Some(argument) = args.next() {
             if argument == "--dev-child" {
                 // Keep old hand-written invocations working as participant 1.
@@ -105,6 +110,8 @@ impl LaunchConfig {
                 dev_peer_index = value.parse().unwrap_or(0);
             } else if argument == "--dev-auto-share" {
                 dev_auto_share = true;
+            } else if argument == "--background" {
+                start_hidden = true;
             } else if let Some(value) = argument.strip_prefix("--dev-pair=") {
                 dev_pair_session = Some(sanitize_session(value));
             } else if argument == "--dev-pair" {
@@ -118,6 +125,7 @@ impl LaunchConfig {
             dev_pair_session,
             dev_peer_index,
             dev_auto_share,
+            start_hidden,
         }
     }
 }
@@ -346,14 +354,29 @@ fn main() -> Result<(), eframe::Error> {
         .with_transparent(rounded)
         .with_resizable(true)
         .with_min_inner_size([460., 500.])
-        .with_inner_size([1100., 720.]);
+        .with_inner_size([1100., 720.])
+        .with_visible(!launch.start_hidden);
     if launch.dev_pair_session.is_some() {
         let offset = launch.dev_peer_index as f32 * 44.0;
         options.viewport = options
             .viewport
             .with_position([56.0 + offset, 48.0 + offset]);
     }
-    let result = App::run(options);
+    let (host, service) = match ApplicationHost::start() {
+        Ok(host_and_service) => host_and_service,
+        Err(StartError::AlreadyRunning) => {
+            ApplicationHost::request_activation().map_err(|error| {
+                eframe::Error::AppCreation(Box::new(std::io::Error::other(error)))
+            })?;
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "could not start Wire application host");
+            return Err(eframe::Error::AppCreation(Box::new(error)));
+        }
+    };
+    let result = App::run(options, service, launch.start_hidden);
+    host.shutdown();
     for mut child in dev_children {
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();

@@ -1,3 +1,4 @@
+mod activation;
 pub mod app;
 mod autostart;
 mod chat;
@@ -5,6 +6,7 @@ mod client_status;
 mod dev_pair;
 #[cfg(windows)]
 mod global_hotkeys;
+pub mod host;
 mod notifications;
 mod overlay_window;
 mod persistence;
@@ -13,6 +15,8 @@ mod runtime;
 mod sounds;
 mod system_audio;
 mod title_bar;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod tray;
 pub mod window_frame;
 /// The application version embedded at compile time from this package's Cargo manifest.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
