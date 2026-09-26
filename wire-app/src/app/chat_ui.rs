@@ -33,6 +33,8 @@ use std::{
 };
 use tracing::warn;
 
+const FILE_OFFER_CARD_MAX_WIDTH: f32 = 420.0;
+
 impl AppState {
     pub(super) fn ui_chat_chrome_body(
         &mut self,
@@ -1286,52 +1288,6 @@ impl AppState {
             .ok()
             .and_then(|owner| self.friend_status.get(&owner))
             .is_some_and(|status| status.availability == Availability::Offline);
-        if let Some(state) = &transfer {
-            let label = match (&state.phase, &state.result) {
-                (Some(FileTransferPhase::Connecting), _) => if owner_offline {
-                    "Owner offline · connecting…"
-                } else {
-                    "Connecting…"
-                }
-                .to_owned(),
-                (Some(FileTransferPhase::Downloading), _) => "Downloading…".to_owned(),
-                (Some(FileTransferPhase::Reconnecting), _) => if owner_offline {
-                    "Owner offline · retrying…"
-                } else {
-                    "Connection stalled · retrying…"
-                }
-                .to_owned(),
-                (Some(FileTransferPhase::Saving), _) => "Saving file…".to_owned(),
-                (Some(FileTransferPhase::Paused(reason)), _) => format!("Paused: {reason}"),
-                (_, Some(Ok(path))) => format!("Saved to {}", path.display()),
-                (_, Some(Err(error))) => format!("Paused: {error}"),
-                _ => "Preparing download…".to_owned(),
-            };
-            ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
-            if state.total > 0 && state.result.is_none() {
-                ui.add(
-                    egui::ProgressBar::new(
-                        state.received.min(state.total) as f32 / state.total as f32,
-                    )
-                    .show_percentage(),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{} of {} received",
-                        format_bytes(state.received),
-                        format_bytes(state.total)
-                    ))
-                    .color(pal.dim)
-                    .size(ui_font_size(10.5)),
-                );
-            }
-        } else if owner_offline && !own {
-            ui.label(
-                RichText::new("Owner offline")
-                    .color(pal.dim)
-                    .size(ui_font_size(11.0)),
-            );
-        }
         if own {
             if attachment.kind == AttachmentKind::FileOffer {
                 let stopped = message.stopped_file_offers.contains(&attachment.hash);
@@ -1411,56 +1367,81 @@ impl AppState {
                 if !stopped {
                     if let Some((position, total)) = active_progress.filter(|(_, total)| *total > 0)
                     {
-                        ui.add(
-                            egui::ProgressBar::new(position.min(total) as f32 / total as f32)
-                                .desired_width(ui.available_width())
-                                .desired_height(6.0)
-                                .corner_radius(3.0)
-                                .fill(pal.accent),
-                        )
-                        .on_hover_text(format!(
-                            "{} of {} sent",
-                            format_bytes(position),
-                            format_bytes(total)
-                        ));
+                        file_transfer_progress(ui, pal, position, total, "sent");
                     }
                 }
             }
             return;
         }
-        if message.stopped_file_offers.contains(&attachment.hash) {
-            ui.label(
-                RichText::new("Owner stopped sharing this file")
-                    .color(pal.dim)
-                    .size(ui_font_size(11.0)),
-            );
-            return;
-        }
-        if transfer.as_ref().is_some_and(FileTransferUiState::active) {
-            if !transfer
-                .as_ref()
-                .is_some_and(|state| matches!(state.phase, Some(FileTransferPhase::Saving)))
-                && action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked()
-            {
-                self.cmd(Command::CancelChatFile {
-                    message_id: message.message_id.clone(),
-                    hash: attachment.hash.clone(),
-                });
-            }
-            return;
-        }
+        let stopped = message.stopped_file_offers.contains(&attachment.hash);
+        let active = transfer.as_ref().is_some_and(FileTransferUiState::active);
+        let saving = transfer
+            .as_ref()
+            .is_some_and(|state| matches!(state.phase, Some(FileTransferPhase::Saving)));
         let resume_path = transfer.as_ref().and_then(|state| {
             (matches!(state.phase, Some(FileTransferPhase::Paused(_)))
                 || matches!(state.result, Some(Err(_))))
             .then(|| state.path.clone())
             .flatten()
         });
-        let label = if resume_path.is_some() {
-            "Resume"
-        } else {
-            "Download"
-        };
-        if action_button(ui, pal, label, ButtonTone::Secondary).clicked() {
+        let (status, status_detail) =
+            receiver_file_offer_status(transfer.as_ref(), stopped, owner_offline, receivers);
+
+        let mut start_download = false;
+        let mut cancel_download = false;
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if !stopped {
+                if active {
+                    if !saving {
+                        cancel_download =
+                            action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked();
+                    }
+                } else {
+                    start_download = action_button(
+                        ui,
+                        pal,
+                        if resume_path.is_some() {
+                            "Resume"
+                        } else {
+                            "Download"
+                        },
+                        ButtonTone::Secondary,
+                    )
+                    .clicked();
+                    if resume_path.is_some()
+                        && action_button(ui, pal, "Discard", ButtonTone::Secondary).clicked()
+                    {
+                        cancel_download = true;
+                    }
+                }
+            }
+            if let Some(status) = status {
+                let response = ui.add(
+                    egui::Label::new(
+                        RichText::new(status)
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    )
+                    .truncate(),
+                );
+                if let Some(detail) = status_detail.as_deref() {
+                    response.on_hover_text(detail);
+                }
+            }
+        });
+        if let Some(state) = transfer
+            .as_ref()
+            .filter(|state| state.total > 0 && state.result.is_none())
+        {
+            file_transfer_progress(ui, pal, state.received, state.total, "received");
+        }
+        if cancel_download {
+            self.cmd(Command::CancelChatFile {
+                message_id: message.message_id.clone(),
+                hash: attachment.hash.clone(),
+            });
+        }
+        if start_download {
             let path = resume_path.clone().or_else(|| {
                 rfd::FileDialog::new()
                     .set_file_name(&attachment.name)
@@ -1484,14 +1465,6 @@ impl AppState {
                     path,
                 });
             }
-        }
-        if resume_path.is_some()
-            && action_button(ui, pal, "Discard", ButtonTone::Secondary).clicked()
-        {
-            self.cmd(Command::CancelChatFile {
-                message_id: message.message_id.clone(),
-                hash: attachment.hash.clone(),
-            });
         }
     }
 
@@ -1532,21 +1505,15 @@ impl AppState {
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {}",
-                                attachment.name,
-                                format_bytes(attachment.byte_len)
-                            ))
-                            .color(pal.text),
-                        );
-                        if !own && !receivers.is_empty() {
+                        ui.set_max_width(ui.available_width().min(FILE_OFFER_CARD_MAX_WIDTH));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&attachment.name).color(pal.text));
                             ui.label(
-                                RichText::new(format!("Received by {}", receivers.join(", ")))
+                                RichText::new(format_bytes(attachment.byte_len))
                                     .color(pal.dim)
                                     .size(ui_font_size(11.0)),
                             );
-                        }
+                        });
                         self.ui_file_download_controls(
                             ui,
                             pal,
@@ -2393,6 +2360,73 @@ fn format_chat_time(sent_at: i64) -> String {
     format!("{hour:02}:{minute:02}")
 }
 
+fn file_transfer_progress(ui: &mut Ui, pal: &Palette, position: u64, total: u64, direction: &str) {
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = pal.line_br;
+        ui.add(
+            egui::ProgressBar::new(position.min(total) as f32 / total as f32)
+                .desired_width(ui.available_width())
+                .desired_height(6.0)
+                .corner_radius(3.0)
+                .fill(pal.accent),
+        )
+        .on_hover_text(format!(
+            "{} of {} {direction}",
+            format_bytes(position),
+            format_bytes(total)
+        ));
+    });
+}
+
+fn receiver_file_offer_status(
+    transfer: Option<&FileTransferUiState>,
+    stopped: bool,
+    owner_offline: bool,
+    receivers: &[String],
+) -> (Option<String>, Option<String>) {
+    if stopped {
+        return (
+            Some("Unavailable".to_owned()),
+            Some("Owner stopped sharing this file".to_owned()),
+        );
+    }
+    if let Some(state) = transfer {
+        return match (&state.result, &state.phase) {
+            (Some(Ok(path)), _) => (
+                Some("Saved".to_owned()),
+                Some(format!("Saved to {}", path.display())),
+            ),
+            (Some(Err(error)), _) => (Some("Paused".to_owned()), Some(error.to_string())),
+            (_, Some(FileTransferPhase::Paused(reason))) => {
+                (Some("Paused".to_owned()), Some(reason.clone()))
+            }
+            (_, Some(FileTransferPhase::Connecting | FileTransferPhase::Reconnecting))
+                if owner_offline =>
+            {
+                (
+                    Some("Waiting for owner".to_owned()),
+                    Some("The owner is offline; Wire will keep retrying".to_owned()),
+                )
+            }
+            (_, Some(FileTransferPhase::Connecting)) => (Some("Connecting".to_owned()), None),
+            (_, Some(FileTransferPhase::Downloading)) => (Some("Downloading".to_owned()), None),
+            (_, Some(FileTransferPhase::Reconnecting)) => (
+                Some("Reconnecting".to_owned()),
+                Some("Connection stalled; Wire is retrying".to_owned()),
+            ),
+            (_, Some(FileTransferPhase::Saving)) => (Some("Saving".to_owned()), None),
+            _ => (Some("Preparing".to_owned()), None),
+        };
+    }
+    if !receivers.is_empty() {
+        return (Some(format!("Received by {}", receivers.join(", "))), None);
+    }
+    if owner_offline {
+        return (Some("Owner offline".to_owned()), None);
+    }
+    (None, None)
+}
+
 fn owner_file_offer_status(
     stopped: bool,
     receivers: &[String],
@@ -2507,6 +2541,44 @@ mod tests {
         assert_eq!(
             owner_file_offer_status(false, &receivers, 0, Some(chat::FileServingPhase::Sent)),
             Some("Received by David".to_owned())
+        );
+    }
+
+    #[test]
+    fn receiver_file_offer_status_keeps_recovery_details_out_of_the_primary_row() {
+        let transfer = FileTransferUiState {
+            path: Some(PathBuf::from("archive.zip")),
+            received: 64,
+            total: 100,
+            phase: Some(FileTransferPhase::Paused("connection lost".to_owned())),
+            result: None,
+        };
+        assert_eq!(
+            receiver_file_offer_status(Some(&transfer), false, false, &[]),
+            (
+                Some("Paused".to_owned()),
+                Some("connection lost".to_owned())
+            )
+        );
+        assert_eq!(
+            receiver_file_offer_status(Some(&transfer), true, false, &[]),
+            (
+                Some("Unavailable".to_owned()),
+                Some("Owner stopped sharing this file".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn receiver_file_offer_status_uses_receipt_as_the_idle_fallback() {
+        let receivers = vec!["David".to_owned()];
+        assert_eq!(
+            receiver_file_offer_status(None, false, false, &receivers),
+            (Some("Received by David".to_owned()), None)
+        );
+        assert_eq!(
+            receiver_file_offer_status(None, false, true, &[]),
+            (Some("Owner offline".to_owned()), None)
         );
     }
 }
