@@ -37,12 +37,22 @@ const TITLE_ONLY_WITH_BUTTONS_HEIGHT: f32 = 90.0;
 const TITLE_BODY_WITH_BUTTONS_HEIGHT: f32 = 108.0;
 const INCOMING_CALL_TITLE_ONLY_HEIGHT: f32 = 100.0;
 const INCOMING_CALL_HEIGHT: f32 = 118.0;
+const TRANSFER_HEIGHT: f32 = 92.0;
+const TRANSFER_BAR_HEIGHT: f32 = 6.0;
 
 fn body_is_visible(body: &str) -> bool {
     !body.trim().is_empty()
 }
 
-fn estimated_single_height(kind: NotificationKind, body: &str, has_buttons: bool) -> f32 {
+fn estimated_single_height(
+    kind: NotificationKind,
+    body: &str,
+    has_buttons: bool,
+    has_progress: bool,
+) -> f32 {
+    if has_progress {
+        return TRANSFER_HEIGHT;
+    }
     let has_body = body_is_visible(body);
     match kind {
         NotificationKind::IncomingCall => {
@@ -108,6 +118,7 @@ struct ActionButton {
 pub(crate) enum NotificationKind {
     Message,
     IncomingCall,
+    Transfer,
     Success,
     Error,
     Info,
@@ -117,7 +128,7 @@ impl NotificationKind {
     fn default_lifetime(self) -> Option<Duration> {
         match self {
             Self::Message => Some(Duration::from_secs(7)),
-            Self::IncomingCall => None,
+            Self::IncomingCall | Self::Transfer => None,
             Self::Success => Some(Duration::from_secs(5)),
             Self::Error => Some(Duration::from_secs(9)),
             Self::Info => Some(Duration::from_secs(6)),
@@ -128,6 +139,7 @@ impl NotificationKind {
         match self {
             Self::Message => "MESSAGE",
             Self::IncomingCall => "INCOMING CALL",
+            Self::Transfer => "FILE TRANSFER",
             Self::Success => "WIRE",
             Self::Error => "ATTENTION",
             Self::Info => "WIRE",
@@ -143,7 +155,24 @@ impl NotificationKind {
 struct NotificationEntry {
     title: String,
     body: String,
+    progress: Option<TransferProgress>,
     action: Option<NotificationAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransferProgress {
+    current: u64,
+    total: u64,
+}
+
+impl TransferProgress {
+    fn fraction(self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.current.min(self.total) as f64 / self.total as f64) as f32
+        }
+    }
 }
 
 struct NotificationGroup {
@@ -175,7 +204,11 @@ impl NotificationGroup {
                 .front()
                 .map(|entry| entry.body.as_str())
                 .unwrap_or("");
-            estimated_single_height(self.kind, body, !self.buttons.is_empty())
+            let has_progress = self
+                .entries
+                .front()
+                .is_some_and(|entry| entry.progress.is_some());
+            estimated_single_height(self.kind, body, !self.buttons.is_empty(), has_progress)
         }
     }
 
@@ -233,12 +266,14 @@ struct NotificationSpec {
     kind: NotificationKind,
     title: String,
     body: String,
+    progress: Option<TransferProgress>,
     action: Option<NotificationAction>,
     buttons: Vec<ActionButton>,
 }
 
 enum NotificationCommand {
     Push(NotificationSpec),
+    UpsertTransfer(NotificationSpec),
     DismissKey(String),
 }
 
@@ -255,6 +290,7 @@ impl NotificationStore {
                     group.entries.push_front(NotificationEntry {
                         title: spec.title,
                         body: spec.body,
+                        progress: spec.progress,
                         action: spec.action,
                     });
                     if group.entries.len() > MAX_FUSED_ROWS {
@@ -269,8 +305,12 @@ impl NotificationStore {
             }
         }
 
-        let estimated_height =
-            estimated_single_height(spec.kind, &spec.body, !spec.buttons.is_empty());
+        let estimated_height = estimated_single_height(
+            spec.kind,
+            &spec.body,
+            !spec.buttons.is_empty(),
+            spec.progress.is_some(),
+        );
         let group = NotificationGroup {
             id: self.next_id,
             key: spec.group_key,
@@ -278,6 +318,7 @@ impl NotificationStore {
             entries: VecDeque::from([NotificationEntry {
                 title: spec.title,
                 body: spec.body,
+                progress: spec.progress,
                 action: spec.action,
             }]),
             hidden_entries: 0,
@@ -294,6 +335,29 @@ impl NotificationStore {
             self.visible.push_front(group);
         } else {
             self.pending.push_back(group);
+        }
+    }
+
+    fn upsert_transfer(&mut self, spec: NotificationSpec, now: Instant) {
+        debug_assert_eq!(spec.kind, NotificationKind::Transfer);
+        let key = spec.group_key.as_deref();
+        let existing = self
+            .visible
+            .iter_mut()
+            .chain(self.pending.iter_mut())
+            .find(|group| group.key.as_deref() == key && group.kind == NotificationKind::Transfer);
+        if let Some(group) = existing {
+            group.entries = VecDeque::from([NotificationEntry {
+                title: spec.title,
+                body: spec.body,
+                progress: spec.progress,
+                action: spec.action,
+            }]);
+            group.buttons = spec.buttons;
+            group.expires_at = None;
+            group.leaving_at = None;
+        } else {
+            self.push(spec, now);
         }
     }
 
@@ -404,13 +468,17 @@ struct NotificationRuntime {
 }
 
 impl NotificationRuntime {
-    fn apply_commands(&mut self, now: Instant) {
+    fn apply_commands(&mut self, now: Instant) -> bool {
+        let mut applied = false;
         while let Ok(command) = self.command_rx.try_recv() {
+            applied = true;
             match command {
                 NotificationCommand::Push(spec) => self.store.push(spec, now),
+                NotificationCommand::UpsertTransfer(spec) => self.store.upsert_transfer(spec, now),
                 NotificationCommand::DismissKey(key) => self.store.dismiss_key(&key, now),
             }
         }
+        applied
     }
 }
 
@@ -466,6 +534,7 @@ impl NotificationService {
                 format!("{author} - {conversation_title}")
             },
             body,
+            progress: None,
             action: Some(NotificationAction::OpenConversation(conversation_id)),
             buttons: Vec::new(),
         });
@@ -477,6 +546,7 @@ impl NotificationService {
             kind: NotificationKind::IncomingCall,
             title: peer_name,
             body: String::new(),
+            progress: None,
             action: Some(NotificationAction::OpenCalls),
             buttons: vec![
                 ActionButton {
@@ -499,6 +569,7 @@ impl NotificationService {
             kind: NotificationKind::Error,
             title: title.into(),
             body,
+            progress: None,
             action: None,
             buttons: Vec::new(),
         });
@@ -510,6 +581,7 @@ impl NotificationService {
             kind: NotificationKind::Success,
             title: title.into(),
             body: String::new(),
+            progress: None,
             action: None,
             buttons: Vec::new(),
         });
@@ -526,6 +598,7 @@ impl NotificationService {
             kind: NotificationKind::Success,
             title: title.into(),
             body: body.into(),
+            progress: None,
             action: None,
             buttons: Vec::new(),
         });
@@ -537,9 +610,39 @@ impl NotificationService {
             kind: NotificationKind::Info,
             title: title.into(),
             body: String::new(),
+            progress: None,
             action: None,
             buttons: Vec::new(),
         });
+    }
+
+    pub(crate) fn transfer_progress(
+        &self,
+        key: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        current: u64,
+        total: u64,
+    ) {
+        let spec = NotificationSpec {
+            group_key: Some(key.into()),
+            kind: NotificationKind::Transfer,
+            title: title.into(),
+            body: body.into(),
+            progress: Some(TransferProgress { current, total }),
+            action: None,
+            buttons: Vec::new(),
+        };
+        if self
+            .command_tx
+            .send(NotificationCommand::UpsertTransfer(spec))
+            .is_ok()
+        {
+            if !self.active.swap(true, Ordering::AcqRel) {
+                self.viewport_created.store(false, Ordering::Release);
+                self.viewport_ready.store(false, Ordering::Release);
+            }
+        }
     }
 
     fn push(&self, spec: NotificationSpec) {
@@ -587,17 +690,20 @@ impl NotificationService {
         // to start at INITIAL_HOST_HEIGHT while hidden and resize itself from
         // its first paint callback. A hidden window may never receive that
         // callback, especially after the eframe/wgpu 0.33 upgrade.
-        let initial_host_size = self
+        let (initial_host_size, commands_applied) = self
             .runtime
             .lock()
             .ok()
             .map(|mut runtime| {
                 let now = Instant::now();
-                runtime.apply_commands(now);
+                let commands_applied = runtime.apply_commands(now);
                 runtime.store.advance(now);
-                Vec2::new(HOST_WIDTH, runtime.store.host_height())
+                (
+                    Vec2::new(HOST_WIDTH, runtime.store.host_height()),
+                    commands_applied,
+                )
             })
-            .unwrap_or_else(|| Vec2::new(HOST_WIDTH, INITIAL_HOST_HEIGHT));
+            .unwrap_or_else(|| (Vec2::new(HOST_WIDTH, INITIAL_HOST_HEIGHT), false));
         let first_creation = !self.viewport_created.swap(true, Ordering::AcqRel);
 
         let monitor_size = ctx
@@ -647,10 +753,10 @@ impl NotificationService {
                 );
             },
         );
-        // Some platforms do not issue an initial redraw for a newly-created,
-        // off-screen deferred viewport. Wake that viewport once at creation;
-        // after that its callback owns all animation and lifetime scheduling.
-        if first_creation {
+        // The root viewport owns the command queue. Wake the independent
+        // notification viewport whenever root applies an update; otherwise a
+        // settled transfer card only repaints in response to pointer movement.
+        if first_creation || commands_applied {
             ctx.request_repaint_of(notification_viewport_id());
         }
     }
@@ -965,7 +1071,9 @@ fn render_single_group(
             let indicator = match group.kind {
                 NotificationKind::Error => pal.err,
                 NotificationKind::Success => pal.ok,
-                NotificationKind::IncomingCall | NotificationKind::Message => pal.accent,
+                NotificationKind::IncomingCall
+                | NotificationKind::Message
+                | NotificationKind::Transfer => pal.accent,
                 NotificationKind::Info => pal.dim,
             };
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
@@ -978,7 +1086,9 @@ fn render_single_group(
                     .color(tint(pal.dim)),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if close_button(ui, pal, opacity).clicked() {
+                if group.kind != NotificationKind::Transfer
+                    && close_button(ui, pal, opacity).clicked()
+                {
                     *dismiss = true;
                 }
             });
@@ -1002,6 +1112,19 @@ fn render_single_group(
                 )
                 .truncate(),
             );
+        }
+        if let Some(progress) = entry.progress {
+            ui.add_space(5.0);
+            ui.scope(|ui| {
+                ui.visuals_mut().extreme_bg_color = tint(pal.line_br);
+                ui.add(
+                    egui::ProgressBar::new(progress.fraction())
+                        .desired_width(ui.available_width())
+                        .desired_height(TRANSFER_BAR_HEIGHT)
+                        .corner_radius(TRANSFER_BAR_HEIGHT / 2.0)
+                        .fill(tint(pal.accent)),
+                );
+            });
         }
         if !group.buttons.is_empty() {
             ui.add_space(7.0);
@@ -1161,6 +1284,19 @@ mod tests {
             kind: NotificationKind::Message,
             title: "Maya".to_owned(),
             body: body.to_owned(),
+            progress: None,
+            action: None,
+            buttons: Vec::new(),
+        }
+    }
+
+    fn transfer_spec(key: &str, current: u64, total: u64) -> NotificationSpec {
+        NotificationSpec {
+            group_key: Some(key.to_owned()),
+            kind: NotificationKind::Transfer,
+            title: "Downloading archive.zip".to_owned(),
+            body: format!("{current} of {total} received"),
+            progress: Some(TransferProgress { current, total }),
             action: None,
             buttons: Vec::new(),
         }
@@ -1199,8 +1335,67 @@ mod tests {
     }
 
     #[test]
+    fn transfer_progress_updates_one_persistent_notification() {
+        let now = Instant::now();
+        let mut store = NotificationStore::default();
+        store.upsert_transfer(transfer_spec("transfer:one", 0, 100), now);
+        store.upsert_transfer(
+            transfer_spec("transfer:one", 64, 100),
+            now + Duration::from_secs(1),
+        );
+
+        assert_eq!(store.visible.len(), 1);
+        assert_eq!(store.visible[0].expires_at, None);
+        assert_eq!(store.visible[0].estimated_height(), TRANSFER_HEIGHT);
+        assert_eq!(
+            store.visible[0].entries[0].progress,
+            Some(TransferProgress {
+                current: 64,
+                total: 100
+            })
+        );
+
+        store.advance(now + Duration::from_secs(60 * 60));
+        assert_eq!(store.visible.len(), 1);
+    }
+
+    #[test]
+    fn transfer_updates_wake_the_existing_notification_viewport() {
+        let service = NotificationService::default();
+        service.transfer_progress(
+            "transfer:one",
+            "Sending archive.zip",
+            "64 B of 100 B sent",
+            64,
+            100,
+        );
+        service.viewport_created.store(true, Ordering::Release);
+
+        let context = egui::Context::default();
+        context.set_embed_viewports(false);
+        let repaint_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&repaint_requests);
+        context.set_request_repaint_callback(move |request| {
+            captured_requests.lock().unwrap().push(request.viewport_id);
+        });
+
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            service.show(ctx, Theme::Amber);
+        });
+
+        assert!(
+            repaint_requests
+                .lock()
+                .unwrap()
+                .contains(&notification_viewport_id()),
+            "applying progress must repaint the independent notification viewport"
+        );
+    }
+
+    #[test]
     fn critical_notifications_do_not_expire() {
         assert_eq!(NotificationKind::IncomingCall.default_lifetime(), None);
+        assert_eq!(NotificationKind::Transfer.default_lifetime(), None);
         assert!(NotificationKind::Error.default_lifetime().is_some());
     }
 
@@ -1238,6 +1433,7 @@ mod tests {
                 kind: NotificationKind::Success,
                 title: "Call connected".to_owned(),
                 body: "Ada".to_owned(),
+                progress: None,
                 action: None,
                 buttons: Vec::new(),
             },
@@ -1258,6 +1454,7 @@ mod tests {
                 kind: NotificationKind::Info,
                 title: "Screen sharing stopped".to_owned(),
                 body: String::new(),
+                progress: None,
                 action: None,
                 buttons: Vec::new(),
             },

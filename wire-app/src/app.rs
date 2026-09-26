@@ -10,7 +10,7 @@ mod widgets;
 
 #[cfg(windows)]
 use self::calls_ui::native_parent_hwnd;
-use self::widgets::{ellipsize, track_pane_viewport};
+use self::widgets::{ellipsize, format_bytes, track_pane_viewport};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use crate::tray::{TrayAction, TrayController};
 #[cfg(windows)]
@@ -330,6 +330,14 @@ impl FileTransferUiState {
             .as_ref()
             .is_some_and(|phase| !matches!(phase, FileTransferPhase::Paused(_)))
     }
+}
+
+fn file_download_notification_key(message_id: &str, hash: &str) -> String {
+    format!("file-download:{message_id}:{hash}")
+}
+
+fn file_serving_notification_key(hash: &str, connection_id: u64, request_id: u64) -> String {
+    format!("file-serving:{hash}:{connection_id}:{request_id}")
 }
 
 const MAX_ATTACHMENT_TEXTURES: usize = 128;
@@ -1872,7 +1880,7 @@ impl AppState {
                                     [attachment]
                                         if attachment.kind == chat::AttachmentKind::FileOffer =>
                                     {
-                                        format!("File offer: {}", attachment.name)
+                                        format!("File: {}", attachment.name)
                                     }
                                     [attachment]
                                         if attachment.kind == chat::AttachmentKind::InlineFile =>
@@ -1937,6 +1945,8 @@ impl AppState {
                 hash,
                 result,
             } => {
+                self.notifications
+                    .dismiss_key(&file_download_notification_key(&message_id, &hash));
                 let transfer = self
                     .chat
                     .file_transfers
@@ -1963,6 +1973,47 @@ impl AppState {
                 total,
                 phase,
             } => {
+                let notification_key = file_download_notification_key(&message_id, &hash);
+                if matches!(phase, FileTransferPhase::Paused(_)) {
+                    self.notifications.dismiss_key(&notification_key);
+                } else {
+                    let file_name = self
+                        .chat
+                        .timelines
+                        .values()
+                        .flat_map(|timeline| timeline.iter())
+                        .find(|message| message.message_id == message_id)
+                        .and_then(|message| {
+                            message
+                                .attachments
+                                .iter()
+                                .find(|attachment| attachment.hash == hash)
+                        })
+                        .map(|attachment| attachment.name.as_str())
+                        .unwrap_or("file");
+                    let status = match &phase {
+                        FileTransferPhase::Connecting => "Connecting".to_owned(),
+                        FileTransferPhase::Downloading => format!(
+                            "{} of {} received",
+                            format_bytes(received),
+                            format_bytes(total)
+                        ),
+                        FileTransferPhase::Reconnecting => format!(
+                            "Reconnecting · {} of {} received",
+                            format_bytes(received),
+                            format_bytes(total)
+                        ),
+                        FileTransferPhase::Saving => "Saving file".to_owned(),
+                        FileTransferPhase::Paused(_) => unreachable!(),
+                    };
+                    self.notifications.transfer_progress(
+                        notification_key,
+                        format!("Downloading {file_name}"),
+                        status,
+                        received,
+                        total,
+                    );
+                }
                 self.chat.file_transfers.insert(
                     (message_id, hash),
                     FileTransferUiState {
@@ -1975,6 +2026,8 @@ impl AppState {
                 );
             }
             ChatNotification::FileTransferCancelled { message_id, hash } => {
+                self.notifications
+                    .dismiss_key(&file_download_notification_key(&message_id, &hash));
                 self.chat.file_transfers.remove(&(message_id, hash));
             }
             ChatNotification::FileServing {
@@ -1985,6 +2038,39 @@ impl AppState {
                 total,
                 phase,
             } => {
+                let notification_key =
+                    file_serving_notification_key(&hash, connection_id, request_id);
+                match phase {
+                    chat::FileServingPhase::Sending => {
+                        let file_name = self
+                            .chat
+                            .timelines
+                            .values()
+                            .flat_map(|timeline| timeline.iter())
+                            .flat_map(|message| message.attachments.iter())
+                            .find(|attachment| {
+                                attachment.kind == chat::AttachmentKind::FileOffer
+                                    && attachment.hash == hash
+                            })
+                            .map(|attachment| attachment.name.as_str());
+                        if let Some(file_name) = file_name {
+                            self.notifications.transfer_progress(
+                                notification_key,
+                                format!("Sending {file_name}"),
+                                format!(
+                                    "{} of {} sent",
+                                    format_bytes(position),
+                                    format_bytes(total)
+                                ),
+                                position,
+                                total,
+                            );
+                        }
+                    }
+                    chat::FileServingPhase::Sent | chat::FileServingPhase::Interrupted => {
+                        self.notifications.dismiss_key(&notification_key);
+                    }
+                }
                 if phase == chat::FileServingPhase::Sending && position == 0 {
                     self.chat
                         .file_serving

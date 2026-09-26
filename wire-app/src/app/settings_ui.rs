@@ -45,8 +45,9 @@ impl AppState {
                     .inner_margin(0.0),
             )
             .show(ctx, |ui| {
-                let width = ui.available_width();
-                ui.set_width(width);
+                // Do not reuse an oversized width remembered from a previous
+                // frame: one unwrapped child used to expand the dialog permanently.
+                ui.set_width(dialog_width);
                 let _ = floating_dialog_header(
                     ui,
                     &pal,
@@ -57,12 +58,19 @@ impl AppState {
                 Frame::new()
                     .inner_margin(egui::Margin::symmetric(18, 16))
                     .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
+                        let content_width = ui.available_width();
+                        ui.set_width(content_width);
                         egui::ScrollArea::vertical()
                             .id_salt("settings-scroll")
                             .max_height(scroll_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                // A vertical scroll area still permits its contents to report a
+                                // wider minimum size. Pin rows to the dialog so long labels wrap
+                                // instead of changing the window geometry.
+                                let scroll_content_width = ui.available_width();
+                                ui.set_min_width(scroll_content_width);
+                                ui.set_max_width(scroll_content_width);
                                 settings_section_heading(
                                     ui,
                                     &pal,
@@ -204,9 +212,7 @@ impl AppState {
                                     });
                                 ui.add_space(8.0);
 
-                                settings_field_label(ui, &pal, "Keep history", Some(
-                                    "File offer and receive records remain visible. Expired inline images and text files are not downloaded or retained."
-                                ));
+                                settings_field_label(ui, &pal, "Keep history", None);
                                 egui::ComboBox::from_id_salt("settings-chat-retention")
                                     .width(ui.available_width())
                                     .selected_text(
@@ -707,24 +713,34 @@ fn settings_section_heading(ui: &mut Ui, pal: &Palette, title: &str, description
     ui.add_space(8.0);
 }
 
-fn settings_field_label(ui: &mut Ui, pal: &Palette, label: &str, detail: Option<&str>) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .color(pal.text2)
-                .size(ui_font_size(12.0)),
-        );
-        if let Some(detail) = detail {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(detail)
-                        .color(pal.dim)
-                        .size(ui_font_size(10.5)),
+fn settings_field_label(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    detail: Option<&str>,
+) -> egui::Response {
+    let response = ui
+        .vertical(|ui| {
+            ui.set_max_width(ui.available_width());
+            ui.label(
+                RichText::new(label)
+                    .color(pal.text2)
+                    .size(ui_font_size(12.0)),
+            );
+            if let Some(detail) = detail {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(detail)
+                            .color(pal.dim)
+                            .size(ui_font_size(10.5)),
+                    )
+                    .wrap(),
                 );
-            });
-        }
-    });
+            }
+        })
+        .response;
     ui.add_space(2.0);
+    response
 }
 
 fn settings_divider(ui: &mut Ui) {
@@ -737,4 +753,37 @@ fn image_limit_label(limit: Option<u64>) -> String {
     limit
         .map(|bytes| format!("{} per image", format_bytes(bytes)))
         .unwrap_or_else(|| "Unlimited".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_settings_details_stay_inside_the_dialog_width() {
+        let context = egui::Context::default();
+        let mut measured = egui::Rect::NOTHING;
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(egui::vec2(320.0, 160.0), |ui| {
+                    ui.set_width(320.0);
+                    measured = settings_field_label(
+                        ui,
+                        &Palette::for_theme(Theme::Amber),
+                        "Keep history",
+                        Some(
+                            "Long descriptions wrap below the setting name instead of widening the dialog or shifting neighboring controls.",
+                        ),
+                    )
+                    .rect;
+                });
+            });
+        });
+
+        assert!(measured.width() <= 320.5, "field widened to {measured:?}");
+        assert!(
+            measured.height() > 30.0,
+            "detail did not wrap: {measured:?}"
+        );
+    }
 }

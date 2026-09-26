@@ -725,7 +725,7 @@ impl AppState {
             }
             if self.chat.preparing_file_offers > 0 {
                 ui.label(
-                    RichText::new("Preparing file offer…")
+                    RichText::new("Preparing file…")
                         .color(pal.dim)
                         .size(ui_font_size(10.5)),
                 );
@@ -1307,10 +1307,12 @@ impl AppState {
                 _ => "Preparing download…".to_owned(),
             };
             ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
-            if state.total > 0 && state.received > 0 && state.received < state.total {
+            if state.total > 0 && state.result.is_none() {
                 ui.add(
-                    egui::ProgressBar::new(state.received as f32 / state.total as f32)
-                        .show_percentage(),
+                    egui::ProgressBar::new(
+                        state.received.min(state.total) as f32 / state.total as f32,
+                    )
+                    .show_percentage(),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -1332,15 +1334,13 @@ impl AppState {
         if own {
             if attachment.kind == AttachmentKind::FileOffer {
                 let stopped = message.stopped_file_offers.contains(&attachment.hash);
-                ui.label(
-                    RichText::new(if stopped {
-                        "Sharing stopped"
-                    } else {
-                        "Available for download while you are online"
-                    })
-                    .color(pal.dim)
-                    .size(ui_font_size(11.0)),
-                );
+                if stopped {
+                    ui.label(
+                        RichText::new("Sharing stopped")
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    );
+                }
                 let active: Vec<_> = self
                     .chat
                     .file_serving
@@ -1353,21 +1353,21 @@ impl AppState {
                     let (position, total, _) = active[0].1;
                     ui.label(
                         RichText::new(if active.len() == 1 {
-                            "Serving to 1 peer…".to_owned()
+                            "Sending to 1 peer…".to_owned()
                         } else {
-                            format!("Serving to {} peers…", active.len())
+                            format!("Sending to {} peers…", active.len())
                         })
                         .color(pal.dim)
                         .size(ui_font_size(11.0)),
                     );
                     if *total > 0 {
                         ui.add(
-                            egui::ProgressBar::new(*position as f32 / *total as f32)
+                            egui::ProgressBar::new((*position).min(*total) as f32 / *total as f32)
                                 .show_percentage(),
                         );
                         ui.label(
                             RichText::new(format!(
-                                "File position {} of {}",
+                                "{} of {} sent",
                                 format_bytes(*position),
                                 format_bytes(*total)
                             ))
@@ -1383,15 +1383,13 @@ impl AppState {
                     .find(|((hash, _, _), _)| hash == &attachment.hash)
                 {
                     let label = match phase {
-                        chat::FileServingPhase::Sent => {
-                            "Sent to peer · waiting for receive receipt".to_owned()
-                        }
+                        chat::FileServingPhase::Sent => "Sent to peer".to_owned(),
                         chat::FileServingPhase::Interrupted => format!(
                             "Transfer interrupted after {} of {}",
                             format_bytes(*position),
                             format_bytes(*total)
                         ),
-                        chat::FileServingPhase::Sending => "Serving to peer…".to_owned(),
+                        chat::FileServingPhase::Sending => "Sending to peer…".to_owned(),
                     };
                     ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
                 }
@@ -1560,10 +1558,7 @@ impl AppState {
                 .chat_retention
                 .includes(message.sent_at, chat::now_millis())
             {
-                ui.label(
-                    RichText::new(format!("{} · expired on this device", attachment.name))
-                        .color(pal.dim),
-                );
+                ui.label(RichText::new(format!("{} · expired", attachment.name)).color(pal.dim));
                 if !receivers.is_empty() {
                     ui.label(
                         RichText::new(format!("Received by {}", receivers.join(", ")))
@@ -1600,26 +1595,6 @@ impl AppState {
                             );
                         }
                         if let Some(data) = data {
-                            ui.label(
-                                RichText::new(
-                                    "Synced automatically; saved copies cannot be recalled",
-                                )
-                                .color(pal.dim)
-                                .size(ui_font_size(10.5)),
-                            );
-                            ui.label(
-                                RichText::new(match self.chat_retention {
-                                    chat::RetentionPolicy::Unlimited => {
-                                        "Stored on this device until chat history is cleared"
-                                            .to_owned()
-                                    }
-                                    chat::RetentionPolicy::Days(days) => {
-                                        format!("Stored on this device for up to {days} days")
-                                    }
-                                })
-                                .color(pal.dim)
-                                .size(ui_font_size(10.5)),
-                            );
                             if let Ok(contents) = std::str::from_utf8(&data) {
                                 let preview: String = contents.chars().take(2_000).collect();
                                 egui::ScrollArea::vertical()
