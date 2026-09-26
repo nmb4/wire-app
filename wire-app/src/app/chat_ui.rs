@@ -1278,6 +1278,7 @@ impl AppState {
         message: &ChatMessage,
         attachment: &ChatAttachment,
         own: bool,
+        receivers: &[String],
     ) {
         let key = (message.message_id.clone(), attachment.hash.clone());
         let transfer = self.chat.file_transfers.get(&key).cloned();
@@ -1334,13 +1335,6 @@ impl AppState {
         if own {
             if attachment.kind == AttachmentKind::FileOffer {
                 let stopped = message.stopped_file_offers.contains(&attachment.hash);
-                if stopped {
-                    ui.label(
-                        RichText::new("Sharing stopped")
-                            .color(pal.dim)
-                            .size(ui_font_size(11.0)),
-                    );
-                }
                 let active: Vec<_> = self
                     .chat
                     .file_serving
@@ -1349,66 +1343,87 @@ impl AppState {
                         hash == &attachment.hash && *phase == chat::FileServingPhase::Sending
                     })
                     .collect();
-                if !active.is_empty() {
-                    let (position, total, _) = active[0].1;
-                    ui.label(
-                        RichText::new(if active.len() == 1 {
-                            "Sending to 1 peer…".to_owned()
-                        } else {
-                            format!("Sending to {} peers…", active.len())
-                        })
-                        .color(pal.dim)
-                        .size(ui_font_size(11.0)),
-                    );
-                    if *total > 0 {
-                        ui.add(
-                            egui::ProgressBar::new((*position).min(*total) as f32 / *total as f32)
-                                .show_percentage(),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "{} of {} sent",
-                                format_bytes(*position),
-                                format_bytes(*total)
-                            ))
-                            .color(pal.dim)
-                            .size(ui_font_size(10.5)),
-                        );
-                    }
-                } else if let Some((_, (position, total, phase))) = self
+                let active_progress = active
+                    .first()
+                    .map(|(_, (position, total, _))| (*position, *total));
+                let latest = self
                     .chat
                     .file_serving
                     .iter()
                     .rev()
                     .find(|((hash, _, _), _)| hash == &attachment.hash)
-                {
-                    let label = match phase {
-                        chat::FileServingPhase::Sent => "Sent to peer".to_owned(),
-                        chat::FileServingPhase::Interrupted => format!(
-                            "Transfer interrupted after {} of {}",
-                            format_bytes(*position),
-                            format_bytes(*total)
-                        ),
-                        chat::FileServingPhase::Sending => "Sending to peer…".to_owned(),
-                    };
-                    ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
-                }
-                if action_button(
-                    ui,
-                    pal,
-                    if stopped {
-                        "Resume sharing"
-                    } else {
-                        "Stop sharing"
-                    },
-                    ButtonTone::Secondary,
-                )
-                .clicked()
-                {
+                    .map(|(_, (position, total, phase))| (*position, *total, *phase));
+                let status = owner_file_offer_status(
+                    stopped,
+                    receivers,
+                    active.len(),
+                    latest.map(|(_, _, phase)| phase),
+                );
+                let status_detail = if !stopped {
+                    active_progress
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(position, total)| {
+                            format!("{} of {} sent", format_bytes(position), format_bytes(total))
+                        })
+                        .or_else(|| {
+                            latest.and_then(|(position, total, phase)| {
+                                (phase == chat::FileServingPhase::Interrupted).then(|| {
+                                    format!(
+                                        "Transfer interrupted after {} of {}",
+                                        format_bytes(position),
+                                        format_bytes(total)
+                                    )
+                                })
+                            })
+                        })
+                } else {
+                    None
+                };
+                let mut toggle_sharing = false;
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    toggle_sharing = action_button(
+                        ui,
+                        pal,
+                        if stopped { "Resume" } else { "Stop" },
+                        ButtonTone::Secondary,
+                    )
+                    .clicked();
+                    if let Some(status) = status {
+                        let response = ui.add(
+                            egui::Label::new(
+                                RichText::new(status)
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.0)),
+                            )
+                            .truncate(),
+                        );
+                        if let Some(detail) = status_detail.as_deref() {
+                            response.on_hover_text(detail);
+                        }
+                    }
+                });
+                if toggle_sharing {
                     self.cmd(Command::SetChatFileServing {
                         hash: attachment.hash.clone(),
                         serving: stopped,
                     });
+                }
+                if !stopped {
+                    if let Some((position, total)) = active_progress.filter(|(_, total)| *total > 0)
+                    {
+                        ui.add(
+                            egui::ProgressBar::new(position.min(total) as f32 / total as f32)
+                                .desired_width(ui.available_width())
+                                .desired_height(6.0)
+                                .corner_radius(3.0)
+                                .fill(pal.accent),
+                        )
+                        .on_hover_text(format!(
+                            "{} of {} sent",
+                            format_bytes(position),
+                            format_bytes(total)
+                        ));
+                    }
                 }
             }
             return;
@@ -1525,7 +1540,7 @@ impl AppState {
                             ))
                             .color(pal.text),
                         );
-                        if !receivers.is_empty() {
+                        if !own && !receivers.is_empty() {
                             ui.label(
                                 RichText::new(format!("Received by {}", receivers.join(", ")))
                                     .color(pal.dim)
@@ -1539,6 +1554,7 @@ impl AppState {
                             message,
                             attachment,
                             own,
+                            &receivers,
                         );
                     })
                     .response;
@@ -1666,6 +1682,7 @@ impl AppState {
                             message,
                             attachment,
                             own,
+                            &receivers,
                         );
                     })
                     .response;
@@ -2376,6 +2393,34 @@ fn format_chat_time(sent_at: i64) -> String {
     format!("{hour:02}:{minute:02}")
 }
 
+fn owner_file_offer_status(
+    stopped: bool,
+    receivers: &[String],
+    active_transfers: usize,
+    latest_phase: Option<chat::FileServingPhase>,
+) -> Option<String> {
+    let receipt = (!receivers.is_empty()).then(|| format!("Received by {}", receivers.join(", ")));
+    if stopped {
+        return receipt;
+    }
+    if active_transfers > 0 {
+        return Some(if active_transfers == 1 {
+            "Sending to 1 peer".to_owned()
+        } else {
+            format!("Sending to {active_transfers} peers")
+        });
+    }
+    if receipt.is_some() {
+        return receipt;
+    }
+    match latest_phase {
+        Some(chat::FileServingPhase::Sent) => Some("Sent to peer".to_owned()),
+        Some(chat::FileServingPhase::Interrupted) => Some("Interrupted".to_owned()),
+        Some(chat::FileServingPhase::Sending) => Some("Sending to peer".to_owned()),
+        None => None,
+    }
+}
+
 fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -> bool {
     previous.author_id == current.author_id
         && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
@@ -2437,5 +2482,31 @@ mod tests {
         assert_eq!(composer_visual_rows("one\ntwo\nthree\nfour", 500.0), 4);
         assert!(composer_visual_rows(&"x".repeat(200), 140.0) > 3);
         assert_eq!(composer_visual_rows(&"x".repeat(10_000), 140.0), 8);
+    }
+
+    #[test]
+    fn stopped_file_offer_prefers_receipt_and_hides_stale_activity() {
+        let receivers = vec!["David".to_owned()];
+        assert_eq!(
+            owner_file_offer_status(true, &receivers, 0, Some(chat::FileServingPhase::Sent),),
+            Some("Received by David".to_owned())
+        );
+        assert_eq!(
+            owner_file_offer_status(true, &[], 0, Some(chat::FileServingPhase::Interrupted),),
+            None
+        );
+    }
+
+    #[test]
+    fn active_file_offer_status_takes_priority_until_receipt_arrives() {
+        let receivers = vec!["David".to_owned()];
+        assert_eq!(
+            owner_file_offer_status(false, &receivers, 1, Some(chat::FileServingPhase::Sending)),
+            Some("Sending to 1 peer".to_owned())
+        );
+        assert_eq!(
+            owner_file_offer_status(false, &receivers, 0, Some(chat::FileServingPhase::Sent)),
+            Some("Received by David".to_owned())
+        );
     }
 }
