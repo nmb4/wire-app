@@ -275,6 +275,26 @@ pub(crate) enum Command {
         conversation_id: String,
         message: ChatMessage,
     },
+    OfferChatFiles {
+        conversation_id: String,
+        body: String,
+        attachments: Vec<crate::chat::ChatAttachment>,
+        paths: Vec<std::path::PathBuf>,
+    },
+    ReceiveChatFile {
+        conversation_id: String,
+        message_id: String,
+        hash: String,
+        path: std::path::PathBuf,
+    },
+    CancelChatFile {
+        message_id: String,
+        hash: String,
+    },
+    SetChatFileServing {
+        hash: String,
+        serving: bool,
+    },
     LoadChatAttachment {
         conversation_id: String,
         hash: String,

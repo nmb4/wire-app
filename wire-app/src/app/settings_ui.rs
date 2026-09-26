@@ -204,7 +204,9 @@ impl AppState {
                                     });
                                 ui.add_space(8.0);
 
-                                settings_field_label(ui, &pal, "Keep history", None);
+                                settings_field_label(ui, &pal, "Keep history", Some(
+                                    "File offer and receive records remain visible. Expired inline images and text files are not downloaded or retained."
+                                ));
                                 egui::ComboBox::from_id_salt("settings-chat-retention")
                                     .width(ui.available_width())
                                     .selected_text(
@@ -621,6 +623,9 @@ impl AppState {
                                 self.cmd(Command::SetChatRetention {
                                     retention: self.chat_retention,
                                 });
+                                self.chat.inline_file_data.clear();
+                                self.chat.attachment_textures = Default::default();
+                                self.chat.attachment_requests.clear();
                                 // Persist all regular settings immediately. The
                                 // startup preference is committed after the OS
                                 // integration succeeds on a background thread.

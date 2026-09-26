@@ -6,14 +6,15 @@ use super::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
         chat_surface, copy_to_clipboard, format_bytes, paint_chat_card,
     },
-    AppMode, AppState, AttachmentTextureCache, ChatStyle, GroupMemberKind, ImagePreview,
-    ImagePreviewAction, ImagePreviewMode,
+    AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
+    ImagePreview, ImagePreviewAction, ImagePreviewMode,
 };
 use crate::{
     chat::{
-        self, ChatAttachment, ChatMessage, ConversationKind, DeleteScope, DeliveryState,
-        MessageDeletion,
+        self, AttachmentKind, ChatAttachment, ChatMessage, ConversationKind, DeleteScope,
+        DeliveryState, FileTransferPhase, MessageDeletion,
     },
+    client_status::Availability,
     runtime::Command,
     theme::{
         action_button, circle_avatar, ghost_icon_button, kh_family, lucide, menu_item_button,
@@ -351,12 +352,19 @@ impl AppState {
             (ui.available_width() - 80.0).max(120.0),
         );
         let editor_height = 10.0 + composer_rows as f32 * 20.0;
-        let composer_height = editor_height + 64.0;
-        let preview_height = if self.chat.draft_attachments.is_empty() {
-            0.0
-        } else {
-            62.0
-        };
+        let composer_height = editor_height
+            + 64.0
+            + if self.chat.preparing_file_offers > 0 {
+                20.0
+            } else {
+                0.0
+            };
+        let preview_height =
+            if self.chat.draft_attachments.is_empty() && self.chat.draft_files.is_empty() {
+                0.0
+            } else {
+                62.0
+            };
         let rect = ui.max_rect();
         let surface_rect = egui::Rect::from_min_max(
             rect.min + Vec2::new(0.0, 10.0),
@@ -418,7 +426,14 @@ impl AppState {
                         .truncate(),
                     );
                     let subtitle = match &conversation.kind {
-                        ConversationKind::Direct { .. } => "Direct message".to_owned(),
+                        ConversationKind::Direct { peer_id } => NodeId::from_str(peer_id)
+                            .ok()
+                            .and_then(|peer| self.friend_status.get(&peer))
+                            .map(|status| match status.availability {
+                                Availability::Online => "Online".to_owned(),
+                                Availability::Offline => "Offline".to_owned(),
+                            })
+                            .unwrap_or_else(|| "Connection status unknown".to_owned()),
                         ConversationKind::Group => group_member_summary
                             .clone()
                             .unwrap_or_else(|| "No members".to_owned()),
@@ -590,7 +605,7 @@ impl AppState {
                             ui.add_space(8.0);
                             let visible_messages = timeline
                                 .into_iter()
-                                .filter(|message| retention.includes(message.sent_at, now))
+                                .filter(|message| message.visible_under(retention, now))
                                 .collect::<Vec<_>>();
                             for (index, message) in visible_messages.iter().enumerate() {
                                 let starts_group = index == 0
@@ -619,7 +634,7 @@ impl AppState {
                 });
         });
 
-        if !self.chat.draft_attachments.is_empty() {
+        if !self.chat.draft_attachments.is_empty() || !self.chat.draft_files.is_empty() {
             ui.scope_builder(egui::UiBuilder::new().max_rect(previews), |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(previews));
                 egui::ScrollArea::horizontal()
@@ -627,7 +642,27 @@ impl AppState {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            for path in self.chat.draft_files.clone() {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("File");
+                                ui.label(RichText::new(name).color(pal.text2))
+                                    .on_hover_text(path.display().to_string());
+                                if ui.small_button("×").clicked() {
+                                    self.chat.draft_files.retain(|item| item != &path);
+                                }
+                            }
                             for attachment in self.chat.draft_attachments.clone() {
+                                if attachment.kind == AttachmentKind::InlineFile {
+                                    ui.label(RichText::new(&attachment.name).color(pal.text2));
+                                    if ui.small_button("×").clicked() {
+                                        self.chat
+                                            .draft_attachments
+                                            .retain(|item| item.id != attachment.id);
+                                    }
+                                    continue;
+                                }
                                 if let Some(texture) = attachment_texture(
                                     ui.ctx(),
                                     &mut self.chat.attachment_textures,
@@ -671,8 +706,8 @@ impl AppState {
                 && ui.input(|input| !input.modifiers.shift && input.key_pressed(egui::Key::Enter));
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach images").clicked() {
-                        self.pick_chat_images();
+                    if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach files").clicked() {
+                        self.pick_chat_files();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let button_send = chat_send_button(ui, pal).clicked();
@@ -686,6 +721,13 @@ impl AppState {
                 ui.add(
                     egui::Label::new(RichText::new(error).color(pal.err).size(ui_font_size(10.5)))
                         .truncate(),
+                );
+            }
+            if self.chat.preparing_file_offers > 0 {
+                ui.label(
+                    RichText::new("Preparing file offer…")
+                        .color(pal.dim)
+                        .size(ui_font_size(10.5)),
                 );
             }
         });
@@ -1024,7 +1066,10 @@ impl AppState {
 
     fn send_chat_composer(&mut self, conversation_id: &str) {
         let body = self.chat.composer.trim().to_owned();
-        if body.is_empty() && self.chat.draft_attachments.is_empty() {
+        if body.is_empty()
+            && self.chat.draft_attachments.is_empty()
+            && self.chat.draft_files.is_empty()
+        {
             self.chat.composer.clear();
             return;
         }
@@ -1034,6 +1079,17 @@ impl AppState {
         };
         self.chat.composer.clear();
         let attachments = std::mem::take(&mut self.chat.draft_attachments);
+        if !self.chat.draft_files.is_empty() {
+            let paths = std::mem::take(&mut self.chat.draft_files);
+            self.chat.preparing_file_offers += 1;
+            self.cmd(Command::OfferChatFiles {
+                conversation_id: conversation_id.to_owned(),
+                body,
+                attachments,
+                paths,
+            });
+            return;
+        }
         let message = ChatMessage::new_with_attachments(author, body, attachments);
         self.chat
             .delivery
@@ -1053,7 +1109,7 @@ impl AppState {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         for file in dropped {
             if let Some(path) = file.path {
-                self.add_chat_image_path(&path);
+                self.add_chat_file_path(&path);
             } else if let Some(bytes) = file.bytes {
                 self.add_chat_image_bytes(
                     if file.name.is_empty() {
@@ -1078,7 +1134,7 @@ impl AppState {
                     let _ = clipboard_win::formats::FileList.read_clipboard(&mut paths);
                 }
                 for path in paths {
-                    self.add_chat_image_path(&path);
+                    self.add_chat_file_path(&path);
                 }
             }
 
@@ -1115,35 +1171,65 @@ impl AppState {
         }
     }
 
-    fn pick_chat_images(&mut self) {
-        if let Some(paths) = rfd::FileDialog::new()
-            .add_filter(
-                "Images",
-                &[
-                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico", "pnm", "qoi",
-                    "tga", "avif", "dds", "ff", "hdr", "exr",
-                ],
-            )
-            .pick_files()
-        {
+    fn pick_chat_files(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new().pick_files() {
             for path in paths {
-                self.add_chat_image_path(&path);
+                self.add_chat_file_path(&path);
             }
         }
     }
 
-    fn add_chat_image_path(&mut self, path: &Path) {
-        match std::fs::read(path) {
-            Ok(bytes) => self.add_chat_image_bytes(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("image")
-                    .to_owned(),
-                bytes,
-            ),
-            Err(error) => {
-                self.chat.error = Some(format!("Could not read {}: {error}", path.display()));
+    fn add_chat_file_path(&mut self, path: &Path) {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            self.chat.error = Some(format!("Could not open {}", path.display()));
+            return;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            self.chat.error = Some("Choose a nonempty file.".to_owned());
+            return;
+        }
+        if metadata.len() <= 8 * 1024 * 1024 {
+            if let Ok(bytes) = std::fs::read(path) {
+                if image::guess_format(&bytes).is_ok() {
+                    self.add_chat_image_bytes(
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("image")
+                            .to_owned(),
+                        bytes,
+                    );
+                    return;
+                }
+                if metadata.len() <= 64 * 1024 && std::str::from_utf8(&bytes).is_ok() {
+                    let hash = iroh_blobs::Hash::new(&bytes).to_string();
+                    if !self
+                        .chat
+                        .draft_attachments
+                        .iter()
+                        .any(|item| item.hash == hash)
+                    {
+                        self.chat.draft_attachments.push(ChatAttachment {
+                            kind: AttachmentKind::InlineFile,
+                            id: hash.clone(),
+                            name: path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("text.txt")
+                                .to_owned(),
+                            media_type: "text/plain".to_owned(),
+                            byte_len: bytes.len() as u64,
+                            width: 0,
+                            height: 0,
+                            hash,
+                            data: Some(Arc::new(bytes)),
+                        });
+                    }
+                    return;
+                }
             }
+        }
+        if !self.chat.draft_files.iter().any(|item| item == path) {
+            self.chat.draft_files.push(path.to_owned());
         }
     }
 
@@ -1171,6 +1257,7 @@ impl AppState {
             .unwrap_or("application/octet-stream")
             .to_owned();
         self.chat.draft_attachments.push(ChatAttachment {
+            kind: AttachmentKind::Image,
             id: hash_string.clone(),
             name,
             media_type,
@@ -1180,6 +1267,219 @@ impl AppState {
             hash: hash_string,
             data: Some(Arc::new(bytes)),
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ui_file_download_controls(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        conversation_id: &str,
+        message: &ChatMessage,
+        attachment: &ChatAttachment,
+        own: bool,
+    ) {
+        let key = (message.message_id.clone(), attachment.hash.clone());
+        let transfer = self.chat.file_transfers.get(&key).cloned();
+        let owner_offline = NodeId::from_str(&message.author_id)
+            .ok()
+            .and_then(|owner| self.friend_status.get(&owner))
+            .is_some_and(|status| status.availability == Availability::Offline);
+        if let Some(state) = &transfer {
+            let label = match (&state.phase, &state.result) {
+                (Some(FileTransferPhase::Connecting), _) => if owner_offline {
+                    "Owner offline · connecting…"
+                } else {
+                    "Connecting…"
+                }
+                .to_owned(),
+                (Some(FileTransferPhase::Downloading), _) => "Downloading…".to_owned(),
+                (Some(FileTransferPhase::Reconnecting), _) => if owner_offline {
+                    "Owner offline · retrying…"
+                } else {
+                    "Connection stalled · retrying…"
+                }
+                .to_owned(),
+                (Some(FileTransferPhase::Saving), _) => "Saving file…".to_owned(),
+                (Some(FileTransferPhase::Paused(reason)), _) => format!("Paused: {reason}"),
+                (_, Some(Ok(path))) => format!("Saved to {}", path.display()),
+                (_, Some(Err(error))) => format!("Paused: {error}"),
+                _ => "Preparing download…".to_owned(),
+            };
+            ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
+            if state.total > 0 && state.received > 0 && state.received < state.total {
+                ui.add(
+                    egui::ProgressBar::new(state.received as f32 / state.total as f32)
+                        .show_percentage(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} of {} received",
+                        format_bytes(state.received),
+                        format_bytes(state.total)
+                    ))
+                    .color(pal.dim)
+                    .size(ui_font_size(10.5)),
+                );
+            }
+        } else if owner_offline && !own {
+            ui.label(
+                RichText::new("Owner offline")
+                    .color(pal.dim)
+                    .size(ui_font_size(11.0)),
+            );
+        }
+        if own {
+            if attachment.kind == AttachmentKind::FileOffer {
+                let stopped = message.stopped_file_offers.contains(&attachment.hash);
+                ui.label(
+                    RichText::new(if stopped {
+                        "Sharing stopped"
+                    } else {
+                        "Available for download while you are online"
+                    })
+                    .color(pal.dim)
+                    .size(ui_font_size(11.0)),
+                );
+                let active: Vec<_> = self
+                    .chat
+                    .file_serving
+                    .iter()
+                    .filter(|((hash, _, _), (_, _, phase))| {
+                        hash == &attachment.hash && *phase == chat::FileServingPhase::Sending
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    let (position, total, _) = active[0].1;
+                    ui.label(
+                        RichText::new(if active.len() == 1 {
+                            "Serving to 1 peer…".to_owned()
+                        } else {
+                            format!("Serving to {} peers…", active.len())
+                        })
+                        .color(pal.dim)
+                        .size(ui_font_size(11.0)),
+                    );
+                    if *total > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(*position as f32 / *total as f32)
+                                .show_percentage(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "File position {} of {}",
+                                format_bytes(*position),
+                                format_bytes(*total)
+                            ))
+                            .color(pal.dim)
+                            .size(ui_font_size(10.5)),
+                        );
+                    }
+                } else if let Some((_, (position, total, phase))) = self
+                    .chat
+                    .file_serving
+                    .iter()
+                    .rev()
+                    .find(|((hash, _, _), _)| hash == &attachment.hash)
+                {
+                    let label = match phase {
+                        chat::FileServingPhase::Sent => {
+                            "Sent to peer · waiting for receive receipt".to_owned()
+                        }
+                        chat::FileServingPhase::Interrupted => format!(
+                            "Transfer interrupted after {} of {}",
+                            format_bytes(*position),
+                            format_bytes(*total)
+                        ),
+                        chat::FileServingPhase::Sending => "Serving to peer…".to_owned(),
+                    };
+                    ui.label(RichText::new(label).color(pal.dim).size(ui_font_size(11.0)));
+                }
+                if action_button(
+                    ui,
+                    pal,
+                    if stopped {
+                        "Resume sharing"
+                    } else {
+                        "Stop sharing"
+                    },
+                    ButtonTone::Secondary,
+                )
+                .clicked()
+                {
+                    self.cmd(Command::SetChatFileServing {
+                        hash: attachment.hash.clone(),
+                        serving: stopped,
+                    });
+                }
+            }
+            return;
+        }
+        if message.stopped_file_offers.contains(&attachment.hash) {
+            ui.label(
+                RichText::new("Owner stopped sharing this file")
+                    .color(pal.dim)
+                    .size(ui_font_size(11.0)),
+            );
+            return;
+        }
+        if transfer.as_ref().is_some_and(FileTransferUiState::active) {
+            if !transfer
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, Some(FileTransferPhase::Saving)))
+                && action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked()
+            {
+                self.cmd(Command::CancelChatFile {
+                    message_id: message.message_id.clone(),
+                    hash: attachment.hash.clone(),
+                });
+            }
+            return;
+        }
+        let resume_path = transfer.as_ref().and_then(|state| {
+            (matches!(state.phase, Some(FileTransferPhase::Paused(_)))
+                || matches!(state.result, Some(Err(_))))
+            .then(|| state.path.clone())
+            .flatten()
+        });
+        let label = if resume_path.is_some() {
+            "Resume"
+        } else {
+            "Download"
+        };
+        if action_button(ui, pal, label, ButtonTone::Secondary).clicked() {
+            let path = resume_path.clone().or_else(|| {
+                rfd::FileDialog::new()
+                    .set_file_name(&attachment.name)
+                    .save_file()
+            });
+            if let Some(path) = path {
+                self.chat.file_transfers.insert(
+                    key,
+                    FileTransferUiState {
+                        path: Some(path.clone()),
+                        received: transfer.as_ref().map_or(0, |state| state.received),
+                        total: attachment.byte_len,
+                        phase: Some(FileTransferPhase::Connecting),
+                        result: None,
+                    },
+                );
+                self.cmd(Command::ReceiveChatFile {
+                    conversation_id: conversation_id.to_owned(),
+                    message_id: message.message_id.clone(),
+                    hash: attachment.hash.clone(),
+                    path,
+                });
+            }
+        }
+        if resume_path.is_some()
+            && action_button(ui, pal, "Discard", ButtonTone::Secondary).clicked()
+        {
+            self.cmd(Command::CancelChatFile {
+                message_id: message.message_id.clone(),
+                hash: attachment.hash.clone(),
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1195,12 +1495,176 @@ impl AppState {
         requested_deletion: &mut Option<DeleteScope>,
     ) {
         for (index, attachment) in message.attachments.iter().enumerate() {
+            let receivers = message
+                .file_receivers
+                .get(&attachment.hash)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| NodeId::from_str(id).ok())
+                        .map(|id| self.peer_display_name(id))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let mut downloadable_attachment = attachment.clone();
             if downloadable_attachment.data.is_none() {
                 downloadable_attachment.data = self.chat.attachment_textures.data(&attachment.id);
             }
             if index > 0 || !message.body.trim().is_empty() {
                 ui.add_space(6.0);
+            }
+            if attachment.kind == AttachmentKind::FileOffer {
+                let response = Frame::new()
+                    .fill(pal.panel2.gamma_multiply(opacity))
+                    .stroke(Stroke::new(1.0_f32, pal.line.gamma_multiply(opacity)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                attachment.name,
+                                format_bytes(attachment.byte_len)
+                            ))
+                            .color(pal.text),
+                        );
+                        if !receivers.is_empty() {
+                            ui.label(
+                                RichText::new(format!("Received by {}", receivers.join(", ")))
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.0)),
+                            );
+                        }
+                        self.ui_file_download_controls(
+                            ui,
+                            pal,
+                            conversation_id,
+                            message,
+                            attachment,
+                            own,
+                        );
+                    })
+                    .response;
+                response.context_menu(|ui| {
+                    chat_message_context_menu(
+                        ui,
+                        pal,
+                        message,
+                        own,
+                        requested_restore,
+                        requested_deletion,
+                    );
+                });
+                continue;
+            }
+            if !self
+                .chat_retention
+                .includes(message.sent_at, chat::now_millis())
+            {
+                ui.label(
+                    RichText::new(format!("{} · expired on this device", attachment.name))
+                        .color(pal.dim),
+                );
+                if !receivers.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Received by {}", receivers.join(", ")))
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    );
+                }
+                continue;
+            }
+            if attachment.kind == AttachmentKind::InlineFile {
+                let data = attachment
+                    .data
+                    .clone()
+                    .or_else(|| self.chat.inline_file_data.get(&attachment.hash).cloned());
+                let response = Frame::new()
+                    .fill(pal.panel2.gamma_multiply(opacity))
+                    .stroke(Stroke::new(1.0_f32, pal.line.gamma_multiply(opacity)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                attachment.name,
+                                format_bytes(attachment.byte_len)
+                            ))
+                            .color(pal.text),
+                        );
+                        if !receivers.is_empty() {
+                            ui.label(
+                                RichText::new(format!("Received by {}", receivers.join(", ")))
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.0)),
+                            );
+                        }
+                        if let Some(data) = data {
+                            ui.label(
+                                RichText::new(
+                                    "Synced automatically; saved copies cannot be recalled",
+                                )
+                                .color(pal.dim)
+                                .size(ui_font_size(10.5)),
+                            );
+                            ui.label(
+                                RichText::new(match self.chat_retention {
+                                    chat::RetentionPolicy::Unlimited => {
+                                        "Stored on this device until chat history is cleared"
+                                            .to_owned()
+                                    }
+                                    chat::RetentionPolicy::Days(days) => {
+                                        format!("Stored on this device for up to {days} days")
+                                    }
+                                })
+                                .color(pal.dim)
+                                .size(ui_font_size(10.5)),
+                            );
+                            if let Ok(contents) = std::str::from_utf8(&data) {
+                                let preview: String = contents.chars().take(2_000).collect();
+                                egui::ScrollArea::vertical()
+                                    .max_height(160.0)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(preview)
+                                                .monospace()
+                                                .color(pal.text2)
+                                                .size(ui_font_size(11.0)),
+                                        );
+                                    });
+                            }
+                            if action_button(ui, pal, "Save", ButtonTone::Secondary).clicked() {
+                                let mut copy = attachment.clone();
+                                copy.data = Some(data);
+                                save_chat_attachment(&copy);
+                            }
+                        } else {
+                            if self
+                                .chat
+                                .attachment_requests
+                                .insert(attachment.hash.clone())
+                            {
+                                self.cmd(Command::LoadChatAttachment {
+                                    conversation_id: conversation_id.to_owned(),
+                                    hash: attachment.hash.clone(),
+                                    byte_len: attachment.byte_len,
+                                });
+                            }
+                            ui.label(RichText::new("Loading text file…").color(pal.dim));
+                        }
+                    })
+                    .response;
+                response.context_menu(|ui| {
+                    chat_message_context_menu(
+                        ui,
+                        pal,
+                        message,
+                        own,
+                        requested_restore,
+                        requested_deletion,
+                    );
+                });
+                continue;
             }
             if self
                 .max_image_bytes
@@ -1219,6 +1683,14 @@ impl AppState {
                             ))
                             .color(pal.dim.gamma_multiply(opacity))
                             .size(ui_font_size(11.5)),
+                        );
+                        self.ui_file_download_controls(
+                            ui,
+                            pal,
+                            conversation_id,
+                            message,
+                            attachment,
+                            own,
                         );
                     })
                     .response;
@@ -1303,6 +1775,13 @@ impl AppState {
                     requested_deletion,
                 );
             });
+            if !receivers.is_empty() {
+                ui.label(
+                    RichText::new(format!("Received by {}", receivers.join(", ")))
+                        .color(pal.dim)
+                        .size(ui_font_size(11.0)),
+                );
+            }
         }
     }
 
@@ -1958,6 +2437,8 @@ mod tests {
             nonce: 0,
             client_version: None,
             attachments: Vec::new(),
+            file_receivers: std::collections::BTreeMap::new(),
+            stopped_file_offers: std::collections::BTreeSet::new(),
             deletion: None,
         };
 

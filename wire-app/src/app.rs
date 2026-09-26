@@ -20,7 +20,7 @@ use crate::{
     autostart,
     chat::{
         self, ChatAttachment, ChatConversation, ChatMessage, ChatNotification, DeliveryState,
-        RetentionPolicy,
+        FileTransferPhase, RetentionPolicy,
     },
     client_status::{Availability, GroupCallAnnouncement, StatusUpdate},
     dev_pair::DevPairState,
@@ -296,7 +296,12 @@ struct ChatUiState {
     unseen: BTreeSet<String>,
     composer: String,
     draft_attachments: Vec<ChatAttachment>,
+    draft_files: Vec<PathBuf>,
+    preparing_file_offers: usize,
     attachment_textures: AttachmentTextureCache,
+    inline_file_data: BTreeMap<String, Arc<Vec<u8>>>,
+    file_transfers: BTreeMap<(String, String), FileTransferUiState>,
+    file_serving: BTreeMap<(String, u64, u64), (u64, u64, chat::FileServingPhase)>,
     attachment_requests: BTreeSet<String>,
     conversations_with_older_messages: BTreeSet<String>,
     image_preview: Option<ImagePreview>,
@@ -308,6 +313,23 @@ struct ChatUiState {
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
     friend_candidate_name: String,
+}
+
+#[derive(Clone)]
+struct FileTransferUiState {
+    path: Option<PathBuf>,
+    received: u64,
+    total: u64,
+    phase: Option<FileTransferPhase>,
+    result: Option<Result<PathBuf, String>>,
+}
+
+impl FileTransferUiState {
+    fn active(&self) -> bool {
+        self.phase
+            .as_ref()
+            .is_some_and(|phase| !matches!(phase, FileTransferPhase::Paused(_)))
+    }
 }
 
 const MAX_ATTACHMENT_TEXTURES: usize = 128;
@@ -1846,9 +1868,19 @@ impl AppState {
                             conversation_title.clone(),
                             author,
                             if message.body.trim().is_empty() {
-                                match message.attachments.len() {
-                                    1 => "Image".to_owned(),
-                                    count => format!("{count} images"),
+                                match message.attachments.as_slice() {
+                                    [attachment]
+                                        if attachment.kind == chat::AttachmentKind::FileOffer =>
+                                    {
+                                        format!("File offer: {}", attachment.name)
+                                    }
+                                    [attachment]
+                                        if attachment.kind == chat::AttachmentKind::InlineFile =>
+                                    {
+                                        format!("Text file: {}", attachment.name)
+                                    }
+                                    [_] => "Image".to_owned(),
+                                    attachments => format!("{} attachments", attachments.len()),
                                 }
                             } else {
                                 ellipsize(message.body.trim(), 180)
@@ -1864,15 +1896,113 @@ impl AppState {
                     .timelines
                     .values()
                     .flat_map(|timeline| timeline.iter())
-                    .flat_map(|message| message.attachments.iter())
-                    .find(|attachment| attachment.hash == hash)
-                    .cloned();
-                if let Some(attachment) = attachment {
-                    let _ = self
-                        .chat
-                        .attachment_textures
-                        .insert_data(ctx, &attachment, data);
+                    .flat_map(|message| {
+                        message
+                            .attachments
+                            .iter()
+                            .map(move |attachment| (message.sent_at, attachment))
+                    })
+                    .find(|(_, attachment)| attachment.hash == hash)
+                    .map(|(sent_at, attachment)| (sent_at, attachment.clone()));
+                if let Some((_, attachment)) = attachment.filter(|(sent_at, _)| {
+                    self.chat_retention.includes(*sent_at, chat::now_millis())
+                }) {
+                    if attachment.kind == chat::AttachmentKind::InlineFile {
+                        while self
+                            .chat
+                            .inline_file_data
+                            .values()
+                            .map(|bytes| bytes.len())
+                            .sum::<usize>()
+                            + data.len()
+                            > 8 * 1024 * 1024
+                        {
+                            let Some(oldest) = self.chat.inline_file_data.keys().next().cloned()
+                            else {
+                                break;
+                            };
+                            self.chat.inline_file_data.remove(&oldest);
+                        }
+                        self.chat.inline_file_data.insert(hash, data);
+                    } else {
+                        let _ = self
+                            .chat
+                            .attachment_textures
+                            .insert_data(ctx, &attachment, data);
+                    }
                 }
+            }
+            ChatNotification::FileTransfer {
+                message_id,
+                hash,
+                result,
+            } => {
+                let transfer = self
+                    .chat
+                    .file_transfers
+                    .entry((message_id, hash))
+                    .or_insert_with(|| FileTransferUiState {
+                        path: None,
+                        received: 0,
+                        total: 0,
+                        phase: None,
+                        result: None,
+                    });
+                if let Ok(path) = &result {
+                    transfer.path = Some(path.clone());
+                    transfer.received = transfer.total;
+                }
+                transfer.phase = None;
+                transfer.result = Some(result);
+            }
+            ChatNotification::FileTransferUpdate {
+                message_id,
+                hash,
+                path,
+                received,
+                total,
+                phase,
+            } => {
+                self.chat.file_transfers.insert(
+                    (message_id, hash),
+                    FileTransferUiState {
+                        path: Some(path),
+                        received,
+                        total,
+                        phase: Some(phase),
+                        result: None,
+                    },
+                );
+            }
+            ChatNotification::FileTransferCancelled { message_id, hash } => {
+                self.chat.file_transfers.remove(&(message_id, hash));
+            }
+            ChatNotification::FileServing {
+                hash,
+                connection_id,
+                request_id,
+                position,
+                total,
+                phase,
+            } => {
+                if phase == chat::FileServingPhase::Sending && position == 0 {
+                    self.chat
+                        .file_serving
+                        .retain(|(prior_hash, _, _), (_, _, prior_phase)| {
+                            prior_hash != &hash || *prior_phase == chat::FileServingPhase::Sending
+                        });
+                }
+                self.chat
+                    .file_serving
+                    .insert((hash, connection_id, request_id), (position, total, phase));
+            }
+            ChatNotification::FileOfferPrepared => {
+                self.chat.preparing_file_offers = self.chat.preparing_file_offers.saturating_sub(1);
+            }
+            ChatNotification::RetentionSweep => {
+                self.chat.inline_file_data.clear();
+                self.chat.attachment_textures = Default::default();
+                self.chat.attachment_requests.clear();
             }
             ChatNotification::Delivery {
                 message_id,
@@ -2613,6 +2743,8 @@ mod layout_tests {
             nonce: 0,
             client_version: None,
             attachments: Vec::new(),
+            file_receivers: BTreeMap::new(),
+            stopped_file_offers: BTreeSet::new(),
             deletion: None,
         };
 

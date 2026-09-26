@@ -172,7 +172,7 @@ impl Worker {
         info!("chat storage opened; starting protocol router");
         let _router = Router::builder(endpoint.clone())
             .accept(RtcProtocol::ALPN, handler.clone())
-            .accept(iroh_blobs::ALPN, chat_protocols.blobs.clone())
+            .accept(iroh_blobs::ALPN, chat_protocols.provider.clone())
             .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
             .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
             .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
@@ -1029,6 +1029,47 @@ impl Worker {
                 message,
             } => {
                 self.chat.send_message(conversation_id, message).await;
+            }
+            Command::OfferChatFiles {
+                conversation_id,
+                body,
+                attachments,
+                paths,
+            } => {
+                self.chat
+                    .offer_files(conversation_id, body, attachments, paths);
+            }
+            Command::ReceiveChatFile {
+                conversation_id,
+                message_id,
+                hash,
+                path,
+            } => {
+                if let Err(error) = self
+                    .chat
+                    .request_file(conversation_id, message_id.clone(), hash.clone(), path)
+                    .await
+                {
+                    self.emit(Event::Chat(chat::ChatNotification::FileTransfer {
+                        message_id,
+                        hash,
+                        result: Err(format!("{error:#}")),
+                    }))
+                    .await?;
+                }
+            }
+            Command::CancelChatFile { message_id, hash } => {
+                if let Err(error) = self.chat.cancel_file(message_id, hash).await {
+                    warn!("could not cancel chat file download: {error:#}");
+                }
+            }
+            Command::SetChatFileServing { hash, serving } => {
+                if let Err(error) = self.chat.set_file_serving(hash, serving).await {
+                    self.emit(Event::Chat(chat::ChatNotification::Error(format!(
+                        "Could not change file sharing: {error:#}"
+                    ))))
+                    .await?;
+                }
             }
             Command::LoadChatAttachment {
                 conversation_id,

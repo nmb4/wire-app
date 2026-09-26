@@ -9614,11 +9614,13 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "anyhow",
  "arboard",
  "async-channel",
+ "bao-tree",
+ "bytes",
  "clipboard-win",
  "dirs",
  "eframe",

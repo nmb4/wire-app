@@ -1,13 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+mod blob_provider;
+use blob_provider::{is_stopped, set_stopped, GuardedBlobProvider, StoppedHashes};
 
 use crate::persistence;
 use anyhow::{bail, Context, Result};
@@ -15,8 +19,13 @@ use futures_lite::StreamExt;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint, NodeAddr, NodeId};
 use iroh_blobs::{
     downloader::DownloadRequest,
+    get::db::{BlobId, DownloadProgress},
     net_protocol::Blobs,
-    store::{fs::Store as BlobStore, GcConfig, Map, Store},
+    store::{
+        fs::Store as BlobStore, ExportMode, GcConfig, ImportMode, ImportProgress, Map, MapMut,
+        ReadableStore, Store,
+    },
+    util::progress::{AsyncChannelProgressSender, IgnoreProgressSender},
     BlobFormat, Hash, HashAndFormat, Tag,
 };
 use iroh_docs::{
@@ -36,6 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
+use tokio::sync::watch;
+
 pub const CHAT_ALPN: &[u8] = b"wire/chat-invite/1";
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_BYTES: usize = 256 * 1024;
@@ -43,6 +54,8 @@ const MAX_ATTACHMENT_PUSH_BYTES: u64 = 1024 * 1024 * 1024;
 const MESSAGE_PREFIX: &[u8] = b"message/";
 const DELETION_PREFIX: &[u8] = b"deletion/";
 const RECEIPT_PREFIX: &[u8] = b"receipt/";
+const FILE_RECEIPT_PREFIX: &[u8] = b"file-receipt/";
+const FILE_SHARING_PREFIX: &[u8] = b"file-sharing/";
 const RETRY_TICK: Duration = Duration::from_secs(1);
 const MAX_RETRY_SECONDS: u64 = 60;
 /// Keep chat-plane QUIC sessions warm for bursty back-and-forth.
@@ -116,12 +129,20 @@ pub struct ChatMessage {
     pub client_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChatAttachment>,
+    /// Receipt identities are reconstructed from the replicated document.
+    #[serde(skip)]
+    pub file_receivers: BTreeMap<String, BTreeSet<String>>,
+    /// Locally reconstructed from owner-authored file-sharing records.
+    #[serde(skip)]
+    pub stopped_file_offers: BTreeSet<String>,
     #[serde(skip)]
     pub deletion: Option<MessageDeletion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatAttachment {
+    #[serde(default)]
+    pub kind: AttachmentKind,
     pub id: String,
     pub name: String,
     pub media_type: String,
@@ -133,6 +154,15 @@ pub struct ChatAttachment {
     /// downloaded. The original bytes are never embedded in message metadata.
     #[serde(skip)]
     pub data: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    #[default]
+    Image,
+    FileOffer,
+    InlineFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +209,8 @@ impl ChatMessage {
             nonce,
             client_version: Some(crate::APP_VERSION.to_owned()),
             attachments,
+            file_receivers: BTreeMap::new(),
+            stopped_file_offers: BTreeSet::new(),
             deletion: None,
         }
     }
@@ -188,6 +220,10 @@ impl ChatMessage {
             "message/{:020}/{}/{:016x}",
             self.sent_at, self.author_id, self.nonce
         )
+    }
+
+    pub fn visible_under(&self, retention: RetentionPolicy, now: i64) -> bool {
+        retention.includes(self.sent_at, now) || !self.attachments.is_empty()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -212,11 +248,13 @@ impl ChatMessage {
                 || attachment.name.len() > 1024
                 || attachment.media_type.len() > 128
                 || attachment.byte_len == 0
-                || attachment.width == 0
-                || attachment.height == 0
+                || (attachment.kind == AttachmentKind::Image
+                    && (attachment.width == 0 || attachment.height == 0))
+                || (attachment.kind == AttachmentKind::InlineFile
+                    && (attachment.byte_len > 64 * 1024 || attachment.media_type != "text/plain"))
                 || Hash::from_str(&attachment.hash).is_err()
             {
-                bail!("image attachment metadata is incomplete");
+                bail!("attachment metadata is incomplete");
             }
         }
         Ok(())
@@ -262,6 +300,37 @@ struct ReplicatedReceipt {
     version: u8,
     message_id: String,
     delivered_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileReceipt {
+    message_id: String,
+    hash: String,
+    receiver_id: String,
+    received_at: i64,
+}
+
+impl FileReceipt {
+    fn entry_key(&self) -> String {
+        format!(
+            "file-receipt/{}/{}/{}",
+            self.message_id, self.hash, self.receiver_id
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileSharingState {
+    message_id: String,
+    hash: String,
+    serving: bool,
+    changed_at: i64,
+}
+
+impl FileSharingState {
+    fn entry_key(&self) -> String {
+        format!("file-sharing/{}/{}", self.message_id, self.hash)
+    }
 }
 
 impl ReplicatedReceipt {
@@ -356,12 +425,75 @@ pub enum ChatNotification {
         hash: String,
         data: Arc<Vec<u8>>,
     },
+    FileTransfer {
+        message_id: String,
+        hash: String,
+        result: std::result::Result<PathBuf, String>,
+    },
+    FileTransferUpdate {
+        message_id: String,
+        hash: String,
+        path: PathBuf,
+        received: u64,
+        total: u64,
+        phase: FileTransferPhase,
+    },
+    FileTransferCancelled {
+        message_id: String,
+        hash: String,
+    },
+    FileServing {
+        hash: String,
+        connection_id: u64,
+        request_id: u64,
+        position: u64,
+        total: u64,
+        phase: FileServingPhase,
+    },
+    FileOfferPrepared,
+    RetentionSweep,
     Delivery {
         message_id: String,
         state: DeliveryState,
         detail: Option<String>,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTransferPhase {
+    Connecting,
+    Downloading,
+    Reconnecting,
+    Saving,
+    Paused(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileServingPhase {
+    Sending,
+    Sent,
+    Interrupted,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoppedFileIndex {
+    #[serde(default)]
+    hashes: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingFileDownload {
+    conversation_id: String,
+    message_id: String,
+    hash: String,
+    path: PathBuf,
+    byte_len: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PendingFileDownloadIndex {
+    downloads: Vec<PendingFileDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +520,10 @@ struct PendingAttachmentDelivery {
     message_id: String,
     hash: String,
     byte_len: u64,
+    #[serde(default)]
+    attachment_kind: AttachmentKind,
+    #[serde(default)]
+    sent_at: i64,
     pending_peers: BTreeSet<String>,
 }
 
@@ -437,6 +573,10 @@ struct AttachmentPush {
     conversation_id: String,
     hash: String,
     byte_len: u64,
+    #[serde(default)]
+    attachment_kind: AttachmentKind,
+    #[serde(default)]
+    sent_at: i64,
     #[serde(skip)]
     data: Vec<u8>,
 }
@@ -742,7 +882,7 @@ impl ChatSessionPool {
 }
 
 pub struct ChatProtocols {
-    pub blobs: Blobs<BlobStore>,
+    pub provider: GuardedBlobProvider,
     pub docs: Docs<BlobStore>,
     pub gossip: Gossip,
     pub invites: ChatInviteProtocol,
@@ -765,6 +905,7 @@ pub struct ChatService {
     doc_event_rx: async_channel::Receiver<DocumentSignal>,
     wake_tx: async_channel::Sender<ChatInput>,
     wake_rx: async_channel::Receiver<ChatInput>,
+    provider_event_rx: async_channel::Receiver<iroh_blobs::provider::Event>,
     subscriptions: BTreeMap<String, String>,
     queued: VecDeque<ChatNotification>,
     retry_tick: tokio::time::Interval,
@@ -789,11 +930,19 @@ pub struct ChatService {
     wake_failures: BTreeMap<String, u8>,
     max_image_bytes: Option<u64>,
     retention: RetentionPolicy,
+    next_retention_sweep: tokio::time::Instant,
     attachment_downloads: BTreeSet<Hash>,
     attachment_retries: BTreeMap<Hash, AttachmentRetry>,
+    recorded_file_receipts: BTreeSet<String>,
     timeline_limits: BTreeMap<String, usize>,
     control_retries: BTreeMap<String, ControlRetry>,
     blob_downloader: iroh_blobs::downloader::Downloader,
+    pending_file_downloads: BTreeMap<(String, String), PendingFileDownload>,
+    active_file_downloads: BTreeMap<(String, String), (u64, watch::Sender<bool>)>,
+    stopped_file_index: StoppedFileIndex,
+    stopped_hashes: StoppedHashes,
+    offered_file_sizes: BTreeMap<Hash, u64>,
+    serving_requests: BTreeMap<(u64, u64), ServingRequest>,
     #[cfg(test)]
     invite_attempts: AtomicU64,
     #[cfg(test)]
@@ -812,6 +961,13 @@ struct AttachmentRetry {
     conversation_id: String,
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+struct ServingRequest {
+    hash: Hash,
+    total: u64,
+    position: u64,
+    last_emit: tokio::time::Instant,
 }
 
 #[derive(Debug)]
@@ -834,6 +990,29 @@ pub(crate) enum ChatInput {
         byte_len: u64,
         succeeded: bool,
     },
+    FilesImported {
+        conversation_id: String,
+        body: String,
+        attachments: Vec<ChatAttachment>,
+        result: std::result::Result<Vec<ChatAttachment>, String>,
+    },
+    FileDownloadFinished {
+        conversation_id: String,
+        message_id: String,
+        hash: String,
+        attempt: u64,
+        result: std::result::Result<PathBuf, String>,
+    },
+    FileDownloadProgress {
+        message_id: String,
+        hash: String,
+        attempt: u64,
+        path: PathBuf,
+        received: u64,
+        total: u64,
+        phase: FileTransferPhase,
+    },
+    BlobProviderEvent(iroh_blobs::provider::Event),
     Retry,
 }
 
@@ -863,7 +1042,20 @@ impl ChatService {
         tokio::fs::create_dir_all(&docs_path).await?;
         let blob_store = BlobStore::load(&blobs_path).await?;
         debug!("chat blob store opened");
-        let blobs = Blobs::builder(blob_store.clone()).build(&endpoint);
+        let stopped_file_index: StoppedFileIndex =
+            load_local_json(&root.join("stopped-files.json"), "stopped file index");
+        let stopped_hashes: StoppedHashes = Arc::new(RwLock::new(
+            stopped_file_index
+                .hashes
+                .iter()
+                .filter_map(|hash| Hash::from_str(hash).ok())
+                .collect(),
+        ));
+        let (provider_event_tx, provider_event_rx) = async_channel::bounded(512);
+        let blobs = Blobs::builder(blob_store.clone())
+            .events(GuardedBlobProvider::events(provider_event_tx))
+            .build(&endpoint);
+        let provider = GuardedBlobProvider::new(blobs.clone(), stopped_hashes.clone());
         let blob_downloader = blobs.downloader().clone();
         let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
         let docs = Docs::persistent(docs_path).spawn(&blobs, &gossip).await?;
@@ -885,6 +1077,7 @@ impl ChatService {
         let index = load_index(&root.join("index.json"));
         let local_deletions = load_local_deletions(&root.join("local-deletions.json"));
         let reliable_control = load_reliable_control(&root.join("reliable-control.json"));
+        let pending_file_downloads = load_pending_file_downloads(&root.join("file-downloads.json"));
         let conversation_count = index.conversations.len();
         let mut service = Self {
             endpoint: endpoint.clone(),
@@ -902,6 +1095,7 @@ impl ChatService {
             doc_event_rx,
             wake_tx,
             wake_rx,
+            provider_event_rx,
             subscriptions: BTreeMap::new(),
             queued: VecDeque::new(),
             retry_tick: tokio::time::interval_at(
@@ -918,11 +1112,19 @@ impl ChatService {
             wake_failures: BTreeMap::new(),
             max_image_bytes: None,
             retention: RetentionPolicy::Unlimited,
+            next_retention_sweep: tokio::time::Instant::now() + Duration::from_secs(60 * 60),
             attachment_downloads: BTreeSet::new(),
             attachment_retries: BTreeMap::new(),
+            recorded_file_receipts: BTreeSet::new(),
             timeline_limits: BTreeMap::new(),
             control_retries: BTreeMap::new(),
             blob_downloader,
+            pending_file_downloads,
+            active_file_downloads: BTreeMap::new(),
+            stopped_file_index,
+            stopped_hashes,
+            offered_file_sizes: BTreeMap::new(),
+            serving_requests: BTreeMap::new(),
             #[cfg(test)]
             invite_attempts: AtomicU64::new(0),
             #[cfg(test)]
@@ -936,7 +1138,7 @@ impl ChatService {
             "text chat service ready"
         );
         Ok(ChatProtocols {
-            blobs,
+            provider,
             docs,
             gossip,
             invites,
@@ -958,6 +1160,7 @@ impl ChatService {
         self.initialize_invite_deliveries();
         self.restore_control_retries();
         self.retry_due_controls();
+        self.restore_file_downloads().await;
     }
 
     async fn restore_pending_delivery_retries(&mut self) {
@@ -1031,6 +1234,12 @@ impl ChatService {
                 changed.expect("chat document event channel closed")
             ),
             wake = self.wake_rx.recv() => wake.expect("chat wake channel closed"),
+            provider = self.provider_event_rx.recv(), if !self.provider_event_rx.is_closed() => {
+                match provider {
+                    Ok(event) => ChatInput::BlobProviderEvent(event),
+                    Err(_) => ChatInput::Retry,
+                }
+            },
             _ = self.retry_tick.tick() => ChatInput::Retry,
         }
     }
@@ -1159,11 +1368,117 @@ impl ChatService {
                             "Could not refresh downloaded image: {error:#}"
                         )));
                     }
+                    if let Err(error) = self.publish_timeline(&conversation_id).await {
+                        warn!("could not record received attachment: {error:#}");
+                    }
                 } else {
                     self.schedule_attachment_retry(&conversation_id, hash);
                 }
             }
+            ChatInput::FilesImported {
+                conversation_id,
+                body,
+                mut attachments,
+                result,
+            } => {
+                match result {
+                    Ok(files) => {
+                        attachments.extend(files);
+                        let message =
+                            ChatMessage::new_with_attachments(self.our_node_id, body, attachments);
+                        if !self.send_message(conversation_id, message).await {
+                            self.queued.push_back(ChatNotification::Error(
+                                "Could not publish file offer".to_owned(),
+                            ));
+                        }
+                    }
+                    Err(error) => self.queued.push_back(ChatNotification::Error(format!(
+                        "Could not offer file: {error}"
+                    ))),
+                }
+                self.queued.push_back(ChatNotification::FileOfferPrepared);
+            }
+            ChatInput::FileDownloadFinished {
+                conversation_id,
+                message_id,
+                hash,
+                attempt,
+                mut result,
+            } => {
+                let key = (message_id.clone(), hash.clone());
+                if !self
+                    .active_file_downloads
+                    .get(&key)
+                    .is_some_and(|(current, _)| *current == attempt)
+                {
+                    return None;
+                }
+                self.active_file_downloads.remove(&key);
+                if result.is_ok() {
+                    if let Err(error) = self
+                        .record_file_receipt(&conversation_id, &message_id, &hash)
+                        .await
+                    {
+                        warn!("file saved but receipt could not be recorded: {error:#}");
+                        result = Err(format!(
+                            "file saved, but its receive receipt could not be recorded: {error:#}"
+                        ));
+                    } else {
+                        self.pending_file_downloads.remove(&key);
+                        if let Err(error) = self.save_pending_file_downloads() {
+                            warn!("could not save completed file download: {error:#}");
+                        }
+                        if let Err(error) = self.release_download_pin(&hash).await {
+                            warn!("could not release completed file download pin: {error:#}");
+                        }
+                        self.spawn_doc_sync(&conversation_id);
+                    }
+                    if let Err(error) = self.publish_timeline(&conversation_id).await {
+                        warn!("could not refresh file receipt: {error:#}");
+                    }
+                }
+                self.queued.push_back(ChatNotification::FileTransfer {
+                    message_id,
+                    hash,
+                    result,
+                });
+            }
+            ChatInput::FileDownloadProgress {
+                message_id,
+                hash,
+                attempt,
+                path,
+                received,
+                total,
+                phase,
+            } => {
+                if self
+                    .active_file_downloads
+                    .get(&(message_id.clone(), hash.clone()))
+                    .is_some_and(|(current, _)| *current == attempt)
+                {
+                    self.queued.push_back(ChatNotification::FileTransferUpdate {
+                        message_id,
+                        hash,
+                        path,
+                        received,
+                        total,
+                        phase,
+                    });
+                }
+            }
+            ChatInput::BlobProviderEvent(event) => self.handle_blob_provider_event(event),
             ChatInput::Retry => {
+                if self.next_retention_sweep <= tokio::time::Instant::now() {
+                    self.next_retention_sweep =
+                        tokio::time::Instant::now() + Duration::from_secs(60 * 60);
+                    if let Err(error) = self.release_expired_attachment_tags().await {
+                        warn!("could not release expired attachment blobs: {error:#}");
+                    }
+                    if self.retention != RetentionPolicy::Unlimited {
+                        self.queued.push_back(ChatNotification::RetentionSweep);
+                    }
+                }
                 self.retry_due_attachment_downloads().await;
                 self.retry_due_deliveries().await;
                 self.retry_due_controls();
@@ -1242,19 +1557,61 @@ impl ChatService {
         Ok(id)
     }
 
-    pub async fn send_message(&mut self, conversation_id: String, message: ChatMessage) {
+    pub async fn send_message(&mut self, conversation_id: String, message: ChatMessage) -> bool {
         if let Err(error) = self.import_attachment_bytes(&message).await {
             self.queued.push_back(ChatNotification::Delivery {
                 message_id: message.message_id.clone(),
                 state: DeliveryState::Failed,
                 detail: Some(error.to_string()),
             });
-            return;
+            return false;
         }
         let message_id = message.message_id.clone();
         let body_bytes = message.body.len();
         match self.insert_message(&conversation_id, &message).await {
             Ok(()) => {
+                if let Some(stored) = self.index.conversations.get(&conversation_id) {
+                    let stopped_offers: Vec<_> = message
+                        .attachments
+                        .iter()
+                        .filter(|attachment| {
+                            attachment.kind == AttachmentKind::FileOffer
+                                && self.stopped_file_index.hashes.contains(&attachment.hash)
+                        })
+                        .collect();
+                    if !stopped_offers.is_empty() {
+                        let result: Result<()> = async {
+                            let doc_id = NamespaceId::from_str(&stored.public.document_id)?;
+                            let doc = self
+                                .docs
+                                .open(doc_id)
+                                .await?
+                                .context("conversation document unavailable")?;
+                            for attachment in stopped_offers {
+                                let state = FileSharingState {
+                                    message_id: message_id.clone(),
+                                    hash: attachment.hash.clone(),
+                                    serving: false,
+                                    changed_at: now_millis(),
+                                };
+                                doc.set_bytes(
+                                    self.author,
+                                    state.entry_key(),
+                                    serde_json::to_vec(&state)?,
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            warn!("could not publish stopped state for new file offer: {error:#}");
+                            self.queued.push_back(ChatNotification::Error(format!(
+                                "File offer was published, but sharing state could not sync: {error:#}"
+                            )));
+                        }
+                    }
+                }
                 info!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
@@ -1283,6 +1640,7 @@ impl ChatService {
                         "failed to refresh timeline after send: {error:#}"
                     );
                 }
+                true
             }
             Err(error) => {
                 warn!(
@@ -1295,8 +1653,595 @@ impl ChatService {
                     state: DeliveryState::Failed,
                     detail: Some(error.to_string()),
                 });
+                false
             }
         }
+    }
+
+    pub fn offer_files(
+        &self,
+        conversation_id: String,
+        body: String,
+        attachments: Vec<ChatAttachment>,
+        paths: Vec<PathBuf>,
+    ) {
+        let blobs = self.blobs.clone();
+        let tx = self.wake_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut imported = Vec::new();
+                for path in paths {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .context("file name is not valid Unicode")?
+                        .to_owned();
+                    let (tag, byte_len) = blobs
+                        .import_file(
+                            path,
+                            ImportMode::Copy,
+                            BlobFormat::Raw,
+                            IgnoreProgressSender::<ImportProgress>::default(),
+                        )
+                        .await?;
+                    if byte_len == 0 {
+                        bail!("empty files cannot be offered");
+                    }
+                    imported.push((tag, byte_len, name));
+                }
+                let mut files = Vec::new();
+                for (tag, byte_len, name) in imported {
+                    let hash = *tag.hash();
+                    blobs
+                        .set_tag(attachment_blob_tag(hash), Some(HashAndFormat::raw(hash)))
+                        .await?;
+                    files.push(ChatAttachment {
+                        kind: AttachmentKind::FileOffer,
+                        id: hash.to_string(),
+                        name,
+                        media_type: "application/octet-stream".to_owned(),
+                        byte_len,
+                        width: 0,
+                        height: 0,
+                        hash: hash.to_string(),
+                        data: None,
+                    });
+                }
+                Ok::<_, anyhow::Error>(files)
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx
+                .send(ChatInput::FilesImported {
+                    conversation_id,
+                    body,
+                    attachments,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    pub async fn request_file(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        hash_text: String,
+        path: PathBuf,
+    ) -> Result<()> {
+        let stored = self
+            .index
+            .conversations
+            .get(&conversation_id)
+            .context("unknown conversation")?;
+        let messages = self.load_messages(stored).await?;
+        let message = messages
+            .iter()
+            .find(|message| message.message_id == message_id && message.deletion.is_none())
+            .or_else(|| {
+                self.staged_inbound
+                    .get(&conversation_id)
+                    .and_then(|staged| staged.get(&message_id))
+            })
+            .context("file offer is unavailable")?;
+        let attachment = message
+            .attachments
+            .iter()
+            .find(|attachment| {
+                attachment.hash == hash_text
+                    && matches!(
+                        attachment.kind,
+                        AttachmentKind::FileOffer | AttachmentKind::Image
+                    )
+            })
+            .context("attachment is unavailable")?;
+        if attachment.kind == AttachmentKind::FileOffer
+            && message.stopped_file_offers.contains(&hash_text)
+        {
+            bail!("file owner stopped sharing this file");
+        }
+        let hash = Hash::from_str(&hash_text)?;
+        let owner = NodeId::from_str(&message.author_id)?;
+        let providers = if owner == self.our_node_id {
+            Vec::new()
+        } else {
+            self.attachment_providers(&conversation_id, Some(owner))
+                .into_iter()
+                .filter(|address| address.node_id == owner)
+                .collect()
+        };
+        let byte_len = attachment.byte_len;
+        let key = (message_id.clone(), hash_text.clone());
+        if self.active_file_downloads.contains_key(&key) {
+            bail!("file download is already active");
+        }
+        let pending = PendingFileDownload {
+            conversation_id: conversation_id.clone(),
+            message_id: message_id.clone(),
+            hash: hash_text.clone(),
+            path: path.clone(),
+            byte_len,
+        };
+        let previous = self.pending_file_downloads.insert(key.clone(), pending);
+        if let Err(error) = self.save_pending_file_downloads() {
+            if let Some(previous) = previous {
+                self.pending_file_downloads.insert(key, previous);
+            } else {
+                self.pending_file_downloads.remove(&key);
+            }
+            return Err(error);
+        }
+        let hash_and_format = HashAndFormat::raw(hash);
+        self.blobs
+            .set_tag(download_blob_tag(hash), Some(hash_and_format))
+            .await?;
+        let received = partial_download_bytes(&self.blobs, hash, byte_len).await;
+        let attempt = next_nonce();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        self.active_file_downloads.insert(key, (attempt, cancel_tx));
+        self.queued.push_back(ChatNotification::FileTransferUpdate {
+            message_id: message_id.clone(),
+            hash: hash_text.clone(),
+            path: path.clone(),
+            received,
+            total: byte_len,
+            phase: FileTransferPhase::Connecting,
+        });
+        let blobs = self.blobs.clone();
+        let downloader = self.blob_downloader.clone();
+        let tx = self.wake_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let available = blobs
+                    .get(&hash)
+                    .await?
+                    .is_some_and(|blob| blob.is_complete());
+                if !available {
+                    if providers.is_empty() {
+                        bail!("file owner is unavailable");
+                    }
+                    let (progress_tx, progress_rx) = async_channel::bounded(128);
+                    let request = DownloadRequest::new(hash_and_format, providers)
+                        .progress_sender(AsyncChannelProgressSender::new(progress_tx));
+                    let mut handle = downloader.queue(request).await;
+                    let deadline = tokio::time::sleep(
+                        attachment_download_timeout(byte_len).max(Duration::from_secs(30 * 60)),
+                    );
+                    tokio::pin!(deadline);
+                    let mut tick = tokio::time::interval(Duration::from_secs(1));
+                    let mut base_received = received;
+                    let mut current_offset = 0;
+                    let mut last_activity = tokio::time::Instant::now();
+                    let mut last_report = tokio::time::Instant::now();
+                    let mut phase = FileTransferPhase::Connecting;
+                    let mut progress_open = true;
+                    let updates = tx.clone();
+                    let report = |received: u64, phase: FileTransferPhase| {
+                        let _ = updates.try_send(ChatInput::FileDownloadProgress {
+                            message_id: message_id.clone(),
+                            hash: hash_text.clone(),
+                            attempt,
+                            path: path.clone(),
+                            received: received.min(byte_len),
+                            total: byte_len,
+                            phase,
+                        });
+                    };
+                    loop {
+                        tokio::select! {
+                            outcome = &mut handle => {
+                                outcome?;
+                                break;
+                            }
+                            _ = &mut deadline => {
+                                downloader.cancel(handle).await;
+                                bail!("file download timed out");
+                            }
+                            changed = cancel_rx.changed() => {
+                                if changed.is_err() || *cancel_rx.borrow() {
+                                    downloader.cancel(handle).await;
+                                    bail!("file download cancelled");
+                                }
+                            }
+                            event = progress_rx.recv(), if progress_open => {
+                                match event {
+                                    Ok(DownloadProgress::FoundLocal { child: BlobId::Root, size, valid_ranges, .. }) => {
+                                        base_received = verified_range_bytes(&valid_ranges, size.value().min(byte_len));
+                                        current_offset = 0;
+                                        report(base_received.saturating_add(current_offset), phase.clone());
+                                    }
+                                    Ok(DownloadProgress::InitialState(state)) => {
+                                        if let (Some(size), Some(ranges)) = (state.root.size, state.root.local_ranges.as_ref()) {
+                                            base_received = verified_range_bytes(ranges, size.value().min(byte_len));
+                                        }
+                                        if let iroh_blobs::get::progress::BlobProgress::Progressing(offset) = state.root.progress {
+                                            current_offset = offset;
+                                        }
+                                        report(base_received.saturating_add(current_offset), phase.clone());
+                                    }
+                                    Ok(DownloadProgress::Connected) => {
+                                        phase = FileTransferPhase::Downloading;
+                                        last_activity = tokio::time::Instant::now();
+                                        report(base_received.saturating_add(current_offset), phase.clone());
+                                    }
+                                    Ok(DownloadProgress::Progress { offset, .. }) => {
+                                        current_offset = current_offset.max(offset);
+                                        last_activity = tokio::time::Instant::now();
+                                        if phase != FileTransferPhase::Downloading
+                                            || last_report.elapsed() >= Duration::from_millis(250)
+                                        {
+                                            phase = FileTransferPhase::Downloading;
+                                            report(base_received.saturating_add(current_offset), phase.clone());
+                                            last_report = tokio::time::Instant::now();
+                                        }
+                                    }
+                                    Ok(DownloadProgress::Done { .. }) => {
+                                        report(byte_len, FileTransferPhase::Saving);
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => progress_open = false,
+                                }
+                            }
+                            _ = tick.tick() => {
+                                if last_activity.elapsed() >= Duration::from_secs(90) {
+                                    downloader.cancel(handle).await;
+                                    bail!("connection stalled for 90 seconds; resume when the owner is online");
+                                }
+                                if last_activity.elapsed() >= Duration::from_secs(10)
+                                    && phase != FileTransferPhase::Reconnecting
+                                {
+                                    phase = FileTransferPhase::Reconnecting;
+                                    report(base_received.saturating_add(current_offset), phase.clone());
+                                }
+                            }
+                        }
+                    }
+                    blobs
+                        .set_tag(attachment_blob_tag(hash), Some(hash_and_format))
+                        .await?;
+                }
+                let _ = tx.try_send(ChatInput::FileDownloadProgress {
+                    message_id: message_id.clone(),
+                    hash: hash_text.clone(),
+                    attempt,
+                    path: path.clone(),
+                    received: byte_len,
+                    total: byte_len,
+                    phase: FileTransferPhase::Saving,
+                });
+                if *cancel_rx.borrow() {
+                    bail!("file download cancelled");
+                }
+                let partial = path.with_file_name(format!(".wire-download-{}.part", next_nonce()));
+                let export = blobs
+                    .export(
+                        hash,
+                        partial.clone(),
+                        ExportMode::Copy,
+                        Box::new(|_| Ok(())),
+                    )
+                    .await;
+                if let Err(error) = export {
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(error.into());
+                }
+                if *cancel_rx.borrow() {
+                    let _ = std::fs::remove_file(&partial);
+                    bail!("file download cancelled");
+                }
+                if let Err(error) = persistence::replace_file(&partial, &path) {
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(error.into());
+                }
+                Ok::<_, anyhow::Error>(path)
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx
+                .send(ChatInput::FileDownloadFinished {
+                    conversation_id,
+                    message_id,
+                    hash: hash_text,
+                    attempt,
+                    result,
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    pub async fn cancel_file(&mut self, message_id: String, hash: String) -> Result<()> {
+        let key = (message_id.clone(), hash.clone());
+        if !self.active_file_downloads.contains_key(&key)
+            && !self.pending_file_downloads.contains_key(&key)
+        {
+            return Ok(());
+        }
+        let previous = self.pending_file_downloads.remove(&key);
+        if let Err(error) = self.save_pending_file_downloads() {
+            if let Some(previous) = previous {
+                self.pending_file_downloads.insert(key, previous);
+            }
+            return Err(error);
+        }
+        if let Some((_, cancel)) = self.active_file_downloads.remove(&key) {
+            let _ = cancel.send(true);
+        }
+        self.queued
+            .push_back(ChatNotification::FileTransferCancelled { message_id, hash });
+        self.release_download_pin(&key.1).await?;
+        Ok(())
+    }
+
+    pub async fn set_file_serving(&mut self, hash_text: String, serving: bool) -> Result<()> {
+        let hash = Hash::from_str(&hash_text)?;
+        let mut offers = Vec::new();
+        for (conversation_id, stored) in &self.index.conversations {
+            for message in self.load_messages(stored).await? {
+                if message.author_id == self.our_node_id.to_string()
+                    && message.deletion.is_none()
+                    && message.attachments.iter().any(|attachment| {
+                        attachment.kind == AttachmentKind::FileOffer && attachment.hash == hash_text
+                    })
+                {
+                    offers.push((conversation_id.clone(), message.message_id));
+                }
+            }
+        }
+        if offers.is_empty() {
+            bail!("no file offer from this device matches this file");
+        }
+        let was_stopped = is_stopped(&self.stopped_hashes, &hash);
+        set_stopped(&self.stopped_hashes, hash, !serving);
+        if serving {
+            self.stopped_file_index.hashes.remove(&hash_text);
+        } else {
+            self.stopped_file_index.hashes.insert(hash_text.clone());
+        }
+        if let Err(error) = persistence::write_json(
+            &self.root.join("stopped-files.json"),
+            &self.stopped_file_index,
+        ) {
+            set_stopped(&self.stopped_hashes, hash, was_stopped);
+            if was_stopped {
+                self.stopped_file_index.hashes.insert(hash_text);
+            } else {
+                self.stopped_file_index.hashes.remove(&hash_text);
+            }
+            return Err(error);
+        }
+        let mut changed_conversations = BTreeSet::new();
+        for (conversation_id, message_id) in offers {
+            let stored = &self.index.conversations[&conversation_id];
+            let doc_id = NamespaceId::from_str(&stored.public.document_id)?;
+            let doc = self
+                .docs
+                .open(doc_id)
+                .await?
+                .context("conversation document unavailable")?;
+            let state = FileSharingState {
+                message_id,
+                hash: hash_text.clone(),
+                serving,
+                changed_at: now_millis(),
+            };
+            doc.set_bytes(self.author, state.entry_key(), serde_json::to_vec(&state)?)
+                .await?;
+            changed_conversations.insert(conversation_id);
+        }
+        for conversation_id in changed_conversations {
+            self.spawn_doc_sync(&conversation_id);
+            self.publish_timeline(&conversation_id).await?;
+        }
+        Ok(())
+    }
+
+    fn handle_blob_provider_event(&mut self, event: iroh_blobs::provider::Event) {
+        use iroh_blobs::provider::Event;
+        match event {
+            Event::GetRequestReceived {
+                connection_id,
+                request_id,
+                hash,
+            } => {
+                let Some(total) = self.offered_file_sizes.get(&hash).copied() else {
+                    return;
+                };
+                self.serving_requests.insert(
+                    (connection_id, request_id),
+                    ServingRequest {
+                        hash,
+                        total,
+                        position: 0,
+                        last_emit: tokio::time::Instant::now(),
+                    },
+                );
+                self.queued.push_back(ChatNotification::FileServing {
+                    hash: hash.to_string(),
+                    connection_id,
+                    request_id,
+                    position: 0,
+                    total,
+                    phase: FileServingPhase::Sending,
+                });
+            }
+            Event::TransferProgress {
+                connection_id,
+                request_id,
+                hash,
+                end_offset,
+            } => {
+                let Some(request) = self.serving_requests.get_mut(&(connection_id, request_id))
+                else {
+                    return;
+                };
+                if request.hash != hash {
+                    return;
+                }
+                request.position = request.position.max(end_offset.min(request.total));
+                if request.last_emit.elapsed() >= Duration::from_millis(200)
+                    || request.position == request.total
+                {
+                    request.last_emit = tokio::time::Instant::now();
+                    self.queued.push_back(ChatNotification::FileServing {
+                        hash: hash.to_string(),
+                        connection_id,
+                        request_id,
+                        position: request.position,
+                        total: request.total,
+                        phase: FileServingPhase::Sending,
+                    });
+                }
+            }
+            Event::TransferCompleted {
+                connection_id,
+                request_id,
+                ..
+            }
+            | Event::TransferAborted {
+                connection_id,
+                request_id,
+                ..
+            } => {
+                let phase = if matches!(event, Event::TransferCompleted { .. }) {
+                    FileServingPhase::Sent
+                } else {
+                    FileServingPhase::Interrupted
+                };
+                if let Some(request) = self.serving_requests.remove(&(connection_id, request_id)) {
+                    self.queued.push_back(ChatNotification::FileServing {
+                        hash: request.hash.to_string(),
+                        connection_id,
+                        request_id,
+                        position: request.position,
+                        total: request.total,
+                        phase,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn save_pending_file_downloads(&self) -> Result<()> {
+        let index = PendingFileDownloadIndex {
+            downloads: self.pending_file_downloads.values().cloned().collect(),
+        };
+        persistence::write_json(&self.root.join("file-downloads.json"), &index)
+    }
+
+    async fn release_download_pin(&self, hash: &str) -> Result<()> {
+        if self
+            .pending_file_downloads
+            .values()
+            .any(|pending| pending.hash == hash)
+        {
+            return Ok(());
+        }
+        self.blobs
+            .set_tag(download_blob_tag(Hash::from_str(hash)?), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn restore_file_downloads(&mut self) {
+        let pending: Vec<_> = self.pending_file_downloads.values().cloned().collect();
+        let mut discarded = Vec::new();
+        for item in pending {
+            let Ok(hash) = Hash::from_str(&item.hash) else {
+                warn!("ignored invalid persisted file download hash");
+                discarded.push((item.message_id, item.hash));
+                continue;
+            };
+            if !self.index.conversations.contains_key(&item.conversation_id) {
+                discarded.push((item.message_id, item.hash));
+                continue;
+            }
+            if let Err(error) = self
+                .blobs
+                .set_tag(download_blob_tag(hash), Some(HashAndFormat::raw(hash)))
+                .await
+            {
+                warn!("could not restore file download pin: {error:#}");
+            }
+            let received = partial_download_bytes(&self.blobs, hash, item.byte_len).await;
+            self.queued.push_back(ChatNotification::FileTransferUpdate {
+                message_id: item.message_id,
+                hash: item.hash,
+                path: item.path,
+                received,
+                total: item.byte_len,
+                phase: FileTransferPhase::Paused("Wire was closed during this download".to_owned()),
+            });
+        }
+        if !discarded.is_empty() {
+            for key in &discarded {
+                self.pending_file_downloads.remove(key);
+            }
+            if let Err(error) = self.save_pending_file_downloads() {
+                warn!("could not discard orphaned file downloads: {error:#}");
+            }
+            for (_, hash) in discarded {
+                if Hash::from_str(&hash).is_ok() {
+                    if let Err(error) = self.release_download_pin(&hash).await {
+                        warn!("could not release orphaned file download pin: {error:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn record_file_receipt(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let stored = self
+            .index
+            .conversations
+            .get(conversation_id)
+            .context("unknown conversation")?;
+        let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+        let doc = self
+            .docs
+            .open(document_id)
+            .await?
+            .context("conversation document is unavailable")?;
+        let receipt = FileReceipt {
+            message_id: message_id.to_owned(),
+            hash: hash.to_owned(),
+            receiver_id: self.our_node_id.to_string(),
+            received_at: now_millis(),
+        };
+        let key = receipt.entry_key();
+        if self.recorded_file_receipts.contains(&key) {
+            return Ok(());
+        }
+        doc.set_bytes(self.author, key.clone(), serde_json::to_vec(&receipt)?)
+            .await?;
+        self.recorded_file_receipts.insert(key);
+        Ok(())
     }
 
     pub fn set_max_image_bytes(&mut self, max_image_bytes: Option<u64>) {
@@ -1331,13 +2276,19 @@ impl ChatService {
         let mut retained = BTreeSet::new();
         for stored in self.index.conversations.values() {
             for message in self.load_messages(stored).await? {
-                let target = if self.retention.includes(message.sent_at, now) {
-                    &mut retained
-                } else {
-                    &mut expired
-                };
                 for attachment in message.attachments {
+                    if attachment.kind == AttachmentKind::FileOffer
+                        && message.author_id == self.our_node_id.to_string()
+                    {
+                        retained.insert(Hash::from_str(&attachment.hash)?);
+                        continue;
+                    }
                     if let Ok(hash) = Hash::from_str(&attachment.hash) {
+                        let target = if self.retention.includes(message.sent_at, now) {
+                            &mut retained
+                        } else {
+                            &mut expired
+                        };
                         target.insert(hash);
                     }
                 }
@@ -1364,9 +2315,6 @@ impl ChatService {
         hash: &str,
         byte_len: u64,
     ) -> Result<()> {
-        if self.max_image_bytes.is_some_and(|limit| byte_len > limit) {
-            return Ok(());
-        }
         let hash = Hash::from_str(hash).context("invalid chat attachment hash")?;
         if self.queue_attachment_data(hash, byte_len).await? {
             return Ok(());
@@ -1536,12 +2484,17 @@ impl ChatService {
             .entry(conversation_id.to_owned())
             .or_default();
         for attachment in &message.attachments {
+            if attachment.kind == AttachmentKind::FileOffer {
+                continue;
+            }
             entries.insert(
                 attachment.hash.clone(),
                 PendingAttachmentDelivery {
                     message_id: message.message_id.clone(),
                     hash: attachment.hash.clone(),
                     byte_len: attachment.byte_len,
+                    attachment_kind: attachment.kind,
+                    sent_at: message.sent_at,
                     pending_peers: pending_peers.clone(),
                 },
             );
@@ -1698,7 +2651,10 @@ impl ChatService {
             .get(conversation_id)
             .into_iter()
             .flat_map(BTreeMap::values)
-            .filter(|pending| !pending.pending_peers.is_empty())
+            .filter(|pending| {
+                !pending.pending_peers.is_empty()
+                    && self.retention.includes(pending.sent_at, now_millis())
+            })
             .cloned()
             .collect();
         WakePayload {
@@ -2241,9 +3197,12 @@ impl ChatService {
         if push.byte_len == 0 || push.byte_len > MAX_ATTACHMENT_PUSH_BYTES {
             bail!("attachment push size is outside the safety limit");
         }
-        if self
-            .max_image_bytes
-            .is_some_and(|limit| push.byte_len > limit)
+        if !self.retention.includes(push.sent_at, now_millis())
+            || (push.attachment_kind == AttachmentKind::Image
+                && self
+                    .max_image_bytes
+                    .is_some_and(|limit| push.byte_len > limit))
+            || (push.attachment_kind == AttachmentKind::InlineFile && push.byte_len > 64 * 1024)
         {
             self.spawn_control_ack(
                 &push.conversation_id,
@@ -2353,6 +3312,19 @@ impl ChatService {
         };
         match result {
             Ok(deletion) => {
+                let pending: Vec<_> = self
+                    .pending_file_downloads
+                    .values()
+                    .filter(|item| {
+                        item.conversation_id == conversation_id && item.message_id == message_id
+                    })
+                    .map(|item| (item.message_id.clone(), item.hash.clone()))
+                    .collect();
+                for (id, hash) in pending {
+                    if let Err(error) = self.cancel_file(id, hash).await {
+                        warn!("could not discard download for deleted message: {error:#}");
+                    }
+                }
                 info!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
@@ -2426,6 +3398,17 @@ impl ChatService {
     pub async fn clear_history(&mut self, conversation_id: String) {
         match self.rotate_conversation_document(&conversation_id).await {
             Ok(epoch) => {
+                let pending: Vec<_> = self
+                    .pending_file_downloads
+                    .values()
+                    .filter(|item| item.conversation_id == conversation_id)
+                    .map(|item| (item.message_id.clone(), item.hash.clone()))
+                    .collect();
+                for (id, hash) in pending {
+                    if let Err(error) = self.cancel_file(id, hash).await {
+                        warn!("could not discard download after history clear: {error:#}");
+                    }
+                }
                 info!(
                     conversation = %log_id(&conversation_id),
                     history_epoch = epoch,
@@ -2924,15 +3907,64 @@ impl ChatService {
             .get(id)
             .copied()
             .unwrap_or(CHAT_TIMELINE_PAGE);
-        let (mut messages, mut has_more) = self.load_recent_messages(&stored, limit).await?;
+        let (mut messages, has_more) = self.load_recent_messages(&stored, limit).await?;
         self.merge_staged_inbound(id, &mut messages);
         self.merge_staged_deletions(id, &mut messages);
         let now = now_millis();
-        messages.retain(|message| self.retention.includes(message.sent_at, now));
-        // Message keys are chronological. If this page already contains expired
-        // rows, no older page can contain a retained row.
-        has_more &= messages.len() == limit;
+        messages.retain(|message| message.visible_under(self.retention, now));
+        for message in &messages {
+            if message.author_id == self.our_node_id.to_string() {
+                for attachment in &message.attachments {
+                    if attachment.kind == AttachmentKind::FileOffer {
+                        if let Ok(hash) = Hash::from_str(&attachment.hash) {
+                            self.offered_file_sizes.insert(hash, attachment.byte_len);
+                        }
+                    }
+                }
+            }
+        }
+        // Older pages may still contain durable file offers after ordinary
+        // messages on this page have expired under the local retention policy.
         self.request_missing_attachments(id, &messages).await;
+        let mut wrote_inline_receipts = false;
+        for message in &mut messages {
+            if message.author_id == self.our_node_id.to_string()
+                || !self.retention.includes(message.sent_at, now)
+            {
+                continue;
+            }
+            for attachment in &message.attachments {
+                if attachment.kind == AttachmentKind::FileOffer
+                    || message
+                        .file_receivers
+                        .get(&attachment.hash)
+                        .is_some_and(|receivers| receivers.contains(&self.our_node_id.to_string()))
+                {
+                    continue;
+                }
+                let Ok(hash) = Hash::from_str(&attachment.hash) else {
+                    continue;
+                };
+                if self
+                    .blobs
+                    .get(&hash)
+                    .await?
+                    .is_some_and(|blob| blob.is_complete())
+                {
+                    self.record_file_receipt(id, &message.message_id, &attachment.hash)
+                        .await?;
+                    message
+                        .file_receivers
+                        .entry(attachment.hash.clone())
+                        .or_default()
+                        .insert(self.our_node_id.to_string());
+                    wrote_inline_receipts = true;
+                }
+            }
+        }
+        if wrote_inline_receipts {
+            self.spawn_doc_sync(id);
+        }
         for message in &messages {
             if message.author_id != self.our_node_id.to_string() {
                 if let Some(version) = message.client_version.as_deref() {
@@ -3046,12 +4078,15 @@ impl ChatService {
             let hash_string = hash.to_string();
             let still_needed = messages.iter().any(|message| {
                 message.author_id != self.our_node_id.to_string()
+                    && self.retention.includes(message.sent_at, now_millis())
                     && message.attachments.iter().any(|attachment| {
                         attachment.hash == hash_string
+                            && attachment.kind != AttachmentKind::FileOffer
                             && attachment.data.is_none()
-                            && !self
-                                .max_image_bytes
-                                .is_some_and(|limit| attachment.byte_len > limit)
+                            && !(attachment.kind == AttachmentKind::Image
+                                && self
+                                    .max_image_bytes
+                                    .is_some_and(|limit| attachment.byte_len > limit))
                     })
             });
             if !still_needed {
@@ -3131,9 +4166,15 @@ impl ChatService {
             let author = NodeId::from_str(&message.author_id).ok();
             let providers = self.attachment_providers(conversation_id, author);
             for attachment in &message.attachments {
-                if self
-                    .max_image_bytes
-                    .is_some_and(|limit| attachment.byte_len > limit)
+                if attachment.kind == AttachmentKind::FileOffer
+                    || !self.retention.includes(message.sent_at, now_millis())
+                {
+                    continue;
+                }
+                if attachment.kind == AttachmentKind::Image
+                    && self
+                        .max_image_bytes
+                        .is_some_and(|limit| attachment.byte_len > limit)
                 {
                     continue;
                 }
@@ -3410,6 +4451,105 @@ impl ChatService {
             if let Some((message, message_author)) = messages.get_mut(&deletion.message_id) {
                 if entry.author() == *message_author {
                     message.deletion = Some(MessageDeletion::Everyone);
+                }
+            }
+        }
+
+        let mut file_receipts = doc
+            .get_many(Query::key_prefix(FILE_RECEIPT_PREFIX).build())
+            .await?;
+        while let Some(entry) = file_receipts.next().await {
+            let entry = entry?;
+            let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
+            if len == 0 || len > 4096 {
+                continue;
+            }
+            let Some(blob) = self.blobs.get(&entry.content_hash()).await? else {
+                continue;
+            };
+            if !blob.is_complete() {
+                continue;
+            }
+            let mut reader = blob.data_reader();
+            let bytes = reader.read_at(0, len).await?;
+            let Ok(receipt) = serde_json::from_slice::<FileReceipt>(&bytes) else {
+                continue;
+            };
+            if receipt.entry_key().as_bytes() != entry.key()
+                || !stored.public.members.contains(&receipt.receiver_id)
+            {
+                continue;
+            }
+            if let Some((message, _)) = messages.get_mut(&receipt.message_id) {
+                if message
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.hash == receipt.hash)
+                {
+                    message
+                        .file_receivers
+                        .entry(receipt.hash)
+                        .or_default()
+                        .insert(receipt.receiver_id);
+                }
+            }
+        }
+
+        let mut sharing_entries = doc
+            .get_many(Query::key_prefix(FILE_SHARING_PREFIX).build())
+            .await?;
+        let mut sharing_by_owner_hash = BTreeMap::<(String, String), (i64, bool)>::new();
+        while let Some(entry) = sharing_entries.next().await {
+            let entry = entry?;
+            let len = usize::try_from(entry.content_len()).unwrap_or(usize::MAX);
+            if len == 0 || len > 4096 {
+                continue;
+            }
+            let Some(blob) = self.blobs.get(&entry.content_hash()).await? else {
+                continue;
+            };
+            if !blob.is_complete() {
+                continue;
+            }
+            let mut reader = blob.data_reader();
+            let bytes = reader.read_at(0, len).await?;
+            let Ok(state) = serde_json::from_slice::<FileSharingState>(&bytes) else {
+                continue;
+            };
+            if state.entry_key().as_bytes() != entry.key() {
+                continue;
+            }
+            if let Some((message, author)) = messages.get(&state.message_id) {
+                if entry.author() != *author
+                    || !message.attachments.iter().any(|attachment| {
+                        attachment.kind == AttachmentKind::FileOffer
+                            && attachment.hash == state.hash
+                    })
+                {
+                    continue;
+                }
+                let key = (message.author_id.clone(), state.hash);
+                let current = sharing_by_owner_hash
+                    .entry(key)
+                    .or_insert((state.changed_at, state.serving));
+                if state.changed_at > current.0 {
+                    *current = (state.changed_at, state.serving);
+                }
+            }
+        }
+
+        for (message, _) in messages.values_mut() {
+            for attachment in &message.attachments {
+                if attachment.kind != AttachmentKind::FileOffer {
+                    continue;
+                }
+                let stopped_locally = message.author_id == self.our_node_id.to_string()
+                    && self.stopped_file_index.hashes.contains(&attachment.hash);
+                let stopped_remotely = sharing_by_owner_hash
+                    .get(&(message.author_id.clone(), attachment.hash.clone()))
+                    .is_some_and(|(_, serving)| !serving);
+                if stopped_locally || stopped_remotely {
+                    message.stopped_file_offers.insert(attachment.hash.clone());
                 }
             }
         }
@@ -3717,6 +4857,8 @@ async fn push_pending_attachments(
                 conversation_id: conversation_id.to_owned(),
                 hash: attachment.hash.clone(),
                 byte_len: attachment.byte_len,
+                attachment_kind: attachment.attachment_kind,
+                sent_at: attachment.sent_at,
                 data: data.to_vec(),
             });
             if let Err(error) = send_chat_packet(sessions.clone(), *peer, packet).await {
@@ -4132,6 +5274,46 @@ fn attachment_blob_tag(hash: Hash) -> Tag {
     Tag::from(format!("wire-chat-attachment-{hash}"))
 }
 
+fn download_blob_tag(hash: Hash) -> Tag {
+    Tag::from(format!("wire-chat-download-{hash}"))
+}
+
+fn verified_range_bytes(ranges: &iroh_blobs::protocol::RangeSpec, total: u64) -> u64 {
+    const CHUNK_BYTES: u64 = 1024;
+    let chunks = total.div_ceil(CHUNK_BYTES);
+    ranges
+        .to_chunk_ranges()
+        .iter()
+        .map(|range| {
+            let start = match range.start_bound() {
+                Bound::Included(chunk) => chunk.0,
+                _ => 0,
+            };
+            let end = match range.end_bound() {
+                Bound::Excluded(chunk) => chunk.0,
+                _ => chunks,
+            };
+            let start = start.min(chunks).saturating_mul(CHUNK_BYTES);
+            let end = end.min(chunks).saturating_mul(CHUNK_BYTES);
+            end.min(total).saturating_sub(start.min(total))
+        })
+        .sum::<u64>()
+        .min(total)
+}
+
+async fn partial_download_bytes(blobs: &BlobStore, hash: Hash, total: u64) -> u64 {
+    let Ok(Some(entry)) = blobs.get_mut(&hash).await else {
+        return 0;
+    };
+    if entry.is_complete() {
+        return total;
+    }
+    let Ok(ranges) = iroh_blobs::get::db::valid_ranges::<BlobStore>(&entry).await else {
+        return 0;
+    };
+    verified_range_bytes(&iroh_blobs::protocol::RangeSpec::new(ranges), total)
+}
+
 fn sorted_members(nodes: impl IntoIterator<Item = NodeId>) -> Vec<String> {
     let mut members: Vec<_> = nodes.into_iter().map(|node| node.to_string()).collect();
     members.sort();
@@ -4172,6 +5354,15 @@ fn load_local_deletions(path: &Path) -> LocalDeletionIndex {
 
 fn load_reliable_control(path: &Path) -> ReliableControlIndex {
     load_local_json(path, "reliable-control index")
+}
+
+fn load_pending_file_downloads(path: &Path) -> BTreeMap<(String, String), PendingFileDownload> {
+    let index: PendingFileDownloadIndex = load_local_json(path, "file download index");
+    index
+        .downloads
+        .into_iter()
+        .map(|item| ((item.message_id.clone(), item.hash.clone()), item))
+        .collect()
 }
 
 fn load_local_json<T: serde::de::DeserializeOwned + Default>(path: &Path, label: &str) -> T {
@@ -4251,6 +5442,8 @@ mod tests {
                     message_id: "a".repeat(64),
                     hash: "image-hash".to_owned(),
                     byte_len: 42,
+                    attachment_kind: AttachmentKind::Image,
+                    sent_at: now_millis(),
                     pending_peers: BTreeSet::from([peer.clone()]),
                 },
             );
@@ -4336,6 +5529,7 @@ mod tests {
         let bytes = Arc::new(vec![1, 2, 3, 4]);
         let hash = Hash::new(bytes.as_slice()).to_string();
         let attachment = ChatAttachment {
+            kind: AttachmentKind::Image,
             id: hash.clone(),
             name: "pixel.png".to_owned(),
             media_type: "image/png".to_owned(),
@@ -4351,6 +5545,50 @@ mod tests {
         assert!(!encoded.windows(9).any(|window| window == b"1,2,3,4"));
         let decoded: ChatMessage = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.attachments[0].data.is_none());
+    }
+
+    #[test]
+    fn file_offer_persists_metadata_and_receiver_records_without_contents() {
+        let contents = b"private zip payload";
+        let hash = Hash::new(contents).to_string();
+        let attachment = ChatAttachment {
+            kind: AttachmentKind::FileOffer,
+            id: hash.clone(),
+            name: "archive.zip".to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+            byte_len: contents.len() as u64,
+            width: 0,
+            height: 0,
+            hash: hash.clone(),
+            data: None,
+        };
+        let mut message =
+            ChatMessage::new_with_attachments(node(1), String::new(), vec![attachment]);
+        message
+            .file_receivers
+            .insert(hash.clone(), BTreeSet::from([node(2).to_string()]));
+        message.validate().unwrap();
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(!encoded.contains("private zip payload"));
+        assert!(!encoded.contains("file_receivers"));
+        let decoded: ChatMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.attachments[0].kind, AttachmentKind::FileOffer);
+        assert!(decoded.file_receivers.is_empty());
+        let now = now_millis();
+        message.sent_at = 1;
+        assert!(message.visible_under(RetentionPolicy::Days(7), now));
+        let mut plain = ChatMessage::new(node(1), "ordinary text".to_owned());
+        plain.sent_at = 1;
+        assert!(!plain.visible_under(RetentionPolicy::Days(7), now));
+        let receipt = FileReceipt {
+            message_id: message.message_id,
+            hash,
+            receiver_id: node(2).to_string(),
+            received_at: 123,
+        };
+        assert!(receipt
+            .entry_key()
+            .starts_with(std::str::from_utf8(FILE_RECEIPT_PREFIX).unwrap()));
     }
 
     #[test]
@@ -4386,7 +5624,7 @@ mod tests {
             .await?;
         let protocols = ChatService::build(endpoint.clone(), root).await?;
         let router = Router::builder(endpoint.clone())
-            .accept(iroh_blobs::ALPN, protocols.blobs.clone())
+            .accept(iroh_blobs::ALPN, protocols.provider.clone())
             .accept(iroh_docs::ALPN, protocols.docs.clone())
             .accept(iroh_gossip::ALPN, protocols.gossip.clone())
             .accept(CHAT_ALPN, protocols.invites.clone())
@@ -4820,6 +6058,7 @@ mod tests {
             .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
             .await?;
         let attachment = ChatAttachment {
+            kind: AttachmentKind::Image,
             id: image_hash.clone(),
             name: "transfer.png".to_owned(),
             media_type: "image/png".to_owned(),
@@ -4847,6 +6086,334 @@ mod tests {
         .await?;
         wait_for_attachment_ack(&mut left, &conversation_id, &image_hash).await?;
 
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_text_file_syncs_automatically() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&temp.path().join("left"), SecretKey::from_bytes(&[113; 32])).await?;
+        let (right_endpoint, right_router, mut right) = spawn_test_node(
+            &temp.path().join("right"),
+            SecretKey::from_bytes(&[114; 32]),
+        )
+        .await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        let bytes = b"small UTF-8 text\n".to_vec();
+        let hash = Hash::new(&bytes).to_string();
+        let attachment = ChatAttachment {
+            kind: AttachmentKind::InlineFile,
+            id: hash.clone(),
+            name: "notes.txt".to_owned(),
+            media_type: "text/plain".to_owned(),
+            byte_len: bytes.len() as u64,
+            width: 0,
+            height: 0,
+            hash: hash.clone(),
+            data: Some(Arc::new(bytes.clone())),
+        };
+        let message = ChatMessage::new_with_attachments(
+            left_endpoint.node_id(),
+            String::new(),
+            vec![attachment],
+        );
+        let message_id = message.message_id.clone();
+        assert!(left.send_message(conversation_id.clone(), message).await);
+        wait_for_attachment(&mut right, &conversation_id, &message_id, &hash, &bytes).await?;
+        wait_for_attachment_ack(&mut left, &conversation_id, &hash).await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let messages = right
+                    .load_messages(&right.index.conversations[&conversation_id])
+                    .await?;
+                if messages
+                    .iter()
+                    .find(|message| message.message_id == message_id)
+                    .and_then(|message| message.file_receivers.get(&hash))
+                    .is_some_and(|receivers| {
+                        receivers.contains(&right_endpoint.node_id().to_string())
+                    })
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                let _ = right.process_input(input).await;
+            }
+        })
+        .await??;
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_offer_waits_for_request_and_records_completed_receive() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("archive.zip");
+        let contents = b"a peer-to-peer file, never a chat body";
+        std::fs::write(&source, contents)?;
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&temp.path().join("left"), SecretKey::from_bytes(&[111; 32])).await?;
+        let (right_endpoint, right_router, mut right) = spawn_test_node(
+            &temp.path().join("right"),
+            SecretKey::from_bytes(&[112; 32]),
+        )
+        .await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        left.offer_files(
+            conversation_id.clone(),
+            "archive for you".to_owned(),
+            Vec::new(),
+            vec![source],
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let stored = &left.index.conversations[&conversation_id];
+                if left
+                    .load_messages(stored)
+                    .await?
+                    .iter()
+                    .any(|message| message.body == "archive for you")
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = left.wait_input().await;
+                let _ = left.process_input(input).await;
+            }
+        })
+        .await??;
+        wait_for_body(&mut right, "archive for you").await?;
+        let stored = &right.index.conversations[&conversation_id];
+        let message = right
+            .load_messages(stored)
+            .await?
+            .into_iter()
+            .find(|message| message.body == "archive for you")
+            .or_else(|| {
+                right
+                    .staged_inbound
+                    .get(&conversation_id)
+                    .and_then(|messages| {
+                        messages
+                            .values()
+                            .find(|message| message.body == "archive for you")
+                            .cloned()
+                    })
+            })
+            .context("missing offer")?;
+        let offer = &message.attachments[0];
+        assert_eq!(offer.kind, AttachmentKind::FileOffer);
+        assert!(
+            right
+                .blobs
+                .get(&Hash::from_str(&offer.hash)?)
+                .await?
+                .is_none(),
+            "offer metadata must not automatically download content"
+        );
+        left.set_file_serving(offer.hash.clone(), false).await?;
+        assert!(is_stopped(
+            &left.stopped_hashes,
+            &Hash::from_str(&offer.hash)?
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let messages = right
+                    .load_messages(&right.index.conversations[&conversation_id])
+                    .await?;
+                if messages
+                    .iter()
+                    .find(|item| item.message_id == message.message_id)
+                    .is_some_and(|item| item.stopped_file_offers.contains(&offer.hash))
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                let _ = right.process_input(input).await;
+            }
+        })
+        .await??;
+        assert!(right
+            .request_file(
+                conversation_id.clone(),
+                message.message_id.clone(),
+                offer.hash.clone(),
+                temp.path().join("blocked.zip")
+            )
+            .await
+            .is_err());
+        let repeated = ChatMessage::new_with_attachments(
+            left_endpoint.node_id(),
+            "same file again".to_owned(),
+            vec![offer.clone()],
+        );
+        let repeated_id = repeated.message_id.clone();
+        assert!(left.send_message(conversation_id.clone(), repeated).await);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let messages = right
+                    .load_messages(&right.index.conversations[&conversation_id])
+                    .await?;
+                if messages
+                    .iter()
+                    .find(|item| item.message_id == repeated_id)
+                    .is_some_and(|item| item.stopped_file_offers.contains(&offer.hash))
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                let _ = right.process_input(input).await;
+            }
+        })
+        .await??;
+        left.set_file_serving(offer.hash.clone(), true).await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let messages = right
+                    .load_messages(&right.index.conversations[&conversation_id])
+                    .await?;
+                if messages
+                    .iter()
+                    .find(|item| item.message_id == message.message_id)
+                    .is_some_and(|item| !item.stopped_file_offers.contains(&offer.hash))
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                let _ = right.process_input(input).await;
+            }
+        })
+        .await??;
+        let destination = temp.path().join("received.zip");
+        std::fs::write(&destination, b"replace this older download")?;
+        let pending = PendingFileDownload {
+            conversation_id: conversation_id.clone(),
+            message_id: message.message_id.clone(),
+            hash: offer.hash.clone(),
+            path: destination.clone(),
+            byte_len: offer.byte_len,
+        };
+        right
+            .pending_file_downloads
+            .insert((pending.message_id.clone(), pending.hash.clone()), pending);
+        right.save_pending_file_downloads()?;
+        right.pending_file_downloads =
+            load_pending_file_downloads(&temp.path().join("right/chat/file-downloads.json"));
+        right.restore_file_downloads().await;
+        assert!(right.queued.iter().any(|notification| matches!(
+            notification,
+            ChatNotification::FileTransferUpdate {
+                message_id,
+                path,
+                phase: FileTransferPhase::Paused(_),
+                ..
+            } if message_id == &message.message_id && path == &destination
+        )));
+        right
+            .request_file(
+                conversation_id.clone(),
+                message.message_id.clone(),
+                offer.hash.clone(),
+                destination.clone(),
+            )
+            .await?;
+        let pending: PendingFileDownloadIndex =
+            persistence::read_json(&temp.path().join("right/chat/file-downloads.json"))?
+                .context("download request was not persisted")?;
+        assert_eq!(pending.downloads.len(), 1);
+        assert_eq!(pending.downloads[0].path, destination);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(ChatNotification::FileTransfer { result, .. }) =
+                    right.pop_notification()
+                {
+                    result.map_err(anyhow::Error::msg)?;
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                if let Some(ChatNotification::FileTransfer { result, .. }) =
+                    right.process_input(input).await
+                {
+                    result.map_err(anyhow::Error::msg)?;
+                    break Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        assert_eq!(std::fs::read(destination)?, contents);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = left.provider_event_rx.recv().await?;
+                left.handle_blob_provider_event(event);
+                if left.queued.iter().any(|notification| {
+                    matches!(notification,
+                    ChatNotification::FileServing { hash, phase: FileServingPhase::Sent, .. }
+                    if hash == &offer.hash)
+                }) {
+                    break Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        let pending: PendingFileDownloadIndex =
+            persistence::read_json(&temp.path().join("right/chat/file-downloads.json"))?
+                .context("download index disappeared")?;
+        assert!(pending.downloads.is_empty());
+        let hash = Hash::from_str(&offer.hash)?;
+        let cancelled = PendingFileDownload {
+            conversation_id: conversation_id.clone(),
+            message_id: message.message_id.clone(),
+            hash: offer.hash.clone(),
+            path: temp.path().join("cancelled.zip"),
+            byte_len: offer.byte_len,
+        };
+        right.pending_file_downloads.insert(
+            (cancelled.message_id.clone(), cancelled.hash.clone()),
+            cancelled,
+        );
+        right.save_pending_file_downloads()?;
+        right
+            .blobs
+            .set_tag(download_blob_tag(hash), Some(HashAndFormat::raw(hash)))
+            .await?;
+        right
+            .cancel_file(message.message_id.clone(), offer.hash.clone())
+            .await?;
+        assert!(right.pending_file_downloads.is_empty());
+        assert!(right
+            .blobs
+            .tags()
+            .await?
+            .all(|tag| { tag.is_ok_and(|(name, _)| name != download_blob_tag(hash)) }));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let received = right
+                    .load_messages(&right.index.conversations[&conversation_id])
+                    .await?;
+                if received
+                    .iter()
+                    .find(|item| item.message_id == message.message_id)
+                    .and_then(|item| item.file_receivers.get(&offer.hash))
+                    .is_some_and(|members| members.contains(&right_endpoint.node_id().to_string()))
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                let input = right.wait_input().await;
+                let _ = right.process_input(input).await;
+            }
+        })
+        .await??;
         left_router.shutdown().await?;
         right_router.shutdown().await?;
         Ok(())

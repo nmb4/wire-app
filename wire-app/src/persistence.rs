@@ -88,7 +88,7 @@ pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         core::PCWSTR,
@@ -126,7 +126,7 @@ fn destination_path(value: &[u16]) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(source, destination)
         .with_context(|| format!("replace {}", destination.display()))?;
     if let Some(parent) = destination.parent() {
