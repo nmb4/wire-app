@@ -143,8 +143,7 @@ upload dry_run="":
 release part="patch" dry_run="":
     just bump-version {{ part }}
     just package
-    just upload {{ dry_run }}
-
+    
 # Pack wire-app/assets/new-icon.png into multi-res icon.ico + icon.png.
 # Requires Pillow:  python -m pip install Pillow
 #
