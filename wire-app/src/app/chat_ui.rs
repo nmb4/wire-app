@@ -1070,7 +1070,7 @@ impl AppState {
         // continuations. The content column always starts at the same x, so
         // names, timestamps, and bodies line up across the timeline.
         const COMPACT_AVATAR: f32 = 36.0;
-        const COMPACT_GAP: f32 = 12.0;
+        const COMPACT_GAP: f32 = 8.0;
         const COMPACT_GUTTER: f32 = COMPACT_AVATAR + COMPACT_GAP;
         // Optical nudge: the gutter stays top-aligned with the name row,
         // but name glyphs start ~3px lower (font ascent gap above the
@@ -2839,7 +2839,7 @@ mod tests {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.allocate_ui_with_layout(
-                        Vec2::new(48.0, 36.0),
+                        Vec2::new(44.0, 36.0),
                         Layout::left_to_right(Align::Min),
                         |ui| {
                             ui.allocate_ui_with_layout(
@@ -2859,7 +2859,7 @@ mod tests {
                                     tops.5 = rect.min.x;
                                 },
                             );
-                            ui.add_space(12.0);
+                            ui.add_space(8.0);
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -2905,8 +2905,8 @@ mod tests {
             "avatar paint must sit 3px below the name row top (cap-top alignment)"
         );
         assert!(
-            (name_left - avatar_left - 48.0).abs() < 0.6,
-            "content column must start a full 48px gutter after the avatar"
+            (name_left - avatar_left - 44.0).abs() < 0.6,
+            "content column must start a full 44px gutter after the avatar"
         );
         assert!(
             (body_left - name_left).abs() < 0.6,
