@@ -1082,9 +1082,21 @@ impl App {
                 if !dev_fixture {
                     match TrayController::new(&cc.egui_ctx, app.window_hidden.clone()) {
                         Ok(tray) => {
+                            let registered = tray.is_registered();
                             app.tray = Some(tray);
                             app.close_to_tray = true;
-                            info!("system tray icon is available");
+                            if registered {
+                                info!("system tray icon is available");
+                            } else {
+                                // The controller exists, so the window still hides
+                                // to a tray the shell never accepted. Say so,
+                                // because otherwise this is only visible as a
+                                // running process with no way to reach it.
+                                warn!(
+                                    "the notification area rejected the Wire tray icon, so no tray \
+                                     entry is shown; relaunching Wire restores the window"
+                                );
+                            }
                         }
                         Err(error) if start_hidden => {
                             return Err(Box::new(std::io::Error::other(error.to_string())));
