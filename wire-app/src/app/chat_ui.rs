@@ -929,7 +929,7 @@ impl AppState {
                                     .size(ui_font_size(10.5)),
                             );
                             if own && message.deletion.is_none() {
-                                chat_delivery_status_slot(
+                                chat_delivery_status_icon(
                                     ui,
                                     pal,
                                     state,
@@ -1133,7 +1133,7 @@ impl AppState {
                                     .size(ui_font_size(11.0)),
                             );
                             if own && message.deletion.is_none() {
-                                chat_delivery_status_slot(
+                                chat_delivery_status_icon(
                                     ui,
                                     pal,
                                     state,
@@ -2583,8 +2583,10 @@ fn chat_message_context_menu(
 
 /// Compact delivery affordance next to a message. Hover shows the detail string.
 /// Delivery status icon in a fixed 18px slot, dropped 3px so the 12px glyph
-/// centers on a body line instead of hugging its top. Used identically in
-/// name rows and continuation rows so the sync icons sit the same everywhere.
+/// centers on a body line instead of hugging its top. Used ONLY for
+/// continuation rows, where the timeline already reserves the 18px width —
+/// name rows and bubble headers keep the icon in-flow at its exact old
+/// width so narrow windows never clip.
 fn chat_delivery_status_slot(
     ui: &mut Ui,
     pal: &Palette,

@@ -95,6 +95,7 @@ impl AppState {
         }
         let entry = self.peer_profiles.entry(peer).or_default();
         let mut changed = false;
+        let mut hash_is_new = false;
         if let Some(name) = cleaned_name {
             if entry.display_name.as_deref() != Some(name.as_str()) {
                 entry.display_name = Some(name);
@@ -105,6 +106,7 @@ impl AppState {
             if entry.avatar_hash.as_deref() != Some(hash.as_str()) {
                 entry.avatar_hash = Some(hash);
                 changed = true;
+                hash_is_new = true;
             }
         }
         if let Some(accent) = cleaned_accent {
@@ -142,6 +144,13 @@ impl AppState {
                         self.peer_avatar_bytes.insert(peer, bytes);
                     }
                 } else {
+                    // A new hash means a new picture: drop any cooldown left
+                    // over from an older fetch so we grab it now. Re-learns
+                    // of a known hash keep the cooldown (no dial per message
+                    // while a fetch is already pending or recently failed).
+                    if hash_is_new {
+                        self.pending_profile_fetches.remove(&peer);
+                    }
                     self.request_peer_profile(peer);
                 }
             }

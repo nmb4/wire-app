@@ -2216,6 +2216,29 @@ impl AppState {
                 state,
                 detail,
             } => {
+                // A receipt proves a direct path to the conversation's peers
+                // just worked — the perfect moment to fetch avatars we're
+                // missing, instead of waiting on blind polling.
+                if matches!(state, DeliveryState::Delivered) {
+                    let mut peers = BTreeSet::new();
+                    for (id, timeline) in &self.chat.timelines {
+                        if timeline
+                            .iter()
+                            .any(|message| message.message_id == message_id)
+                        {
+                            if let Some(conversation) = self.chat.conversations.get(id) {
+                                peers.extend(
+                                    conversation
+                                        .members
+                                        .iter()
+                                        .filter_map(|member| NodeId::from_str(member).ok()),
+                                );
+                            }
+                            break;
+                        }
+                    }
+                    self.ensure_peer_profiles(peers);
+                }
                 self.chat.delivery.insert(message_id, (state, detail));
             }
             ChatNotification::Error(error) => {
