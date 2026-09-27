@@ -25,7 +25,9 @@ use tracing::{debug, warn};
 pub const PROFILE_ALPN: &[u8] = b"wire/profile/1";
 const MAX_PROFILE_REQUEST_BYTES: usize = 1024;
 const MAX_PROFILE_RESPONSE_BYTES: usize = 768 * 1024;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(6);
+/// Generous: relayed avatar responses can be slow, and the server only
+/// finishes after we close (see `accept`), so haste here causes failures.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Maximum display-name length in Unicode scalar values (Discord uses 32).
 pub const MAX_DISPLAY_NAME_LEN: usize = 32;
@@ -791,6 +793,13 @@ mod tests {
         let source = image::DynamicImage::ImageRgba8(raw);
         let (png, hash) = finalize_avatar_image(source).unwrap();
         assert_eq!((image::load_from_memory(&png).unwrap().width(), 256), (256, 256));
+        // Even adversarial photo noise must leave headroom under the fetch
+        // response cap, or pictures would fail exactly when set.
+        assert!(
+            png.len() * 4 / 3 + 1024 < MAX_PROFILE_RESPONSE_BYTES,
+            "noisy avatar PNG is {} bytes, too close to the response cap",
+            png.len()
+        );
 
         let served = ServedProfile {
             display_name: "Noah".to_owned(),

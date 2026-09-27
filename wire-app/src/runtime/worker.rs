@@ -388,7 +388,9 @@ impl Worker {
                             .await?;
                         }
                         Err(error) => {
-                            debug!(peer = %peer.fmt_short(), "profile fetch failed: {error:#}");
+                            // Warn, not debug: a failing fetch is the only
+                            // signal when peer pictures never resolve.
+                            warn!(peer = %peer.fmt_short(), "profile fetch failed: {error:#}");
                         }
                     }
                 }
