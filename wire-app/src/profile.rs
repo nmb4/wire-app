@@ -502,6 +502,12 @@ impl ProtocolHandler for ProfileProtocol {
             let response = protocol.response();
             write_json_packet(&mut send, &response, MAX_PROFILE_RESPONSE_BYTES).await?;
             send.finish()?;
+            // Do NOT return (dropping our connection handle) yet: Quinn
+            // closes the connection as soon as the last handle drops, which
+            // races the client still reading a large avatar response
+            // ("closed by peer: 0"). The client closes after a full read, so
+            // waiting here is bounded and race-free.
+            connection.closed().await;
             debug!(peer = %peer_label, "served profile");
             Ok(())
         }
@@ -528,51 +534,59 @@ pub async fn fetch_profile(endpoint: &Endpoint, peer: NodeId) -> Result<FetchedP
             .connect(NodeAddr::from(peer), PROFILE_ALPN)
             .await
             .with_context(|| format!("connect to {} for profile", peer.fmt_short()))?;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        write_json_packet(
-            &mut send,
-            &ProfileRequest { version: 1 },
-            MAX_PROFILE_REQUEST_BYTES,
-        )
-        .await?;
-        send.finish()?;
-        let response: ProfileResponse =
-            read_json_packet(&mut recv, MAX_PROFILE_RESPONSE_BYTES).await?;
-        if response.version != 1 {
-            bail!("unsupported profile protocol version {}", response.version);
-        }
-        let display_name = sanitize_display_name(&response.display_name);
-        let avatar_bytes = response
-            .avatar_base64
-            .as_deref()
-            .map(base64_decode)
-            .transpose()
-            .context("invalid profile avatar")?;
-        if let Some(bytes) = &avatar_bytes {
-            if bytes.len() > MAX_PROFILE_RESPONSE_BYTES {
-                bail!("profile avatar exceeds safety limit");
+        // Always close when done (success or failure): the server waits for
+        // our close before dropping its handle (see `accept`), so skipping
+        // this would leave the server hanging until idle timeout.
+        let outcome: Result<FetchedProfile> = async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_json_packet(
+                &mut send,
+                &ProfileRequest { version: 1 },
+                MAX_PROFILE_REQUEST_BYTES,
+            )
+            .await?;
+            send.finish()?;
+            let response: ProfileResponse =
+                read_json_packet(&mut recv, MAX_PROFILE_RESPONSE_BYTES).await?;
+            if response.version != 1 {
+                bail!("unsupported profile protocol version {}", response.version);
             }
-        }
-        // A hash mismatch just means "treat bytes as authoritative for this
-        // fetch".
-        if let (Some(hash), Some(bytes)) = (&response.avatar_hash, &avatar_bytes) {
-            let actual = avatar_hash_for(bytes);
-            if &actual != hash {
-                debug!(peer = %peer.fmt_short(), "profile avatar hash mismatch; using fetched bytes");
+            let display_name = sanitize_display_name(&response.display_name);
+            let avatar_bytes = response
+                .avatar_base64
+                .as_deref()
+                .map(base64_decode)
+                .transpose()
+                .context("invalid profile avatar")?;
+            if let Some(bytes) = &avatar_bytes {
+                if bytes.len() > MAX_PROFILE_RESPONSE_BYTES {
+                    bail!("profile avatar exceeds safety limit");
+                }
             }
+            // A hash mismatch just means "treat bytes as authoritative for
+            // this fetch".
+            if let (Some(hash), Some(bytes)) = (&response.avatar_hash, &avatar_bytes) {
+                let actual = avatar_hash_for(bytes);
+                if &actual != hash {
+                    debug!(peer = %peer.fmt_short(), "profile avatar hash mismatch; using fetched bytes");
+                }
+            }
+            let avatar_hash = match (response.avatar_hash, avatar_bytes.as_deref()) {
+                (Some(hash), _) => Some(hash),
+                (None, Some(bytes)) => Some(avatar_hash_for(bytes)),
+                (None, None) => None,
+            };
+            let accent_color = response.accent_color.as_deref().and_then(sanitize_accent_color);
+            Ok(FetchedProfile {
+                display_name,
+                avatar_hash,
+                avatar_bytes,
+                accent_color,
+            })
         }
-        let avatar_hash = match (response.avatar_hash, avatar_bytes.as_deref()) {
-            (Some(hash), _) => Some(hash),
-            (None, Some(bytes)) => Some(avatar_hash_for(bytes)),
-            (None, None) => None,
-        };
-        let accent_color = response.accent_color.as_deref().and_then(sanitize_accent_color);
-        Ok(FetchedProfile {
-            display_name,
-            avatar_hash,
-            avatar_bytes,
-            accent_color,
-        })
+        .await;
+        connection.close(0u32.into(), b"profile-done");
+        outcome
     })
     .await
     .context("profile fetch timed out")?
@@ -738,6 +752,70 @@ mod tests {
         let bytes: Vec<u8> = (0..255).collect();
         let encoded = base64_encode(&bytes);
         assert_eq!(base64_decode(&encoded).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn profile_fetch_serves_name_avatar_and_color_end_to_end() {
+        use iroh::{protocol::Router, RelayMode, SecretKey};
+
+        let secret_a = SecretKey::from_bytes(&[61; 32]);
+        let secret_b = SecretKey::from_bytes(&[62; 32]);
+        let endpoint_a = Endpoint::builder()
+            .secret_key(secret_a)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![PROFILE_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint_b = Endpoint::builder()
+            .secret_key(secret_b)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![PROFILE_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        endpoint_a
+            .add_node_addr(endpoint_b.node_addr().await.unwrap())
+            .unwrap();
+        endpoint_b
+            .add_node_addr(endpoint_a.node_addr().await.unwrap())
+            .unwrap();
+
+        // Noisy photo-like source (flat images compress trivially and would
+        // never catch size/base64 edge cases).
+        let mut raw = image::RgbaImage::new(213, 137);
+        for (x, y, pixel) in raw.enumerate_pixels_mut() {
+            let value = ((x * 31 + y * 57 + x * y) % 251) as u8;
+            *pixel = image::Rgba([value, 255 - value, (x % 200) as u8, 255]);
+        }
+        let source = image::DynamicImage::ImageRgba8(raw);
+        let (png, hash) = finalize_avatar_image(source).unwrap();
+        assert_eq!((image::load_from_memory(&png).unwrap().width(), 256), (256, 256));
+
+        let served = ServedProfile {
+            display_name: "Noah".to_owned(),
+            avatar_png: Some(png.clone()),
+            avatar_hash: Some(hash.clone()),
+            accent_color: Some("#E67E22".to_owned()),
+        };
+        let protocol = ProfileProtocol::new(served);
+        let _router = Router::builder(endpoint_b.clone())
+            .accept(PROFILE_ALPN, protocol)
+            .spawn()
+            .await
+            .unwrap();
+
+        let fetched = fetch_profile(&endpoint_a, endpoint_b.node_id())
+            .await
+            .expect("profile fetch must succeed end to end");
+        assert_eq!(fetched.display_name, "Noah");
+        assert_eq!(fetched.avatar_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(fetched.accent_color.as_deref(), Some("#E67E22"));
+        let bytes = fetched.avatar_bytes.expect("avatar bytes must arrive");
+        assert_eq!(bytes, png);
+        assert_eq!(avatar_hash_for(&bytes), hash);
+        // And the UI's decode path must accept exactly these bytes.
+        image::load_from_memory(&bytes).expect("fetched bytes must decode");
     }
 
     #[test]

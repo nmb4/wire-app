@@ -441,6 +441,10 @@ impl ProtocolHandler for ClientStatusProtocol {
             )
             .await?;
             send.finish()?;
+            // Same graceful-close pattern as the profile protocol: dropping
+            // our handle here would race a client still reading a large
+            // group-call advertisement ("closed by peer: 0").
+            connection.closed().await;
             Ok(())
         }
         .boxed()
@@ -463,16 +467,21 @@ async fn exchange(
             .connect(NodeAddr::from(peer), CLIENT_STATUS_ALPN)
             .await
             .with_context(|| format!("connect to {} for client status", peer.fmt_short()))?;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        write_packet(
-            &mut send,
-            &StatusPacket::new(availability, active_group_calls, own_profile),
-        )
-        .await?;
-        send.finish()?;
-        let response: StatusPacket = read_packet(&mut recv).await?;
-        response.validate()?;
-        Result::<_>::Ok(response)
+        let outcome: Result<StatusPacket> = async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_packet(
+                &mut send,
+                &StatusPacket::new(availability, active_group_calls, own_profile),
+            )
+            .await?;
+            send.finish()?;
+            let response: StatusPacket = read_packet(&mut recv).await?;
+            response.validate()?;
+            Result::<_>::Ok(response)
+        }
+        .await;
+        connection.close(0u32.into(), b"status-done");
+        outcome
     })
     .await
     .context("client status exchange timed out")?
