@@ -643,6 +643,13 @@ impl AppState {
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
+                            // The theme defaults to 6px vertical item spacing,
+                            // which egui adds between every message row on top
+                            // of the explicit gaps below (continuations were
+                            // really 8px, groups really 20px). Zero it so the
+                            // Discord-style rhythm is exact: 2px inside a
+                            // burst, 14px between bursts, 9px for bubbles.
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             ui.add_space(8.0);
                             let visible_messages = timeline
                                 .into_iter()
@@ -1012,7 +1019,7 @@ impl AppState {
             ui.spacing_mut().item_spacing.x = 0.0;
             if starts_group {
                 ui.allocate_ui_with_layout(
-                    Vec2::new(COMPACT_GUTTER, 0.0),
+                    Vec2::new(COMPACT_GUTTER, COMPACT_AVATAR),
                     Layout::left_to_right(Align::Min),
                     |ui| {
                         paint_profile_avatar(ui, pal, compact_avatar, &initial, COMPACT_AVATAR);
@@ -1036,7 +1043,9 @@ impl AppState {
                     ui.set_max_width(content_width);
                     ui.spacing_mut().item_spacing.y = 1.0;
                     if starts_group {
-                        ui.horizontal(|ui| {
+                        // Bottom-aligned like Discord: the timestamp sits on
+                        // the name baseline instead of floating centered.
+                        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(
                                 RichText::new(&author)
