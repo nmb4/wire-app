@@ -1014,16 +1014,21 @@ impl AppState {
         const COMPACT_AVATAR: f32 = 40.0;
         const COMPACT_GAP: f32 = 12.0;
         const COMPACT_GUTTER: f32 = COMPACT_AVATAR + COMPACT_GAP;
+        // Optical nudge: the gutter stays top-aligned with the name row,
+        // but name glyphs start ~3px lower (font ascent gap above the
+        // cap-top). A crisp circle edge makes those 3px read as "avatar too
+        // far up", so the painted avatar drops to meet the cap-top.
+        const COMPACT_AVATAR_NUDGE: f32 = 3.0;
 
         let row_response = ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             if starts_group {
                 ui.allocate_ui_with_layout(
                     Vec2::new(COMPACT_GUTTER, COMPACT_AVATAR),
-                    Layout::left_to_right(Align::Min),
+                    Layout::top_down(Align::Min),
                     |ui| {
+                        ui.add_space(COMPACT_AVATAR_NUDGE);
                         paint_profile_avatar(ui, pal, compact_avatar, &initial, COMPACT_AVATAR);
-                        ui.add_space(COMPACT_GAP);
                     },
                 );
             } else {
@@ -2697,6 +2702,84 @@ mod tests {
         assert_eq!(
             format_chat_timestamp(8 * DAY + 8 * HOUR, today),
             "1/9/1970 08:00"
+        );
+    }
+
+    #[test]
+    fn compact_row_probes_avatar_name_and_body_geometry() {
+        // Headless probe mirroring `ui_compact_chat_message`'s skeleton:
+        // reports where the avatar allocation, name label, and body label
+        // actually land so alignment regressions show up as numbers.
+        let context = egui::Context::default();
+        let mut tops = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(52.0, 40.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            // Mirrors the optical nudge in
+                            // `ui_compact_chat_message`: allocation stays
+                            // top-aligned, paint drops 3px to the cap-top.
+                            ui.add_space(3.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::splat(40.0),
+                                egui::Sense::hover(),
+                            );
+                            tops.0 = rect.min.y;
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(300.0, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let name_rect = ui
+                                    .label(
+                                        RichText::new("Macbook")
+                                            .strong()
+                                            .size(16.0),
+                                    )
+                                    .rect;
+                                tops.1 = name_rect.min.y;
+                                tops.4 = name_rect.min.x;
+                                ui.label(
+                                    RichText::new("8/16/2026 18:17").size(13.0),
+                                );
+                            });
+                            ui.add_space(1.0);
+                            let body_rect = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new("jfg").size(15.0),
+                                    )
+                                    .wrap(),
+                                )
+                                .rect;
+                            tops.2 = body_rect.min.y;
+                            tops.3 = body_rect.min.x;
+                        },
+                    );
+                });
+            });
+        });
+        let (avatar_top, name_top, body_top, body_left, name_left) = tops;
+        eprintln!("avatar_top={avatar_top} name_top={name_top} body_top={body_top} body_left={body_left} name_left={name_left}");
+        assert!(
+            (avatar_top - name_top - 3.0).abs() < 0.6,
+            "avatar paint must sit 3px below the name row top (cap-top alignment)"
+        );
+        assert!(
+            (body_left - name_left).abs() < 0.6,
+            "body must start at the name's x"
+        );
+        assert!(
+            body_top > name_top,
+            "body must sit below the name row"
         );
     }
 
