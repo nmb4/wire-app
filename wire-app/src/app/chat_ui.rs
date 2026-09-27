@@ -1023,12 +1023,32 @@ impl AppState {
         let row_response = ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             if starts_group {
+                // Nested layout: the outer row stacks gutter + content
+                // horizontally (widths accumulate to the fixed 52px gutter),
+                // while the inner column drops the painted avatar 3px to the
+                // glyph cap-top. A single top-down gutter would collapse to
+                // the 40px avatar and eat the 12px gap (widths don't
+                // accumulate vertically).
                 ui.allocate_ui_with_layout(
                     Vec2::new(COMPACT_GUTTER, COMPACT_AVATAR),
-                    Layout::top_down(Align::Min),
+                    Layout::left_to_right(Align::Min),
                     |ui| {
-                        ui.add_space(COMPACT_AVATAR_NUDGE);
-                        paint_profile_avatar(ui, pal, compact_avatar, &initial, COMPACT_AVATAR);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(COMPACT_AVATAR, COMPACT_AVATAR),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add_space(COMPACT_AVATAR_NUDGE);
+                                paint_profile_avatar(
+                                    ui,
+                                    pal,
+                                    compact_avatar,
+                                    &initial,
+                                    COMPACT_AVATAR,
+                                );
+                            },
+                        );
+                        ui.add_space(COMPACT_GAP);
                     },
                 );
             } else {
@@ -2711,24 +2731,33 @@ mod tests {
         // reports where the avatar allocation, name label, and body label
         // actually land so alignment regressions show up as numbers.
         let context = egui::Context::default();
-        let mut tops = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut tops = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
         let _ = context.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.allocate_ui_with_layout(
                         Vec2::new(52.0, 40.0),
-                        Layout::top_down(Align::Min),
+                        Layout::left_to_right(Align::Min),
                         |ui| {
-                            // Mirrors the optical nudge in
-                            // `ui_compact_chat_message`: allocation stays
-                            // top-aligned, paint drops 3px to the cap-top.
-                            ui.add_space(3.0);
-                            let (rect, _) = ui.allocate_exact_size(
-                                Vec2::splat(40.0),
-                                egui::Sense::hover(),
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(40.0, 40.0),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    // Mirrors the optical nudge in
+                                    // `ui_compact_chat_message`: allocation
+                                    // stays top-aligned, paint drops 3px.
+                                    ui.add_space(3.0);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(40.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    tops.0 = rect.min.y;
+                                    tops.5 = rect.min.x;
+                                },
                             );
-                            tops.0 = rect.min.y;
+                            ui.add_space(12.0);
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -2767,11 +2796,15 @@ mod tests {
                 });
             });
         });
-        let (avatar_top, name_top, body_top, body_left, name_left) = tops;
-        eprintln!("avatar_top={avatar_top} name_top={name_top} body_top={body_top} body_left={body_left} name_left={name_left}");
+        let (avatar_top, name_top, body_top, body_left, name_left, avatar_left) = tops;
+        eprintln!("avatar_top={avatar_top} name_top={name_top} body_top={body_top} body_left={body_left} name_left={name_left} avatar_left={avatar_left}");
         assert!(
             (avatar_top - name_top - 3.0).abs() < 0.6,
             "avatar paint must sit 3px below the name row top (cap-top alignment)"
+        );
+        assert!(
+            (name_left - avatar_left - 52.0).abs() < 0.6,
+            "content column must start a full 52px gutter after the avatar"
         );
         assert!(
             (body_left - name_left).abs() < 0.6,
