@@ -22,6 +22,10 @@ mod tray;
 pub mod window_frame;
 /// The application version embedded at compile time from this package's Cargo manifest.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Short git commit hash embedded at compile time (see build.rs, "unknown"
+/// when git is unavailable). Shown in Settings so two machines can confirm
+/// they run the same build.
+pub const GIT_HASH: &str = env!("WIRE_GIT_HASH");
 
 #[cfg(any(windows, target_os = "macos"))]
 mod scap_capture;

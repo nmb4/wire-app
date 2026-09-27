@@ -193,6 +193,17 @@ impl AppState {
                                 settings_section_heading(
                                     ui,
                                     &pal,
+                                    "About",
+                                    &format!(
+                                        "Wire v{} · build {}",
+                                        crate::APP_VERSION,
+                                        crate::GIT_HASH
+                                    ),
+                                );
+                                settings_divider(ui);
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
                                     "General",
                                     "Choose how Wire starts.",
                                 );

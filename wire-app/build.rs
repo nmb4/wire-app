@@ -4,6 +4,25 @@ use std::path::Path;
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    // Run on every build so the embedded hash tracks the current commit.
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // Short commit hash shown in Settings so two machines can confirm they
+    // run the same build. Never fails the build (falls back to "unknown").
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            } else {
+                None
+            }
+        })
+        .filter(|hash| !hash.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=WIRE_GIT_HASH={git_hash}");
 
     // Embed the .ico into the PE resources on Windows so Explorer / taskbar /
     // shortcuts show the branded file icon (separate from the eframe window icon).
