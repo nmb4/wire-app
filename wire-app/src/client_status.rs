@@ -116,6 +116,8 @@ struct StatusPacket {
     display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accent_color: Option<String>,
 }
 
 impl StatusPacket {
@@ -131,6 +133,7 @@ impl StatusPacket {
             active_group_calls,
             display_name: profile.display_name,
             avatar_hash: profile.avatar_hash,
+            accent_color: profile.accent_color,
         }
     }
 
@@ -138,6 +141,7 @@ impl StatusPacket {
         ProfileSnapshot {
             display_name: self.display_name.clone(),
             avatar_hash: self.avatar_hash.clone(),
+            accent_color: self.accent_color.clone(),
         }
     }
 
@@ -523,11 +527,16 @@ mod tests {
             ProfileSnapshot {
                 display_name: Some("Ada".to_owned()),
                 avatar_hash: Some("abc123".to_owned()),
+                accent_color: Some("#5865F2".to_owned()),
             },
         );
         assert!(packet.validate().is_ok());
         assert_eq!(packet.profile().display_name.as_deref(), Some("Ada"));
+        assert_eq!(packet.profile().accent_color.as_deref(), Some("#5865F2"));
         packet.display_name = Some("x".repeat(64));
+        assert!(packet.validate().is_err());
+        packet.display_name = Some("Ada".to_owned());
+        packet.accent_color = Some("bogus".to_owned());
         assert!(packet.validate().is_err());
     }
 

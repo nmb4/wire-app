@@ -60,14 +60,22 @@ impl AppState {
             .filter(|name| !name.is_empty())
     }
 
-    /// Learn a display-name / avatar-hash snapshot from presence, chat, or an
-    /// invite. Persists the cache and triggers an avatar fetch when we see a
-    /// hash we have no bytes for.
+    /// Remote profile name color (`#RRGGBB`), if the peer picked one.
+    pub fn peer_accent_hex(&self, peer: NodeId) -> Option<&str> {
+        self.peer_profiles
+            .get(&peer)
+            .and_then(|profile| profile.accent_color.as_deref())
+    }
+
+    /// Learn a display-name / avatar-hash / accent snapshot from presence,
+    /// chat, or an invite. Persists the cache and triggers an avatar fetch
+    /// when we see a hash we have no bytes for.
     pub fn learn_peer_snapshot(
         &mut self,
         peer: NodeId,
         display_name: Option<String>,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
         _source: &str,
     ) {
         if Some(peer) == self.our_node_id {
@@ -79,7 +87,10 @@ impl AppState {
         let cleaned_hash = avatar_hash
             .map(|hash| hash.trim().to_owned())
             .filter(|hash| !hash.is_empty());
-        if cleaned_name.is_none() && cleaned_hash.is_none() {
+        let cleaned_accent = accent_color
+            .as_deref()
+            .and_then(profile::sanitize_accent_color);
+        if cleaned_name.is_none() && cleaned_hash.is_none() && cleaned_accent.is_none() {
             return;
         }
         let entry = self.peer_profiles.entry(peer).or_default();
@@ -93,6 +104,12 @@ impl AppState {
         if let Some(hash) = cleaned_hash {
             if entry.avatar_hash.as_deref() != Some(hash.as_str()) {
                 entry.avatar_hash = Some(hash);
+                changed = true;
+            }
+        }
+        if let Some(accent) = cleaned_accent {
+            if entry.accent_color.as_deref() != Some(accent.as_str()) {
+                entry.accent_color = Some(accent);
                 changed = true;
             }
         }
@@ -131,13 +148,14 @@ impl AppState {
         }
     }
 
-    /// Apply a full fetched profile (name + optional avatar bytes).
+    /// Apply a full fetched profile (name + optional avatar bytes + color).
     pub fn apply_fetched_profile(
         &mut self,
         peer: NodeId,
         display_name: String,
         avatar_hash: Option<String>,
         avatar_bytes: Option<Vec<u8>>,
+        accent_color: Option<String>,
     ) {
         if Some(peer) == self.our_node_id {
             return;
@@ -155,6 +173,12 @@ impl AppState {
             entry.avatar_hash = Some(hash);
         } else if let Some(bytes) = avatar_bytes.as_deref() {
             entry.avatar_hash = Some(profile::avatar_hash_for(bytes));
+        }
+        if let Some(accent) = accent_color
+            .as_deref()
+            .and_then(profile::sanitize_accent_color)
+        {
+            entry.accent_color = Some(accent);
         }
         entry.touch();
         if let Some(bytes) = avatar_bytes {
@@ -193,52 +217,98 @@ impl AppState {
         self.cmd(Command::SetChatProfile {
             display_name: (!name.trim().is_empty()).then_some(name.clone()),
             avatar_hash: self.own_avatar_hash.clone(),
+            accent_color: self.own_accent_color.clone(),
         });
         self.cmd(Command::SetOwnProfile {
             display_name: name,
             avatar_hash: self.own_avatar_hash.clone(),
+            accent_color: self.own_accent_color.clone(),
         });
     }
 
     /// Persist an edit of our own profile and advertise it immediately.
-    pub fn save_own_profile_edit(&mut self) {
+    /// Returns `false` (leaving the editor open) when validation fails.
+    pub fn save_own_profile_edit(&mut self) -> bool {
         let name = profile::sanitize_display_name(&self.profile_edit_name);
+        if name.is_empty() {
+            self.profile_edit_error =
+                Some("Enter a display name (or Cancel to keep browsing as a peer ID).".to_owned());
+            return false;
+        }
+        if !self.profile_edit_accent.trim().is_empty()
+            && profile::sanitize_accent_color(&self.profile_edit_accent).is_none()
+        {
+            self.profile_edit_error =
+                Some("Name color must be #RGB or #RRGGBB hex.".to_owned());
+            return false;
+        }
+        let accent = profile::sanitize_accent_color(&self.profile_edit_accent);
         self.own_profile_name = name.clone();
         self.profile_edit_name = name.clone();
+        self.own_accent_color = accent.clone();
+        self.profile_edit_accent = accent.clone().unwrap_or_default();
         self.profile_edit_error = None;
         profile::save_own_profile(&profile::OwnProfile {
             display_name: self.own_profile_name.clone(),
             avatar_hash: self.own_avatar_hash.clone(),
+            accent_color: self.own_accent_color.clone(),
         });
         // File bytes are written at pick time; just refresh the texture.
         self.own_avatar_texture = None;
         self.sync_own_profile_to_worker();
         self.play_control_sound(true);
+        true
     }
 
-    /// User picked an image file: normalize to a square PNG, store it, and
-    /// advertise the new hash.
-    pub fn set_own_avatar_from_file(&mut self, path: &std::path::Path) {
+    /// User picked an image file: open the crop editor so they choose the
+    /// framing themselves instead of accepting a blind center-cover.
+    pub fn set_own_avatar_from_file(&mut self, ctx: &egui::Context, path: &std::path::Path) {
         match std::fs::read(path) {
-            Ok(raw) => match profile::process_avatar_bytes(&raw) {
-                Ok((png, hash)) => {
-                    profile::save_avatar_bytes(&png);
-                    self.own_avatar_bytes = Some(png);
-                    self.own_avatar_hash = Some(hash);
-                    self.own_avatar_texture = None;
-                    profile::save_own_profile(&profile::OwnProfile {
-                        display_name: self.own_profile_name.clone(),
-                        avatar_hash: self.own_avatar_hash.clone(),
-                    });
-                    self.sync_own_profile_to_worker();
-                    self.profile_edit_error = None;
+            Ok(raw) => {
+                if raw.len() > profile::MAX_AVATAR_UPLOAD_BYTES {
+                    self.profile_edit_error =
+                        Some("Image is larger than 8 MiB.".to_owned());
+                    return;
                 }
-                Err(error) => {
-                    self.profile_edit_error = Some(format!("Could not use image: {error:#}"));
+                match image::load_from_memory(&raw) {
+                    Ok(img) => {
+                        self.avatar_crop = Some(AvatarCropState::new(ctx, img));
+                        self.profile_edit_error = None;
+                    }
+                    Err(error) => {
+                        self.profile_edit_error =
+                            Some(format!("Could not decode image: {error:#}"));
+                    }
                 }
-            },
+            }
             Err(error) => {
                 self.profile_edit_error = Some(format!("Could not read image: {error}"));
+            }
+        }
+    }
+
+    /// Confirm the current crop selection: encode, store, and advertise.
+    pub fn confirm_avatar_crop(&mut self) {
+        let Some(crop) = self.avatar_crop.take() else {
+            return;
+        };
+        let (x, y, edge) = crop.source_rect();
+        match profile::crop_avatar_image(crop.image(), x, y, edge) {
+            Ok((png, hash)) => {
+                profile::save_avatar_bytes(&png);
+                self.own_avatar_bytes = Some(png);
+                self.own_avatar_hash = Some(hash);
+                self.own_avatar_texture = None;
+                profile::save_own_profile(&profile::OwnProfile {
+                    display_name: self.own_profile_name.clone(),
+                    avatar_hash: self.own_avatar_hash.clone(),
+                    accent_color: self.own_accent_color.clone(),
+                });
+                self.sync_own_profile_to_worker();
+                self.profile_edit_error = None;
+            }
+            Err(error) => {
+                self.profile_edit_error = Some(format!("Could not crop image: {error:#}"));
             }
         }
     }
@@ -251,6 +321,7 @@ impl AppState {
         profile::save_own_profile(&profile::OwnProfile {
             display_name: self.own_profile_name.clone(),
             avatar_hash: None,
+            accent_color: self.own_accent_color.clone(),
         });
         self.sync_own_profile_to_worker();
     }
@@ -371,6 +442,7 @@ impl AppState {
             .clicked()
         {
             self.profile_edit_name = self.own_profile_name.clone();
+            self.profile_edit_accent = self.own_accent_color.clone().unwrap_or_default();
             self.profile_edit_error = None;
             self.show_profile_editor = true;
         }
@@ -473,6 +545,8 @@ impl AppState {
                             .color(pal.dim)
                             .size(ui_font_size(10.5)),
                         );
+                        ui.add_space(8.0);
+                        self.ui_accent_picker(ui, &pal);
                         if let Some(error) = &self.profile_edit_error {
                             ui.label(
                                 egui::RichText::new(error)
@@ -497,20 +571,14 @@ impl AppState {
                 .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
                 .pick_file()
             {
-                self.set_own_avatar_from_file(&path);
+                self.set_own_avatar_from_file(ctx, &path);
             }
         }
         if remove_avatar {
             self.clear_own_avatar();
         }
         if save {
-            if profile::sanitize_display_name(&self.profile_edit_name).is_empty() {
-                self.profile_edit_error =
-                    Some("Enter a display name (or Cancel to keep browsing as a peer ID).".to_owned());
-            } else {
-                self.save_own_profile_edit();
-                open = false;
-            }
+            open = self.save_own_profile_edit();
         }
         self.show_profile_editor = open;
     }
@@ -609,6 +677,330 @@ fn paint_circular_image(ui: &egui::Ui, rect: egui::Rect, texture: &TextureHandle
         mesh.add_triangle(0, i, i + 1);
     }
     ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// Resolve a `#RRGGBB` accent into paint color, falling back to `fallback`
+/// when unset or invalid.
+pub fn accent_color_for(accent_hex: Option<&str>, fallback: egui::Color32) -> egui::Color32 {
+    accent_hex
+        .and_then(profile::accent_rgb)
+        .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+        .unwrap_or(fallback)
+}
+
+// ---------------------------------------------------------------------------
+// Avatar crop session
+// ---------------------------------------------------------------------------
+
+/// Display-space layout of the crop editor.
+pub const CROP_AREA: f32 = 300.0;
+pub const CROP_SIZE: f32 = 240.0;
+const CROP_MAX_ZOOM: f32 = 4.0;
+
+/// An in-progress avatar framing: the picked image plus pan/zoom state. The
+/// crop square stays fixed and centered; the user drags the picture behind
+/// it and zooms with the slider.
+pub struct AvatarCropState {
+    image: image::DynamicImage,
+    texture: TextureHandle,
+    zoom: f32,
+    offset: Vec2,
+}
+
+impl AvatarCropState {
+    pub fn new(ctx: &egui::Context, image: image::DynamicImage) -> Self {
+        let rgba = image.to_rgba8();
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        let texture = ctx.load_texture(
+            "avatar-crop",
+            ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw()),
+            Default::default(),
+        );
+        Self {
+            image,
+            texture,
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+        }
+    }
+
+    fn min_scale(&self) -> f32 {
+        profile::crop_min_scale(self.image.width(), self.image.height(), CROP_SIZE)
+    }
+
+    fn scale(&self) -> f32 {
+        self.min_scale() * self.zoom
+    }
+
+    fn clamped_offset(&self) -> (f32, f32) {
+        profile::clamp_crop_offset(
+            (self.offset.x, self.offset.y),
+            self.image.width(),
+            self.image.height(),
+            self.scale(),
+            CROP_SIZE,
+        )
+    }
+
+    /// Source-pixel square for the current framing.
+    pub fn source_rect(&self) -> (u32, u32, u32) {
+        let (ox, oy) = self.clamped_offset();
+        profile::crop_source_rect(
+            self.image.width(),
+            self.image.height(),
+            self.scale(),
+            (ox, oy),
+            CROP_SIZE,
+        )
+    }
+
+    pub fn image(&self) -> &image::DynamicImage {
+        &self.image
+    }
+}
+
+impl AppState {
+    /// Modal crop editor rendered above the profile editor. Drag to pan,
+    /// slider to zoom, Save to confirm.
+    pub fn ui_avatar_crop_editor(&mut self, ctx: &egui::Context) {
+        if self.avatar_crop.is_none() {
+            return;
+        }
+        let pal = Palette::for_theme(self.theme);
+        let pane_rect = self.pane_constrain_rect();
+        let dialog_width = (pane_rect.width() - 60.0).clamp(360.0, 400.0);
+        let mut close = false;
+        let mut confirm = false;
+        egui::Window::new("avatar-crop-editor")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .constrain_to(pane_rect)
+            .default_width(dialog_width)
+            .min_width(dialog_width)
+            .max_width(dialog_width)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0_f32, pal.line_br))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(0.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(dialog_width);
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("CROP PICTURE")
+                                .family(kh_family())
+                                .color(pal.text2)
+                                .size(13.0),
+                        );
+                        ui.label(
+                            egui::RichText::new("Drag to position, zoom with the slider.")
+                                .color(pal.dim)
+                                .size(ui_font_size(11.0)),
+                        );
+                        ui.add_space(10.0);
+                        let Some(crop) = self.avatar_crop.as_mut() else {
+                            return;
+                        };
+                        // Fixed-size stage; the crop square is centered in it.
+                        let (stage_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(CROP_AREA), egui::Sense::hover());
+                        let painter = ui.painter();
+                        painter.rect_filled(stage_rect, CornerRadius::ZERO, egui::Color32::BLACK);
+                        let scale = crop.scale();
+                        let displayed = Vec2::new(
+                            crop.image.width() as f32 * scale,
+                            crop.image.height() as f32 * scale,
+                        );
+                        let img_rect = egui::Rect::from_center_size(
+                            stage_rect.center() + crop.offset,
+                            displayed,
+                        );
+                        painter.image(
+                            crop.texture.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        // Dim everything outside the crop square.
+                        let crop_rect = egui::Rect::from_center_size(
+                            stage_rect.center(),
+                            Vec2::splat(CROP_SIZE),
+                        );
+                        let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(stage_rect.min, egui::pos2(stage_rect.max.x, crop_rect.min.y)),
+                            CornerRadius::ZERO,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(stage_rect.min.x, crop_rect.max.y), stage_rect.max),
+                            CornerRadius::ZERO,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(stage_rect.min.x, crop_rect.min.y), egui::pos2(crop_rect.min.x, crop_rect.max.y)),
+                            CornerRadius::ZERO,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(crop_rect.max.x, crop_rect.min.y), egui::pos2(stage_rect.max.x, crop_rect.max.y)),
+                            CornerRadius::ZERO,
+                            dim,
+                        );
+                        painter.rect_stroke(
+                            crop_rect,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.5_f32, egui::Color32::WHITE),
+                            egui::StrokeKind::Outside,
+                        );
+                        // Pan the picture behind the fixed square.
+                        let pan = ui.interact(
+                            stage_rect,
+                            ui.id().with("avatar-crop-pan"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if pan.dragged() {
+                            crop.offset += pan.drag_delta();
+                        }
+                        let (ox, oy) = crop.clamped_offset();
+                        crop.offset = Vec2::new(ox, oy);
+                        ui.add_space(8.0);
+                        let zoom_response = ui.add(
+                            egui::Slider::new(&mut crop.zoom, 1.0..=CROP_MAX_ZOOM)
+                                .text("Zoom"),
+                        );
+                        if zoom_response.changed() {
+                            let (ox, oy) = crop.clamped_offset();
+                            crop.offset = Vec2::new(ox, oy);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save picture").clicked() {
+                                confirm = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        if confirm {
+            self.confirm_avatar_crop();
+        } else if close {
+            self.avatar_crop = None;
+        }
+    }
+
+    /// Preset swatches + custom hex input for the name color. Shared by the
+    /// profile editor modal and the settings section.
+    pub fn ui_accent_picker(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.label(
+            egui::RichText::new("Name color")
+                .color(pal.text2)
+                .size(ui_font_size(12.0)),
+        );
+        ui.label(
+            egui::RichText::new("Shown next to your messages and in calls.")
+                .color(pal.dim)
+                .size(ui_font_size(10.5)),
+        );
+        ui.add_space(4.0);
+        let current = profile::sanitize_accent_color(&self.profile_edit_accent);
+        let mut picked: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+            // "Default" swatch: theme text color.
+            let default_selected = current.is_none() && self.profile_edit_accent.trim().is_empty();
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+            ui.painter().circle_filled(rect.center(), 11.0, pal.text);
+            if default_selected {
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    12.0,
+                    Stroke::new(2.0_f32, pal.accent),
+                );
+            }
+            if response.on_hover_text("Default (theme text)").clicked() {
+                picked = Some(String::new());
+            }
+            for preset in profile::ACCENT_PRESETS {
+                let (r, g, b) = profile::accent_rgb(preset).unwrap_or((255, 255, 255));
+                let color = egui::Color32::from_rgb(r, g, b);
+                let (rect, response) =
+                    ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+                ui.painter().circle_filled(rect.center(), 11.0, color);
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    11.0,
+                    Stroke::new(1.0_f32, pal.line_br),
+                );
+                if current.as_deref() == Some(preset) {
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        13.0,
+                        Stroke::new(2.0_f32, pal.accent),
+                    );
+                }
+                if response.on_hover_text(preset).clicked() {
+                    picked = Some(preset.to_owned());
+                }
+            }
+        });
+        if let Some(picked) = picked {
+            self.profile_edit_accent = picked;
+            self.profile_edit_error = None;
+        }
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Custom hex")
+                    .color(pal.dim)
+                    .size(ui_font_size(11.0)),
+            );
+            let changed = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.profile_edit_accent)
+                        .hint_text("#5865F2")
+                        .desired_width(110.0),
+                )
+                .changed();
+            if changed {
+                self.profile_edit_error = None;
+            }
+            let trimmed = self.profile_edit_accent.trim();
+            if !trimmed.is_empty() {
+                match profile::accent_rgb(trimmed) {
+                    Some((r, g, b)) => {
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            9.0,
+                            egui::Color32::from_rgb(r, g, b),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("Use #RGB or #RRGGBB")
+                                .color(pal.err)
+                                .size(ui_font_size(10.5)),
+                        );
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
 }
 
 fn truncate_name(name: &str, max: usize) -> String {

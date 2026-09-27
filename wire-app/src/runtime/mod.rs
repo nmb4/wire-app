@@ -36,6 +36,7 @@ pub(crate) enum Event {
         display_name: String,
         avatar_hash: Option<String>,
         avatar_bytes: Option<Vec<u8>>,
+        accent_color: Option<String>,
     },
     GroupCallEntered(GroupCallAnnouncement),
     InitialChatLoaded,
@@ -322,10 +323,12 @@ pub(crate) enum Command {
     SetOwnProfile {
         display_name: String,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
     },
     SetChatProfile {
         display_name: Option<String>,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
     },
     FetchPeerProfiles {
         peers: Vec<NodeId>,

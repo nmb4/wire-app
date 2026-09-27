@@ -125,7 +125,7 @@ impl AppState {
                                                         )
                                                         .pick_file()
                                                     {
-                                                        self.set_own_avatar_from_file(&path);
+                                                        self.set_own_avatar_from_file(ctx, &path);
                                                     }
                                                 }
                                                 if self.own_avatar_hash.is_some() {
@@ -168,6 +168,8 @@ impl AppState {
                                             .color(pal.dim)
                                             .size(ui_font_size(10.5)),
                                         );
+                                        ui.add_space(6.0);
+                                        self.ui_accent_picker(ui, &pal);
                                         if let Some(error) = &self.profile_edit_error {
                                             ui.label(
                                                 RichText::new(error)
@@ -184,17 +186,7 @@ impl AppState {
                                         )
                                         .clicked()
                                         {
-                                            if crate::profile::sanitize_display_name(
-                                                &self.profile_edit_name,
-                                            )
-                                            .is_empty()
-                                            {
-                                                self.profile_edit_error = Some(
-                                                    "Enter a display name.".to_owned(),
-                                                );
-                                            } else {
-                                                self.save_own_profile_edit();
-                                            }
+                                            self.save_own_profile_edit();
                                         }
                                     });
                                 settings_divider(ui);

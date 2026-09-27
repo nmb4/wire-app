@@ -242,11 +242,12 @@ struct AppState {
     seen_group_calls: BTreeMap<String, i64>,
     new_friend_name: String,
     new_friend_id: String,
-    /// Own personal profile (display name + avatar).
+    /// Own personal profile (display name + avatar + name color).
     own_profile_name: String,
     own_avatar_hash: Option<String>,
     own_avatar_bytes: Option<Vec<u8>>,
     own_avatar_texture: Option<egui::TextureHandle>,
+    own_accent_color: Option<String>,
     /// Remote profiles learned via presence, chat snapshots, invites, and the
     /// public profile fetch protocol. This is what lets unknown senders show
     /// a name + avatar instead of a raw peer ID.
@@ -255,8 +256,11 @@ struct AppState {
     peer_avatar_bytes: BTreeMap<NodeId, Vec<u8>>,
     pending_profile_fetches: BTreeMap<NodeId, i64>,
     profile_edit_name: String,
+    profile_edit_accent: String,
     profile_edit_error: Option<String>,
     show_profile_editor: bool,
+    /// Active avatar crop session (image picked, framing not yet confirmed).
+    avatar_crop: Option<profile_ui::AvatarCropState>,
     theme: Theme,
     window_frame_style: WindowFrameStyle,
     muted: bool,
@@ -971,13 +975,16 @@ impl App {
             own_avatar_hash: own_profile.avatar_hash.clone(),
             own_avatar_bytes,
             own_avatar_texture: None,
+            own_accent_color: own_profile.accent_color.clone(),
             peer_profiles,
             peer_avatar_textures: BTreeMap::new(),
             peer_avatar_bytes: BTreeMap::new(),
             pending_profile_fetches: BTreeMap::new(),
             profile_edit_name,
+            profile_edit_accent: own_profile.accent_color.clone().unwrap_or_default(),
             profile_edit_error: None,
             show_profile_editor: false,
+            avatar_crop: None,
             theme: settings.theme,
             window_frame_style: settings.window_frame_style,
             muted: false,
@@ -1223,8 +1230,10 @@ impl AppState {
             self.ui_capture_picker(ctx, &pal);
         }
         // Profile editor is a modal overlay available in both Text and Calls
-        // modes, independent of the settings / contacts windows.
+        // modes, independent of the settings / contacts windows. The avatar
+        // crop editor sits above it.
         self.ui_profile_editor(ctx);
+        self.ui_avatar_crop_editor(ctx);
         #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
@@ -1427,11 +1436,12 @@ impl AppState {
                         self.group_call_reports.remove(&peer);
                     }
                     // Profiles ride on presence: every heartbeat carries the
-                    // peer's current display name + avatar hash.
+                    // peer's current display name + avatar hash + name color.
                     self.learn_peer_snapshot(
                         peer,
                         update.profile.display_name.clone(),
                         update.profile.avatar_hash.clone(),
+                        update.profile.accent_color.clone(),
                         "presence",
                     );
                     #[cfg(windows)]
@@ -1801,8 +1811,15 @@ impl AppState {
                     display_name,
                     avatar_hash,
                     avatar_bytes,
+                    accent_color,
                 } => {
-                    self.apply_fetched_profile(peer, display_name, avatar_hash, avatar_bytes);
+                    self.apply_fetched_profile(
+                        peer,
+                        display_name,
+                        avatar_hash,
+                        avatar_bytes,
+                        accent_color,
+                    );
                 }
                 Event::WorkerFailed(error) => {
                     warn!("Wire worker unavailable: {error}");
@@ -1933,11 +1950,13 @@ impl AppState {
                     if let Ok(peer) = NodeId::from_str(&message.author_id) {
                         if message.author_display_name.is_some()
                             || message.author_avatar_hash.is_some()
+                            || message.author_accent_color.is_some()
                         {
                             self.learn_peer_snapshot(
                                 peer,
                                 message.author_display_name.clone(),
                                 message.author_avatar_hash.clone(),
+                                message.author_accent_color.clone(),
                                 "message",
                             );
                         }
@@ -2181,9 +2200,10 @@ impl AppState {
                 peer,
                 display_name,
                 avatar_hash,
+                accent_color,
             } => {
                 if let Ok(peer) = NodeId::from_str(&peer) {
-                    self.learn_peer_snapshot(peer, display_name, avatar_hash, "invite");
+                    self.learn_peer_snapshot(peer, display_name, avatar_hash, accent_color, "invite");
                 }
             }
             ChatNotification::RetentionSweep => {
@@ -2974,6 +2994,7 @@ mod layout_tests {
             client_version: None,
             author_display_name: None,
             author_avatar_hash: None,
+            author_accent_color: None,
             attachments: Vec::new(),
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),

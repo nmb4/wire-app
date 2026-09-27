@@ -133,6 +133,8 @@ pub struct ChatMessage {
     pub author_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_accent_color: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChatAttachment>,
     /// Receipt identities are reconstructed from the replicated document.
@@ -216,6 +218,7 @@ impl ChatMessage {
             client_version: Some(crate::APP_VERSION.to_owned()),
             author_display_name: None,
             author_avatar_hash: None,
+            author_accent_color: None,
             attachments,
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),
@@ -235,6 +238,7 @@ impl ChatMessage {
         mut self,
         display_name: Option<String>,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
     ) -> Self {
         let name = display_name
             .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -244,6 +248,9 @@ impl ChatMessage {
             .filter(|name| !name.is_empty());
         self.author_display_name = name;
         self.author_avatar_hash = avatar_hash.filter(|hash| !hash.trim().is_empty());
+        self.author_accent_color = accent_color
+            .as_deref()
+            .and_then(crate::profile::sanitize_accent_color);
         self
     }
 
@@ -483,6 +490,7 @@ pub enum ChatNotification {
         peer: String,
         display_name: Option<String>,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
     },
     Delivery {
         message_id: String,
@@ -592,6 +600,8 @@ struct ChatInvite {
     inviter_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     inviter_avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inviter_accent_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,6 +979,7 @@ pub struct ChatService {
     /// Own identity snapshot stamped onto outbound messages + invites.
     own_display_name: Option<String>,
     own_avatar_hash: Option<String>,
+    own_accent_color: Option<String>,
     next_retention_sweep: tokio::time::Instant,
     attachment_downloads: BTreeSet<Hash>,
     attachment_retries: BTreeMap<Hash, AttachmentRetry>,
@@ -1153,6 +1164,7 @@ impl ChatService {
             retention: RetentionPolicy::Unlimited,
             own_display_name: None,
             own_avatar_hash: None,
+            own_accent_color: None,
             next_retention_sweep: tokio::time::Instant::now() + Duration::from_secs(60 * 60),
             attachment_downloads: BTreeSet::new(),
             attachment_retries: BTreeMap::new(),
@@ -2317,6 +2329,7 @@ impl ChatService {
         &mut self,
         display_name: Option<String>,
         avatar_hash: Option<String>,
+        accent_color: Option<String>,
     ) {
         self.own_display_name = display_name
             .map(|name| {
@@ -2332,6 +2345,9 @@ impl ChatService {
             })
             .filter(|name| !name.is_empty());
         self.own_avatar_hash = avatar_hash.filter(|hash| !hash.trim().is_empty());
+        self.own_accent_color = accent_color
+            .as_deref()
+            .and_then(crate::profile::sanitize_accent_color);
     }
 
     fn stamp_own_profile(&self, message: &mut ChatMessage) {
@@ -2340,6 +2356,9 @@ impl ChatService {
         }
         if message.author_avatar_hash.is_none() {
             message.author_avatar_hash = self.own_avatar_hash.clone();
+        }
+        if message.author_accent_color.is_none() {
+            message.author_accent_color = self.own_accent_color.clone();
         }
     }
 
@@ -3818,11 +3837,15 @@ impl ChatService {
             history_reset,
             "chat invitation imported"
         );
-        if invite.inviter_display_name.is_some() || invite.inviter_avatar_hash.is_some() {
+        if invite.inviter_display_name.is_some()
+            || invite.inviter_avatar_hash.is_some()
+            || invite.inviter_accent_color.is_some()
+        {
             self.queued.push_back(ChatNotification::PeerIdentity {
                 peer: remote.to_string(),
                 display_name: invite.inviter_display_name,
                 avatar_hash: invite.inviter_avatar_hash,
+                accent_color: invite.inviter_accent_color,
             });
         }
         for message in migrated {
@@ -4816,6 +4839,7 @@ impl ChatService {
         let stored = stored.clone();
         let own_display_name = self.own_display_name.clone();
         let own_avatar_hash = self.own_avatar_hash.clone();
+        let own_accent_color = self.own_accent_color.clone();
         tokio::spawn(async move {
             let ticket = refresh_share_ticket(&docs, &stored, &endpoint)
                 .await
@@ -4827,6 +4851,7 @@ impl ChatService {
                 client_version: Some(crate::APP_VERSION.to_owned()),
                 inviter_display_name: own_display_name,
                 inviter_avatar_hash: own_avatar_hash,
+                inviter_accent_color: own_accent_color,
             };
             for peer in peers {
                 if let Err(error) = send_invite(sessions.clone(), peer, &invite).await {
@@ -4851,6 +4876,7 @@ impl ChatService {
             client_version: Some(crate::APP_VERSION.to_owned()),
             inviter_display_name: self.own_display_name.clone(),
             inviter_avatar_hash: self.own_avatar_hash.clone(),
+            inviter_accent_color: self.own_accent_color.clone(),
         };
         let mut join_set = tokio::task::JoinSet::new();
         for peer in self.other_members(stored) {

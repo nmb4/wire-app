@@ -186,6 +186,7 @@ impl Worker {
             (!own_profile.display_name.trim().is_empty())
                 .then(|| own_profile.display_name.clone()),
             own_profile.avatar_hash.clone(),
+            own_profile.accent_color.clone(),
         );
         info!("chat storage opened; starting protocol router");
         let _router = Router::builder(endpoint.clone())
@@ -251,8 +252,11 @@ impl Worker {
         let own = profile::load_own_profile();
         let avatar = profile::load_avatar_bytes();
         self.client_status.set_own_profile(own.snapshot());
-        self.chat
-            .set_own_profile(Some(own.display_name.clone()), own.avatar_hash.clone());
+        self.chat.set_own_profile(
+            Some(own.display_name.clone()),
+            own.avatar_hash.clone(),
+            own.accent_color.clone(),
+        );
         self.profile_protocol
             .set_served(ServedProfile::from_own(&own, avatar));
     }
@@ -379,6 +383,7 @@ impl Worker {
                                 display_name: fetched.display_name,
                                 avatar_hash: fetched.avatar_hash,
                                 avatar_bytes: fetched.avatar_bytes,
+                                accent_color: fetched.accent_color,
                             })
                             .await?;
                         }
@@ -1157,15 +1162,20 @@ impl Worker {
             Command::SetOwnProfile {
                 display_name,
                 avatar_hash,
+                accent_color,
             } => {
                 let snapshot = profile::ProfileSnapshot {
                     display_name: (!display_name.trim().is_empty())
                         .then_some(display_name.clone()),
                     avatar_hash: avatar_hash.clone(),
+                    accent_color: accent_color.clone(),
                 };
                 self.client_status.set_own_profile(snapshot);
-                self.chat
-                    .set_own_profile(Some(display_name.clone()), avatar_hash);
+                self.chat.set_own_profile(
+                    Some(display_name.clone()),
+                    avatar_hash,
+                    accent_color,
+                );
                 self.refresh_served_profile();
                 // Re-announce so friends learn the new identity immediately.
                 self.client_status.refresh_allowed_peers();
@@ -1173,8 +1183,10 @@ impl Worker {
             Command::SetChatProfile {
                 display_name,
                 avatar_hash,
+                accent_color,
             } => {
-                self.chat.set_own_profile(display_name, avatar_hash);
+                self.chat
+                    .set_own_profile(display_name, avatar_hash, accent_color);
             }
             Command::FetchPeerProfiles { peers } => {
                 for peer in peers {

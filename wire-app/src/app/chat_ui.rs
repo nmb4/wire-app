@@ -2,7 +2,7 @@
 
 use super::{
     format_group_member_summary,
-    profile_ui::paint_profile_avatar,
+    profile_ui::{accent_color_for, paint_profile_avatar},
     unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
@@ -668,7 +668,7 @@ impl AppState {
                                 ui.add_space(match self.chat_style {
                                     ChatStyle::Bubbles => 9.0,
                                     ChatStyle::Compact if next_is_grouped => 2.0,
-                                    ChatStyle::Compact => 10.0,
+                                    ChatStyle::Compact => 14.0,
                                 });
                             }
                         });
@@ -808,19 +808,27 @@ impl AppState {
             .cloned()
             .unwrap_or((DeliveryState::Delivered, None));
         let author = if own {
-            "You".to_owned()
+            self.own_label()
         } else {
             NodeId::from_str(&message.author_id)
                 .ok()
                 .map(|node| self.peer_display_name(node))
                 .unwrap_or_else(|| "Unknown peer".to_owned())
         };
+        let author_peer = NodeId::from_str(&message.author_id).ok();
+        let author_color = if own {
+            accent_color_for(self.own_accent_color.as_deref(), pal.text)
+        } else {
+            let snapshot_accent = message.author_accent_color.as_deref();
+            let peer_accent =
+                author_peer.and_then(|peer| snapshot_accent.or_else(|| self.peer_accent_hex(peer)));
+            accent_color_for(peer_accent, pal.text)
+        };
         let opacity = chat_delivery_opacity(state);
-        let time = format_chat_time(message.sent_at);
+        let time = format_chat_timestamp(message.sent_at, chat::now_millis());
         let mut requested_deletion = None;
         let mut requested_restore = false;
         // Profile avatar for the author (own picture for self).
-        let author_peer = NodeId::from_str(&message.author_id).ok();
         let bubble_initial = if own {
             crate::profile::display_name_initial(&self.own_label())
                 .unwrap_or_else(|| "Y".to_owned())
@@ -849,8 +857,15 @@ impl AppState {
                     Layout::top_down(if own { Align::Max } else { Align::Min }),
                     |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(
-                                RichText::new(format!("{author} · {time}"))
+                                RichText::new(&author)
+                                    .strong()
+                                    .color(author_color.gamma_multiply(opacity))
+                                    .size(ui_font_size(11.5)),
+                            );
+                            ui.label(
+                                RichText::new(&time)
                                     .color(pal.dim.gamma_multiply(opacity))
                                     .size(ui_font_size(10.5)),
                             );
@@ -949,12 +964,21 @@ impl AppState {
             .cloned()
             .unwrap_or((DeliveryState::Delivered, None));
         let author = if own {
-            "You".to_owned()
+            self.own_label()
         } else {
             NodeId::from_str(&message.author_id)
                 .ok()
                 .map(|node| self.peer_display_name(node))
                 .unwrap_or_else(|| "Unknown peer".to_owned())
+        };
+        let author_peer = NodeId::from_str(&message.author_id).ok();
+        let author_color = if own {
+            accent_color_for(self.own_accent_color.as_deref(), pal.text)
+        } else {
+            let snapshot_accent = message.author_accent_color.as_deref();
+            let peer_accent =
+                author_peer.and_then(|peer| snapshot_accent.or_else(|| self.peer_accent_hex(peer)));
+            accent_color_for(peer_accent, pal.text)
         };
         let initial = if own {
             crate::profile::display_name_initial(&self.own_label())
@@ -973,12 +997,36 @@ impl AppState {
         let opacity = chat_delivery_opacity(state);
         let mut requested_deletion = None;
         let mut requested_restore = false;
+        let now = chat::now_millis();
+        let mut gutter_hover_rect: Option<egui::Rect> = None;
 
-        ui.horizontal_top(|ui| {
+        // Discord-cozy layout: a fixed gutter holds the 40px avatar for group
+        // starts (top-aligned) and reveals a small timestamp on hover for
+        // continuations. The content column always starts at the same x, so
+        // names, timestamps, and bodies line up across the timeline.
+        const COMPACT_AVATAR: f32 = 40.0;
+        const COMPACT_GAP: f32 = 12.0;
+        const COMPACT_GUTTER: f32 = COMPACT_AVATAR + COMPACT_GAP;
+
+        let row_response = ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             if starts_group {
-                paint_profile_avatar(ui, pal, compact_avatar, &initial, 32.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(COMPACT_GUTTER, 0.0),
+                    Layout::left_to_right(Align::Min),
+                    |ui| {
+                        paint_profile_avatar(ui, pal, compact_avatar, &initial, COMPACT_AVATAR);
+                        ui.add_space(COMPACT_GAP);
+                    },
+                );
             } else {
-                ui.add_space(40.0);
+                // Gutter slot for the hover-revealed timestamp, painted
+                // after the row so we know whether the row is hovered.
+                let (gutter_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(COMPACT_GUTTER, 18.0),
+                    egui::Sense::hover(),
+                );
+                gutter_hover_rect = Some(gutter_rect);
             }
             let content_width = (ui.available_width() - 4.0).max(80.0);
             ui.allocate_ui_with_layout(
@@ -986,18 +1034,20 @@ impl AppState {
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.set_max_width(content_width);
+                    ui.spacing_mut().item_spacing.y = 1.0;
                     if starts_group {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(
                                 RichText::new(&author)
                                     .strong()
-                                    .color(pal.text.gamma_multiply(opacity))
-                                    .size(ui_font_size(13.0)),
+                                    .color(author_color.gamma_multiply(opacity))
+                                    .size(ui_font_size(14.0)),
                             );
                             ui.label(
-                                RichText::new(format_chat_time(message.sent_at))
+                                RichText::new(format_chat_timestamp(message.sent_at, now))
                                     .color(pal.dim.gamma_multiply(opacity))
-                                    .size(ui_font_size(10.5)),
+                                    .size(ui_font_size(11.0)),
                             );
                             if own && message.deletion.is_none() {
                                 chat_delivery_status_icon(
@@ -1009,6 +1059,7 @@ impl AppState {
                                 );
                             }
                         });
+                        ui.add_space(1.0);
                     }
 
                     // Constrain width so the label wraps (horizontal layouts
@@ -1069,6 +1120,20 @@ impl AppState {
                 },
             );
         });
+
+        // Discord-style: hovering a continuation reveals its time in the
+        // gutter, aligned with the message's first line.
+        if let Some(gutter) = gutter_hover_rect {
+            if row_response.response.hovered() {
+                ui.painter().text(
+                    egui::pos2(gutter.right() - 4.0, gutter.top() + 1.0),
+                    egui::Align2::RIGHT_TOP,
+                    format_chat_time(message.sent_at),
+                    egui::FontId::proportional(10.0),
+                    pal.dim2.gamma_multiply(opacity),
+                );
+            }
+        }
 
         if requested_restore {
             self.restore_chat_message(conversation_id, &message.message_id);
@@ -1158,14 +1223,19 @@ impl AppState {
             return;
         }
         let mut message = ChatMessage::new_with_attachments(author, body, attachments);
-        // Stamp our current profile so strangers see a name + avatar.
+        // Stamp our current profile so strangers see a name + avatar + color.
         if !self.own_profile_name.trim().is_empty() {
             message = message.with_author_profile(
                 Some(self.own_profile_name.clone()),
                 self.own_avatar_hash.clone(),
+                self.own_accent_color.clone(),
             );
-        } else if self.own_avatar_hash.is_some() {
-            message = message.with_author_profile(None, self.own_avatar_hash.clone());
+        } else if self.own_avatar_hash.is_some() || self.own_accent_color.is_some() {
+            message = message.with_author_profile(
+                None,
+                self.own_avatar_hash.clone(),
+                self.own_accent_color.clone(),
+            );
         }
         self.chat
             .delivery
@@ -2021,10 +2091,17 @@ impl AppState {
                         let initial = crate::profile::display_name_initial(&member.text)
                             .unwrap_or_else(|| "?".to_owned());
                         paint_profile_avatar(ui, pal, member_avatar, &initial, 28.0);
+                        let member_color = if member.kind == GroupMemberKind::You {
+                            accent_color_for(self.own_accent_color.as_deref(), pal.text)
+                        } else if let Some(peer) = member.node_id {
+                            accent_color_for(self.peer_accent_hex(peer), pal.text)
+                        } else {
+                            pal.text
+                        };
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new(&member.text)
-                                    .color(pal.text)
+                                    .color(member_color)
                                     .size(ui_font_size(13.0)),
                             );
                             ui.label(
@@ -2439,6 +2516,36 @@ fn format_chat_time(sent_at: i64) -> String {
     format!("{hour:02}:{minute:02}")
 }
 
+/// Discord-style group header timestamp: time for today's messages, day +
+/// time for yesterday, full date for anything older. Day boundaries use UTC
+/// day numbers, matching `format_chat_time`'s naive UTC clock.
+fn format_chat_timestamp(sent_at: i64, now_ms: i64) -> String {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let time = format_chat_time(sent_at);
+    let day = sent_at.div_euclid(DAY_MS);
+    let today = now_ms.div_euclid(DAY_MS);
+    match today - day {
+        0 => format!("Today at {time}"),
+        1 => format!("Yesterday at {time}"),
+        _ => {
+            //naive UTC calendar date (no timezone database on this stack).
+            let days = day;
+            // Convert days-since-epoch to Y/M/D via Howard Hinnant's algorithm.
+            let z = days + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z.rem_euclid(146_097);
+            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+            let mut year = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            year += i64::from(month <= 2);
+            let date_day = doy - (153 * mp + 2) / 5 + 1;
+            format!("{month}/{date_day}/{year} {time}")
+        }
+    }
+}
+
 fn file_transfer_progress(ui: &mut Ui, pal: &Palette, position: u64, total: u64, direction: &str) {
     ui.scope(|ui| {
         ui.visuals_mut().extreme_bg_color = pal.line_br;
@@ -2560,6 +2667,31 @@ mod tests {
     }
 
     #[test]
+    fn chat_timestamps_read_like_discord() {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        const HOUR: i64 = 60 * 60 * 1000;
+        const MINUTE: i64 = 60 * 1000;
+        // Epoch day itself.
+        assert_eq!(format_chat_timestamp(0, 0), "Today at 00:00");
+        assert_eq!(format_chat_timestamp(0, DAY), "Yesterday at 00:00");
+        assert_eq!(format_chat_timestamp(0, 2 * DAY), "1/1/1970 00:00");
+        // Same-day times stay short; the header only gains a date when old.
+        let today = 10 * DAY + 19 * HOUR + 51 * MINUTE;
+        assert_eq!(
+            format_chat_timestamp(10 * DAY + 8 * HOUR, today),
+            "Today at 08:00"
+        );
+        assert_eq!(
+            format_chat_timestamp(9 * DAY + 8 * HOUR, today),
+            "Yesterday at 08:00"
+        );
+        assert_eq!(
+            format_chat_timestamp(8 * DAY + 8 * HOUR, today),
+            "1/9/1970 08:00"
+        );
+    }
+
+    #[test]
     fn compact_chat_groups_only_same_author_in_same_minute() {
         let message = |author: &str, sent_at| ChatMessage {
             version: 1,
@@ -2571,6 +2703,7 @@ mod tests {
             client_version: None,
             author_display_name: None,
             author_avatar_hash: None,
+            author_accent_color: None,
             attachments: Vec::new(),
             file_receivers: std::collections::BTreeMap::new(),
             stopped_file_offers: std::collections::BTreeSet::new(),

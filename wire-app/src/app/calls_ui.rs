@@ -4,7 +4,7 @@
 use super::open_screen_recording_settings;
 use super::{
     friend_call_enabled,
-    profile_ui::{paint_profile_avatar, paint_stream_owner_avatar},
+    profile_ui::{accent_color_for, paint_profile_avatar, paint_stream_owner_avatar},
     save_friends,
     widgets::{
         aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
@@ -339,6 +339,13 @@ impl AppState {
         let display_name = self.peer_display_name(node_id);
         let initial = self.peer_initial(node_id);
         let avatar = self.peer_avatar_texture(ctx, node_id);
+        let name_color = accent_color_for(self.peer_accent_hex(node_id), {
+            if is_active {
+                pal.text
+            } else {
+                pal.text2
+            }
+        });
 
         Frame::new()
             .fill(fill)
@@ -355,7 +362,7 @@ impl AppState {
                     chip_name_label(
                         ui,
                         &ellipsize(&display_name, 16),
-                        if is_active { pal.text } else { pal.text2 },
+                        name_color,
                     );
                     ui.add_space(CHIP_IDENTITY_GAP);
                     voice_level_meter(ui, pal, voice_level)
@@ -1174,6 +1181,9 @@ impl AppState {
                             .get(node_id)
                             .map(|status| status.availability)
                     });
+                    let name_color = parsed.as_ref().ok().map_or(pal.text, |peer| {
+                        accent_color_for(self.peer_accent_hex(*peer), pal.text)
+                    });
                     let call_enabled = parsed
                         .as_ref()
                         .is_ok_and(|node_id| friend_call_enabled(self.calls.get(node_id)));
@@ -1194,7 +1204,7 @@ impl AppState {
                                     ui.spacing_mut().item_spacing.y = 1.0;
                                     ui.label(
                                         RichText::new(&display_name)
-                                            .color(pal.text)
+                                            .color(name_color)
                                             .size(ui_font_size(13.0)),
                                     );
                                     ui.horizontal(|ui| {

@@ -53,6 +53,44 @@ pub fn display_name_initial(name: &str) -> Option<String> {
         .map(|c| c.to_uppercase().to_string())
 }
 
+/// Preset name-color palette offered in the profile editor.
+pub const ACCENT_PRESETS: [&str; 10] = [
+    "#5865F2", // blurple
+    "#57F287", // green
+    "#FEE75C", // yellow
+    "#EB459E", // fuchsia
+    "#ED4245", // red
+    "#E67E22", // orange
+    "#1ABC9C", // teal
+    "#9B59B6", // purple
+    "#3498DB", // blue
+    "#E8E6E3", // near-white
+];
+
+/// Normalize a user-supplied accent color to `#RRGGBB` (uppercase). Accepts
+/// `#RGB`, `#RRGGBB`, with or without the leading `#`. Returns `None` for
+/// anything else (callers fall back to the theme text color).
+pub fn sanitize_accent_color(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix('#').unwrap_or(raw.trim());
+    let expanded = match hex.len() {
+        3 if hex.chars().all(|c| c.is_ascii_hexdigit()) => hex
+            .chars()
+            .flat_map(|c| [c, c])
+            .collect::<String>(),
+        6 if hex.chars().all(|c| c.is_ascii_hexdigit()) => hex.to_owned(),
+        _ => return None,
+    };
+    Some(format!("#{}", expanded.to_ascii_uppercase()))
+}
+
+/// Decode a sanitized (or raw) accent color into RGB bytes.
+pub fn accent_rgb(raw: &str) -> Option<(u8, u8, u8)> {
+    let normalized = sanitize_accent_color(raw)?;
+    let hex = &normalized[1..];
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
+    Some((channel(0..2)?, channel(2..4)?, channel(4..6)?))
+}
+
 fn config_dir() -> Option<PathBuf> {
     wire::net::config_dir()
 }
@@ -85,6 +123,9 @@ pub struct OwnProfile {
     /// Hex sha256 of the stored `avatar.png`, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_hash: Option<String>,
+    /// Name accent color as `#RRGGBB`, if the user picked one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
 }
 
 impl OwnProfile {
@@ -97,6 +138,7 @@ impl OwnProfile {
         ProfileSnapshot {
             display_name,
             avatar_hash: self.avatar_hash.clone(),
+            accent_color: self.accent_color.clone(),
         }
     }
 }
@@ -108,6 +150,8 @@ pub struct PeerProfile {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<i64>,
 }
@@ -127,6 +171,8 @@ pub struct ProfileSnapshot {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
 }
 
 impl ProfileSnapshot {
@@ -141,6 +187,11 @@ impl ProfileSnapshot {
                 bail!("profile avatar hash exceeds safety limit");
             }
         }
+        if let Some(color) = &self.accent_color {
+            if sanitize_accent_color(color).is_none() {
+                bail!("profile accent color is not a valid hex color");
+            }
+        }
         Ok(())
     }
 }
@@ -152,6 +203,10 @@ pub fn load_own_profile() -> OwnProfile {
     match crate::persistence::read_json::<OwnProfile>(&path) {
         Ok(Some(mut profile)) => {
             profile.display_name = sanitize_display_name(&profile.display_name);
+            profile.accent_color = profile
+                .accent_color
+                .as_deref()
+                .and_then(sanitize_accent_color);
             // Drop a hash that no longer has bytes behind it (user deleted the
             // file out of band, fresh config dir, ...).
             if profile.avatar_hash.is_some() && load_avatar_bytes().is_none() {
@@ -181,12 +236,20 @@ pub fn load_avatar_bytes() -> Option<Vec<u8>> {
 }
 
 /// Decode an arbitrary user-supplied image, cover-resize it to a square, and
-/// re-encode as PNG. Returns `(png_bytes, hash)`.
+/// re-encode as PNG. Returns `(png_bytes, hash)`. Kept for the non-interactive
+/// path and tests; the UI goes through the crop editor + `crop_avatar_image`.
+#[allow(dead_code)]
 pub fn process_avatar_bytes(raw: &[u8]) -> Result<(Vec<u8>, String)> {
     if raw.is_empty() || raw.len() > MAX_AVATAR_UPLOAD_BYTES {
         bail!("image is empty or larger than 8 MiB");
     }
     let img = image::load_from_memory(raw).context("could not decode image")?;
+    finalize_avatar_image(img)
+}
+
+/// Final shared avatar output: cover-resize any image to the stored square
+/// PNG. Used both for direct uploads and for user-cropped selections.
+pub fn finalize_avatar_image(img: image::DynamicImage) -> Result<(Vec<u8>, String)> {
     let square = img.resize_to_fill(
         AVATAR_EDGE,
         AVATAR_EDGE,
@@ -198,6 +261,81 @@ pub fn process_avatar_bytes(raw: &[u8]) -> Result<(Vec<u8>, String)> {
         .context("could not encode avatar")?;
     let hash = hex_bytes(&Sha256::digest(&png));
     Ok((png, hash))
+}
+
+/// Crop a square region (source pixels: x, y, edge) out of an image and run
+/// it through the standard avatar output. Lets users choose the framing
+/// instead of accepting a blind center-cover.
+pub fn crop_avatar_image(
+    img: &image::DynamicImage,
+    x: u32,
+    y: u32,
+    edge: u32,
+) -> Result<(Vec<u8>, String)> {
+    let (width, height) = (img.width(), img.height());
+    if edge == 0 || width == 0 || height == 0 {
+        bail!("image is empty");
+    }
+    let edge = edge.min(width).min(height);
+    let x = x.min(width.saturating_sub(edge));
+    let y = y.min(height.saturating_sub(edge));
+    let cropped = img.crop_imm(x, y, edge, edge);
+    finalize_avatar_image(cropped)
+}
+
+// ---------------------------------------------------------------------------
+// Interactive crop math (display-space <-> source-pixel mapping).
+//
+// The editor shows the image scaled uniformly by `scale` (display pixels per
+// source pixel) with its center at `area_center + offset`. A fixed crop
+// square of `crop_size` display pixels sits centered in the area. Zoom is
+// expressed relative to the minimum cover scale so the crop square is always
+// fully covered by image content.
+// ---------------------------------------------------------------------------
+
+/// Minimum scale so the crop square is fully covered by the image.
+pub fn crop_min_scale(src_w: u32, src_h: u32, crop_size: f32) -> f32 {
+    let smallest = src_w.min(src_h).max(1) as f32;
+    (crop_size / smallest).max(0.01)
+}
+
+/// Clamp a pan offset so the crop square never leaves the image.
+pub fn clamp_crop_offset(
+    offset: (f32, f32),
+    src_w: u32,
+    src_h: u32,
+    scale: f32,
+    crop_size: f32,
+) -> (f32, f32) {
+    let clamp_axis = |displayed: f32, value: f32| {
+        let slack = (displayed - crop_size).max(0.0) / 2.0;
+        value.clamp(-slack, slack)
+    };
+    (
+        clamp_axis(src_w as f32 * scale, offset.0),
+        clamp_axis(src_h as f32 * scale, offset.1),
+    )
+}
+
+/// Map the centered crop square back to source pixels: `(x, y, edge)`.
+pub fn crop_source_rect(
+    src_w: u32,
+    src_h: u32,
+    scale: f32,
+    offset: (f32, f32),
+    crop_size: f32,
+) -> (u32, u32, u32) {
+    let edge = ((crop_size / scale).round() as u32).max(1).min(src_w).min(src_h);
+    // Center of the crop square in source pixels.
+    let center_x = src_w as f32 / 2.0 - offset.0 / scale;
+    let center_y = src_h as f32 / 2.0 - offset.1 / scale;
+    let x = (center_x - edge as f32 / 2.0)
+        .round()
+        .clamp(0.0, src_w.saturating_sub(edge) as f32) as u32;
+    let y = (center_y - edge as f32 / 2.0)
+        .round()
+        .clamp(0.0, src_h.saturating_sub(edge) as f32) as u32;
+    (x, y, edge)
 }
 
 pub fn avatar_hash_for(bytes: &[u8]) -> String {
@@ -294,6 +432,8 @@ struct ProfileResponse {
     avatar_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avatar_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accent_color: Option<String>,
 }
 
 /// Data served to anyone asking for our profile.
@@ -302,6 +442,7 @@ pub struct ServedProfile {
     pub display_name: String,
     pub avatar_png: Option<Vec<u8>>,
     pub avatar_hash: Option<String>,
+    pub accent_color: Option<String>,
 }
 
 impl ServedProfile {
@@ -309,6 +450,7 @@ impl ServedProfile {
         Self {
             display_name: profile.display_name.clone(),
             avatar_hash: profile.avatar_hash.clone(),
+            accent_color: profile.accent_color.clone(),
             avatar_png: avatar_bytes,
         }
     }
@@ -339,6 +481,7 @@ impl ProfileProtocol {
             version: 1,
             display_name: served.display_name,
             avatar_hash: served.avatar_hash,
+            accent_color: served.accent_color,
             avatar_base64,
         }
     }
@@ -376,6 +519,7 @@ pub struct FetchedProfile {
     pub display_name: String,
     pub avatar_bytes: Option<Vec<u8>>,
     pub avatar_hash: Option<String>,
+    pub accent_color: Option<String>,
 }
 
 pub async fn fetch_profile(endpoint: &Endpoint, peer: NodeId) -> Result<FetchedProfile> {
@@ -422,10 +566,12 @@ pub async fn fetch_profile(endpoint: &Endpoint, peer: NodeId) -> Result<FetchedP
             (None, Some(bytes)) => Some(avatar_hash_for(bytes)),
             (None, None) => None,
         };
+        let accent_color = response.accent_color.as_deref().and_then(sanitize_accent_color);
         Ok(FetchedProfile {
             display_name,
             avatar_hash,
             avatar_bytes,
+            accent_color,
         })
     })
     .await
@@ -533,12 +679,58 @@ mod tests {
         let mut snapshot = ProfileSnapshot {
             display_name: Some("a".repeat(64)),
             avatar_hash: None,
+            accent_color: None,
         };
         assert!(snapshot.validate().is_err());
         snapshot.display_name = Some("Ada".to_owned());
         assert!(snapshot.validate().is_ok());
         snapshot.display_name = Some("   ".to_owned());
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn accent_colors_normalize_and_reject_garbage() {
+        assert_eq!(
+            sanitize_accent_color("#5865f2").as_deref(),
+            Some("#5865F2")
+        );
+        assert_eq!(sanitize_accent_color("f27").as_deref(), Some("#FF2277"));
+        assert_eq!(sanitize_accent_color("  #1abc9c ").as_deref(), Some("#1ABC9C"));
+        assert_eq!(sanitize_accent_color("not a color"), None);
+        assert_eq!(sanitize_accent_color("#12345"), None);
+        assert_eq!(sanitize_accent_color(""), None);
+        assert_eq!(accent_rgb("#FF0000"), Some((255, 0, 0)));
+        assert_eq!(accent_rgb("bogus"), None);
+        let mut snapshot = ProfileSnapshot {
+            display_name: None,
+            avatar_hash: None,
+            accent_color: Some("#ZZZZZZ".to_owned()),
+        };
+        assert!(snapshot.validate().is_err());
+        snapshot.accent_color = Some("#5865F2".to_owned());
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn crop_math_covers_and_round_trips() {
+        // Wide panorama: min scale makes the 240px crop fit the 100px height.
+        let min = crop_min_scale(400, 100, 240.0);
+        assert!((min - 2.4).abs() < 1e-5);
+        // Center offset maps to a centered source square.
+        let (x, y, edge) = crop_source_rect(400, 100, min, (0.0, 0.0), 240.0);
+        assert_eq!(edge, 100);
+        assert!((x as i32 - 150).abs() <= 1);
+        assert_eq!(y, 0);
+        // Panning is clamped so the crop never leaves the image.
+        let clamped = clamp_crop_offset((10_000.0, -10_000.0), 400, 100, min, 240.0);
+        let expected_x = (400.0 * min - 240.0) / 2.0;
+        assert!((clamped.0 - expected_x).abs() < 1e-3);
+        assert!(clamped.1.abs() < 1e-3);
+        // Cropping the computed rect yields a square avatar.
+        let img = image::DynamicImage::new_rgba8(400, 100);
+        let (png, _) = crop_avatar_image(&img, x, y, edge).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (256, 256));
     }
 
     #[test]
