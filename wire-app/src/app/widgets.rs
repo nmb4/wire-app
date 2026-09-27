@@ -460,29 +460,41 @@ pub(super) fn chat_navigation_button(
     } else {
         rect.right() - 12.0
     };
-    // Optional leading avatar (28px) so contacts and unknown senders show
-    // the learned profile picture instead of an initial baked into the label.
+    let label_font = FontId::proportional(ui_font_size(13.0));
+    let subtitle_font = FontId::proportional(ui_font_size(10.5));
+    // Optional leading avatar so contacts and unknown senders show the
+    // learned profile picture instead of an initial baked into the label.
+    // Two-line rows grow the circle to span both lines; one-line rows keep
+    // the compact list size.
+    let avatar_size = if subtitle.is_some() {
+        super::profile_ui::two_line_avatar_size(ui, &label_font, &subtitle_font)
+    } else {
+        26.0
+    };
     let text_left = if let Some(avatar) = &avatar {
-        let center = egui::pos2(rect.left() + 8.0 + 13.0, rect.center().y);
-        let avatar_rect = Rect::from_center_size(center, Vec2::splat(26.0));
+        let center = egui::pos2(rect.left() + 8.0 + avatar_size * 0.5, rect.center().y);
+        let avatar_rect = Rect::from_center_size(center, Vec2::splat(avatar_size));
         if let Some(texture) = &avatar.texture {
             super::profile_ui::paint_circular_image(ui, avatar_rect, texture);
         } else {
             ui.painter()
-                .circle_filled(center, 13.0, pal.panel2);
+                .circle_filled(center, avatar_size * 0.5, pal.panel2);
         }
-        ui.painter()
-            .circle_stroke(center, 13.0, Stroke::new(1.0_f32, pal.line_br));
+        ui.painter().circle_stroke(
+            center,
+            avatar_size * 0.5,
+            Stroke::new(1.0_f32, pal.line_br),
+        );
         if avatar.texture.is_none() {
             ui.painter().text(
                 center,
                 Align2::CENTER_CENTER,
                 &avatar.initial,
-                FontId::new(26.0 * 0.42, kh_family()),
+                FontId::new(avatar_size * 0.42, kh_family()),
                 pal.text2,
             );
         }
-        rect.left() + 8.0 + 26.0 + 10.0
+        rect.left() + 8.0 + avatar_size + 10.0
     } else {
         rect.left() + 14.0
     };
@@ -494,15 +506,21 @@ pub(super) fn chat_navigation_button(
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             ui.set_max_width(text_rect.width());
             if subtitle.is_some() {
-                ui.add_space(2.0);
+                // Two stacked lines sit flush and centered on the avatar.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let block_top = rect.center().y - avatar_size * 0.5;
+                ui.add_space((block_top - text_rect.top()).max(0.0));
             } else {
-                ui.add_space((text_rect.height() - 18.0).max(0.0) * 0.5);
+                let label_row = ui
+                    .ctx()
+                    .fonts_mut(|fonts| fonts.row_height(&label_font));
+                ui.add_space(((text_rect.height() - label_row) * 0.5).max(0.0));
             }
             ui.add(
                 egui::Label::new(
                     RichText::new(label)
                         .color(if selected { pal.text } else { pal.text2 })
-                        .size(ui_font_size(13.0)),
+                        .font(label_font),
                 )
                 .truncate()
                 .selectable(false),
@@ -512,7 +530,7 @@ pub(super) fn chat_navigation_button(
                     egui::Label::new(
                         RichText::new(subtitle)
                             .color(pal.dim)
-                            .size(ui_font_size(10.5)),
+                            .font(subtitle_font),
                     )
                     .truncate()
                     .selectable(false),

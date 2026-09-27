@@ -2,7 +2,7 @@
 
 use super::{
     format_group_member_summary,
-    profile_ui::{accent_color_for, paint_profile_avatar},
+    profile_ui::{accent_color_for, paint_profile_avatar, two_line_avatar_size},
     unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
@@ -336,9 +336,16 @@ impl AppState {
             let mut open_editor = false;
             ui.scope_builder(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
                 ui.set_clip_rect(footer);
+                // Two-line identity row: the picture spans the name + ID.
+                let avatar_size = two_line_avatar_size(
+                    ui,
+                    &egui::FontId::proportional(ui_font_size(12.5)),
+                    &egui::FontId::monospace(ui_font_size(10.5)),
+                );
                 ui.horizontal(|ui| {
-                    paint_profile_avatar(ui, pal, own_avatar, &own_initial, 32.0);
+                    paint_profile_avatar(ui, pal, own_avatar, &own_initial, avatar_size);
                     ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(
                             RichText::new(&own_name)
                                 .color(pal.text)
@@ -503,7 +510,13 @@ impl AppState {
             // not the vertical middle of the whole title+subtitle block.
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                paint_profile_avatar(ui, pal, header_avatar, &header_initial, 36.0);
+                // The picture spans the title + status block.
+                let header_avatar_size = two_line_avatar_size(
+                    ui,
+                    &egui::FontId::proportional(ui_font_size(15.0)),
+                    &egui::FontId::proportional(ui_font_size(11.5)),
+                );
+                paint_profile_avatar(ui, pal, header_avatar, &header_initial, header_avatar_size);
                 let group_members = matches!(conversation.kind, ConversationKind::Group)
                     .then(|| self.group_members_for(&conversation));
                 let group_member_summary = group_members
@@ -511,6 +524,7 @@ impl AppState {
                     .map(|members| format_group_member_summary(members));
                 ui.vertical(|ui| {
                     ui.set_max_width((ui.available_width() - 160.0).max(80.0));
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     // Direct peers render in their accent color, matching
                     // message author names; groups stay theme text.
                     let title_color = match conversation.direct_peer() {
@@ -2195,7 +2209,12 @@ impl AppState {
                     ui.horizontal(|ui| {
                         let initial = crate::profile::display_name_initial(&member.text)
                             .unwrap_or_else(|| "?".to_owned());
-                        paint_profile_avatar(ui, pal, member_avatar, &initial, 28.0);
+                        let avatar_size = two_line_avatar_size(
+                            ui,
+                            &egui::FontId::proportional(ui_font_size(13.0)),
+                            &egui::FontId::proportional(ui_font_size(10.5)),
+                        );
+                        paint_profile_avatar(ui, pal, member_avatar, &initial, avatar_size);
                         let member_color = if member.kind == GroupMemberKind::You {
                             accent_color_for(self.own_accent_color.as_deref(), pal.text)
                         } else if let Some(peer) = member.node_id {
@@ -2204,6 +2223,7 @@ impl AppState {
                             pal.text
                         };
                         ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(
                                 RichText::new(&member.text)
                                     .color(member_color)

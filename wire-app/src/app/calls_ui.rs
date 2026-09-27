@@ -4,7 +4,10 @@
 use super::open_screen_recording_settings;
 use super::{
     friend_call_enabled,
-    profile_ui::{accent_color_for, paint_profile_avatar, paint_stream_owner_avatar},
+    profile_ui::{
+        accent_color_for, paint_profile_avatar, paint_stream_owner_avatar, two_line_avatar_size,
+        SELF_CARD_HEIGHT,
+    },
     save_friends,
     widgets::{
         aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
@@ -780,8 +783,8 @@ impl AppState {
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
                 if dock_width >= 700.0 {
-                    // Center the 44px card inside the 46px slot.
-                    ui.add_space(((left_rect.height() - 44.0) * 0.5).max(0.0));
+                    // Center the self card inside the 46px slot.
+                    ui.add_space(((left_rect.height() - SELF_CARD_HEIGHT) * 0.5).max(0.0));
                     self.ui_self_user_card(ui, pal, ctx);
                 } else {
                     let avatar = self.own_avatar_texture(ctx);
@@ -1012,9 +1015,14 @@ impl AppState {
         section_card(ui, &pal, "Your identity", |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                paint_profile_avatar(ui, &pal, own_avatar, &own_initial, 40.0);
+                let avatar_size = two_line_avatar_size(
+                    ui,
+                    &egui::FontId::proportional(ui_font_size(13.5)),
+                    &egui::FontId::proportional(ui_font_size(13.0)),
+                );
+                paint_profile_avatar(ui, &pal, own_avatar, &own_initial, avatar_size);
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(
                         RichText::new(&own_name)
                             .color(pal.text)
@@ -1256,11 +1264,18 @@ impl AppState {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.set_min_height(40.0);
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                paint_profile_avatar(ui, &pal, avatar, &initial, 32.0);
+                                // Two-line contact row: the picture spans the
+                                // name + ID/status block.
+                                let avatar_size = two_line_avatar_size(
+                                    ui,
+                                    &egui::FontId::proportional(ui_font_size(13.0)),
+                                    &egui::FontId::proportional(ui_font_size(10.5)),
+                                );
+                                ui.set_min_height(avatar_size);
+                                paint_profile_avatar(ui, &pal, avatar, &initial, avatar_size);
                                 ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.spacing_mut().item_spacing.y = 0.0;
                                     ui.label(
                                         RichText::new(&display_name)
                                             .color(name_color)

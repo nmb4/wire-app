@@ -413,18 +413,24 @@ impl AppState {
         let name = self.own_label();
         let avatar = self.own_avatar_texture(ctx);
         let initials = profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
+        // Two-line identity row: the picture spans the name and online line.
+        let avatar_size = two_line_avatar_size(
+            ui,
+            &FontId::proportional(ui_font_size(12.0)),
+            &FontId::proportional(ui_font_size(10.5)),
+        );
         let response = egui::Frame::new()
             .fill(pal.panel)
             .stroke(Stroke::new(1.0_f32, pal.line))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(7, 3))
             .show(ui, |ui| {
-                ui.set_height(38.0);
+                ui.set_height(SELF_CARD_HEIGHT - 6.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    paint_profile_avatar(ui, pal, avatar, &initials, 30.0);
+                    paint_profile_avatar(ui, pal, avatar, &initials, avatar_size);
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(
                             egui::RichText::new(truncate_name(&name, 16))
                                 .color(pal.text)
@@ -620,6 +626,24 @@ pub fn paint_profile_avatar(
         );
     }
 }
+
+/// Diameter for an avatar sitting beside a two-line text block (name plus a
+/// secondary line).
+///
+/// Two-line rows stack their labels with zero vertical item spacing, so the
+/// combined row height is exactly the block the circle should cover — the
+/// same "avatar spans the text" look the compact chat gutter has. Rows must
+/// use the returned size together with zero vertical item spacing.
+pub fn two_line_avatar_size(ui: &egui::Ui, primary: &FontId, secondary: &FontId) -> f32 {
+    let rows = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.row_height(primary) + fonts.row_height(secondary));
+    rows.round()
+}
+
+/// Outer height of the call-dock self card (content plus the frame's 3px
+/// vertical margins). The dock slot centers the card using this value.
+pub const SELF_CARD_HEIGHT: f32 = 46.0;
 
 /// Avatar badge pinned to a stream tile corner, deliberately overflowing the
 /// frame so stream ownership is obvious at a glance.
@@ -1035,3 +1059,28 @@ pub(super) fn example_friend(name: &str, node: &str) -> Friend {
 /// IDs whose display we attempted to resolve this frame (for fetch batching).
 #[allow(dead_code)]
 pub type PeerSet = BTreeMap<NodeId, ()>;
+
+#[cfg(test)]
+mod tests {
+    use super::two_line_avatar_size;
+    use egui::FontId;
+
+    /// The helper reads font metrics from inside a live frame, where UI code
+    /// calls it; make sure that stays panic-free and returns a usable size.
+    #[test]
+    fn two_line_avatar_size_reads_font_metrics_in_frame() {
+        let ctx = egui::Context::default();
+        let mut measured = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                measured = Some(two_line_avatar_size(
+                    ui,
+                    &FontId::proportional(14.0),
+                    &FontId::monospace(12.0),
+                ));
+            });
+        });
+        let size = measured.expect("avatar size measured during layout");
+        assert!(size > 20.0, "avatar should span both text rows, got {size}");
+    }
+}
