@@ -499,8 +499,11 @@ impl AppState {
         ui.scope_builder(egui::UiBuilder::new().max_rect(header_inner), |ui| {
             ui.set_clip_rect(header);
             let show_call = ui.available_width() >= 430.0;
-            ui.horizontal(|ui| {
-                paint_profile_avatar(ui, pal, header_avatar, &header_initial, 34.0);
+            // Top-aligned like compact rows: the avatar meets the title,
+            // not the vertical middle of the whole title+subtitle block.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                paint_profile_avatar(ui, pal, header_avatar, &header_initial, 36.0);
                 let group_members = matches!(conversation.kind, ConversationKind::Group)
                     .then(|| self.group_members_for(&conversation));
                 let group_member_summary = group_members
@@ -508,10 +511,16 @@ impl AppState {
                     .map(|members| format_group_member_summary(members));
                 ui.vertical(|ui| {
                     ui.set_max_width((ui.available_width() - 160.0).max(80.0));
+                    // Direct peers render in their accent color, matching
+                    // message author names; groups stay theme text.
+                    let title_color = match conversation.direct_peer() {
+                        Some(peer) => accent_color_for(self.peer_accent_hex(peer), pal.text),
+                        None => pal.text,
+                    };
                     ui.add(
                         egui::Label::new(
                             RichText::new(&display_title)
-                                .color(pal.text)
+                                .color(title_color)
                                 .size(ui_font_size(15.0)),
                         )
                         .truncate(),
@@ -1056,11 +1065,11 @@ impl AppState {
         let now = chat::now_millis();
         let mut gutter_hover_rect: Option<egui::Rect> = None;
 
-        // Discord-cozy layout: a fixed gutter holds the 40px avatar for group
+        // Discord-cozy layout: a fixed gutter holds the 36px avatar for group
         // starts (top-aligned) and reveals a small timestamp on hover for
         // continuations. The content column always starts at the same x, so
         // names, timestamps, and bodies line up across the timeline.
-        const COMPACT_AVATAR: f32 = 40.0;
+        const COMPACT_AVATAR: f32 = 36.0;
         const COMPACT_GAP: f32 = 12.0;
         const COMPACT_GUTTER: f32 = COMPACT_AVATAR + COMPACT_GAP;
         // Optical nudge: the gutter stays top-aligned with the name row,
@@ -1117,9 +1126,12 @@ impl AppState {
                     ui.set_max_width(content_width);
                     ui.spacing_mut().item_spacing.y = 1.0;
                     if starts_group {
-                        // Bottom-aligned like Discord: the timestamp sits on
-                        // the name baseline instead of floating centered.
-                        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+                        // Centered, not bottom-aligned: measured Fraktion
+                        // boxes are 24px (name, baseline 16) vs 19px
+                        // (timestamp, baseline 13), so bottom alignment sits
+                        // the timestamp 2px too low while centering lands
+                        // within half a pixel of the shared baseline.
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(
                                 RichText::new(&author)
@@ -2817,8 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_row_probes_avatar_name_and_body_geometry() {
-        // Headless probe mirroring `ui_compact_chat_message`'s skeleton:
+    fn compact_row_probes_avatar_name_and_body_geometry() {        // Headless probe mirroring `ui_compact_chat_message`'s skeleton:
         // reports where the avatar allocation, name label, and body label
         // actually land so alignment regressions show up as numbers.
         let context = egui::Context::default();
@@ -2828,11 +2839,11 @@ mod tests {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.allocate_ui_with_layout(
-                        Vec2::new(52.0, 40.0),
+                        Vec2::new(48.0, 36.0),
                         Layout::left_to_right(Align::Min),
                         |ui| {
                             ui.allocate_ui_with_layout(
-                                Vec2::new(40.0, 40.0),
+                                Vec2::new(36.0, 36.0),
                                 Layout::top_down(Align::Min),
                                 |ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -2841,7 +2852,7 @@ mod tests {
                                     // stays top-aligned, paint drops 3px.
                                     ui.add_space(3.0);
                                     let (rect, _) = ui.allocate_exact_size(
-                                        Vec2::splat(40.0),
+                                        Vec2::splat(36.0),
                                         egui::Sense::hover(),
                                     );
                                     tops.0 = rect.min.y;
@@ -2894,8 +2905,8 @@ mod tests {
             "avatar paint must sit 3px below the name row top (cap-top alignment)"
         );
         assert!(
-            (name_left - avatar_left - 52.0).abs() < 0.6,
-            "content column must start a full 52px gutter after the avatar"
+            (name_left - avatar_left - 48.0).abs() < 0.6,
+            "content column must start a full 48px gutter after the avatar"
         );
         assert!(
             (body_left - name_left).abs() < 0.6,
@@ -2905,6 +2916,53 @@ mod tests {
             body_top > name_top,
             "body must sit below the name row"
         );
+    }
+
+    #[test]
+    fn name_row_reports_real_fraktion_boxes_and_baselines() {
+        // Decides timestamp alignment with app fonts instead of guesses:
+        // reports label-box heights and glyph baselines for the exact
+        // name/timestamp styles used in compact rows.
+        let context = egui::Context::default();
+        crate::theme::setup_fonts(&context);
+        let mut out = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let name_font = egui::FontId::proportional(crate::theme::ui_font_size(14.0));
+                let time_font = egui::FontId::proportional(crate::theme::ui_font_size(11.0));
+                let name_galley = ui.painter().layout_no_wrap(
+                    "Macbook".to_owned(),
+                    name_font,
+                    egui::Color32::WHITE,
+                );
+                let time_galley = ui.painter().layout_no_wrap(
+                    "9/24/2026 18:47".to_owned(),
+                    time_font,
+                    egui::Color32::WHITE,
+                );
+                let name_base = name_galley.rows.first().and_then(|row| {
+                    row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace())
+                });
+                let time_base = time_galley.rows.first().and_then(|row| {
+                    row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace())
+                });
+                out = (
+                    name_galley.rect.height(),
+                    time_galley.rect.height(),
+                    name_base.map(|glyph| glyph.pos.y).unwrap_or(-1.0),
+                    time_base.map(|glyph| glyph.pos.y).unwrap_or(-1.0),
+                );
+            });
+        });
+        eprintln!("name_box={} time_box={} name_base={} time_base={}", out.0, out.1, out.2, out.3);
+        // Name rows center the timestamp: with these boxes that lands the
+        // timestamp baseline within half a pixel of the name baseline,
+        // while bottom alignment would sink it ~2px. If a font swap flips
+        // this comparison, the name row layout must be revisited.
+        let bottom_err = ((out.0 - out.1) + out.3 - out.2).abs();
+        let center_err = ((out.0 - out.1) / 2.0 + out.3 - out.2).abs();
+        assert!(center_err < 0.6, "centered timestamp must sit on the baseline");
+        assert!(center_err < bottom_err, "centering must beat bottom alignment");
     }
 
     #[test]

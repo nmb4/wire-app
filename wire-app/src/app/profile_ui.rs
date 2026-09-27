@@ -417,18 +417,18 @@ impl AppState {
             .fill(pal.panel)
             .stroke(Stroke::new(1.0_f32, pal.line))
             .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(8, 5))
+            .inner_margin(egui::Margin::symmetric(7, 3))
             .show(ui, |ui| {
-                ui.set_height(44.0);
+                ui.set_height(38.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    paint_profile_avatar(ui, pal, avatar, &initials, 32.0);
+                    paint_profile_avatar(ui, pal, avatar, &initials, 30.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         ui.label(
                             egui::RichText::new(truncate_name(&name, 16))
                                 .color(pal.text)
-                                .size(ui_font_size(12.5)),
+                                .size(ui_font_size(12.0)),
                         );
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;

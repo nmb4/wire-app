@@ -447,21 +447,14 @@ pub(super) fn chat_navigation_button(
         egui::Sense::click(),
     );
     let fill = if selected {
-        chat_selected_surface(pal)
+        // Soft light wash for the open chat — no accent marker bar.
+        mix_color(pal.panel2, Color32::WHITE, 0.08)
     } else if response.hovered() {
         chat_hover_surface(pal)
     } else {
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
-    if selected {
-        let marker = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 3.0, rect.top() + 12.0),
-            egui::pos2(rect.left() + 6.0, rect.bottom() - 12.0),
-        );
-        ui.painter()
-            .rect_filled(marker, CornerRadius::same(2), pal.accent);
-    }
     let text_right = if unseen {
         rect.right() - 28.0
     } else {

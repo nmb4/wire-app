@@ -482,7 +482,7 @@ impl AppState {
             self.ui_mode_switcher(ui, pal);
 
             // Compact active-call indicator — same chrome language as the mode switcher.
-            if let Some((label, color, detail)) = self.active_call_indicator(pal) {
+            if let Some((prefix, name, suffix, color, detail)) = self.active_call_indicator(pal) {
                 ui.add_space(8.0);
                 let chip = Frame::new()
                     .fill(chat_surface(pal))
@@ -492,13 +492,28 @@ impl AppState {
                     .show(ui, |ui| {
                         ui.set_min_height(CHROME_CONTROL_HEIGHT);
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 7.0;
+                            ui.spacing_mut().item_spacing.x = 0.0;
                             dot(ui, color, 6.0);
+                            ui.add_space(7.0);
                             ui.label(
-                                RichText::new(label)
+                                RichText::new(prefix)
                                     .color(pal.text2)
                                     .size(ui_font_size(12.0)),
                             );
+                            if let Some((name, name_color)) = name {
+                                ui.label(
+                                    RichText::new(name)
+                                        .color(name_color)
+                                        .size(ui_font_size(12.0)),
+                                );
+                            }
+                            if !suffix.is_empty() {
+                                ui.label(
+                                    RichText::new(suffix)
+                                        .color(pal.text2)
+                                        .size(ui_font_size(12.0)),
+                                );
+                            }
                             if self.sharing_active {
                                 ui.label(
                                     RichText::new(if self.system_audio_active {
@@ -611,8 +626,12 @@ impl AppState {
         });
     }
 
-    /// Compact summary for the chrome top bar: label, accent color, hover detail.
-    fn active_call_indicator(&self, pal: &Palette) -> Option<(String, Color32, String)> {
+    /// Compact summary for the chrome top bar: status prefix, peer name with
+    /// its accent color, count suffix, dot color, hover detail.
+    fn active_call_indicator(
+        &self,
+        pal: &Palette,
+    ) -> Option<(String, Option<(String, Color32)>, String, Color32, String)> {
         if let Some(call) = &self.local_group_call {
             if let Some(waiting) = self.calls.iter().find_map(|(node_id, state)| {
                 (matches!(state, CallState::Incoming)
@@ -620,8 +639,12 @@ impl AppState {
                 .then_some(*node_id)
             }) {
                 let name = self.peer_display_name(waiting);
+                let name_color =
+                    accent_color_for(self.peer_accent_hex(waiting), pal.text2);
                 return Some((
-                    format!("Call waiting · {name}"),
+                    "Call waiting · ".to_owned(),
+                    Some((name.clone(), name_color)),
+                    String::new(),
                     Color32::from_rgb(255, 200, 80),
                     format!("{name} is calling while you are in {}", call.title),
                 ));
@@ -634,7 +657,9 @@ impl AppState {
                     + 1,
             );
             return Some((
-                format!("In group call · {}", call.title),
+                "In group call · ".to_owned(),
+                Some((call.title.clone(), pal.text2)),
+                String::new(),
                 pal.ok,
                 format!("{} · {participants} in call", call.title),
             ));
@@ -656,47 +681,66 @@ impl AppState {
         }
 
         let name = |id: NodeId| self.peer_display_name(id);
+        let name_color = |id: NodeId| accent_color_for(self.peer_accent_hex(id), pal.text2);
         if !incoming.is_empty() {
             let primary = name(incoming[0]);
-            let label = if incoming.len() == 1 {
-                format!("Incoming · {primary}")
+            let suffix = if incoming.len() == 1 {
+                String::new()
             } else {
-                format!("Incoming · {} +{}", primary, incoming.len() - 1)
+                format!(" +{}", incoming.len() - 1)
             };
             let detail = incoming
                 .iter()
                 .map(|id| name(*id))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Some((label, Color32::from_rgb(255, 200, 80), detail));
+            return Some((
+                "Incoming · ".to_owned(),
+                Some((primary, name_color(incoming[0]))),
+                suffix,
+                Color32::from_rgb(255, 200, 80),
+                detail,
+            ));
         }
         if !active.is_empty() {
             let primary = name(active[0]);
-            let label = if active.len() == 1 {
-                format!("In call · {primary}")
+            let suffix = if active.len() == 1 {
+                String::new()
             } else {
-                format!("In call · {} +{}", primary, active.len() - 1)
+                format!(" +{}", active.len() - 1)
             };
             let detail = active
                 .iter()
                 .map(|id| name(*id))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Some((label, pal.ok, detail));
+            return Some((
+                "In call · ".to_owned(),
+                Some((primary, name_color(active[0]))),
+                suffix,
+                pal.ok,
+                detail,
+            ));
         }
         if !calling.is_empty() {
             let primary = name(calling[0]);
-            let label = if calling.len() == 1 {
-                format!("Calling · {primary}")
+            let suffix = if calling.len() == 1 {
+                String::new()
             } else {
-                format!("Calling · {} +{}", primary, calling.len() - 1)
+                format!(" +{}", calling.len() - 1)
             };
             let detail = calling
                 .iter()
                 .map(|id| name(*id))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Some((label, Color32::from_rgb(120, 170, 255), detail));
+            return Some((
+                "Calling · ".to_owned(),
+                Some((primary, name_color(calling[0]))),
+                suffix,
+                Color32::from_rgb(120, 170, 255),
+                detail,
+            ));
         }
         None
     }
@@ -715,26 +759,37 @@ impl AppState {
             .count();
         let in_call = active_calls > 0 || self.local_group_call.is_some();
 
-        // Discord-style self card on the left. Hide the whole card on narrow
-        // windows and fall back to an avatar-only badge on medium widths so it
-        // never overlaps the centered controls.
+        // Discord-style self card on the left, vertically centered with the
+        // controls and inset from the window edges so it never touches the
+        // rounded corner. Hide the whole card on narrow windows and fall
+        // back to an avatar-only badge on medium widths so it never overlaps
+        // the centered controls.
         let dock_width = rect.width();
         if dock_width >= 520.0 {
-            let card_width: f32 = if dock_width >= 700.0 { 200.0 } else { 56.0 };
+            const CARD_SLOT_HEIGHT: f32 = 46.0;
+            const CARD_EDGE_INSET: f32 = 6.0;
+            let card_width: f32 = if dock_width >= 700.0 { 196.0 } else { 56.0 };
+            let slot_bottom = (rect.center().y + CARD_SLOT_HEIGHT / 2.0)
+                .min(rect.max.y - 2.0);
+            let slot_top = (slot_bottom - CARD_SLOT_HEIGHT).max(rect.top());
+            let slot_right = (rect.min.x + CARD_EDGE_INSET + card_width).min(rect.right());
             let left_rect = egui::Rect::from_min_max(
-                rect.min,
-                egui::pos2((rect.min.x + card_width).min(rect.max.x), rect.max.y),
+                egui::pos2(rect.min.x + CARD_EDGE_INSET, slot_top),
+                egui::pos2(slot_right, slot_bottom),
             );
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
                 if dock_width >= 700.0 {
+                    // Center the 44px card inside the 46px slot.
+                    ui.add_space(((left_rect.height() - 44.0) * 0.5).max(0.0));
                     self.ui_self_user_card(ui, pal, ctx);
                 } else {
                     let avatar = self.own_avatar_texture(ctx);
                     let name = self.own_label();
                     let initial = crate::profile::display_name_initial(&name)
                         .unwrap_or_else(|| "Y".to_owned());
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(((left_rect.height() - 32.0) * 0.5).max(0.0));
                         paint_profile_avatar(ui, pal, avatar, &initial, 32.0);
                     });
                 }
@@ -1750,11 +1805,22 @@ impl AppState {
             let overlay_fill =
                 Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), 190);
             let hovered = ui.rect_contains_pointer(tile_rect);
+            // Stream owners render in their accent color, matching chat and
+            // call chips; the quality badge stays dim.
+            let name_color = match source {
+                StreamSource::Local => {
+                    accent_color_for(self.own_accent_color.as_deref(), Color32::WHITE)
+                }
+                StreamSource::Remote(node_id) => {
+                    accent_color_for(self.peer_accent_hex(node_id), Color32::WHITE)
+                }
+            };
             let left_overlay_width = paint_stream_info_badges(
                 ui,
                 pal,
                 tile_rect,
                 &label,
+                name_color,
                 hovered.then_some(quality.as_deref()).flatten(),
                 overlay_fill,
             );
@@ -2667,6 +2733,7 @@ fn paint_stream_info_badges(
     pal: &Palette,
     tile_rect: egui::Rect,
     name: &str,
+    name_color: Color32,
     quality: Option<&str>,
     fill: Color32,
 ) -> f32 {
@@ -2686,7 +2753,7 @@ fn paint_stream_info_badges(
     let y = tile_rect.bottom() - STREAM_OVERLAY_MARGIN - STREAM_OVERLAY_BADGE_HEIGHT;
     for (index, text) in badges.iter().enumerate() {
         let color = if index == 0 {
-            Color32::WHITE
+            name_color
         } else {
             pal.text2
         };
