@@ -3,7 +3,9 @@
 #[cfg(target_os = "macos")]
 use super::open_screen_recording_settings;
 use super::{
-    friend_call_enabled, save_friends,
+    friend_call_enabled,
+    profile_ui::{paint_profile_avatar, paint_stream_owner_avatar},
+    save_friends,
     widgets::{
         aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
         ellipsize, floating_dialog_header, fmt_error, fmt_node_id, paint_volume_track,
@@ -20,9 +22,9 @@ use crate::{
     runtime::{CallState, Command},
     sounds::Sound,
     theme::{
-        action_button, action_button_full, button_tone_style, circle_avatar, compact_v_sep,
-        dock_control, dot, ghost_icon_button, kh_family, leave_button, lucide, menu_item_button,
-        sans, toolbar_ghost_icon_button, ui_font_size, v_sep, ButtonTone, Palette,
+        action_button, action_button_full, button_tone_style, compact_v_sep, dock_control, dot,
+        ghost_icon_button, kh_family, leave_button, lucide, menu_item_button, sans,
+        toolbar_ghost_icon_button, ui_font_size, v_sep, ButtonTone, Palette,
     },
     video_decode::DecodedFrameData,
 };
@@ -185,10 +187,17 @@ impl AppState {
         }
     }
 
-    pub(super) fn ui_call_participant_bar(&mut self, ui: &mut Ui, pal: &Palette) {
+    pub(super) fn ui_call_participant_bar(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        ctx: &egui::Context,
+    ) {
         let bar_height = ui.available_height();
         let bar_width = ui.available_width();
         let calls: Vec<_> = self.calls.iter().map(|(id, state)| (*id, *state)).collect();
+        // Unknown callers resolve via the public profile protocol.
+        self.ensure_peer_profiles(calls.iter().map(|(id, _)| *id));
         egui::ScrollArea::vertical()
             .id_salt("participant-bar-scroll")
             .auto_shrink([false, false])
@@ -215,9 +224,9 @@ impl AppState {
                             for index in row_start..row_end {
                                 let response =
                                     if let Some((node_id, state)) = calls.get(index).copied() {
-                                        self.ui_participant_chip(ui, pal, node_id, state)
+                                        self.ui_participant_chip(ui, pal, ctx, node_id, state)
                                     } else {
-                                        self.ui_self_participant_chip(ui, pal)
+                                        self.ui_self_participant_chip(ui, pal, ctx)
                                     };
                                 content_rect = content_rect.union(response.rect);
                             }
@@ -239,7 +248,15 @@ impl AppState {
             });
     }
 
-    fn ui_self_participant_chip(&self, ui: &mut Ui, pal: &Palette) -> egui::Response {
+    fn ui_self_participant_chip(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        ctx: &egui::Context,
+    ) -> egui::Response {
+        let name = self.own_label();
+        let initial = crate::profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
+        let avatar = self.own_avatar_texture(ctx);
         Frame::new()
             .fill(chat_surface(pal))
             .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
@@ -250,9 +267,9 @@ impl AppState {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    circle_avatar(ui, pal, "Y", PARTICIPANT_AVATAR_SIZE);
+                    paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
                     ui.add_space(CHIP_IDENTITY_GAP);
-                    chip_name_label(ui, "You", pal.text2);
+                    chip_name_label(ui, &name, pal.text2);
                     ui.add_space(CHIP_IDENTITY_GAP);
                     let level = self
                         .local_audio_level
@@ -282,6 +299,7 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
+        ctx: &egui::Context,
         node_id: NodeId,
         state: CallState,
     ) -> egui::Response {
@@ -318,6 +336,9 @@ impl AppState {
             .get(&node_id)
             .map(load_audio_level)
             .unwrap_or(0.0);
+        let display_name = self.peer_display_name(node_id);
+        let initial = self.peer_initial(node_id);
+        let avatar = self.peer_avatar_texture(ctx, node_id);
 
         Frame::new()
             .fill(fill)
@@ -329,16 +350,11 @@ impl AppState {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    circle_avatar(
-                        ui,
-                        pal,
-                        &self.peer_initial(node_id),
-                        PARTICIPANT_AVATAR_SIZE,
-                    );
+                    paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
                     ui.add_space(CHIP_IDENTITY_GAP);
                     chip_name_label(
                         ui,
-                        &ellipsize(&self.peer_display_name(node_id), 16),
+                        &ellipsize(&display_name, 16),
                         if is_active { pal.text } else { pal.text2 },
                     );
                     ui.add_space(CHIP_IDENTITY_GAP);
@@ -678,7 +694,12 @@ impl AppState {
         None
     }
 
-    pub(super) fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette) {
+    pub(super) fn ui_dock_content(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        ctx: &egui::Context,
+    ) {
         let rect = ui.max_rect();
         let active_calls = self
             .calls
@@ -686,6 +707,32 @@ impl AppState {
             .filter(|state| matches!(state, CallState::Active))
             .count();
         let in_call = active_calls > 0 || self.local_group_call.is_some();
+
+        // Discord-style self card on the left. Hide the whole card on narrow
+        // windows and fall back to an avatar-only badge on medium widths so it
+        // never overlaps the centered controls.
+        let dock_width = rect.width();
+        if dock_width >= 520.0 {
+            let card_width: f32 = if dock_width >= 700.0 { 200.0 } else { 56.0 };
+            let left_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2((rect.min.x + card_width).min(rect.max.x), rect.max.y),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
+                if dock_width >= 700.0 {
+                    self.ui_self_user_card(ui, pal, ctx);
+                } else {
+                    let avatar = self.own_avatar_texture(ctx);
+                    let name = self.own_label();
+                    let initial = crate::profile::display_name_initial(&name)
+                        .unwrap_or_else(|| "Y".to_owned());
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        paint_profile_avatar(ui, pal, avatar, &initial, 32.0);
+                    });
+                }
+            });
+        }
 
         // Keep the control cluster centered at every window width.
         let desired_controls_width: f32 = if in_call { 245.0 } else { 142.0 };
@@ -894,11 +941,38 @@ impl AppState {
 
     fn ui_identity_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
+        let ctx_clone = ui.ctx().clone();
+        let own_name = self.own_label();
+        let own_initial = crate::profile::display_name_initial(&own_name)
+            .unwrap_or_else(|| "Y".to_owned());
+        let own_avatar = self.own_avatar_texture(&ctx_clone);
+        let mut open_editor = false;
         section_card(ui, &pal, "Your identity", |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                paint_profile_avatar(ui, &pal, own_avatar, &own_initial, 40.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(
+                        RichText::new(&own_name)
+                            .color(pal.text)
+                            .size(ui_font_size(13.5)),
+                    );
+                    if let Some(node_id) = &self.our_node_id {
+                        ui.label(fmt_node_id(&node_id.fmt_short()));
+                    } else {
+                        ui.label(RichText::new("Waiting for network…").weak());
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if action_button(ui, &pal, "Edit profile", ButtonTone::Secondary).clicked() {
+                        open_editor = true;
+                    }
+                });
+            });
             if let Some(node_id) = &self.our_node_id {
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if action_button(ui, &pal, "Copy ID", ButtonTone::Secondary).clicked() {
                                 copy_to_clipboard(&node_id.to_string());
@@ -913,10 +987,13 @@ impl AppState {
                     .small()
                     .weak(),
                 );
-            } else {
-                ui.label(RichText::new("Waiting for network…").weak());
             }
         });
+        if open_editor {
+            self.profile_edit_name = self.own_profile_name.clone();
+            self.profile_edit_error = None;
+            self.show_profile_editor = true;
+        }
     }
 
     fn ui_dial_card(&mut self, ui: &mut Ui) {
@@ -1005,6 +1082,13 @@ impl AppState {
 
     fn ui_friends_card(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
+        let ctx_clone = ui.ctx().clone();
+        let friend_peers: Vec<NodeId> = self
+            .friends
+            .iter()
+            .filter_map(|friend| NodeId::from_str(friend.node_id.trim()).ok())
+            .collect();
+        self.ensure_peer_profiles(friend_peers);
         Frame::new()
             .fill(pal.panel)
             .corner_radius(CornerRadius::same(CHROME_RADIUS))
@@ -1049,20 +1133,30 @@ impl AppState {
                     );
                 }
 
-                for (idx, friend) in self.friends.iter().enumerate() {
+                for (idx, friend) in self.friends.clone().iter().enumerate() {
                     let parsed = NodeId::from_str(friend.node_id.trim());
-                    let display_name = if friend.name.trim().is_empty()
-                        || friend.name.trim() == friend.node_id.trim()
-                    {
-                        "Unnamed contact"
-                    } else {
-                        friend.name.trim()
-                    };
-                    let initial = display_name
-                        .chars()
-                        .find(|c| c.is_alphanumeric())
-                        .map(|c| c.to_uppercase().to_string())
+                    // Prefer the saved contact name, then the learned profile
+                    // display name, so renamed peers still resolve.
+                    let display_name = parsed
+                        .as_ref()
+                        .ok()
+                        .map(|peer| self.peer_display_name(*peer))
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if friend.name.trim().is_empty()
+                                || friend.name.trim() == friend.node_id.trim()
+                            {
+                                "Unnamed contact".to_owned()
+                            } else {
+                                friend.name.trim().to_owned()
+                            }
+                        });
+                    let initial = crate::profile::display_name_initial(&display_name)
                         .unwrap_or_else(|| "?".to_owned());
+                    let avatar = parsed
+                        .as_ref()
+                        .ok()
+                        .and_then(|peer| self.peer_avatar_texture(&ctx_clone, *peer));
                     let short_id = parsed
                         .as_ref()
                         .ok()
@@ -1095,11 +1189,11 @@ impl AppState {
                             ui.horizontal(|ui| {
                                 ui.set_min_height(40.0);
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                circle_avatar(ui, &pal, &initial, 32.0);
+                                paint_profile_avatar(ui, &pal, avatar, &initial, 32.0);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
                                     ui.label(
-                                        RichText::new(display_name)
+                                        RichText::new(&display_name)
                                             .color(pal.text)
                                             .size(ui_font_size(13.0)),
                                     );
@@ -1291,6 +1385,7 @@ impl AppState {
                 self.ui_stream_tile(
                     ui,
                     &pal,
+                    ctx,
                     focused,
                     true,
                     immersive,
@@ -1324,6 +1419,7 @@ impl AppState {
                 self.ui_stream_tile(
                     ui,
                     &pal,
+                    ctx,
                     *source,
                     false,
                     immersive,
@@ -1483,6 +1579,7 @@ impl AppState {
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
+        ctx: &egui::Context,
         source: StreamSource,
         expanded: bool,
         immersive: bool,
@@ -1760,6 +1857,24 @@ impl AppState {
                         );
                     }
                 }
+            }
+        }
+
+        // Stream-owner avatar badge, deliberately overflowing the top-left
+        // corner so ownership reads at a glance.
+        match source {
+            StreamSource::Local => {
+                let name = self.own_label();
+                let initial = crate::profile::display_name_initial(&name)
+                    .unwrap_or_else(|| "Y".to_owned());
+                let texture = self.own_avatar_texture(ctx);
+                paint_stream_owner_avatar(ui, pal, tile_rect, texture, &initial, &name);
+            }
+            StreamSource::Remote(peer) => {
+                let name = self.peer_display_name(peer);
+                let initial = self.peer_initial(peer);
+                let texture = self.peer_avatar_texture(ctx, peer);
+                paint_stream_owner_avatar(ui, pal, tile_rect, texture, &initial, &name);
             }
         }
     }

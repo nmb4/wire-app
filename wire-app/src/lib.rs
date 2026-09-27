@@ -11,6 +11,7 @@ pub mod host;
 mod notifications;
 mod overlay_window;
 mod persistence;
+mod profile;
 mod resource_monitor;
 mod runtime;
 mod sounds;

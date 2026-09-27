@@ -5,6 +5,7 @@
 mod calls_ui;
 mod chat_ui;
 mod chrome;
+mod profile_ui;
 mod settings_ui;
 mod widgets;
 
@@ -28,6 +29,7 @@ use crate::{
     host::ServiceClient,
     notifications::{NotificationAction, NotificationService},
     persistence,
+    profile::{self, PeerProfile},
     resource_monitor::ResourceMonitor,
     runtime::{CallState, Command, Event},
     sounds::{Sound, Sounds},
@@ -240,6 +242,21 @@ struct AppState {
     seen_group_calls: BTreeMap<String, i64>,
     new_friend_name: String,
     new_friend_id: String,
+    /// Own personal profile (display name + avatar).
+    own_profile_name: String,
+    own_avatar_hash: Option<String>,
+    own_avatar_bytes: Option<Vec<u8>>,
+    own_avatar_texture: Option<egui::TextureHandle>,
+    /// Remote profiles learned via presence, chat snapshots, invites, and the
+    /// public profile fetch protocol. This is what lets unknown senders show
+    /// a name + avatar instead of a raw peer ID.
+    peer_profiles: BTreeMap<NodeId, PeerProfile>,
+    peer_avatar_textures: BTreeMap<NodeId, egui::TextureHandle>,
+    peer_avatar_bytes: BTreeMap<NodeId, Vec<u8>>,
+    pending_profile_fetches: BTreeMap<NodeId, i64>,
+    profile_edit_name: String,
+    profile_edit_error: Option<String>,
+    show_profile_editor: bool,
     theme: Theme,
     window_frame_style: WindowFrameStyle,
     muted: bool,
@@ -904,6 +921,13 @@ impl App {
         if let Some(sounds) = &sounds {
             sounds.play(Sound::Whoosh2);
         }
+        let own_profile = profile::load_own_profile();
+        let own_avatar_bytes = profile::load_avatar_bytes();
+        let peer_profiles = profile::load_peer_profiles()
+            .into_iter()
+            .filter_map(|(id, peer)| NodeId::from_str(&id).ok().map(|node| (node, peer)))
+            .collect::<BTreeMap<_, _>>();
+        let profile_edit_name = own_profile.display_name.clone();
         let state = AppState {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
@@ -943,6 +967,17 @@ impl App {
             seen_group_calls: load_seen_group_calls(),
             new_friend_name: String::new(),
             new_friend_id: String::new(),
+            own_profile_name: own_profile.display_name.clone(),
+            own_avatar_hash: own_profile.avatar_hash.clone(),
+            own_avatar_bytes,
+            own_avatar_texture: None,
+            peer_profiles,
+            peer_avatar_textures: BTreeMap::new(),
+            peer_avatar_bytes: BTreeMap::new(),
+            pending_profile_fetches: BTreeMap::new(),
+            profile_edit_name,
+            profile_edit_error: None,
+            show_profile_editor: false,
             theme: settings.theme,
             window_frame_style: settings.window_frame_style,
             muted: false,
@@ -991,6 +1026,7 @@ impl App {
             retention: state.chat_retention,
         });
         state.sync_friends_with_worker();
+        state.sync_own_profile_to_worker();
 
         let rounded = window_frame::style_wants_rounded(state.window_frame_style);
         let window_hidden = Arc::new(AtomicBool::new(start_hidden));
@@ -1186,6 +1222,9 @@ impl AppState {
         if self.show_capture_picker {
             self.ui_capture_picker(ctx, &pal);
         }
+        // Profile editor is a modal overlay available in both Text and Calls
+        // modes, independent of the settings / contacts windows.
+        self.ui_profile_editor(ctx);
         #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
@@ -1337,6 +1376,9 @@ impl AppState {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
                     self.chat.service_error = None;
+                    // Worker starts with disk state, but re-assert the UI's
+                    // copy so an edit made while offline still propagates.
+                    self.sync_own_profile_to_worker();
                     let (dev_call_peers, dev_fixture_peers) = match self.dev_pair.as_mut() {
                         Some(dev_pair) => match dev_pair.register(node_id) {
                             Ok(call_peers) => match dev_pair.discover_fixture_peers(node_id) {
@@ -1384,6 +1426,14 @@ impl AppState {
                     } else {
                         self.group_call_reports.remove(&peer);
                     }
+                    // Profiles ride on presence: every heartbeat carries the
+                    // peer's current display name + avatar hash.
+                    self.learn_peer_snapshot(
+                        peer,
+                        update.profile.display_name.clone(),
+                        update.profile.avatar_hash.clone(),
+                        "presence",
+                    );
                     #[cfg(windows)]
                     let peer_is_newer = update.client_version.as_deref().is_some_and(|version| {
                         update::is_version_newer(version, crate::APP_VERSION)
@@ -1405,6 +1455,13 @@ impl AppState {
                 }
                 Event::InitialChatLoaded => self.chat_notifications_ready = true,
                 Event::SetCallState(node_id, call_state) => {
+                    // Unknown callers still resolve via the public profile
+                    // protocol so the incoming-call UI shows a name + avatar.
+                    if matches!(call_state, CallState::Incoming)
+                        && !self.peer_profiles.contains_key(&node_id)
+                    {
+                        self.request_peer_profile(node_id);
+                    }
                     let auto_accept =
                         self.dev_pair.is_some() && matches!(call_state, CallState::Incoming);
                     let auto_share = self.dev_auto_share
@@ -1739,6 +1796,14 @@ impl AppState {
                     preview.generation += 1;
                 }
                 Event::Chat(notification) => self.apply_chat_notification(notification, ctx),
+                Event::PeerProfile {
+                    peer,
+                    display_name,
+                    avatar_hash,
+                    avatar_bytes,
+                } => {
+                    self.apply_fetched_profile(peer, display_name, avatar_hash, avatar_bytes);
+                }
                 Event::WorkerFailed(error) => {
                     warn!("Wire worker unavailable: {error}");
                     self.notifications.error(
@@ -1811,6 +1876,17 @@ impl AppState {
                 self.chat.conversations.insert(id.clone(), conversation);
                 if conversation_is_new {
                     self.sync_friends_with_worker();
+                    // Unknown DM peers: try the public profile protocol so the
+                    // sidebar shows a name + avatar immediately.
+                    if let Some(conversation) = self.chat.conversations.get(&id) {
+                        if let Some(peer) = conversation.direct_peer() {
+                            if Some(peer) != self.our_node_id
+                                && !self.peer_profiles.contains_key(&peer)
+                            {
+                                self.request_peer_profile(peer);
+                            }
+                        }
+                    }
                 }
                 let mut by_id: BTreeMap<_, _> = messages
                     .into_iter()
@@ -1851,6 +1927,22 @@ impl AppState {
                 }
                 let mut timeline: Vec<_> = by_id.into_values().collect();
                 timeline.sort();
+                // Learn identity snapshots from message fast-paths so unknown
+                // senders show a name + avatar instead of a raw peer ID.
+                for message in &timeline {
+                    if let Ok(peer) = NodeId::from_str(&message.author_id) {
+                        if message.author_display_name.is_some()
+                            || message.author_avatar_hash.is_some()
+                        {
+                            self.learn_peer_snapshot(
+                                peer,
+                                message.author_display_name.clone(),
+                                message.author_avatar_hash.clone(),
+                                "message",
+                            );
+                        }
+                    }
+                }
                 self.chat.timelines.insert(id.clone(), timeline);
                 if has_more {
                     self.chat
@@ -2084,6 +2176,15 @@ impl AppState {
             }
             ChatNotification::FileOfferPrepared => {
                 self.chat.preparing_file_offers = self.chat.preparing_file_offers.saturating_sub(1);
+            }
+            ChatNotification::PeerIdentity {
+                peer,
+                display_name,
+                avatar_hash,
+            } => {
+                if let Ok(peer) = NodeId::from_str(&peer) {
+                    self.learn_peer_snapshot(peer, display_name, avatar_hash, "invite");
+                }
             }
             ChatNotification::RetentionSweep => {
                 self.chat.inline_file_data.clear();
@@ -2430,8 +2531,10 @@ impl AppState {
 
     fn stream_label(&self, source: StreamSource) -> String {
         match source {
-            StreamSource::Local if self.system_audio_active => "You · audio".to_string(),
-            StreamSource::Local => "You".to_string(),
+            StreamSource::Local if self.system_audio_active => {
+                format!("{} · audio", self.own_label())
+            }
+            StreamSource::Local => self.own_label(),
             StreamSource::Remote(node_id) => self.peer_display_name(node_id),
         }
     }
@@ -2460,7 +2563,13 @@ impl AppState {
             .find(|friend| friend.node_id.trim() == node_id.as_str())
             .and_then(|friend| {
                 let name = friend.name.trim();
-                (!name.is_empty() && name != friend.node_id.trim()).then_some(name)
+                // "Unnamed contact" is the add-dialog placeholder, not a real
+                // custom name. Ignore it so a learned profile name (or the
+                // Peer fallback) shows instead of shadowing it.
+                (!name.is_empty()
+                    && name != friend.node_id.trim()
+                    && !is_placeholder_contact_name(name))
+                .then_some(name)
             })
     }
 
@@ -2472,30 +2581,58 @@ impl AppState {
     }
 
     fn peer_display_name(&self, node_id: NodeId) -> String {
-        self.friend_name(node_id)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("Peer {}", node_id.fmt_short()))
+        if Some(node_id) == self.our_node_id {
+            return self.own_label();
+        }
+        if let Some(name) = self.friend_name(node_id) {
+            return name.to_owned();
+        }
+        if let Some(name) = self.peer_profile_name(node_id) {
+            return name.to_owned();
+        }
+        format!("Peer {}", node_id.fmt_short())
     }
 
     fn peer_initial(&self, node_id: NodeId) -> String {
-        self.friend_name(node_id)
-            .and_then(|name| name.chars().find(|c| c.is_alphanumeric()))
+        if Some(node_id) == self.our_node_id {
+            return profile::display_name_initial(&self.own_label())
+                .unwrap_or_else(|| "Y".to_owned());
+        }
+        if let Some(name) = self.friend_name(node_id) {
+            if let Some(initial) = profile::display_name_initial(name) {
+                return initial;
+            }
+        }
+        if let Some(name) = self.peer_profile_name(node_id) {
+            if let Some(initial) = profile::display_name_initial(name) {
+                return initial;
+            }
+        }
+        node_id
+            .fmt_short()
+            .to_string()
+            .chars()
+            .next()
             .map(|c| c.to_uppercase().to_string())
-            .or_else(|| {
-                node_id
-                    .fmt_short()
-                    .to_string()
-                    .chars()
-                    .next()
-                    .map(|c| c.to_uppercase().to_string())
-            })
             .unwrap_or_else(|| "?".to_owned())
     }
 
     fn group_members_for(&self, conversation: &ChatConversation) -> Vec<GroupMemberLabel> {
-        group_member_labels(&conversation.members, self.our_node_id, |node| {
+        let mut labels = group_member_labels(&conversation.members, self.our_node_id, |node| {
             self.friend_name(node).map(str::to_owned)
-        })
+        });
+        // Show learned profile names for non-contacts while keeping their
+        // Unknown kind (so the dialog still offers "Add friend" + Copy ID).
+        for label in &mut labels {
+            if label.kind == GroupMemberKind::Unknown {
+                if let Some(peer) = label.node_id {
+                    if let Some(name) = self.peer_profile_name(peer) {
+                        label.text = name.to_owned();
+                    }
+                }
+            }
+        }
+        labels
     }
 
     fn set_stream_view_mode(&mut self, ctx: &egui::Context, mode: StreamViewMode) {
@@ -2691,6 +2828,13 @@ fn should_mark_conversation_unseen(
     !conversation_is_open && new_remote_messages.is_some_and(|messages| !messages.is_empty())
 }
 
+/// Placeholder written by the add-contact dialog when no name was typed. It
+/// is not a real custom name, so display resolution skips it in favor of the
+/// peer's profile name (or the Peer fallback).
+fn is_placeholder_contact_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("unnamed contact")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupMemberKind {
     You,
@@ -2828,6 +2972,8 @@ mod layout_tests {
             body: "hello".to_owned(),
             nonce: 0,
             client_version: None,
+            author_display_name: None,
+            author_avatar_hash: None,
             attachments: Vec::new(),
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),

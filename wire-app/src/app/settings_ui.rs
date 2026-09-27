@@ -3,6 +3,7 @@
 #[cfg(windows)]
 use super::UpdateStatus;
 use super::{
+    profile_ui::paint_profile_avatar,
     widgets::{floating_dialog_header, format_bytes, painted_volume_slider},
     AppState, ChatStyle, DEFAULT,
 };
@@ -71,6 +72,132 @@ impl AppState {
                                 let scroll_content_width = ui.available_width();
                                 ui.set_min_width(scroll_content_width);
                                 ui.set_max_width(scroll_content_width);
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
+                                    "Profile",
+                                    "Your display name and picture, shown to everyone you message or call.",
+                                );
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0_f32, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 12.0;
+                                            let avatar = self.own_avatar_texture(ctx);
+                                            let preview_name =
+                                                crate::profile::sanitize_display_name(
+                                                    &self.profile_edit_name,
+                                                );
+                                            let preview_name = if preview_name.is_empty() {
+                                                self.own_label()
+                                            } else {
+                                                preview_name
+                                            };
+                                            let initials =
+                                                crate::profile::display_name_initial(&preview_name)
+                                                    .unwrap_or_else(|| "?".to_owned());
+                                            paint_profile_avatar(
+                                                ui, &pal, avatar, &initials, 56.0,
+                                            );
+                                            ui.vertical(|ui| {
+                                                if action_button(
+                                                    ui,
+                                                    &pal,
+                                                    "Choose picture…",
+                                                    ButtonTone::Secondary,
+                                                )
+                                                .on_hover_text(
+                                                    "PNG, JPEG, GIF or WebP up to 8 MiB",
+                                                )
+                                                .clicked()
+                                                {
+                                                    if let Some(path) = rfd::FileDialog::new()
+                                                        .set_title("Choose profile picture")
+                                                        .add_filter(
+                                                            "Images",
+                                                            &[
+                                                                "png", "jpg", "jpeg", "gif",
+                                                                "webp", "bmp",
+                                                            ],
+                                                        )
+                                                        .pick_file()
+                                                    {
+                                                        self.set_own_avatar_from_file(&path);
+                                                    }
+                                                }
+                                                if self.own_avatar_hash.is_some() {
+                                                    if action_button(
+                                                        ui,
+                                                        &pal,
+                                                        "Remove",
+                                                        ButtonTone::Secondary,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        self.clear_own_avatar();
+                                                    }
+                                                }
+                                            });
+                                        });
+                                        ui.add_space(6.0);
+                                        settings_field_label(ui, &pal, "Display name", None);
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.profile_edit_name,
+                                                )
+                                                .hint_text("e.g. Ada Lovelace")
+                                                .desired_width(f32::INFINITY),
+                                            )
+                                            .changed()
+                                        {
+                                            self.profile_edit_error = None;
+                                        }
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{}/32",
+                                                crate::profile::sanitize_display_name(
+                                                    &self.profile_edit_name
+                                                )
+                                                .chars()
+                                                .count()
+                                            ))
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                        if let Some(error) = &self.profile_edit_error {
+                                            ui.label(
+                                                RichText::new(error)
+                                                    .color(pal.err)
+                                                    .size(ui_font_size(11.5)),
+                                            );
+                                        }
+                                        ui.add_space(4.0);
+                                        if action_button(
+                                            ui,
+                                            &pal,
+                                            "Save profile",
+                                            ButtonTone::Primary,
+                                        )
+                                        .clicked()
+                                        {
+                                            if crate::profile::sanitize_display_name(
+                                                &self.profile_edit_name,
+                                            )
+                                            .is_empty()
+                                            {
+                                                self.profile_edit_error = Some(
+                                                    "Enter a display name.".to_owned(),
+                                                );
+                                            } else {
+                                                self.save_own_profile_edit();
+                                            }
+                                        }
+                                    });
+                                settings_divider(ui);
                                 settings_section_heading(
                                     ui,
                                     &pal,

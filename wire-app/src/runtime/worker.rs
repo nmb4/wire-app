@@ -32,6 +32,7 @@ use crate::{
         Availability, ClientStatusProtocol, GroupCallAnnouncement, CLIENT_STATUS_ALPN,
         PRESENCE_REFRESH_INTERVAL,
     },
+    profile::{self, FetchedProfile, ProfileProtocol, ServedProfile, PROFILE_ALPN},
 };
 
 enum CallInfo {
@@ -77,6 +78,8 @@ pub(super) struct Worker {
     deafened: bool,
     chat: chat::ChatService,
     client_status: ClientStatusProtocol,
+    profile_protocol: ProfileProtocol,
+    profile_fetches: JoinSet<(NodeId, Result<FetchedProfile>)>,
     local_group_call: Option<GroupCallAnnouncement>,
     peer_group_calls: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
 }
@@ -160,6 +163,7 @@ impl Worker {
             iroh_gossip::ALPN.to_vec(),
             chat::CHAT_ALPN.to_vec(),
             CLIENT_STATUS_ALPN.to_vec(),
+            PROFILE_ALPN.to_vec(),
             wire::remote_logs::LOGS_ALPN.to_vec(),
         ])
         .await?;
@@ -167,8 +171,22 @@ impl Worker {
         let handler = RtcProtocol::new(endpoint.clone());
         let logs_protocol = wire::remote_logs::LogsProtocol::new(endpoint.node_id());
         let client_status = ClientStatusProtocol::new(endpoint.clone());
+        // Profiles ride on presence: seed the heartbeat snapshot (and the
+        // public fetch protocol + chat snapshots) from local disk.
+        let own_profile = profile::load_own_profile();
+        let own_avatar = profile::load_avatar_bytes();
+        client_status.set_own_profile(own_profile.snapshot());
+        let profile_protocol = ProfileProtocol::new(ServedProfile::from_own(
+            &own_profile,
+            own_avatar,
+        ));
         let config_dir = wire::net::config_dir().context("missing Wire config directory")?;
-        let chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
+        let mut chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
+        chat_protocols.service.set_own_profile(
+            (!own_profile.display_name.trim().is_empty())
+                .then(|| own_profile.display_name.clone()),
+            own_profile.avatar_hash.clone(),
+        );
         info!("chat storage opened; starting protocol router");
         let _router = Router::builder(endpoint.clone())
             .accept(RtcProtocol::ALPN, handler.clone())
@@ -177,6 +195,7 @@ impl Worker {
             .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
             .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
             .accept(CLIENT_STATUS_ALPN, client_status.clone())
+            .accept(PROFILE_ALPN, profile_protocol.clone())
             .accept(wire::remote_logs::LOGS_ALPN, logs_protocol)
             .spawn()
             .await?;
@@ -222,7 +241,20 @@ impl Worker {
             deafened: false,
             chat: chat_protocols.service,
             client_status,
+            profile_protocol,
+            profile_fetches: JoinSet::new(),
         })
+    }
+
+    /// Refresh the served profile from disk (used when the UI edits identity).
+    fn refresh_served_profile(&mut self) {
+        let own = profile::load_own_profile();
+        let avatar = profile::load_avatar_bytes();
+        self.client_status.set_own_profile(own.snapshot());
+        self.chat
+            .set_own_profile(Some(own.display_name.clone()), own.avatar_hash.clone());
+        self.profile_protocol
+            .set_served(ServedProfile::from_own(&own, avatar));
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -333,6 +365,27 @@ impl Worker {
                         self.peer_group_calls.remove(&status.peer);
                     }
                     self.emit(Event::ClientStatus(status)).await?;
+                }
+                Some(joined) = self.profile_fetches.join_next(), if !self.profile_fetches.is_empty() => {
+                    let Ok((peer, result)) = joined else {
+                        warn!("profile fetch task was cancelled or panicked");
+                        continue;
+                    };
+                    match result {
+                        Ok(fetched) => {
+                            debug!(peer = %peer.fmt_short(), "profile fetch succeeded");
+                            self.emit(Event::PeerProfile {
+                                peer,
+                                display_name: fetched.display_name,
+                                avatar_hash: fetched.avatar_hash,
+                                avatar_bytes: fetched.avatar_bytes,
+                            })
+                            .await?;
+                        }
+                        Err(error) => {
+                            debug!(peer = %peer.fmt_short(), "profile fetch failed: {error:#}");
+                        }
+                    }
                 }
                 failure = self.capture_failure_rx.recv() => {
                     if let Ok(message) = failure {
@@ -1100,6 +1153,41 @@ impl Worker {
             Command::SetFriends { friends } => {
                 self.client_status.replace_peers(friends.clone());
                 self.client_status.announce_online(friends);
+            }
+            Command::SetOwnProfile {
+                display_name,
+                avatar_hash,
+            } => {
+                let snapshot = profile::ProfileSnapshot {
+                    display_name: (!display_name.trim().is_empty())
+                        .then_some(display_name.clone()),
+                    avatar_hash: avatar_hash.clone(),
+                };
+                self.client_status.set_own_profile(snapshot);
+                self.chat
+                    .set_own_profile(Some(display_name.clone()), avatar_hash);
+                self.refresh_served_profile();
+                // Re-announce so friends learn the new identity immediately.
+                self.client_status.refresh_allowed_peers();
+            }
+            Command::SetChatProfile {
+                display_name,
+                avatar_hash,
+            } => {
+                self.chat.set_own_profile(display_name, avatar_hash);
+            }
+            Command::FetchPeerProfiles { peers } => {
+                for peer in peers {
+                    // Bound concurrent fetches; the UI de-dupes requests.
+                    if self.profile_fetches.len() >= 8 {
+                        break;
+                    }
+                    let endpoint = self.endpoint.clone();
+                    self.profile_fetches.spawn(async move {
+                        let result = profile::fetch_profile(&endpoint, peer).await;
+                        (peer, result)
+                    });
+                }
             }
             Command::DeleteChatMessage {
                 conversation_id,

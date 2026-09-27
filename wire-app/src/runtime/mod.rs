@@ -30,6 +30,13 @@ use crate::{
 pub(crate) enum Event {
     EndpointBound(NodeId),
     ClientStatus(StatusUpdate),
+    /// Profile fetched (or refreshed) for a peer, including strangers.
+    PeerProfile {
+        peer: NodeId,
+        display_name: String,
+        avatar_hash: Option<String>,
+        avatar_bytes: Option<Vec<u8>>,
+    },
     GroupCallEntered(GroupCallAnnouncement),
     InitialChatLoaded,
     Chat(ChatNotification),
@@ -311,6 +318,17 @@ pub(crate) enum Command {
     },
     SetFriends {
         friends: BTreeSet<NodeId>,
+    },
+    SetOwnProfile {
+        display_name: String,
+        avatar_hash: Option<String>,
+    },
+    SetChatProfile {
+        display_name: Option<String>,
+        avatar_hash: Option<String>,
+    },
+    FetchPeerProfiles {
+        peers: Vec<NodeId>,
     },
     DeleteChatMessage {
         conversation_id: String,

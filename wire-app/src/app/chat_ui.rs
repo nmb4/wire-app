@@ -1,7 +1,9 @@
 //! Chat views, composer actions, attachments, and group dialogs.
 
 use super::{
-    format_group_member_summary, unknown_direct_conversations,
+    format_group_member_summary,
+    profile_ui::paint_profile_avatar,
+    unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
         chat_surface, copy_to_clipboard, format_bytes, paint_chat_card,
@@ -17,8 +19,8 @@ use crate::{
     client_status::Availability,
     runtime::Command,
     theme::{
-        action_button, circle_avatar, ghost_icon_button, kh_family, lucide, menu_item_button,
-        toolbar_button, ui_font_size, ButtonTone, Palette,
+        action_button, ghost_icon_button, kh_family, lucide, menu_item_button, toolbar_button,
+        ui_font_size, ButtonTone, Palette,
     },
 };
 use egui::{Align, Align2, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
@@ -276,13 +278,19 @@ impl AppState {
             );
             paint_chat_card(ui, footer, pal, 14);
             let footer_inner = footer.shrink2(Vec2::new(11.0, 8.0));
+            let ctx_clone = ui.ctx().clone();
+            let own_name = self.own_label();
+            let own_initial = crate::profile::display_name_initial(&own_name)
+                .unwrap_or_else(|| "Y".to_owned());
+            let own_avatar = self.own_avatar_texture(&ctx_clone);
+            let mut open_editor = false;
             ui.scope_builder(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
                 ui.set_clip_rect(footer);
                 ui.horizontal(|ui| {
-                    circle_avatar(ui, pal, "Y", 32.0);
+                    paint_profile_avatar(ui, pal, own_avatar, &own_initial, 32.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("You")
+                            RichText::new(&own_name)
                                 .color(pal.text)
                                 .size(ui_font_size(12.5)),
                         );
@@ -302,7 +310,24 @@ impl AppState {
                         }
                     });
                 });
+                // Clicking the self card opens the profile editor.
+                let footer_response = ui.interact(
+                    footer_inner,
+                    ui.id().with("sidebar-self-card"),
+                    egui::Sense::click(),
+                );
+                if footer_response
+                    .on_hover_text("Edit your profile (name + picture)")
+                    .clicked()
+                {
+                    open_editor = true;
+                }
             });
+            if open_editor {
+                self.profile_edit_name = self.own_profile_name.clone();
+                self.profile_edit_error = None;
+                self.show_profile_editor = true;
+            }
         }
     }
 
@@ -345,6 +370,30 @@ impl AppState {
             .direct_peer()
             .map(|peer| self.peer_display_name(peer))
             .unwrap_or_else(|| conversation.title.clone());
+        // Resolve unknown conversation members / senders in the background.
+        {
+            let mut visible: Vec<NodeId> = conversation
+                .members
+                .iter()
+                .filter_map(|member| NodeId::from_str(member).ok())
+                .collect();
+            if let Some(peer) = conversation.direct_peer() {
+                visible.push(peer);
+            }
+            if let Some(timeline) = self.chat.timelines.get(&conversation.id) {
+                for message in timeline.iter().take(200) {
+                    if let Ok(peer) = NodeId::from_str(&message.author_id) {
+                        visible.push(peer);
+                    }
+                }
+            }
+            self.ensure_peer_profiles(visible);
+        }
+        let header_peer = conversation.direct_peer();
+        let header_initial = crate::profile::display_name_initial(&display_title)
+            .unwrap_or_else(|| "#".to_owned());
+        let ctx_clone = ui.ctx().clone();
+        let header_avatar = header_peer.and_then(|peer| self.peer_avatar_texture(&ctx_clone, peer));
 
         const HEADER: f32 = 72.0;
         const GAP: f32 = 10.0;
@@ -401,17 +450,7 @@ impl AppState {
             ui.set_clip_rect(header);
             let show_call = ui.available_width() >= 430.0;
             ui.horizontal(|ui| {
-                circle_avatar(
-                    ui,
-                    pal,
-                    &display_title
-                        .chars()
-                        .next()
-                        .unwrap_or('#')
-                        .to_uppercase()
-                        .to_string(),
-                    34.0,
-                );
+                paint_profile_avatar(ui, pal, header_avatar, &header_initial, 34.0);
                 let group_members = matches!(conversation.kind, ConversationKind::Group)
                     .then(|| self.group_members_for(&conversation));
                 let group_member_summary = group_members
@@ -780,6 +819,22 @@ impl AppState {
         let time = format_chat_time(message.sent_at);
         let mut requested_deletion = None;
         let mut requested_restore = false;
+        // Profile avatar for the author (own picture for self).
+        let author_peer = NodeId::from_str(&message.author_id).ok();
+        let bubble_initial = if own {
+            crate::profile::display_name_initial(&self.own_label())
+                .unwrap_or_else(|| "Y".to_owned())
+        } else {
+            crate::profile::display_name_initial(&author).unwrap_or_else(|| "?".to_owned())
+        };
+        let ctx_clone = ui.ctx().clone();
+        let bubble_avatar = if own {
+            self.own_avatar_texture(&ctx_clone)
+        } else if let Some(peer) = author_peer {
+            self.peer_avatar_texture(&ctx_clone, peer)
+        } else {
+            None
+        };
         ui.with_layout(
             if own {
                 Layout::right_to_left(Align::Min)
@@ -787,6 +842,8 @@ impl AppState {
                 Layout::left_to_right(Align::Min)
             },
             |ui| {
+                paint_profile_avatar(ui, pal, bubble_avatar, &bubble_initial, 28.0);
+                ui.add_space(8.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(ui.available_width().min(680.0), 0.0),
                     Layout::top_down(if own { Align::Max } else { Align::Min }),
@@ -899,19 +956,27 @@ impl AppState {
                 .map(|node| self.peer_display_name(node))
                 .unwrap_or_else(|| "Unknown peer".to_owned())
         };
-        let initial = author
-            .chars()
-            .next()
-            .unwrap_or('?')
-            .to_uppercase()
-            .to_string();
+        let initial = if own {
+            crate::profile::display_name_initial(&self.own_label())
+                .unwrap_or_else(|| "Y".to_owned())
+        } else {
+            crate::profile::display_name_initial(&author).unwrap_or_else(|| "?".to_owned())
+        };
+        let ctx_clone = ui.ctx().clone();
+        let compact_avatar = if own {
+            self.own_avatar_texture(&ctx_clone)
+        } else if let Ok(peer) = NodeId::from_str(&message.author_id) {
+            self.peer_avatar_texture(&ctx_clone, peer)
+        } else {
+            None
+        };
         let opacity = chat_delivery_opacity(state);
         let mut requested_deletion = None;
         let mut requested_restore = false;
 
         ui.horizontal_top(|ui| {
             if starts_group {
-                circle_avatar(ui, pal, &initial, 32.0);
+                paint_profile_avatar(ui, pal, compact_avatar, &initial, 32.0);
             } else {
                 ui.add_space(40.0);
             }
@@ -1092,7 +1157,16 @@ impl AppState {
             });
             return;
         }
-        let message = ChatMessage::new_with_attachments(author, body, attachments);
+        let mut message = ChatMessage::new_with_attachments(author, body, attachments);
+        // Stamp our current profile so strangers see a name + avatar.
+        if !self.own_profile_name.trim().is_empty() {
+            message = message.with_author_profile(
+                Some(self.own_profile_name.clone()),
+                self.own_avatar_hash.clone(),
+            );
+        } else if self.own_avatar_hash.is_some() {
+            message = message.with_author_profile(None, self.own_avatar_hash.clone());
+        }
         self.chat
             .delivery
             .insert(message.message_id.clone(), (DeliveryState::Pending, None));
@@ -1934,14 +2008,19 @@ impl AppState {
                 );
                 ui.add_space(10.0);
                 for member in &members {
+                    // Resolve the avatar before painting (fetch is cool-down
+                    // guarded so this stays cheap per frame).
+                    let member_avatar = if member.kind == GroupMemberKind::You {
+                        self.own_avatar_texture(ctx)
+                    } else if let Some(peer) = member.node_id {
+                        self.peer_avatar_texture(ctx, peer)
+                    } else {
+                        None
+                    };
                     ui.horizontal(|ui| {
-                        let initial = member
-                            .text
-                            .chars()
-                            .find(|c| c.is_alphanumeric())
-                            .map(|c| c.to_uppercase().to_string())
+                        let initial = crate::profile::display_name_initial(&member.text)
                             .unwrap_or_else(|| "?".to_owned());
-                        circle_avatar(ui, pal, &initial, 28.0);
+                        paint_profile_avatar(ui, pal, member_avatar, &initial, 28.0);
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new(&member.text)
@@ -2490,6 +2569,8 @@ mod tests {
             body: "hello".to_owned(),
             nonce: 0,
             client_version: None,
+            author_display_name: None,
+            author_avatar_hash: None,
             attachments: Vec::new(),
             file_receivers: std::collections::BTreeMap::new(),
             stopped_file_offers: std::collections::BTreeSet::new(),

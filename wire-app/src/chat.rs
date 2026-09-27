@@ -127,6 +127,12 @@ pub struct ChatMessage {
     /// older peers / historical entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Identity snapshot so receivers show a display name (and can fetch the
+    /// matching avatar) even for senders they never saved as contacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_avatar_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChatAttachment>,
     /// Receipt identities are reconstructed from the replicated document.
@@ -208,6 +214,8 @@ impl ChatMessage {
             body,
             nonce,
             client_version: Some(crate::APP_VERSION.to_owned()),
+            author_display_name: None,
+            author_avatar_hash: None,
             attachments,
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),
@@ -220,6 +228,23 @@ impl ChatMessage {
             "message/{:020}/{}/{:016x}",
             self.sent_at, self.author_id, self.nonce
         )
+    }
+
+    /// Attach the sender's current profile snapshot before publishing.
+    pub fn with_author_profile(
+        mut self,
+        display_name: Option<String>,
+        avatar_hash: Option<String>,
+    ) -> Self {
+        let name = display_name
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.chars().take(32).collect::<String>().trim().to_owned())
+            .filter(|name| !name.is_empty());
+        self.author_display_name = name;
+        self.author_avatar_hash = avatar_hash.filter(|hash| !hash.trim().is_empty());
+        self
     }
 
     pub fn visible_under(&self, retention: RetentionPolicy, now: i64) -> bool {
@@ -452,6 +477,13 @@ pub enum ChatNotification {
     },
     FileOfferPrepared,
     RetentionSweep,
+    /// Identity snapshot learned from an invite/message fast-path, for a peer
+    /// we may never have saved as a contact.
+    PeerIdentity {
+        peer: String,
+        display_name: Option<String>,
+        avatar_hash: Option<String>,
+    },
     Delivery {
         message_id: String,
         state: DeliveryState,
@@ -556,6 +588,10 @@ struct ChatInvite {
     ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inviter_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inviter_avatar_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -930,6 +966,9 @@ pub struct ChatService {
     wake_failures: BTreeMap<String, u8>,
     max_image_bytes: Option<u64>,
     retention: RetentionPolicy,
+    /// Own identity snapshot stamped onto outbound messages + invites.
+    own_display_name: Option<String>,
+    own_avatar_hash: Option<String>,
     next_retention_sweep: tokio::time::Instant,
     attachment_downloads: BTreeSet<Hash>,
     attachment_retries: BTreeMap<Hash, AttachmentRetry>,
@@ -1112,6 +1151,8 @@ impl ChatService {
             wake_failures: BTreeMap::new(),
             max_image_bytes: None,
             retention: RetentionPolicy::Unlimited,
+            own_display_name: None,
+            own_avatar_hash: None,
             next_retention_sweep: tokio::time::Instant::now() + Duration::from_secs(60 * 60),
             attachment_downloads: BTreeSet::new(),
             attachment_retries: BTreeMap::new(),
@@ -1384,8 +1425,9 @@ impl ChatService {
                 match result {
                     Ok(files) => {
                         attachments.extend(files);
-                        let message =
+                        let mut message =
                             ChatMessage::new_with_attachments(self.our_node_id, body, attachments);
+                        self.stamp_own_profile(&mut message);
                         if !self.send_message(conversation_id, message).await {
                             self.queued.push_back(ChatNotification::Error(
                                 "Could not publish file offer".to_owned(),
@@ -1558,6 +1600,8 @@ impl ChatService {
     }
 
     pub async fn send_message(&mut self, conversation_id: String, message: ChatMessage) -> bool {
+        let mut message = message;
+        self.stamp_own_profile(&mut message);
         if let Err(error) = self.import_attachment_bytes(&message).await {
             self.queued.push_back(ChatNotification::Delivery {
                 message_id: message.message_id.clone(),
@@ -2265,6 +2309,38 @@ impl ChatService {
             self.publish_timeline(&id).await?;
         }
         Ok(())
+    }
+
+    /// Remember our current identity so outbound messages and invites carry
+    /// a snapshot for peers that never saved us as contacts.
+    pub fn set_own_profile(
+        &mut self,
+        display_name: Option<String>,
+        avatar_hash: Option<String>,
+    ) {
+        self.own_display_name = display_name
+            .map(|name| {
+                name.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .chars()
+                    .take(32)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|name| !name.is_empty());
+        self.own_avatar_hash = avatar_hash.filter(|hash| !hash.trim().is_empty());
+    }
+
+    fn stamp_own_profile(&self, message: &mut ChatMessage) {
+        if message.author_display_name.is_none() {
+            message.author_display_name = self.own_display_name.clone();
+        }
+        if message.author_avatar_hash.is_none() {
+            message.author_avatar_hash = self.own_avatar_hash.clone();
+        }
     }
 
     async fn release_expired_attachment_tags(&self) -> Result<()> {
@@ -3742,6 +3818,13 @@ impl ChatService {
             history_reset,
             "chat invitation imported"
         );
+        if invite.inviter_display_name.is_some() || invite.inviter_avatar_hash.is_some() {
+            self.queued.push_back(ChatNotification::PeerIdentity {
+                peer: remote.to_string(),
+                display_name: invite.inviter_display_name,
+                avatar_hash: invite.inviter_avatar_hash,
+            });
+        }
         for message in migrated {
             let migrate_deletion = message.deletion == Some(MessageDeletion::Everyone);
             if let Err(error) = self.insert_message(&id, &message).await {
@@ -4731,6 +4814,8 @@ impl ChatService {
         let docs = self.docs.clone();
         let endpoint = self.endpoint.clone();
         let stored = stored.clone();
+        let own_display_name = self.own_display_name.clone();
+        let own_avatar_hash = self.own_avatar_hash.clone();
         tokio::spawn(async move {
             let ticket = refresh_share_ticket(&docs, &stored, &endpoint)
                 .await
@@ -4740,6 +4825,8 @@ impl ChatService {
                 conversation: stored.public,
                 ticket,
                 client_version: Some(crate::APP_VERSION.to_owned()),
+                inviter_display_name: own_display_name,
+                inviter_avatar_hash: own_avatar_hash,
             };
             for peer in peers {
                 if let Err(error) = send_invite(sessions.clone(), peer, &invite).await {
@@ -4762,6 +4849,8 @@ impl ChatService {
             conversation: stored.public.clone(),
             ticket,
             client_version: Some(crate::APP_VERSION.to_owned()),
+            inviter_display_name: self.own_display_name.clone(),
+            inviter_avatar_hash: self.own_avatar_hash.clone(),
         };
         let mut join_set = tokio::task::JoinSet::new();
         for peer in self.other_members(stored) {

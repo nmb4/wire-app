@@ -17,6 +17,8 @@ use n0_future::{boxed::BoxFuture, FutureExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::profile::ProfileSnapshot;
+
 pub const CLIENT_STATUS_ALPN: &[u8] = b"wire/client-status/2";
 const MAX_PACKET_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -81,6 +83,8 @@ pub struct StatusUpdate {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub client_version: Option<String>,
     pub active_group_calls: Vec<GroupCallAnnouncement>,
+    /// Identity snapshot advertised alongside presence.
+    pub profile: ProfileSnapshot,
 }
 
 /// Ephemeral group-call room state replicated during the existing presence
@@ -103,15 +107,37 @@ struct StatusPacket {
     availability: Availability,
     client_version: String,
     active_group_calls: Vec<GroupCallAnnouncement>,
+    /// Identity snapshot. Optional with `skip_serializing_if`, so old peers
+    /// (which deserialize with serde's default unknown-field tolerance) keep
+    /// interoping: they simply ignore these fields. The protocol version
+    /// deliberately stays at 2 for the same reason — bumping it would make
+    /// released clients reject our heartbeats outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_hash: Option<String>,
 }
 
 impl StatusPacket {
-    fn new(availability: Availability, active_group_calls: Vec<GroupCallAnnouncement>) -> Self {
+    fn new(
+        availability: Availability,
+        active_group_calls: Vec<GroupCallAnnouncement>,
+        profile: ProfileSnapshot,
+    ) -> Self {
         Self {
             protocol_version: 2,
             availability,
             client_version: crate::APP_VERSION.to_owned(),
             active_group_calls,
+            display_name: profile.display_name,
+            avatar_hash: profile.avatar_hash,
+        }
+    }
+
+    fn profile(&self) -> ProfileSnapshot {
+        ProfileSnapshot {
+            display_name: self.display_name.clone(),
+            avatar_hash: self.avatar_hash.clone(),
         }
     }
 
@@ -125,6 +151,7 @@ impl StatusPacket {
         if self.client_version.len() > 64 {
             bail!("client version exceeds safety limit");
         }
+        self.profile().validate()?;
         if self.active_group_calls.len() > 32
             || self.active_group_calls.iter().any(|call| {
                 call.call_id.len() > 160
@@ -148,6 +175,7 @@ pub struct ClientStatusProtocol {
     update_tx: Sender<StatusUpdate>,
     update_rx: Receiver<StatusUpdate>,
     active_group_calls: Arc<RwLock<Vec<GroupCallAnnouncement>>>,
+    own_profile: Arc<RwLock<ProfileSnapshot>>,
     probe_health: Arc<Mutex<BTreeMap<NodeId, ProbeHealth>>>,
 }
 
@@ -160,8 +188,24 @@ impl ClientStatusProtocol {
             update_tx,
             update_rx,
             active_group_calls: Arc::new(RwLock::new(Vec::new())),
+            own_profile: Arc::new(RwLock::new(ProfileSnapshot::default())),
             probe_health: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Update the identity snapshot advertised with every heartbeat.
+    pub fn set_own_profile(&self, profile: ProfileSnapshot) {
+        *self
+            .own_profile
+            .write()
+            .expect("client status profile lock poisoned") = profile;
+    }
+
+    fn own_profile(&self) -> ProfileSnapshot {
+        self.own_profile
+            .read()
+            .expect("client status profile lock poisoned")
+            .clone()
     }
 
     pub fn set_active_group_calls(&self, calls: Vec<GroupCallAnnouncement>) {
@@ -198,6 +242,7 @@ impl ClientStatusProtocol {
             let endpoint = self.endpoint.clone();
             let update_tx = self.update_tx.clone();
             let active_group_calls = self.active_group_calls();
+            let own_profile = self.own_profile();
             let probe_health = self.probe_health.clone();
             let generation = probe_health
                 .lock()
@@ -206,7 +251,14 @@ impl ClientStatusProtocol {
                 .or_default()
                 .begin();
             tokio::spawn(async move {
-                match exchange(&endpoint, peer, Availability::Online, active_group_calls).await {
+                match exchange(
+                    &endpoint,
+                    peer,
+                    Availability::Online,
+                    active_group_calls,
+                    own_profile,
+                )
+                .await {
                     Ok(packet) => {
                         let current = probe_health
                             .lock()
@@ -227,8 +279,9 @@ impl ClientStatusProtocol {
                             .send(StatusUpdate {
                                 peer,
                                 availability: packet.availability,
-                                client_version: Some(packet.client_version),
-                                active_group_calls: packet.active_group_calls,
+                                client_version: Some(packet.client_version.clone()),
+                                active_group_calls: packet.active_group_calls.clone(),
+                                profile: packet.profile(),
                             })
                             .await;
                     }
@@ -252,6 +305,7 @@ impl ClientStatusProtocol {
                                     availability: Availability::Offline,
                                     client_version: None,
                                     active_group_calls: Vec::new(),
+                                    profile: ProfileSnapshot::default(),
                                 })
                                 .await;
                         }
@@ -281,13 +335,21 @@ impl ClientStatusProtocol {
         }
 
         let endpoint = self.endpoint.clone();
+        let own_profile = self.own_profile();
         let broadcast = async move {
             let mut tasks = tokio::task::JoinSet::new();
             for peer in peers {
                 let endpoint = endpoint.clone();
+                let own_profile = own_profile.clone();
                 tasks.spawn(async move {
-                    if let Err(error) =
-                        exchange(&endpoint, peer, Availability::Offline, Vec::new()).await
+                    if let Err(error) = exchange(
+                        &endpoint,
+                        peer,
+                        Availability::Offline,
+                        Vec::new(),
+                        own_profile,
+                    )
+                    .await
                     {
                         debug!(
                             peer = %peer.fmt_short(),
@@ -359,14 +421,19 @@ impl ProtocolHandler for ClientStatusProtocol {
                 .send(StatusUpdate {
                     peer,
                     availability: packet.availability,
-                    client_version: Some(packet.client_version),
-                    active_group_calls: packet.active_group_calls,
+                    client_version: Some(packet.client_version.clone()),
+                    active_group_calls: packet.active_group_calls.clone(),
+                    profile: packet.profile(),
                 })
                 .await?;
 
             write_packet(
                 &mut send,
-                &StatusPacket::new(Availability::Online, protocol.active_group_calls()),
+                &StatusPacket::new(
+                    Availability::Online,
+                    protocol.active_group_calls(),
+                    protocol.own_profile(),
+                ),
             )
             .await?;
             send.finish()?;
@@ -385,6 +452,7 @@ async fn exchange(
     peer: NodeId,
     availability: Availability,
     active_group_calls: Vec<GroupCallAnnouncement>,
+    own_profile: ProfileSnapshot,
 ) -> Result<StatusPacket> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         let connection: Connection = endpoint
@@ -394,7 +462,7 @@ async fn exchange(
         let (mut send, mut recv) = connection.open_bi().await?;
         write_packet(
             &mut send,
-            &StatusPacket::new(availability, active_group_calls),
+            &StatusPacket::new(availability, active_group_calls, own_profile),
         )
         .await?;
         send.finish()?;
@@ -437,8 +505,29 @@ mod tests {
 
     #[test]
     fn status_packet_rejects_unknown_protocol_versions() {
-        let mut packet = StatusPacket::new(Availability::Online, Vec::new());
+        let mut packet =
+            StatusPacket::new(Availability::Online, Vec::new(), ProfileSnapshot::default());
         packet.protocol_version = 1;
+        assert!(packet.validate().is_err());
+        packet.protocol_version = 2;
+        assert!(packet.validate().is_ok());
+        packet.protocol_version = 3;
+        assert!(packet.validate().is_err());
+    }
+
+    #[test]
+    fn status_packet_carries_and_validates_profiles() {
+        let mut packet = StatusPacket::new(
+            Availability::Online,
+            Vec::new(),
+            ProfileSnapshot {
+                display_name: Some("Ada".to_owned()),
+                avatar_hash: Some("abc123".to_owned()),
+            },
+        );
+        assert!(packet.validate().is_ok());
+        assert_eq!(packet.profile().display_name.as_deref(), Some("Ada"));
+        packet.display_name = Some("x".repeat(64));
         assert!(packet.validate().is_err());
     }
 
@@ -455,6 +544,7 @@ mod tests {
                 ended_at_ms: None,
                 participants: vec!["x".repeat(129)],
             }],
+            ProfileSnapshot::default(),
         );
         assert!(packet.validate().is_err());
         packet.active_group_calls[0].participants = vec!["peer".to_owned()];

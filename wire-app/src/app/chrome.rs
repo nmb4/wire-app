@@ -154,7 +154,7 @@ impl AppState {
                         top: 2,
                         bottom: 6,
                     })
-                    .show(ui, |ui| self.ui_call_participant_bar(ui, pal));
+                    .show(ui, |ui| self.ui_call_participant_bar(ui, pal, ctx));
             });
         }
 
@@ -169,7 +169,7 @@ impl AppState {
                     bottom: 2,
                 })
                 .inner_margin(egui::Margin::symmetric(12, 4))
-                .show(ui, |ui| self.ui_dock_content(ui, pal));
+                .show(ui, |ui| self.ui_dock_content(ui, pal, ctx));
         });
     }
 
