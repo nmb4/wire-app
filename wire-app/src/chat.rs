@@ -6013,6 +6013,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn profile_snapshots_survive_message_replication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let left_secret = SecretKey::from_bytes(&[51; 32]);
+        let right_secret = SecretKey::from_bytes(&[52; 32]);
+        let (left_endpoint, left_router, mut left) =
+            spawn_test_node(&temp.path().join("left"), left_secret).await?;
+        let (right_endpoint, right_router, mut right) =
+            spawn_test_node(&temp.path().join("right"), right_secret).await?;
+        left_endpoint.add_node_addr(right_endpoint.node_addr().await?)?;
+        right_endpoint.add_node_addr(left_endpoint.node_addr().await?)?;
+
+        left.set_own_profile(
+            Some("Noah".to_owned()),
+            Some("abc123".to_owned()),
+            Some("#E67E22".to_owned()),
+        );
+        let conversation_id = left
+            .ensure_direct(right_endpoint.node_id(), "Right".to_owned())
+            .await?;
+        let outbound = ChatMessage::new_with_attachments(
+            left_endpoint.node_id(),
+            "snapshot check".to_owned(),
+            Vec::new(),
+        )
+        .with_author_profile(
+            Some("Noah".to_owned()),
+            Some("abc123".to_owned()),
+            Some("#E67E22".to_owned()),
+        );
+        left.send_message(conversation_id.clone(), outbound.clone())
+            .await;
+        // The receiver must see the full identity snapshot, not just the
+        // accent color: name + avatar hash drive the peer cache.
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let ChatNotification::Conversation { messages, .. } =
+                    right.next_notification().await
+                {
+                    if let Some(message) = messages
+                        .iter()
+                        .find(|message| message.message_id == outbound.message_id)
+                    {
+                        return message.clone();
+                    }
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for replicated chat message")?;
+        assert_eq!(seen.author_display_name.as_deref(), Some("Noah"));
+        assert_eq!(seen.author_avatar_hash.as_deref(), Some("abc123"));
+        assert_eq!(seen.author_accent_color.as_deref(), Some("#E67E22"));
+
+        left_router.shutdown().await?;
+        right_router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_exchange_and_reload_messages_without_calls() -> Result<()> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("wire_app_lib=debug,iroh_docs=info")

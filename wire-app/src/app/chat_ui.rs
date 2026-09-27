@@ -6,7 +6,7 @@ use super::{
     unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
-        chat_surface, copy_to_clipboard, format_bytes, paint_chat_card,
+        chat_surface, copy_to_clipboard, format_bytes, paint_chat_card, SidebarAvatar,
     },
     AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
     ImagePreview, ImagePreviewAction, ImagePreviewMode,
@@ -136,6 +136,20 @@ impl AppState {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let friends = self.friends.clone();
+                    // Resolve profile pictures for everyone listed here so
+                    // unknown senders fetch avatars while visible.
+                    let sidebar_peers: Vec<NodeId> = friends
+                        .iter()
+                        .filter_map(|friend| NodeId::from_str(friend.node_id.trim()).ok())
+                        .chain(
+                            self.chat
+                                .conversations
+                                .values()
+                                .filter_map(|conversation| conversation.direct_peer()),
+                        )
+                        .collect();
+                    self.ensure_peer_profiles(sidebar_peers);
+                    let ctx_clone = ui.ctx().clone();
                     for friend in friends {
                         let Ok(peer) = NodeId::from_str(friend.node_id.trim()) else {
                             continue;
@@ -147,8 +161,23 @@ impl AppState {
                             .as_ref()
                             .is_some_and(|id| self.chat.selected.as_deref() == Some(id.as_str()));
                         let unseen = id.as_ref().is_some_and(|id| self.chat.unseen.contains(id));
-                        let label = format!("{}   {}", self.peer_initial(peer), friend.name);
-                        if chat_navigation_button(ui, pal, &label, None, selected, unseen).clicked()
+                        // Saved contact name first, then the learned profile
+                        // name — never a stale placeholder.
+                        let label = self.peer_display_name(peer);
+                        let avatar = SidebarAvatar {
+                            texture: self.peer_avatar_texture(&ctx_clone, peer),
+                            initial: self.peer_initial(peer),
+                        };
+                        if chat_navigation_button(
+                            ui,
+                            pal,
+                            &label,
+                            None,
+                            selected,
+                            unseen,
+                            Some(avatar),
+                        )
+                        .clicked()
                         {
                             if let Some(id) = id {
                                 self.chat.selected = Some(id.clone());
@@ -182,8 +211,18 @@ impl AppState {
                     }
                     for (id, peer) in unknown_directs {
                         let selected = self.chat.selected.as_deref() == Some(id.as_str());
-                        let label =
-                            format!("{}   Peer {}", self.peer_initial(peer), peer.fmt_short());
+                        // Resolve learned profile names here too — strangers
+                        // stop looking like raw peer IDs once we've seen them.
+                        let label = self.peer_display_name(peer);
+                        let avatar = SidebarAvatar {
+                            texture: self.peer_avatar_texture(&ctx_clone, peer),
+                            initial: self.peer_initial(peer),
+                        };
+                        let hover = if self.peer_profile_name(peer).is_some() {
+                            format!("{} · add them from the chat header", label)
+                        } else {
+                            "Unknown sender · add them from the chat header".to_owned()
+                        };
                         if chat_navigation_button(
                             ui,
                             pal,
@@ -191,8 +230,9 @@ impl AppState {
                             None,
                             selected,
                             self.chat.unseen.contains(&id),
+                            Some(avatar),
                         )
-                        .on_hover_text("Unknown sender · add them from the chat header")
+                        .on_hover_text(&hover)
                         .clicked()
                         {
                             self.chat.selected = Some(id);
@@ -251,13 +291,23 @@ impl AppState {
                             })
                             .or_else(|| missed_call.map(|_| "Missed group call".to_owned()))
                             .unwrap_or_else(|| member_summary.clone());
+                        let group_initial = group
+                            .title
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "#".to_owned());
                         if chat_navigation_button(
                             ui,
                             pal,
-                            &format!("#   {}", group.title),
+                            &group.title,
                             Some(&sidebar_summary),
                             selected,
                             self.chat.unseen.contains(&group.id),
+                            Some(SidebarAvatar {
+                                texture: None,
+                                initial: group_initial,
+                            }),
                         )
                         .on_hover_text(&member_summary)
                         .clicked()
@@ -596,7 +646,12 @@ impl AppState {
                 });
                 if let Some(peer) = friend_to_add {
                     self.chat.friend_candidate = Some(peer);
-                    self.chat.friend_candidate_name.clear();
+                    // Prefill a learned profile name so adding a stranger
+                    // doesn't freeze their "Peer …" fallback as the contact.
+                    self.chat.friend_candidate_name = self
+                        .peer_profile_name(peer)
+                        .unwrap_or_default()
+                        .to_owned();
                 }
                 if open_members {
                     self.chat.show_group_members = true;
@@ -817,10 +872,7 @@ impl AppState {
         let author = if own {
             self.own_label()
         } else {
-            NodeId::from_str(&message.author_id)
-                .ok()
-                .map(|node| self.peer_display_name(node))
-                .unwrap_or_else(|| "Unknown peer".to_owned())
+            self.remote_author_name(&message.author_id, message.author_display_name.as_deref())
         };
         let author_peer = NodeId::from_str(&message.author_id).ok();
         let author_color = if own {
@@ -877,7 +929,7 @@ impl AppState {
                                     .size(ui_font_size(10.5)),
                             );
                             if own && message.deletion.is_none() {
-                                chat_delivery_status_icon(
+                                chat_delivery_status_slot(
                                     ui,
                                     pal,
                                     state,
@@ -973,10 +1025,7 @@ impl AppState {
         let author = if own {
             self.own_label()
         } else {
-            NodeId::from_str(&message.author_id)
-                .ok()
-                .map(|node| self.peer_display_name(node))
-                .unwrap_or_else(|| "Unknown peer".to_owned())
+            self.remote_author_name(&message.author_id, message.author_display_name.as_deref())
         };
         let author_peer = NodeId::from_str(&message.author_id).ok();
         let author_color = if own {
@@ -1084,7 +1133,7 @@ impl AppState {
                                     .size(ui_font_size(11.0)),
                             );
                             if own && message.deletion.is_none() {
-                                chat_delivery_status_icon(
+                                chat_delivery_status_slot(
                                     ui,
                                     pal,
                                     state,
@@ -1148,7 +1197,7 @@ impl AppState {
                             },
                         );
                         if status_slot > 0.0 {
-                            chat_delivery_status_icon(ui, pal, state, detail.as_deref(), opacity);
+                            chat_delivery_status_slot(ui, pal, state, detail.as_deref(), opacity);
                         }
                     });
                 },
@@ -1684,8 +1733,18 @@ impl AppState {
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().min(FILE_OFFER_CARD_MAX_WIDTH));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&attachment.name).color(pal.text));
+                        // Bottom-aligned like the chat name rows: the small
+                        // size sits on the filename baseline with a fixed 6px
+                        // gap instead of floating centered.
+                        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&attachment.name).color(pal.text),
+                                )
+                                .truncate()
+                                .selectable(true),
+                            );
                             ui.label(
                                 RichText::new(format_bytes(attachment.byte_len))
                                     .color(pal.dim)
@@ -2172,7 +2231,12 @@ impl AppState {
         self.chat.show_group_members = open;
         if let Some(peer) = friend_to_add {
             self.chat.friend_candidate = Some(peer);
-            self.chat.friend_candidate_name.clear();
+            // Prefill a learned profile name so adding a stranger doesn't
+            // freeze their "Peer …" fallback as the contact.
+            self.chat.friend_candidate_name = self
+                .peer_profile_name(peer)
+                .unwrap_or_default()
+                .to_owned();
         }
     }
 
@@ -2227,10 +2291,15 @@ impl AppState {
             });
 
         if add {
-            let name = if self.chat.friend_candidate_name.trim().is_empty() {
-                format!("Peer {}", peer.fmt_short())
+            // Empty falls back to the learned profile name (prefilled above)
+            // before the Peer fallback, so contacts keep resolving.
+            let typed = self.chat.friend_candidate_name.trim().to_owned();
+            let name = if typed.is_empty() {
+                self.peer_profile_name(peer)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Peer {}", peer.fmt_short()))
             } else {
-                self.chat.friend_candidate_name.trim().to_owned()
+                typed
             };
             self.add_friend_record(peer, name);
             self.chat.friend_candidate = None;
@@ -2513,6 +2582,26 @@ fn chat_message_context_menu(
 }
 
 /// Compact delivery affordance next to a message. Hover shows the detail string.
+/// Delivery status icon in a fixed 18px slot, dropped 3px so the 12px glyph
+/// centers on a body line instead of hugging its top. Used identically in
+/// name rows and continuation rows so the sync icons sit the same everywhere.
+fn chat_delivery_status_slot(
+    ui: &mut Ui,
+    pal: &Palette,
+    state: DeliveryState,
+    detail: Option<&str>,
+    opacity: f32,
+) {
+    if matches!(state, DeliveryState::Delivered) {
+        return;
+    }
+    ui.allocate_ui_with_layout(Vec2::new(18.0, 0.0), Layout::top_down(Align::Min), |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_space(3.0);
+        chat_delivery_status_icon(ui, pal, state, detail, opacity);
+    });
+}
+
 fn chat_delivery_status_icon(
     ui: &mut Ui,
     pal: &Palette,

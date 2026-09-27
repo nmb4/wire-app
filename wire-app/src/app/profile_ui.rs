@@ -654,7 +654,7 @@ pub fn paint_stream_owner_avatar(
 
 /// Paint a texture clipped to a true circle via a triangle-fan mesh. The
 /// stored avatars are square PNGs, so a centered 0..1 UV mapping is correct.
-fn paint_circular_image(ui: &egui::Ui, rect: egui::Rect, texture: &TextureHandle) {
+pub(super) fn paint_circular_image(ui: &egui::Ui, rect: egui::Rect, texture: &TextureHandle) {
     const SEGMENTS: usize = 40;
     let center = rect.center();
     let radius = rect.width().min(rect.height()) / 2.0;

@@ -1,7 +1,10 @@
 //! Shared UI painting and layout helpers.
 
 use crate::theme::{ghost_icon_button, kh_family, lucide, sans, ui_font_size, Palette};
-use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, Rect, RichText, Stroke, Ui, Vec2};
+use egui::{
+    Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Rect, RichText, Stroke,
+    TextureHandle, Ui, Vec2,
+};
 use egui_phosphor::regular as ph;
 use lucide_icons::Icon;
 use std::sync::atomic::Ordering;
@@ -422,6 +425,13 @@ pub(super) fn chat_segment_button(
     response
 }
 
+/// Leading avatar for a sidebar navigation row: profile picture when known,
+/// initial letter otherwise.
+pub(super) struct SidebarAvatar {
+    pub texture: Option<TextureHandle>,
+    pub initial: String,
+}
+
 pub(super) fn chat_navigation_button(
     ui: &mut Ui,
     pal: &Palette,
@@ -429,6 +439,7 @@ pub(super) fn chat_navigation_button(
     subtitle: Option<&str>,
     selected: bool,
     unseen: bool,
+    avatar: Option<SidebarAvatar>,
 ) -> egui::Response {
     let height = if subtitle.is_some() { 54.0 } else { 42.0 };
     let (rect, response) = ui.allocate_exact_size(
@@ -456,8 +467,34 @@ pub(super) fn chat_navigation_button(
     } else {
         rect.right() - 12.0
     };
+    // Optional leading avatar (28px) so contacts and unknown senders show
+    // the learned profile picture instead of an initial baked into the label.
+    let text_left = if let Some(avatar) = &avatar {
+        let center = egui::pos2(rect.left() + 8.0 + 13.0, rect.center().y);
+        let avatar_rect = Rect::from_center_size(center, Vec2::splat(26.0));
+        if let Some(texture) = &avatar.texture {
+            super::profile_ui::paint_circular_image(ui, avatar_rect, texture);
+        } else {
+            ui.painter()
+                .circle_filled(center, 13.0, pal.panel2);
+        }
+        ui.painter()
+            .circle_stroke(center, 13.0, Stroke::new(1.0_f32, pal.line_br));
+        if avatar.texture.is_none() {
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                &avatar.initial,
+                FontId::new(26.0 * 0.42, kh_family()),
+                pal.text2,
+            );
+        }
+        rect.left() + 8.0 + 26.0 + 10.0
+    } else {
+        rect.left() + 14.0
+    };
     let text_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 14.0, rect.top() + 6.0),
+        egui::pos2(text_left, rect.top() + 6.0),
         egui::pos2(text_right, rect.bottom() - 6.0),
     );
     ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {

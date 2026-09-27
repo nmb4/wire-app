@@ -2613,6 +2613,31 @@ impl AppState {
         format!("Peer {}", node_id.fmt_short())
     }
 
+    /// Author name for a received message. Same priority as
+    /// `peer_display_name`, but falls back to the name stamped inside the
+    /// message itself before giving up to the Peer fallback — so a stranger's
+    /// chosen name renders even if the profile cache hasn't caught up (or was
+    /// cleared) yet. The cache still wins over the snapshot when both exist,
+    /// so renames converge instead of flapping on old messages.
+    fn remote_author_name(&self, author_id: &str, snapshot_name: Option<&str>) -> String {
+        if let Ok(peer) = NodeId::from_str(author_id) {
+            if Some(peer) == self.our_node_id {
+                return self.own_label();
+            }
+            if let Some(name) = self.friend_name(peer) {
+                return name.to_owned();
+            }
+            if let Some(name) = self.peer_profile_name(peer) {
+                return name.to_owned();
+            }
+            if let Some(name) = snapshot_name.map(str::trim).filter(|name| !name.is_empty()) {
+                return name.to_owned();
+            }
+            return format!("Peer {}", peer.fmt_short());
+        }
+        "Unknown peer".to_owned()
+    }
+
     fn peer_initial(&self, node_id: NodeId) -> String {
         if Some(node_id) == self.our_node_id {
             return profile::display_name_initial(&self.own_label())
