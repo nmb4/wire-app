@@ -2627,13 +2627,11 @@ impl AppState {
         if Some(node_id) == self.our_node_id {
             return self.own_label();
         }
-        if let Some(name) = self.friend_name(node_id) {
-            return name.to_owned();
-        }
-        if let Some(name) = self.peer_profile_name(node_id) {
-            return name.to_owned();
-        }
-        format!("Peer {}", node_id.fmt_short())
+        resolve_peer_display_name(
+            self.peer_profile_name(node_id),
+            self.friend_name(node_id),
+            &node_id.fmt_short().to_string(),
+        )
     }
 
     /// Author name for a received message. Same priority as
@@ -2647,13 +2645,13 @@ impl AppState {
             if Some(peer) == self.our_node_id {
                 return self.own_label();
             }
-            if let Some(name) = self.friend_name(peer) {
-                return name.to_owned();
-            }
             if let Some(name) = self.peer_profile_name(peer) {
                 return name.to_owned();
             }
             if let Some(name) = snapshot_name.map(str::trim).filter(|name| !name.is_empty()) {
+                return name.to_owned();
+            }
+            if let Some(name) = self.friend_name(peer) {
                 return name.to_owned();
             }
             return format!("Peer {}", peer.fmt_short());
@@ -2666,33 +2664,22 @@ impl AppState {
             return profile::display_name_initial(&self.own_label())
                 .unwrap_or_else(|| "Y".to_owned());
         }
-        if let Some(name) = self.friend_name(node_id) {
-            if let Some(initial) = profile::display_name_initial(name) {
-                return initial;
-            }
-        }
-        if let Some(name) = self.peer_profile_name(node_id) {
-            if let Some(initial) = profile::display_name_initial(name) {
-                return initial;
-            }
-        }
-        node_id
-            .fmt_short()
-            .to_string()
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".to_owned())
+        resolve_peer_initial(
+            self.peer_profile_name(node_id),
+            self.friend_name(node_id),
+            &node_id.fmt_short().to_string(),
+        )
     }
 
     fn group_members_for(&self, conversation: &ChatConversation) -> Vec<GroupMemberLabel> {
         let mut labels = group_member_labels(&conversation.members, self.our_node_id, |node| {
             self.friend_name(node).map(str::to_owned)
         });
-        // Show learned profile names for non-contacts while keeping their
-        // Unknown kind (so the dialog still offers "Add friend" + Copy ID).
+        // Advertised profile names win over stored contact names (which only
+        // cover peers without profile support), but kinds stay put so the
+        // dialog still offers "Add friend" + Copy ID for non-contacts.
         for label in &mut labels {
-            if label.kind == GroupMemberKind::Unknown {
+            if label.kind != GroupMemberKind::You {
                 if let Some(peer) = label.node_id {
                     if let Some(name) = self.peer_profile_name(peer) {
                         label.text = name.to_owned();
@@ -2903,6 +2890,41 @@ fn is_placeholder_contact_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("unnamed contact")
 }
 
+/// Display-name priority shared by every peer label: the advertised profile
+/// name first; the locally stored contact name is only a fallback for peers
+/// without profile support (old clients); the raw peer ID last.
+fn resolve_peer_display_name(
+    profile_name: Option<&str>,
+    friend_name: Option<&str>,
+    peer_short: &str,
+) -> String {
+    if let Some(name) = profile_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_owned();
+    }
+    if let Some(name) = friend_name {
+        return name.to_owned();
+    }
+    format!("Peer {peer_short}")
+}
+
+/// Initial-letter priority matching `resolve_peer_display_name`.
+fn resolve_peer_initial(
+    profile_name: Option<&str>,
+    friend_name: Option<&str>,
+    peer_short: &str,
+) -> String {
+    for candidate in [profile_name, friend_name].into_iter().flatten() {
+        if let Some(initial) = profile::display_name_initial(candidate) {
+            return initial;
+        }
+    }
+    peer_short
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupMemberKind {
     You,
@@ -3078,6 +3100,37 @@ mod layout_tests {
             vec![("unknown-direct".to_owned(), peer)]
         );
         assert!(unknown_direct_conversations(&conversations, &BTreeSet::from([peer])).is_empty());
+    }
+
+    #[test]
+    fn advertised_profile_names_win_over_stored_contact_names() {
+        // Profile known: advertised name wins, stored name is ignored.
+        assert_eq!(
+            resolve_peer_display_name(Some("Alice"), Some("Mom"), "abc123"),
+            "Alice"
+        );
+        assert_eq!(
+            resolve_peer_initial(Some("Alice"), Some("Mom"), "abc123"),
+            "A"
+        );
+        // Old client (no profile): stored contact name is the fallback.
+        assert_eq!(
+            resolve_peer_display_name(None, Some("Mom"), "abc123"),
+            "Mom"
+        );
+        assert_eq!(resolve_peer_initial(None, Some("Mom"), "abc123"), "M");
+        // Nobody known: raw peer ID fallback.
+        assert_eq!(
+            resolve_peer_display_name(None, None, "abc123"),
+            "Peer abc123"
+        );
+        assert_eq!(resolve_peer_initial(None, None, "abc123"), "A");
+        assert_eq!(resolve_peer_initial(None, None, ""), "?");
+        // Blank/whitespace profile names don't shadow anything.
+        assert_eq!(
+            resolve_peer_display_name(Some("   "), Some("Mom"), "abc123"),
+            "Mom"
+        );
     }
 
     #[test]

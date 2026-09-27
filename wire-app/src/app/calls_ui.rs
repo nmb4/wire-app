@@ -1045,8 +1045,12 @@ impl AppState {
                 });
                 match &self.remote_node_id {
                     Some(Ok(node_id)) => {
-                        let status = self
-                            .friend_name(*node_id)
+                        // Advertised profile names win here too; the stored
+                        // contact name only covers peers without profiles.
+                        let known = self
+                            .peer_profile_name(*node_id)
+                            .or_else(|| self.friend_name(*node_id));
+                        let status = known
                             .map(|name| format!("Ready to call {name}"))
                             .unwrap_or_else(|| "Valid node ID".to_owned());
                         ui.label(RichText::new(status).color(pal.ok));
