@@ -4,11 +4,11 @@
 //! arrive via `StatusUpdate.profile`, chat message snapshots, and invites,
 //! while avatar *bytes* are fetched on demand through `wire/profile/1`.
 
-use super::{AppState, Friend};
+use super::{widgets::floating_panel, AppState, Friend};
 use crate::{
     profile::{self, PeerProfile},
     runtime::Command,
-    theme::{kh_family, ui_font_size, Palette},
+    theme::{action_button, kh_family, ui_font_size, ButtonTone, Palette},
 };
 use egui::{ColorImage, CornerRadius, FontId, Stroke, TextureHandle, Vec2};
 use iroh::NodeId;
@@ -247,8 +247,7 @@ impl AppState {
         if !self.profile_edit_accent.trim().is_empty()
             && profile::sanitize_accent_color(&self.profile_edit_accent).is_none()
         {
-            self.profile_edit_error =
-                Some("Name color must be #RGB or #RRGGBB hex.".to_owned());
+            self.profile_edit_error = Some("Name color must be #RGB or #RRGGBB hex.".to_owned());
             return false;
         }
         let accent = profile::sanitize_accent_color(&self.profile_edit_accent);
@@ -275,8 +274,7 @@ impl AppState {
         match std::fs::read(path) {
             Ok(raw) => {
                 if raw.len() > profile::MAX_AVATAR_UPLOAD_BYTES {
-                    self.profile_edit_error =
-                        Some("Image is larger than 8 MiB.".to_owned());
+                    self.profile_edit_error = Some("Image is larger than 8 MiB.".to_owned());
                     return;
                 }
                 match image::load_from_memory(&raw) {
@@ -470,115 +468,96 @@ impl AppState {
         }
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = (pane_rect.width() - 60.0).clamp(360.0, 440.0);
         let mut open = true;
+        let mut cancel = false;
         let mut pick_avatar = false;
         let mut remove_avatar = false;
         let mut save = false;
-        egui::Window::new("profile-editor")
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .constrain_to(pane_rect)
-            .default_width(dialog_width)
-            .min_width(dialog_width)
-            .max_width(dialog_width)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line_br))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(0.0),
-            )
+        floating_panel("Your profile", &pal, pane_rect, 440.0)
+            .id(egui::Id::new("profile-editor"))
+            .enabled(self.avatar_crop.is_none())
+            .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_width(dialog_width);
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(18, 14))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("YOUR PROFILE")
-                                .family(kh_family())
-                                .color(pal.text2)
-                                .size(13.0),
-                        );
-                        ui.label(
-                            egui::RichText::new("Shown to everyone you message or call.")
-                                .color(pal.dim)
-                                .size(ui_font_size(11.0)),
-                        );
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            let avatar = self.own_avatar_texture(ctx);
-                            let preview_name = profile::sanitize_display_name(
-                                &self.profile_edit_name,
-                            );
-                            let preview_name =
-                                if preview_name.is_empty() { "You".to_owned() } else { preview_name };
-                            let initials =
-                                profile::display_name_initial(&preview_name).unwrap_or_else(|| "?".to_owned());
-                            paint_profile_avatar(ui, &pal, avatar, &initials, 56.0);
-                            ui.vertical(|ui| {
-                                if ui
-                                    .button("Choose picture…")
-                                    .on_hover_text("PNG, JPEG, GIF or WebP up to 8 MiB")
-                                    .clicked()
-                                {
-                                    pick_avatar = true;
-                                }
-                                if self.own_avatar_hash.is_some()
-                                    && ui.button("Remove picture").clicked()
-                                {
-                                    remove_avatar = true;
-                                }
-                            });
-                        });
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("Display name")
-                                .color(pal.text2)
-                                .size(ui_font_size(12.0)),
-                        );
-                        let changed = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.profile_edit_name)
-                                    .hint_text("e.g. Ada Lovelace")
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed();
-                        if changed {
-                            self.profile_edit_error = None;
-                        }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}/32",
-                                profile::sanitize_display_name(&self.profile_edit_name)
-                                    .chars()
-                                    .count()
-                            ))
+                ui.set_width(ui.available_width());
+                egui::Frame::new().inner_margin(0.0).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Shown to everyone you message or call.")
                             .color(pal.dim)
-                            .size(ui_font_size(10.5)),
-                        );
-                        ui.add_space(8.0);
-                        self.ui_accent_picker(ui, &pal);
-                        if let Some(error) = &self.profile_edit_error {
-                            ui.label(
-                                egui::RichText::new(error)
-                                    .color(pal.err)
-                                    .size(ui_font_size(11.5)),
-                            );
-                        }
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Save").clicked() {
-                                save = true;
+                            .size(ui_font_size(11.0)),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        let avatar = self.own_avatar_texture(ctx);
+                        let preview_name = profile::sanitize_display_name(&self.profile_edit_name);
+                        let preview_name = if preview_name.is_empty() {
+                            "You".to_owned()
+                        } else {
+                            preview_name
+                        };
+                        let initials = profile::display_name_initial(&preview_name)
+                            .unwrap_or_else(|| "?".to_owned());
+                        paint_profile_avatar(ui, &pal, avatar, &initials, 56.0);
+                        ui.vertical(|ui| {
+                            if action_button(ui, &pal, "Choose picture…", ButtonTone::Secondary)
+                                .on_hover_text("PNG, JPEG, GIF or WebP up to 8 MiB")
+                                .clicked()
+                            {
+                                pick_avatar = true;
                             }
-                            if ui.button("Cancel").clicked() {
-                                open = false;
+                            if self.own_avatar_hash.is_some()
+                                && action_button(ui, &pal, "Remove picture", ButtonTone::Secondary)
+                                    .clicked()
+                            {
+                                remove_avatar = true;
                             }
                         });
                     });
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Display name")
+                            .color(pal.text2)
+                            .size(ui_font_size(12.0)),
+                    );
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.profile_edit_name)
+                                .hint_text("e.g. Ada Lovelace")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
+                    if changed {
+                        self.profile_edit_error = None;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}/32",
+                            profile::sanitize_display_name(&self.profile_edit_name)
+                                .chars()
+                                .count()
+                        ))
+                        .color(pal.dim)
+                        .size(ui_font_size(10.5)),
+                    );
+                    ui.add_space(8.0);
+                    self.ui_accent_picker(ui, &pal);
+                    if let Some(error) = &self.profile_edit_error {
+                        ui.label(
+                            egui::RichText::new(error)
+                                .color(pal.err)
+                                .size(ui_font_size(11.5)),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if action_button(ui, &pal, "Save", ButtonTone::Primary).clicked() {
+                            save = true;
+                        }
+                        if action_button(ui, &pal, "Cancel", ButtonTone::Secondary).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
             });
         if pick_avatar {
             if let Some(path) = rfd::FileDialog::new()
@@ -595,7 +574,7 @@ impl AppState {
         if save {
             open = self.save_own_profile_edit();
         }
-        self.show_profile_editor = open;
+        self.show_profile_editor = open && !cancel;
     }
 }
 
@@ -681,7 +660,11 @@ pub fn paint_stream_owner_avatar(
     }
     // Tooltip for screen readers / hover.
     let _ = ui
-        .interact(rect, ui.id().with(("stream-owner", name)), egui::Sense::hover())
+        .interact(
+            rect,
+            ui.id().with(("stream-owner", name)),
+            egui::Sense::hover(),
+        )
         .on_hover_text(format!("{name}'s stream"));
 }
 
@@ -801,134 +784,125 @@ impl AppState {
         }
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = (pane_rect.width() - 60.0).clamp(360.0, 400.0);
         let mut close = false;
+        let mut open = true;
         let mut confirm = false;
-        egui::Window::new("avatar-crop-editor")
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .constrain_to(pane_rect)
-            .default_width(dialog_width)
-            .min_width(dialog_width)
-            .max_width(dialog_width)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line_br))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(0.0),
-            )
+        floating_panel("Crop picture", &pal, pane_rect, 400.0)
+            .id(egui::Id::new("avatar-crop-editor"))
+            .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_width(dialog_width);
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(18, 14))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("CROP PICTURE")
-                                .family(kh_family())
-                                .color(pal.text2)
-                                .size(13.0),
-                        );
-                        ui.label(
-                            egui::RichText::new("Drag to position, zoom with the slider.")
-                                .color(pal.dim)
-                                .size(ui_font_size(11.0)),
-                        );
-                        ui.add_space(10.0);
-                        let Some(crop) = self.avatar_crop.as_mut() else {
-                            return;
-                        };
-                        // Fixed-size stage; the crop square is centered in it.
-                        let (stage_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(CROP_AREA), egui::Sense::hover());
-                        let painter = ui.painter();
-                        painter.rect_filled(stage_rect, CornerRadius::ZERO, egui::Color32::BLACK);
-                        let scale = crop.scale();
-                        let displayed = Vec2::new(
-                            crop.image.width() as f32 * scale,
-                            crop.image.height() as f32 * scale,
-                        );
-                        let img_rect = egui::Rect::from_center_size(
-                            stage_rect.center() + crop.offset,
-                            displayed,
-                        );
-                        painter.image(
-                            crop.texture.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
-                        // Dim everything outside the crop square.
-                        let crop_rect = egui::Rect::from_center_size(
-                            stage_rect.center(),
-                            Vec2::splat(CROP_SIZE),
-                        );
-                        let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140);
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(stage_rect.min, egui::pos2(stage_rect.max.x, crop_rect.min.y)),
-                            CornerRadius::ZERO,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(stage_rect.min.x, crop_rect.max.y), stage_rect.max),
-                            CornerRadius::ZERO,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(stage_rect.min.x, crop_rect.min.y), egui::pos2(crop_rect.min.x, crop_rect.max.y)),
-                            CornerRadius::ZERO,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(crop_rect.max.x, crop_rect.min.y), egui::pos2(stage_rect.max.x, crop_rect.max.y)),
-                            CornerRadius::ZERO,
-                            dim,
-                        );
-                        painter.rect_stroke(
-                            crop_rect,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.5_f32, egui::Color32::WHITE),
-                            egui::StrokeKind::Outside,
-                        );
-                        // Pan the picture behind the fixed square.
-                        let pan = ui.interact(
-                            stage_rect,
-                            ui.id().with("avatar-crop-pan"),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if pan.dragged() {
-                            crop.offset += pan.drag_delta();
-                        }
+                ui.set_width(ui.available_width());
+                egui::Frame::new().inner_margin(0.0).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Drag to position, zoom with the slider.")
+                            .color(pal.dim)
+                            .size(ui_font_size(11.0)),
+                    );
+                    ui.add_space(10.0);
+                    let Some(crop) = self.avatar_crop.as_mut() else {
+                        return;
+                    };
+                    // Scale the preview only; source cropping stays in canonical coordinates.
+                    let preview_scale = (ui.available_width() / CROP_AREA)
+                        .min((pane_rect.height() - 250.0).max(120.0) / CROP_AREA)
+                        .min(1.0);
+                    let (stage_rect, _) = ui.allocate_exact_size(
+                        Vec2::splat(CROP_AREA * preview_scale),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter().with_clip_rect(stage_rect);
+                    painter.rect_filled(stage_rect, CornerRadius::ZERO, egui::Color32::BLACK);
+                    let scale = crop.scale() * preview_scale;
+                    let displayed = Vec2::new(
+                        crop.image.width() as f32 * scale,
+                        crop.image.height() as f32 * scale,
+                    );
+                    let img_rect = egui::Rect::from_center_size(
+                        stage_rect.center() + crop.offset * preview_scale,
+                        displayed,
+                    );
+                    painter.image(
+                        crop.texture.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    // Dim everything outside the crop square.
+                    let crop_rect = egui::Rect::from_center_size(
+                        stage_rect.center(),
+                        Vec2::splat(CROP_SIZE * preview_scale),
+                    );
+                    let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140);
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            stage_rect.min,
+                            egui::pos2(stage_rect.max.x, crop_rect.min.y),
+                        ),
+                        CornerRadius::ZERO,
+                        dim,
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(stage_rect.min.x, crop_rect.max.y),
+                            stage_rect.max,
+                        ),
+                        CornerRadius::ZERO,
+                        dim,
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(stage_rect.min.x, crop_rect.min.y),
+                            egui::pos2(crop_rect.min.x, crop_rect.max.y),
+                        ),
+                        CornerRadius::ZERO,
+                        dim,
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(crop_rect.max.x, crop_rect.min.y),
+                            egui::pos2(stage_rect.max.x, crop_rect.max.y),
+                        ),
+                        CornerRadius::ZERO,
+                        dim,
+                    );
+                    painter.rect_stroke(
+                        crop_rect,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.5_f32, egui::Color32::WHITE),
+                        egui::StrokeKind::Outside,
+                    );
+                    // Pan the picture behind the fixed square.
+                    let pan = ui.interact(
+                        stage_rect,
+                        ui.id().with("avatar-crop-pan"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if pan.dragged() {
+                        crop.offset += pan.drag_delta() / preview_scale;
+                    }
+                    let (ox, oy) = crop.clamped_offset();
+                    crop.offset = Vec2::new(ox, oy);
+                    ui.add_space(8.0);
+                    let zoom_response =
+                        ui.add(egui::Slider::new(&mut crop.zoom, 1.0..=CROP_MAX_ZOOM).text("Zoom"));
+                    if zoom_response.changed() {
                         let (ox, oy) = crop.clamped_offset();
                         crop.offset = Vec2::new(ox, oy);
-                        ui.add_space(8.0);
-                        let zoom_response = ui.add(
-                            egui::Slider::new(&mut crop.zoom, 1.0..=CROP_MAX_ZOOM)
-                                .text("Zoom"),
-                        );
-                        if zoom_response.changed() {
-                            let (ox, oy) = crop.clamped_offset();
-                            crop.offset = Vec2::new(ox, oy);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if action_button(ui, &pal, "Save picture", ButtonTone::Primary).clicked() {
+                            confirm = true;
                         }
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Save picture").clicked() {
-                                confirm = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
+                        if action_button(ui, &pal, "Cancel", ButtonTone::Secondary).clicked() {
+                            close = true;
+                        }
                     });
+                });
             });
         if confirm {
             self.confirm_avatar_crop();
-        } else if close {
+        } else if close || !open {
             self.avatar_crop = None;
         }
     }
@@ -953,15 +927,11 @@ impl AppState {
             ui.spacing_mut().item_spacing = Vec2::splat(6.0);
             // "Default" swatch: theme text color.
             let default_selected = current.is_none() && self.profile_edit_accent.trim().is_empty();
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+            let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
             ui.painter().circle_filled(rect.center(), 11.0, pal.text);
             if default_selected {
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    12.0,
-                    Stroke::new(2.0_f32, pal.accent),
-                );
+                ui.painter()
+                    .circle_stroke(rect.center(), 12.0, Stroke::new(2.0_f32, pal.accent));
             }
             if response.on_hover_text("Default (theme text)").clicked() {
                 picked = Some(String::new());
@@ -972,11 +942,8 @@ impl AppState {
                 let (rect, response) =
                     ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
                 ui.painter().circle_filled(rect.center(), 11.0, color);
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    11.0,
-                    Stroke::new(1.0_f32, pal.line_br),
-                );
+                ui.painter()
+                    .circle_stroke(rect.center(), 11.0, Stroke::new(1.0_f32, pal.line_br));
                 if current.as_deref() == Some(preset) {
                     ui.painter().circle_stroke(
                         rect.center(),

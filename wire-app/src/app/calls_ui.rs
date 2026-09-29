@@ -11,10 +11,11 @@ use super::{
     save_friends,
     widgets::{
         aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
-        ellipsize, floating_dialog_header, fmt_error, fmt_node_id, paint_volume_track,
-        participant_bar_columns, peer_volume_slider, read_clipboard, section_card,
-        video_display_size, VolumeKnob, CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS,
-        PARTICIPANT_CHIP_HEIGHT, PARTICIPANT_GAP,
+        ellipsize, floating_dialog_header, floating_panel, floating_panel_frame,
+        floating_panel_width, fmt_error, fmt_node_id, paint_volume_track, participant_bar_columns,
+        peer_volume_slider, read_clipboard, section_card, video_display_size, VolumeKnob,
+        CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS, PARTICIPANT_CHIP_HEIGHT,
+        PARTICIPANT_GAP,
     },
     AppMode, AppState, StreamSource, StreamViewMode, TextureUploadStats, STREAM_GRID_GAP,
 };
@@ -57,116 +58,128 @@ impl AppState {
         let (picker_width, picker_body_height, use_columns) =
             capture_picker_layout(self.pane_constrain_rect().size());
 
-        egui::Window::new("Share a screen or window")
-            .id(egui::Id::new("capture-target-picker"))
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .constrain_to(self.pane_constrain_rect())
-            .default_width(picker_width)
-            .min_width(picker_width)
-            .max_width(picker_width)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.set_width(picker_width);
-                ui.label(
-                    RichText::new("Choose exactly what people in this call can see and hear.")
-                        .color(pal.text2),
-                );
-                ui.add_space(14.0);
+        floating_panel(
+            "Share a screen or window",
+            pal,
+            self.pane_constrain_rect(),
+            picker_width,
+        )
+        .id(egui::Id::new("capture-target-picker"))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("Choose exactly what people in this call can see and hear.")
+                    .color(pal.text2),
+            );
+            ui.add_space(14.0);
 
-                if use_columns {
-                    ui.columns(2, |columns| {
-                        capture_target_column(
-                            &mut columns[0],
-                            pal,
-                            "Screens",
-                            crate::screen_capture::CaptureTargetKind::Display,
-                            Icon::Monitor,
-                            &targets,
-                            &mut selected,
-                            picker_body_height,
-                        );
-                        capture_target_column(
-                            &mut columns[1],
-                            pal,
-                            "Windows",
-                            crate::screen_capture::CaptureTargetKind::Window,
-                            Icon::AppWindow,
-                            &targets,
-                            &mut selected,
-                            picker_body_height,
-                        );
-                    });
-                } else {
-                    let compact_height = ((picker_body_height - 8.0) * 0.5).max(86.0);
+            if use_columns {
+                ctx.data_mut(|data| {
+                    data.remove::<bool>(egui::Id::new("capture-picker-windows-tab"))
+                });
+                ui.columns(2, |columns| {
                     capture_target_column(
-                        ui,
+                        &mut columns[0],
                         pal,
                         "Screens",
                         crate::screen_capture::CaptureTargetKind::Display,
                         Icon::Monitor,
                         &targets,
                         &mut selected,
-                        compact_height,
+                        picker_body_height,
                     );
-                    ui.add_space(8.0);
                     capture_target_column(
-                        ui,
+                        &mut columns[1],
                         pal,
                         "Windows",
                         crate::screen_capture::CaptureTargetKind::Window,
                         Icon::AppWindow,
                         &targets,
                         &mut selected,
-                        compact_height,
+                        picker_body_height,
                     );
-                }
-
-                ui.add_space(12.0);
-                system_audio_share_row(ui, pal, &mut share_system_audio);
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
+                });
+            } else {
+                // A single list keeps the sharing controls reachable on short
+                // windows; stacking two independently scrolling lists did not.
+                let tab_id = egui::Id::new("capture-picker-windows-tab");
+                let mut windows = ctx
+                    .data_mut(|data| data.get_temp::<bool>(tab_id))
+                    .unwrap_or_else(|| {
+                        selected
+                            .and_then(|index| targets.get(index))
+                            .is_some_and(|target| {
+                                target.kind == crate::screen_capture::CaptureTargetKind::Window
+                            })
+                    });
+                let previous = windows;
                 ui.horizontal(|ui| {
-                    if action_button(ui, pal, "Refresh", ButtonTone::Secondary).clicked() {
-                        refresh = true;
-                    }
-                    if picker_width >= 640.0 {
-                        let target = selected.and_then(|index| targets.get(index));
-                        if let Some(target) = target {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Selected: {}",
-                                    ellipsize(&target.title, 42)
-                                ))
+                    ui.selectable_value(&mut windows, false, "Screens");
+                    ui.selectable_value(&mut windows, true, "Windows");
+                });
+                if previous != windows {
+                    selected = None;
+                }
+                ctx.data_mut(|data| data.insert_temp(tab_id, windows));
+                ui.add_space(6.0);
+                capture_target_column(
+                    ui,
+                    pal,
+                    if windows { "Windows" } else { "Screens" },
+                    if windows {
+                        crate::screen_capture::CaptureTargetKind::Window
+                    } else {
+                        crate::screen_capture::CaptureTargetKind::Display
+                    },
+                    if windows {
+                        Icon::AppWindow
+                    } else {
+                        Icon::Monitor
+                    },
+                    &targets,
+                    &mut selected,
+                    picker_body_height,
+                );
+            }
+
+            ui.add_space(12.0);
+            system_audio_share_row(ui, pal, &mut share_system_audio);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if action_button(ui, pal, "Refresh", ButtonTone::Secondary).clicked() {
+                    refresh = true;
+                }
+                if picker_width >= 640.0 {
+                    let target = selected.and_then(|index| targets.get(index));
+                    if let Some(target) = target {
+                        ui.label(
+                            RichText::new(format!("Selected: {}", ellipsize(&target.title, 42)))
                                 .color(pal.dim)
                                 .size(ui_font_size(11.5)),
-                            );
-                        }
+                        );
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_enabled_ui(selected.is_some(), |ui| {
-                            if action_button(ui, pal, "Start sharing", ButtonTone::Primary)
-                                .clicked()
-                            {
-                                start = true;
-                            }
-                        });
-                        if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
-                            cancel = true;
-                        }
-                        if ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            && selected.is_some()
-                        {
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_enabled_ui(selected.is_some(), |ui| {
+                        if action_button(ui, pal, "Start sharing", ButtonTone::Primary).clicked() {
                             start = true;
                         }
-                        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                            cancel = true;
-                        }
                     });
+                    if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
+                        cancel = true;
+                    }
+                    if ui.input(|input| input.key_pressed(egui::Key::Enter)) && selected.is_some() {
+                        start = true;
+                    }
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
                 });
             });
+        });
 
         self.selected_capture_target = selected;
         if self.share_system_audio != share_system_audio {
@@ -362,11 +375,7 @@ impl AppState {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
                     ui.add_space(CHIP_IDENTITY_GAP);
-                    chip_name_label(
-                        ui,
-                        &ellipsize(&display_name, 16),
-                        name_color,
-                    );
+                    chip_name_label(ui, &ellipsize(&display_name, 16), name_color);
                     ui.add_space(CHIP_IDENTITY_GAP);
                     voice_level_meter(ui, pal, voice_level)
                         .on_hover_text("Voice received from this participant");
@@ -642,8 +651,7 @@ impl AppState {
                 .then_some(*node_id)
             }) {
                 let name = self.peer_display_name(waiting);
-                let name_color =
-                    accent_color_for(self.peer_accent_hex(waiting), pal.text2);
+                let name_color = accent_color_for(self.peer_accent_hex(waiting), pal.text2);
                 return Some((
                     "Call waiting · ".to_owned(),
                     Some((name.clone(), name_color)),
@@ -748,12 +756,7 @@ impl AppState {
         None
     }
 
-    pub(super) fn ui_dock_content(
-        &mut self,
-        ui: &mut Ui,
-        pal: &Palette,
-        ctx: &egui::Context,
-    ) {
+    pub(super) fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette, ctx: &egui::Context) {
         let rect = ui.max_rect();
         let active_calls = self
             .calls
@@ -772,8 +775,7 @@ impl AppState {
             const CARD_SLOT_HEIGHT: f32 = 46.0;
             const CARD_EDGE_INSET: f32 = 6.0;
             let card_width: f32 = if dock_width >= 700.0 { 196.0 } else { 56.0 };
-            let slot_bottom = (rect.center().y + CARD_SLOT_HEIGHT / 2.0)
-                .min(rect.max.y - 2.0);
+            let slot_bottom = (rect.center().y + CARD_SLOT_HEIGHT / 2.0).min(rect.max.y - 2.0);
             let slot_top = (slot_bottom - CARD_SLOT_HEIGHT).max(rect.top());
             let slot_right = (rect.min.x + CARD_EDGE_INSET + card_width).min(rect.right());
             let left_rect = egui::Rect::from_min_max(
@@ -955,29 +957,19 @@ impl AppState {
     pub(super) fn ui_contacts_window(&mut self, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = (pane_rect.width() - 32.0).clamp(340.0, 560.0);
-        let scroll_height = (pane_rect.height() - 190.0).clamp(220.0, 720.0);
+        let dialog_width = floating_panel_width(pane_rect, 560.0, 0.0);
+        let scroll_height = (pane_rect.height() - 130.0).clamp(1.0, 700.0);
         let can_close = self.has_active_call();
 
-        egui::Window::new("contacts-dialog")
+        floating_panel("contacts-dialog", &pal, pane_rect, 560.0)
             .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .constrain_to(pane_rect)
+            .vscroll(false)
             .default_width(dialog_width)
             .min_width(dialog_width)
             .max_width(dialog_width)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line_br))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(0.0),
-            )
+            .frame(floating_panel_frame(&pal, 0))
             .show(ctx, |ui| {
-                let width = ui.available_width();
-                ui.set_width(width);
+                ui.set_width(dialog_width);
                 if floating_dialog_header(
                     ui,
                     &pal,
@@ -996,6 +988,7 @@ impl AppState {
                             .max_height(scroll_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
                                 self.ui_friends_card(ui);
                                 ui.add_space(12.0);
                                 self.ui_call_more_options(ui);
@@ -1008,8 +1001,8 @@ impl AppState {
         let pal = Palette::for_theme(self.theme);
         let ctx_clone = ui.ctx().clone();
         let own_name = self.own_label();
-        let own_initial = crate::profile::display_name_initial(&own_name)
-            .unwrap_or_else(|| "Y".to_owned());
+        let own_initial =
+            crate::profile::display_name_initial(&own_name).unwrap_or_else(|| "Y".to_owned());
         let own_avatar = self.own_avatar_texture(&ctx_clone);
         let mut open_editor = false;
         section_card(ui, &pal, "Your identity", |ui| {
@@ -1021,19 +1014,28 @@ impl AppState {
                     &egui::FontId::proportional(ui_font_size(13.0)),
                 );
                 paint_profile_avatar(ui, &pal, own_avatar, &own_initial, avatar_size);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(
-                        RichText::new(&own_name)
-                            .color(pal.text)
-                            .size(ui_font_size(13.5)),
-                    );
-                    if let Some(node_id) = &self.our_node_id {
-                        ui.label(fmt_node_id(&node_id.fmt_short()));
-                    } else {
-                        ui.label(RichText::new("Waiting for network…").weak());
-                    }
-                });
+                let text_width = (ui.available_width() - 114.0).max(24.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&own_name)
+                                    .color(pal.text)
+                                    .size(ui_font_size(13.5)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&own_name);
+                        if let Some(node_id) = &self.our_node_id {
+                            ui.label(fmt_node_id(&node_id.fmt_short()));
+                        } else {
+                            ui.label(RichText::new("Waiting for network…").weak());
+                        }
+                    },
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if action_button(ui, &pal, "Edit profile", ButtonTone::Secondary).clicked() {
                         open_editor = true;
@@ -1274,38 +1276,51 @@ impl AppState {
                                 );
                                 ui.set_min_height(avatar_size);
                                 paint_profile_avatar(ui, &pal, avatar, &initial, avatar_size);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(
-                                        RichText::new(&display_name)
-                                            .color(name_color)
-                                            .size(ui_font_size(13.0)),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 5.0;
-                                        ui.label(
-                                            RichText::new(if parsed.is_err() {
-                                                "invalid id".to_owned()
-                                            } else {
-                                                short_id
-                                            })
-                                            .monospace()
-                                            .color(if parsed.is_err() { pal.err } else { pal.dim })
-                                            .size(ui_font_size(10.5)),
-                                        );
-                                        if let Some(availability) = availability {
-                                            let (label, color) = match availability {
-                                                Availability::Online => ("Online", pal.ok),
-                                                Availability::Offline => ("Offline", pal.dim2),
-                                            };
+                                let text_width = (ui.available_width() - 112.0).max(24.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(text_width, 0.0),
+                                    Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&display_name)
+                                                    .color(name_color)
+                                                    .size(ui_font_size(13.0)),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&display_name);
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
                                             ui.label(
-                                                RichText::new(format!("• {label}"))
-                                                    .color(color)
-                                                    .size(ui_font_size(10.5)),
+                                                RichText::new(if parsed.is_err() {
+                                                    "invalid id".to_owned()
+                                                } else {
+                                                    short_id
+                                                })
+                                                .monospace()
+                                                .color(if parsed.is_err() {
+                                                    pal.err
+                                                } else {
+                                                    pal.dim
+                                                })
+                                                .size(ui_font_size(10.5)),
                                             );
-                                        }
-                                    });
-                                });
+                                            if let Some(availability) = availability {
+                                                let (label, color) = match availability {
+                                                    Availability::Online => ("Online", pal.ok),
+                                                    Availability::Offline => ("Offline", pal.dim2),
+                                                };
+                                                ui.label(
+                                                    RichText::new(format!("• {label}"))
+                                                        .color(color)
+                                                        .size(ui_font_size(10.5)),
+                                                );
+                                            }
+                                        });
+                                    },
+                                );
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -1960,8 +1975,8 @@ impl AppState {
         match source {
             StreamSource::Local => {
                 let name = self.own_label();
-                let initial = crate::profile::display_name_initial(&name)
-                    .unwrap_or_else(|| "Y".to_owned());
+                let initial =
+                    crate::profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
                 let texture = self.own_avatar_texture(ctx);
                 paint_stream_owner_avatar(ui, pal, tile_rect, texture, &initial, &name);
             }
@@ -2310,7 +2325,7 @@ fn present_native_video(
 
 fn capture_picker_layout(viewport: Vec2) -> (f32, f32, bool) {
     let width = (viewport.x - 56.0).clamp(280.0, 820.0);
-    let body_height = (viewport.y - 250.0).clamp(160.0, 360.0);
+    let body_height = (viewport.y - 350.0).clamp(86.0, 360.0);
     (width, body_height, width >= 560.0)
 }
 
@@ -2421,18 +2436,23 @@ fn system_audio_share_row(ui: &mut Ui, pal: &Palette, enabled: &mut bool) {
                     if *enabled { pal.accent } else { pal.dim },
                 );
                 ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Also share system audio")
-                            .color(pal.text)
-                            .size(ui_font_size(12.5)),
-                    );
-                    ui.label(
-                        RichText::new("People in this call will hear this computer.")
-                            .color(pal.dim)
-                            .size(ui_font_size(11.0)),
-                    );
-                });
+                let text_width = (ui.available_width() - 28.0).max(24.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.label(
+                            RichText::new("Also share system audio")
+                                .color(pal.text)
+                                .size(ui_font_size(12.5)),
+                        );
+                        ui.label(
+                            RichText::new("People in this call will hear this computer.")
+                                .color(pal.dim)
+                                .size(ui_font_size(11.0)),
+                        );
+                    },
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (check_rect, _) =
                         ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
@@ -2767,11 +2787,7 @@ fn paint_stream_info_badges(
     let mut x = tile_rect.left() + STREAM_OVERLAY_MARGIN;
     let y = tile_rect.bottom() - STREAM_OVERLAY_MARGIN - STREAM_OVERLAY_BADGE_HEIGHT;
     for (index, text) in badges.iter().enumerate() {
-        let color = if index == 0 {
-            name_color
-        } else {
-            pal.text2
-        };
+        let color = if index == 0 { name_color } else { pal.text2 };
         let galley = ui.painter().layout_no_wrap(text.clone(), sans(12.0), color);
         let badge_size = Vec2::new(
             galley.size().x + STREAM_OVERLAY_BADGE_PAD_X * 2.0,
@@ -2811,11 +2827,11 @@ mod tests {
         );
         assert_eq!(
             capture_picker_layout(Vec2::new(600.0, 500.0)),
-            (544.0, 250.0, false)
+            (544.0, 150.0, false)
         );
         assert_eq!(
             capture_picker_layout(Vec2::new(420.0, 360.0)),
-            (364.0, 160.0, false)
+            (364.0, 86.0, false)
         );
     }
 

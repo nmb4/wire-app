@@ -4,7 +4,10 @@
 use super::UpdateStatus;
 use super::{
     profile_ui::paint_profile_avatar,
-    widgets::{floating_dialog_header, format_bytes, painted_volume_slider},
+    widgets::{
+        floating_dialog_header, floating_panel, floating_panel_frame, floating_panel_width,
+        format_bytes, painted_volume_slider,
+    },
     AppState, ChatStyle, DEFAULT,
 };
 use crate::{
@@ -14,7 +17,7 @@ use crate::{
     theme::{action_button, kh_family, ui_font_size, ButtonTone, Palette, Theme, WindowFrameStyle},
     window_frame,
 };
-use egui::{Align, Align2, CornerRadius, Frame, Layout, RichText, Stroke, Ui};
+use egui::{Align, CornerRadius, Frame, Layout, RichText, Stroke, Ui};
 use wire::{
     audio::AudioQuality,
     video::{BitratePreset, StreamPreset},
@@ -25,37 +28,30 @@ impl AppState {
         let can_close = self.configured;
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = (pane_rect.width() - 40.0).clamp(420.0, 500.0);
+        let dialog_width = floating_panel_width(pane_rect, 500.0, 0.0);
         // Reserve enough vertical space for the dialog chrome plus a visible
         // inset above and below the centered window.
-        let scroll_height = (pane_rect.height() - 230.0).clamp(220.0, 700.0);
-        egui::Window::new("settings-dialog")
+        let scroll_height = (pane_rect.height() - 220.0).clamp(1.0, 700.0);
+        floating_panel("settings-dialog", &pal, pane_rect, 500.0)
             .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .constrain_to(pane_rect)
+            .vscroll(false)
             .default_width(dialog_width)
             .min_width(dialog_width)
             .max_width(dialog_width)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line_br))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(0.0),
-            )
+            .frame(floating_panel_frame(&pal, 0))
             .show(ctx, |ui| {
                 // Do not reuse an oversized width remembered from a previous
                 // frame: one unwrapped child used to expand the dialog permanently.
                 ui.set_width(dialog_width);
-                let _ = floating_dialog_header(
+                if floating_dialog_header(
                     ui,
                     &pal,
                     "SETTINGS",
                     "appearance, audio, video and updates",
-                    None,
-                );
+                    can_close.then_some("Close settings"),
+                ) {
+                    self.show_settings = false;
+                }
                 Frame::new()
                     .inner_margin(egui::Margin::symmetric(18, 16))
                     .show(ui, |ui| {
@@ -237,6 +233,7 @@ impl AppState {
                                 settings_field_label(ui, &pal, "Theme", None);
                                 egui::ComboBox::from_id_salt("settings-theme")
                                     .width(ui.available_width())
+                                    .truncate()
                                     .selected_text(
                                         RichText::new(self.theme.label())
                                             .color(pal.text2)
@@ -283,6 +280,7 @@ impl AppState {
                                 );
                                 egui::ComboBox::from_id_salt("settings-window-corners")
                                     .width(ui.available_width())
+                                    .truncate()
                                     .selected_text(
                                         RichText::new(self.window_frame_style.label())
                                             .color(pal.text2)
@@ -812,12 +810,9 @@ impl AppState {
         let mut open = self.show_update_prompt;
         let mut download = false;
         let mut later = false;
-        egui::Window::new("Update available")
-            .collapsible(false)
-            .resizable(false)
+        let pal = Palette::for_theme(self.theme);
+        floating_panel("Update available", &pal, self.pane_constrain_rect(), 440.0)
             .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .constrain_to(self.pane_constrain_rect())
             .show(ctx, |ui| {
                 ui.label(format!(
                     "Wire v{} is available. You are running v{}.",

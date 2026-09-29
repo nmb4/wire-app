@@ -114,6 +114,51 @@ pub(super) fn track_pane_viewport(current: Rect, candidate: Rect) -> Rect {
     }
 }
 
+/// A single geometry policy for floating panels. Widths are content widths:
+/// leave room for the frame, shadow, and the native window's rounded edge.
+pub(super) fn floating_panel_width(viewport: Rect, preferred: f32, padding: f32) -> f32 {
+    (viewport.width() - 32.0 - padding * 2.0 - 2.0)
+        .max(1.0)
+        .min(preferred)
+}
+
+pub(super) fn floating_panel_frame(pal: &Palette, padding: i8) -> Frame {
+    Frame::new()
+        .fill(pal.bg)
+        .stroke(Stroke::new(1.0_f32, pal.line_br))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(padding)
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(60),
+        })
+}
+
+/// Content-driven height, bounded to the viewport; long forms and lists scroll.
+/// Pin the current width every frame so remembered geometry cannot fight resize.
+pub(super) fn floating_panel<'a>(
+    title: &'a str,
+    pal: &Palette,
+    viewport: Rect,
+    preferred_width: f32,
+) -> egui::Window<'a> {
+    let width = floating_panel_width(viewport, preferred_width, 16.0);
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .constrain_to(viewport.shrink(16.0))
+        .default_width(width)
+        .min_width(width)
+        .max_width(width)
+        .min_height(0.0)
+        .max_height((viewport.height() - 128.0).max(1.0))
+        .vscroll(true)
+        .frame(floating_panel_frame(pal, 16))
+}
+
 pub(super) fn peer_volume_slider(
     ui: &mut Ui,
     pal: &Palette,
@@ -328,47 +373,57 @@ pub(super) fn floating_dialog_header(
     subtitle: &str,
     close_tooltip: Option<&str>,
 ) -> bool {
-    const RADIUS: u8 = 12;
     let mut closed = false;
     Frame::new()
         .fill(pal.panel)
         .corner_radius(CornerRadius {
-            nw: RADIUS,
-            ne: RADIUS,
+            nw: 14,
+            ne: 14,
             sw: 0,
             se: 0,
         })
         .inner_margin(egui::Margin::symmetric(18, 12))
         .show(ui, |ui| {
-            // Frame sizes to content — expand to the full content max so both
-            // left and right edges meet the panel, not just the text run.
-            ui.set_min_width(ui.available_width());
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(
-                    RichText::new(title)
-                        .family(kh_family())
-                        .color(pal.text)
-                        .size(16.0),
-                );
-                ui.label(
-                    RichText::new(subtitle)
-                        .color(pal.dim)
-                        .size(ui_font_size(11.5)),
-                );
+                // Reserve the close control before laying out text. A long
+                // subtitle wraps below the title instead of pushing it offscreen.
                 if let Some(tooltip) = close_tooltip {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ghost_icon_button(ui, pal, ph::X)
+                        closed = ghost_icon_button(ui, pal, ph::X)
                             .on_hover_text(tooltip)
-                            .clicked()
-                        {
-                            closed = true;
-                        }
+                            .clicked();
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| floating_panel_heading(ui, pal, title, subtitle),
+                        );
                     });
+                } else {
+                    ui.vertical(|ui| floating_panel_heading(ui, pal, title, subtitle));
                 }
             });
         });
     closed
+}
+
+fn floating_panel_heading(ui: &mut Ui, pal: &Palette, title: &str, subtitle: &str) {
+    ui.label(
+        RichText::new(title)
+            .family(kh_family())
+            .color(pal.text)
+            .size(16.0),
+    );
+    if !subtitle.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(subtitle)
+                    .color(pal.dim)
+                    .size(ui_font_size(11.5)),
+            )
+            .wrap(),
+        );
+    }
 }
 
 pub(super) fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Response {
@@ -480,11 +535,8 @@ pub(super) fn chat_navigation_button(
             ui.painter()
                 .circle_filled(center, avatar_size * 0.5, pal.panel2);
         }
-        ui.painter().circle_stroke(
-            center,
-            avatar_size * 0.5,
-            Stroke::new(1.0_f32, pal.line_br),
-        );
+        ui.painter()
+            .circle_stroke(center, avatar_size * 0.5, Stroke::new(1.0_f32, pal.line_br));
         if avatar.texture.is_none() {
             ui.painter().text(
                 center,
@@ -511,9 +563,7 @@ pub(super) fn chat_navigation_button(
                 let block_top = rect.center().y - avatar_size * 0.5;
                 ui.add_space((block_top - text_rect.top()).max(0.0));
             } else {
-                let label_row = ui
-                    .ctx()
-                    .fonts_mut(|fonts| fonts.row_height(&label_font));
+                let label_row = ui.ctx().fonts_mut(|fonts| fonts.row_height(&label_font));
                 ui.add_space(((text_rect.height() - label_row) * 0.5).max(0.0));
             }
             ui.add(
@@ -527,13 +577,9 @@ pub(super) fn chat_navigation_button(
             );
             if let Some(subtitle) = subtitle {
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(subtitle)
-                            .color(pal.dim)
-                            .font(subtitle_font),
-                    )
-                    .truncate()
-                    .selectable(false),
+                    egui::Label::new(RichText::new(subtitle).color(pal.dim).font(subtitle_font))
+                        .truncate()
+                        .selectable(false),
                 );
             }
         });
@@ -573,6 +619,98 @@ pub(super) const PARTICIPANT_CARD_SLOT_WIDTH: f32 = 250.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_panels_stay_bounded_when_resized_and_restore_their_width() {
+        let ctx = egui::Context::default();
+        let pal = Palette::for_theme(crate::theme::Theme::default());
+        for size in [
+            Vec2::new(1200.0, 900.0),
+            Vec2::new(460.0, 500.0),
+            Vec2::new(1200.0, 900.0),
+        ] {
+            let viewport = Rect::from_min_size(egui::Pos2::ZERO, size);
+            // Two passes allow egui to settle a content-driven window's position.
+            for _ in 0..2 {
+                ctx.begin_pass(egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                });
+                let shown = floating_panel("test floating panel", &pal, viewport, 560.0)
+                    .show(&ctx, |ui| {
+                        ui.set_width(ui.available_width());
+                        for _ in 0..50 {
+                            ui.add(
+                                egui::Label::new("A very long member or device name ".repeat(8))
+                                    .wrap(),
+                            );
+                        }
+                    })
+                    .unwrap();
+                assert!(
+                    shown.response.rect.width() <= size.x - 30.0,
+                    "{:?}",
+                    shown.response.rect
+                );
+                assert!(
+                    shown.response.rect.height() <= size.y - 30.0,
+                    "{:?}",
+                    shown.response.rect
+                );
+                let expected = floating_panel_width(viewport, 560.0, 16.0) + 34.0;
+                assert!(
+                    (shown.response.rect.width() - expected).abs() < 2.0,
+                    "expected {expected}, got {:?}",
+                    shown.response.rect
+                );
+                let _ = ctx.end_pass();
+            }
+        }
+    }
+
+    #[test]
+    fn floating_header_wraps_without_expanding_panel() {
+        let ctx = egui::Context::default();
+        let pal = Palette::for_theme(crate::theme::Theme::default());
+        // Tests do not load Wire's custom heading font.
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(
+            kh_family(),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, MIN_WINDOW_SIZE);
+        for close in [None, Some("Close settings")] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            });
+            let width = floating_panel_width(viewport, 500.0, 0.0);
+            let shown = floating_panel("header test", &pal, viewport, 500.0)
+                .title_bar(false)
+                .vscroll(false)
+                .min_width(width)
+                .max_width(width)
+                .frame(floating_panel_frame(&pal, 0))
+                .show(&ctx, |ui| {
+                    ui.set_width(width);
+                    floating_dialog_header(
+                        ui,
+                        &pal,
+                        "SETTINGS",
+                        "appearance, audio, video and updates ".repeat(4).as_str(),
+                        close,
+                    );
+                })
+                .unwrap();
+            assert!(
+                shown.response.rect.width() <= viewport.width() - 30.0,
+                "{:?}",
+                shown.response.rect
+            );
+            let _ = ctx.end_pass();
+        }
+    }
 
     #[test]
     fn participant_bar_adds_rows_as_the_window_narrows() {

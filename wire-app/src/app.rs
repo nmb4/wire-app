@@ -1297,7 +1297,13 @@ impl AppState {
                 || !self.configured
                 || self.show_update_prompt
                 || contacts_visible
-                || self.show_capture_picker;
+                || self.show_capture_picker
+                || self.show_profile_editor
+                || self.avatar_crop.is_some()
+                || self.chat.show_group_editor
+                || self.chat.show_group_members
+                || self.chat.friend_candidate.is_some()
+                || self.chat.image_preview.is_some();
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
                     presenter.hide_if_unused(force_hide);

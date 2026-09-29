@@ -6,7 +6,8 @@ use super::{
     unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
-        chat_surface, copy_to_clipboard, format_bytes, paint_chat_card, SidebarAvatar,
+        chat_surface, copy_to_clipboard, floating_panel, floating_panel_frame, format_bytes,
+        paint_chat_card, SidebarAvatar,
     },
     AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
     ImagePreview, ImagePreviewAction, ImagePreviewMode, KlipyAnimationState,
@@ -342,8 +343,8 @@ impl AppState {
             let footer_inner = footer.shrink2(Vec2::new(11.0, 8.0));
             let ctx_clone = ui.ctx().clone();
             let own_name = self.own_label();
-            let own_initial = crate::profile::display_name_initial(&own_name)
-                .unwrap_or_else(|| "Y".to_owned());
+            let own_initial =
+                crate::profile::display_name_initial(&own_name).unwrap_or_else(|| "Y".to_owned());
             let own_avatar = self.own_avatar_texture(&ctx_clone);
             let mut open_editor = false;
             ui.scope_builder(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
@@ -460,8 +461,8 @@ impl AppState {
             self.ensure_peer_profiles(visible);
         }
         let header_peer = conversation.direct_peer();
-        let header_initial = crate::profile::display_name_initial(&display_title)
-            .unwrap_or_else(|| "#".to_owned());
+        let header_initial =
+            crate::profile::display_name_initial(&display_title).unwrap_or_else(|| "#".to_owned());
         let ctx_clone = ui.ctx().clone();
         let header_avatar = header_peer.and_then(|peer| self.peer_avatar_texture(&ctx_clone, peer));
 
@@ -684,10 +685,8 @@ impl AppState {
                     self.chat.friend_candidate = Some(peer);
                     // Prefill a learned profile name so adding a stranger
                     // doesn't freeze their "Peer …" fallback as the contact.
-                    self.chat.friend_candidate_name = self
-                        .peer_profile_name(peer)
-                        .unwrap_or_default()
-                        .to_owned();
+                    self.chat.friend_candidate_name =
+                        self.peer_profile_name(peer).unwrap_or_default().to_owned();
                 }
                 if open_members {
                     self.chat.show_group_members = true;
@@ -848,9 +847,7 @@ impl AppState {
                     if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach files").clicked() {
                         self.pick_chat_files();
                     }
-                    let gif_button = ui
-                        .small_button("GIF")
-                        .on_hover_text("Search KLIPY GIFs");
+                    let gif_button = ui.small_button("GIF").on_hover_text("Search KLIPY GIFs");
                     let was_open = self.chat.gif_picker_open;
                     if gif_button.clicked() {
                         self.chat.gif_picker_open = !was_open;
@@ -1178,10 +1175,8 @@ impl AppState {
             } else {
                 // Gutter slot for the hover-revealed timestamp, painted
                 // after the row so we know whether the row is hovered.
-                let (gutter_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(COMPACT_GUTTER, 18.0),
-                    egui::Sense::hover(),
-                );
+                let (gutter_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(COMPACT_GUTTER, 18.0), egui::Sense::hover());
                 gutter_hover_rect = Some(gutter_rect);
             }
             let content_width = (ui.available_width() - 4.0).max(80.0);
@@ -1299,16 +1294,19 @@ impl AppState {
         }
 
         if gif_only_message {
-            row_response.response.interact(egui::Sense::click()).context_menu(|ui| {
-                chat_message_context_menu(
-                    ui,
-                    pal,
-                    message,
-                    own,
-                    &mut requested_restore,
-                    &mut requested_deletion,
-                );
-            });
+            row_response
+                .response
+                .interact(egui::Sense::click())
+                .context_menu(|ui| {
+                    chat_message_context_menu(
+                        ui,
+                        pal,
+                        message,
+                        own,
+                        &mut requested_restore,
+                        &mut requested_deletion,
+                    );
+                });
         }
 
         if requested_restore {
@@ -1529,8 +1527,7 @@ impl AppState {
                     url,
                     result,
                 } => {
-                    self.chat.gif_loads_in_flight =
-                        self.chat.gif_loads_in_flight.saturating_sub(1);
+                    self.chat.gif_loads_in_flight = self.chat.gif_loads_in_flight.saturating_sub(1);
                     if !matches!(
                         self.chat.gif_animations.get(&url),
                         Some(KlipyAnimationState::Loading {
@@ -1660,10 +1657,9 @@ impl AppState {
             };
             self.chat.gif_animations.remove(&oldest);
         }
-        self.chat.gif_animations.insert(
-            url.to_owned(),
-            KlipyAnimationState::Queued { preview_only },
-        );
+        self.chat
+            .gif_animations
+            .insert(url.to_owned(), KlipyAnimationState::Queued { preview_only });
         self.chat
             .gif_load_queue
             .push_back((url.to_owned(), preview_only));
@@ -1684,8 +1680,7 @@ impl AppState {
             ) {
                 continue;
             }
-            self.chat.gif_animation_request_id =
-                self.chat.gif_animation_request_id.wrapping_add(1);
+            self.chat.gif_animation_request_id = self.chat.gif_animation_request_id.wrapping_add(1);
             let request_id = self.chat.gif_animation_request_id;
             self.chat.gif_animations.insert(
                 url.clone(),
@@ -1787,11 +1782,7 @@ impl AppState {
         }
     }
 
-    fn ui_klipy_gif_picker(
-        &mut self,
-        ui: &mut Ui,
-        pal: &Palette,
-    ) -> Option<crate::klipy::GifItem> {
+    fn ui_klipy_gif_picker(&mut self, ui: &mut Ui, pal: &Palette) -> Option<crate::klipy::GifItem> {
         let mut search = false;
         let mut selected = None;
         let api_key_missing = self.klipy_api_key.trim().is_empty();
@@ -1827,7 +1818,10 @@ impl AppState {
             if edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 search = true;
             }
-            if ui.add_sized([button_width, 30.0], egui::Button::new("Search")).clicked() {
+            if ui
+                .add_sized([button_width, 30.0], egui::Button::new("Search"))
+                .clicked()
+            {
                 search = true;
             }
         });
@@ -1835,8 +1829,7 @@ impl AppState {
 
         if api_key_missing {
             ui.label(
-                RichText::new("Add your KLIPY app key in Settings to browse GIFs.")
-                    .color(pal.dim),
+                RichText::new("Add your KLIPY app key in Settings to browse GIFs.").color(pal.dim),
             );
             if action_button(ui, pal, "Open Settings", ButtonTone::Secondary).clicked() {
                 self.show_settings = true;
@@ -1868,8 +1861,7 @@ impl AppState {
                                             .show(ui, |ui| {
                                                 ui.set_min_size(Vec2::new(84.0, 58.0));
                                                 ui.label(
-                                                    RichText::new("Advertisement")
-                                                        .color(pal.dim),
+                                                    RichText::new("Advertisement").color(pal.dim),
                                                 );
                                                 if item.ad_content.is_some() {
                                                     ui.label(
@@ -1888,8 +1880,7 @@ impl AppState {
                                             egui::Sense::click(),
                                         );
                                         let corner_radius = self.gif_corner_radius(ui);
-                                        ui.painter()
-                                            .rect_filled(rect, corner_radius, pal.panel2);
+                                        ui.painter().rect_filled(rect, corner_radius, pal.panel2);
                                         if let Some((texture, width, height)) =
                                             self.klipy_gif_texture(ui.ctx(), url, true)
                                         {
@@ -2522,11 +2513,9 @@ impl AppState {
                         ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(&attachment.name).color(pal.text),
-                                )
-                                .truncate()
-                                .selectable(true),
+                                egui::Label::new(RichText::new(&attachment.name).color(pal.text))
+                                    .truncate()
+                                    .selectable(true),
                             );
                             ui.label(
                                 RichText::new(format_bytes(attachment.byte_len))
@@ -2797,7 +2786,11 @@ impl AppState {
                     .constrain_to(pane_rect)
                     .min_size(IMAGE_PREVIEW_MIN_SIZE)
                     .default_size(image_preview_default_size(pane_rect.size()))
-                    .default_pos(pane_rect.center())
+                    .default_pos(
+                        pane_rect.center() - image_preview_default_size(pane_rect.size()) * 0.5,
+                    )
+                    .max_size(pane_rect.size() - Vec2::splat(64.0))
+                    .frame(floating_panel_frame(pal, 12))
                     .show(ctx, |ui| {
                         action = image_preview_panel(
                             ui,
@@ -2873,19 +2866,14 @@ impl AppState {
 
     fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut open = self.chat.show_group_editor;
-        egui::Window::new("Create group")
-            .collapsible(false)
-            .resizable(false)
+        floating_panel("Create group", pal, self.pane_constrain_rect(), 400.0)
             .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .constrain_to(self.pane_constrain_rect())
-            .min_width(340.0)
             .show(ctx, |ui| {
                 ui.label("Group name");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.chat.group_name)
                         .hint_text("Weekend plans")
-                        .desired_width(300.0),
+                        .desired_width(ui.available_width()),
                 );
                 ui.add_space(8.0);
                 ui.label("Members");
@@ -2903,7 +2891,7 @@ impl AppState {
                     }
                 }
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
                         self.chat.show_group_editor = false;
                     }
@@ -2941,15 +2929,11 @@ impl AppState {
         let members = self.group_members_for(&conversation);
         let mut open = self.chat.show_group_members;
         let mut friend_to_add = None;
-        egui::Window::new("Group members")
-            .collapsible(false)
-            .resizable(false)
+        floating_panel("Group members", pal, self.pane_constrain_rect(), 480.0)
+            .enabled(self.chat.friend_candidate.is_none())
             .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .constrain_to(self.pane_constrain_rect())
-            .min_width(340.0)
             .show(ctx, |ui| {
-                ui.set_min_width(320.0);
+                ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(&conversation.title)
                         .color(pal.text)
@@ -2995,23 +2979,37 @@ impl AppState {
                         } else {
                             pal.text
                         };
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label(
-                                RichText::new(&member.text)
-                                    .color(member_color)
-                                    .size(ui_font_size(13.0)),
-                            );
-                            ui.label(
-                                RichText::new(match member.kind {
-                                    GroupMemberKind::You => "You",
-                                    GroupMemberKind::Friend => "Friend",
-                                    GroupMemberKind::Unknown => "Unknown ID",
-                                })
-                                .color(pal.dim)
-                                .size(ui_font_size(10.5)),
-                            );
-                        });
+                        let actions_width = if member.kind == GroupMemberKind::Unknown {
+                            148.0
+                        } else {
+                            38.0
+                        };
+                        let text_width = (ui.available_width() - actions_width).max(24.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_width, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&member.text)
+                                            .color(member_color)
+                                            .size(ui_font_size(13.0)),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&member.text);
+                                ui.label(
+                                    RichText::new(match member.kind {
+                                        GroupMemberKind::You => "You",
+                                        GroupMemberKind::Friend => "Friend",
+                                        GroupMemberKind::Unknown => "Unknown ID",
+                                    })
+                                    .color(pal.dim)
+                                    .size(ui_font_size(10.5)),
+                                );
+                            },
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if let Some(node_id) = member.node_id {
                                 if chat_lucide_icon_button(ui, pal, Icon::Copy)
@@ -3038,10 +3036,8 @@ impl AppState {
             self.chat.friend_candidate = Some(peer);
             // Prefill a learned profile name so adding a stranger doesn't
             // freeze their "Peer …" fallback as the contact.
-            self.chat.friend_candidate_name = self
-                .peer_profile_name(peer)
-                .unwrap_or_default()
-                .to_owned();
+            self.chat.friend_candidate_name =
+                self.peer_profile_name(peer).unwrap_or_default().to_owned();
         }
     }
 
@@ -3052,15 +3048,10 @@ impl AppState {
         let mut open = true;
         let mut add = false;
         let mut cancel = false;
-        egui::Window::new("Add friend")
-            .collapsible(false)
-            .resizable(false)
+        floating_panel("Add friend", pal, self.pane_constrain_rect(), 400.0)
             .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .constrain_to(self.pane_constrain_rect())
-            .min_width(340.0)
             .show(ctx, |ui| {
-                ui.set_min_width(320.0);
+                ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(format!("Peer {}", peer.fmt_short()))
                         .monospace()
@@ -3082,7 +3073,7 @@ impl AppState {
                     add = true;
                 }
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if action_button(ui, pal, "Add friend", ButtonTone::Primary).clicked() {
                         add = true;
                     }
@@ -3188,66 +3179,70 @@ fn image_preview_panel(
     if downloadable_attachment.data.is_none() {
         downloadable_attachment.data = textures.data(&preview.attachment.id);
     }
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!(
-                "{} × {} · {}",
-                preview.attachment.width,
-                preview.attachment.height,
-                format_bytes(preview.attachment.byte_len)
-            ))
-            .color(pal.dim),
+    ui.label(
+        RichText::new(format!(
+            "{} × {} · {}",
+            preview.attachment.width,
+            preview.attachment.height,
+            format_bytes(preview.attachment.byte_len)
+        ))
+        .color(pal.dim),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.with_layout(
+            Layout::right_to_left(Align::Center).with_main_wrap(true),
+            |ui| {
+                if toolbar_button(ui, pal, Icon::X, "Close", false).clicked() {
+                    action = Some(ImagePreviewAction::Close);
+                }
+                if preview.draft && toolbar_button(ui, pal, Icon::Trash2, "Delete", false).clicked()
+                {
+                    action = Some(ImagePreviewAction::Delete);
+                }
+                if toolbar_button(ui, pal, Icon::Download, "Download", false).clicked() {
+                    save_chat_attachment(&downloadable_attachment);
+                }
+                if toolbar_button(
+                    ui,
+                    pal,
+                    Icon::Fullscreen,
+                    "Fullscreen",
+                    preview.mode == ImagePreviewMode::Fullscreen,
+                )
+                .clicked()
+                {
+                    action = Some(ImagePreviewAction::SetMode(
+                        if preview.mode == ImagePreviewMode::Fullscreen {
+                            ImagePreviewMode::Floating
+                        } else {
+                            ImagePreviewMode::Fullscreen
+                        },
+                    ));
+                }
+                if toolbar_button(
+                    ui,
+                    pal,
+                    Icon::Expand,
+                    "Fill window",
+                    preview.mode == ImagePreviewMode::FillWindow,
+                )
+                .clicked()
+                {
+                    action = Some(ImagePreviewAction::SetMode(
+                        if preview.mode == ImagePreviewMode::FillWindow {
+                            ImagePreviewMode::Floating
+                        } else {
+                            ImagePreviewMode::FillWindow
+                        },
+                    ));
+                }
+                if preview.mode != ImagePreviewMode::Floating
+                    && toolbar_button(ui, pal, Icon::Minimize2, "Floating", false).clicked()
+                {
+                    action = Some(ImagePreviewAction::SetMode(ImagePreviewMode::Floating));
+                }
+            },
         );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if toolbar_button(ui, pal, Icon::X, "Close", false).clicked() {
-                action = Some(ImagePreviewAction::Close);
-            }
-            if preview.draft && toolbar_button(ui, pal, Icon::Trash2, "Delete", false).clicked() {
-                action = Some(ImagePreviewAction::Delete);
-            }
-            if toolbar_button(ui, pal, Icon::Download, "Download", false).clicked() {
-                save_chat_attachment(&downloadable_attachment);
-            }
-            if toolbar_button(
-                ui,
-                pal,
-                Icon::Fullscreen,
-                "Fullscreen",
-                preview.mode == ImagePreviewMode::Fullscreen,
-            )
-            .clicked()
-            {
-                action = Some(ImagePreviewAction::SetMode(
-                    if preview.mode == ImagePreviewMode::Fullscreen {
-                        ImagePreviewMode::Floating
-                    } else {
-                        ImagePreviewMode::Fullscreen
-                    },
-                ));
-            }
-            if toolbar_button(
-                ui,
-                pal,
-                Icon::Expand,
-                "Fill window",
-                preview.mode == ImagePreviewMode::FillWindow,
-            )
-            .clicked()
-            {
-                action = Some(ImagePreviewAction::SetMode(
-                    if preview.mode == ImagePreviewMode::FillWindow {
-                        ImagePreviewMode::Floating
-                    } else {
-                        ImagePreviewMode::FillWindow
-                    },
-                ));
-            }
-            if preview.mode != ImagePreviewMode::Floating
-                && toolbar_button(ui, pal, Icon::Minimize2, "Floating", false).clicked()
-            {
-                action = Some(ImagePreviewAction::SetMode(ImagePreviewMode::Floating));
-            }
-        });
     });
     ui.separator();
     if let Some(texture) = attachment_texture(ui.ctx(), textures, &preview.attachment) {
@@ -3630,7 +3625,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_row_probes_avatar_name_and_body_geometry() {        // Headless probe mirroring `ui_compact_chat_message`'s skeleton:
+    fn compact_row_probes_avatar_name_and_body_geometry() {
+        // Headless probe mirroring `ui_compact_chat_message`'s skeleton:
         // reports where the avatar allocation, name label, and body label
         // actually land so alignment regressions show up as numbers.
         let context = egui::Context::default();
@@ -3670,27 +3666,15 @@ mod tests {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                let name_rect = ui
-                                    .label(
-                                        RichText::new("Macbook")
-                                            .strong()
-                                            .size(16.0),
-                                    )
-                                    .rect;
+                                let name_rect =
+                                    ui.label(RichText::new("Macbook").strong().size(16.0)).rect;
                                 tops.1 = name_rect.min.y;
                                 tops.4 = name_rect.min.x;
-                                ui.label(
-                                    RichText::new("8/16/2026 18:17").size(13.0),
-                                );
+                                ui.label(RichText::new("8/16/2026 18:17").size(13.0));
                             });
                             ui.add_space(1.0);
                             let body_rect = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new("jfg").size(15.0),
-                                    )
-                                    .wrap(),
-                                )
+                                .add(egui::Label::new(RichText::new("jfg").size(15.0)).wrap())
                                 .rect;
                             tops.2 = body_rect.min.y;
                             tops.3 = body_rect.min.x;
@@ -3713,10 +3697,7 @@ mod tests {
             (body_left - name_left).abs() < 0.6,
             "body must start at the name's x"
         );
-        assert!(
-            body_top > name_top,
-            "body must sit below the name row"
-        );
+        assert!(body_top > name_top, "body must sit below the name row");
     }
 
     #[test]
@@ -3741,12 +3722,14 @@ mod tests {
                     time_font,
                     egui::Color32::WHITE,
                 );
-                let name_base = name_galley.rows.first().and_then(|row| {
-                    row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace())
-                });
-                let time_base = time_galley.rows.first().and_then(|row| {
-                    row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace())
-                });
+                let name_base = name_galley
+                    .rows
+                    .first()
+                    .and_then(|row| row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace()));
+                let time_base = time_galley
+                    .rows
+                    .first()
+                    .and_then(|row| row.glyphs.iter().find(|glyph| !glyph.chr.is_whitespace()));
                 out = (
                     name_galley.rect.height(),
                     time_galley.rect.height(),
@@ -3755,15 +3738,24 @@ mod tests {
                 );
             });
         });
-        eprintln!("name_box={} time_box={} name_base={} time_base={}", out.0, out.1, out.2, out.3);
+        eprintln!(
+            "name_box={} time_box={} name_base={} time_base={}",
+            out.0, out.1, out.2, out.3
+        );
         // Name rows center the timestamp: with these boxes that lands the
         // timestamp baseline within half a pixel of the name baseline,
         // while bottom alignment would sink it ~2px. If a font swap flips
         // this comparison, the name row layout must be revisited.
         let bottom_err = ((out.0 - out.1) + out.3 - out.2).abs();
         let center_err = ((out.0 - out.1) / 2.0 + out.3 - out.2).abs();
-        assert!(center_err < 0.6, "centered timestamp must sit on the baseline");
-        assert!(center_err < bottom_err, "centering must beat bottom alignment");
+        assert!(
+            center_err < 0.6,
+            "centered timestamp must sit on the baseline"
+        );
+        assert!(
+            center_err < bottom_err,
+            "centering must beat bottom alignment"
+        );
     }
 
     #[test]
