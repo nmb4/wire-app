@@ -1,6 +1,6 @@
 [package]
 name = "wire-app"
-version = "0.6.9"
+version = "0.7.3"
 edition = "2021"
 repository = { workspace = true }
 license = { workspace = true }
@@ -37,6 +37,7 @@ futures-lite = "2.6"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "io-util"] }
 xcap = "0.4"
 image = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 fast_image_resize = { version = "5.1", features = ["image"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "std"] }
@@ -60,7 +61,6 @@ sysinfo = { version = "=0.31.4", default-features = false, features = ["system"]
 tray-icon = { version = "0.25.1", default-features = false }
 windows-core = "0.61"
 clipboard-win = "5.4"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 raw-window-handle = "0.6"
 # `eframe` has default features disabled above, so select the Vulkan backend
 # explicitly. This also keeps Windows and Linux on the same presentation path.

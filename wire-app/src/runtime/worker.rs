@@ -1215,8 +1215,11 @@ impl Worker {
             Command::RestoreChatMessage {
                 conversation_id,
                 message_id,
+                scope,
             } => {
-                self.chat.restore_message(conversation_id, message_id).await;
+                self.chat
+                    .restore_message(conversation_id, message_id, scope)
+                    .await;
             }
             Command::ClearChatHistory { conversation_id } => {
                 self.chat.clear_history(conversation_id).await;

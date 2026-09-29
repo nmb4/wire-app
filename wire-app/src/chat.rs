@@ -145,6 +145,10 @@ pub struct ChatMessage {
     pub stopped_file_offers: BTreeSet<String>,
     #[serde(skip)]
     pub deletion: Option<MessageDeletion>,
+    /// Reconstructed from a version-2 shared deletion record. This lets the
+    /// timeline discard an older fast-path tombstone after a restore.
+    #[serde(skip)]
+    pub replicated_restoration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -158,10 +162,25 @@ pub struct ChatAttachment {
     pub width: u32,
     pub height: u32,
     pub hash: String,
+    /// Exact media URL returned by an external provider, loaded directly by clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
+    /// Provider item id used for provider-side share tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_slug: Option<String>,
     /// Present only on the local UI side or after the referenced blob was
     /// downloaded. The original bytes are never embedded in message metadata.
     #[serde(skip)]
     pub data: Option<Arc<Vec<u8>>>,
+}
+
+impl ChatAttachment {
+    pub fn is_klipy_gif(&self) -> bool {
+        self.kind == AttachmentKind::Image
+            && self.media_type == "image/gif"
+            && self.external_url.is_some()
+            && self.provider_slug.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +242,7 @@ impl ChatMessage {
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),
             deletion: None,
+            replicated_restoration: false,
         }
     }
 
@@ -275,13 +295,37 @@ impl ChatMessage {
             bail!("message has more than 128 attachments");
         }
         for attachment in &self.attachments {
+            let has_provider_metadata =
+                attachment.external_url.is_some() || attachment.provider_slug.is_some();
             if attachment.id.is_empty()
                 || attachment.name.is_empty()
                 || attachment.name.len() > 1024
                 || attachment.media_type.len() > 128
-                || attachment.byte_len == 0
+                || (attachment.byte_len == 0 && !attachment.is_klipy_gif())
                 || (attachment.kind == AttachmentKind::Image
+                    && !attachment.is_klipy_gif()
                     && (attachment.width == 0 || attachment.height == 0))
+                || (attachment.is_klipy_gif()
+                    && (attachment.width == 0
+                        || attachment.height == 0
+                        || attachment
+                            .external_url
+                            .as_deref()
+                            .is_none_or(|url| !crate::klipy::is_klipy_media_url(url))
+                        || attachment
+                            .provider_slug
+                            .as_deref()
+                            .is_none_or(str::is_empty)))
+                || (has_provider_metadata
+                    && (!attachment.is_klipy_gif()
+                        || attachment
+                            .external_url
+                            .as_ref()
+                            .is_some_and(|url| url.len() > 8192)
+                        || attachment
+                            .provider_slug
+                            .as_ref()
+                            .is_some_and(|slug| slug.len() > 512)))
                 || (attachment.kind == AttachmentKind::InlineFile
                     && (attachment.byte_len > 64 * 1024 || attachment.media_type != "text/plain"))
                 || Hash::from_str(&attachment.hash).is_err()
@@ -309,12 +353,24 @@ impl ReplicatedDeletion {
         }
     }
 
+    fn restored(message_id: String) -> Self {
+        Self {
+            version: 2,
+            message_id,
+            deleted_at: now_millis(),
+        }
+    }
+
+    fn is_restoration(&self) -> bool {
+        self.version == 2
+    }
+
     fn entry_key(&self) -> String {
         format!("deletion/{}", self.message_id)
     }
 
     fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             bail!("unsupported deletion version {}", self.version);
         }
         if !is_message_id(&self.message_id) {
@@ -964,9 +1020,10 @@ pub struct ChatService {
     /// docs author (that would forge peer entries); merged into the timeline
     /// until `load_messages` sees the real replica.
     staged_inbound: BTreeMap<String, BTreeMap<String, ChatMessage>>,
-    /// Author-validated tombstones received over the chat ALPN before Docs
-    /// replication lands them. conversation_id -> message_id -> author_id.
-    staged_deletions: BTreeMap<String, BTreeMap<String, String>>,
+    /// Author-validated deletion states received over chat ALPN before Docs
+    /// replication lands them. The version distinguishes delete from restore.
+    /// conversation_id -> message_id -> (author_id, deletion state).
+    staged_deletions: BTreeMap<String, BTreeMap<String, (String, ReplicatedDeletion)>>,
     /// In-flight background wakes per conversation — prevents a losing race
     /// from parking deliveries as Queued right after a successful wake.
     wake_inflight: BTreeMap<String, u32>,
@@ -1760,6 +1817,8 @@ impl ChatService {
                         width: 0,
                         height: 0,
                         hash: hash.to_string(),
+                        external_url: None,
+                        provider_slug: None,
                         data: None,
                     });
                 }
@@ -1805,6 +1864,7 @@ impl ChatService {
             .iter()
             .find(|attachment| {
                 attachment.hash == hash_text
+                    && !attachment.is_klipy_gif()
                     && matches!(
                         attachment.kind,
                         AttachmentKind::FileOffer | AttachmentKind::Image
@@ -2372,6 +2432,9 @@ impl ChatService {
         for stored in self.index.conversations.values() {
             for message in self.load_messages(stored).await? {
                 for attachment in message.attachments {
+                    if attachment.is_klipy_gif() {
+                        continue;
+                    }
                     if attachment.kind == AttachmentKind::FileOffer
                         && message.author_id == self.our_node_id.to_string()
                     {
@@ -2437,6 +2500,11 @@ impl ChatService {
 
     async fn import_attachment_bytes(&self, message: &ChatMessage) -> Result<()> {
         for attachment in &message.attachments {
+            // Provider GIFs deliberately carry only their trusted remote URL.
+            // They have no local Iroh blob to import before the message is sent.
+            if attachment.is_klipy_gif() {
+                continue;
+            }
             let expected = Hash::from_str(&attachment.hash)?;
             if let Some(data) = &attachment.data {
                 if data.len() as u64 != attachment.byte_len
@@ -2579,7 +2647,7 @@ impl ChatService {
             .entry(conversation_id.to_owned())
             .or_default();
         for attachment in &message.attachments {
-            if attachment.kind == AttachmentKind::FileOffer {
+            if attachment.kind == AttachmentKind::FileOffer || attachment.is_klipy_gif() {
                 continue;
             }
             entries.insert(
@@ -3263,16 +3331,23 @@ impl ChatService {
             if deletion.validate().is_err() {
                 continue;
             }
-            let inserted = staged
-                .insert(deletion.message_id.clone(), remote_s.clone())
-                .is_none();
+            let should_replace = staged
+                .get(&deletion.message_id)
+                .is_none_or(|(_, current)| deletion.deleted_at >= current.deleted_at);
+            if should_replace {
+                staged.insert(
+                    deletion.message_id.clone(),
+                    (remote_s.clone(), deletion.clone()),
+                );
+            }
             accepted.push(deletion.message_id.clone());
-            if inserted {
+            if should_replace {
                 info!(
                     conversation = %log_id(conversation_id),
                     peer = %remote.fmt_short(),
                     message = %log_id(&deletion.message_id),
-                    "accepted message deletion over ALPN fast path"
+                    restored = deletion.is_restoration(),
+                    "accepted message deletion state over ALPN fast path"
                 );
             }
         }
@@ -3457,24 +3532,45 @@ impl ChatService {
         }
     }
 
-    pub async fn restore_message(&mut self, conversation_id: String, message_id: String) {
-        match self.restore_message_locally(&conversation_id, &message_id) {
-            Ok(()) => {
+    pub async fn restore_message(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        scope: DeleteScope,
+    ) {
+        let result = match scope {
+            DeleteScope::Local => self
+                .restore_message_locally(&conversation_id, &message_id)
+                .map(|()| None),
+            DeleteScope::Everyone => self
+                .insert_replicated_restoration(&conversation_id, &message_id)
+                .await
+                .map(Some),
+        };
+        match result {
+            Ok(restoration) => {
                 info!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
-                    "local message tombstone removed"
+                    ?scope,
+                    "message restoration committed"
                 );
                 if let Err(error) = self.publish_timeline(&conversation_id).await {
                     self.queued.push_back(ChatNotification::Error(format!(
                         "Could not refresh restored message: {error:#}"
                     )));
                 }
+                if let Some(restoration) = restoration {
+                    self.register_deletion_delivery(&conversation_id, restoration);
+                    self.spawn_doc_sync(&conversation_id);
+                    self.spawn_wake(&conversation_id);
+                }
             }
             Err(error) => {
                 warn!(
                     conversation = %log_id(&conversation_id),
                     message = %log_id(&message_id),
+                    ?scope,
                     "failed to restore message: {error:#}"
                 );
                 if let Err(refresh_error) = self.publish_timeline(&conversation_id).await {
@@ -3628,18 +3724,26 @@ impl ChatService {
         let Some(staged) = self.staged_deletions.get_mut(conversation_id) else {
             return;
         };
-        staged.retain(|message_id, author_id| {
+        staged.retain(|message_id, (author_id, deletion)| {
             let Some(message) = messages
                 .iter_mut()
                 .find(|message| message.message_id == *message_id)
             else {
                 return true;
             };
-            if message.deletion == Some(MessageDeletion::Everyone) {
+            if message.replicated_restoration {
                 return false;
             }
             if message.author_id == *author_id {
-                message.deletion = Some(MessageDeletion::Everyone);
+                if deletion.is_restoration() {
+                    if message.deletion != Some(MessageDeletion::Local) {
+                        message.deletion = None;
+                    }
+                } else if message.deletion == Some(MessageDeletion::Everyone) {
+                    return false;
+                } else {
+                    message.deletion = Some(MessageDeletion::Everyone);
+                }
             }
             true
         });
@@ -4041,6 +4145,7 @@ impl ChatService {
             }
             for attachment in &message.attachments {
                 if attachment.kind == AttachmentKind::FileOffer
+                    || attachment.is_klipy_gif()
                     || message
                         .file_receivers
                         .get(&attachment.hash)
@@ -4188,6 +4293,7 @@ impl ChatService {
                     && message.attachments.iter().any(|attachment| {
                         attachment.hash == hash_string
                             && attachment.kind != AttachmentKind::FileOffer
+                            && !attachment.is_klipy_gif()
                             && attachment.data.is_none()
                             && !(attachment.kind == AttachmentKind::Image
                                 && self
@@ -4273,6 +4379,7 @@ impl ChatService {
             let providers = self.attachment_providers(conversation_id, author);
             for attachment in &message.attachments {
                 if attachment.kind == AttachmentKind::FileOffer
+                    || attachment.is_klipy_gif()
                     || !self.retention.includes(message.sent_at, now_millis())
                 {
                     continue;
@@ -4556,7 +4663,13 @@ impl ChatService {
             }
             if let Some((message, message_author)) = messages.get_mut(&deletion.message_id) {
                 if entry.author() == *message_author {
-                    message.deletion = Some(MessageDeletion::Everyone);
+                    if deletion.is_restoration() {
+                        message.deletion = None;
+                        message.replicated_restoration = true;
+                    } else {
+                        message.deletion = Some(MessageDeletion::Everyone);
+                        message.replicated_restoration = false;
+                    }
                 }
             }
         }
@@ -4788,6 +4901,57 @@ impl ChatService {
         )
         .await?;
         Ok(deletion)
+    }
+
+    async fn insert_replicated_restoration(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<ReplicatedDeletion> {
+        if !is_message_id(message_id) {
+            bail!("invalid message id");
+        }
+        let stored = self
+            .index
+            .conversations
+            .get(conversation_id)
+            .context("unknown conversation")?;
+        let messages = self.load_messages(stored).await?;
+        let message = messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .context("message is no longer available")?;
+        if message.author_id != self.our_node_id.to_string() {
+            bail!("only the author can restore a message for everyone");
+        }
+        if message.deletion != Some(MessageDeletion::Everyone) {
+            bail!("message is not deleted for everyone");
+        }
+
+        let ticket = DocTicket::from_str(&stored.ticket)?;
+        let document_id = NamespaceId::from_str(&stored.public.document_id)?;
+        let doc = match self.docs.open(document_id).await {
+            Ok(Some(doc)) => doc,
+            _ => self.docs.import(ticket).await?,
+        };
+        let mut authored_entries = doc
+            .get_many(
+                Query::author(self.author)
+                    .key_exact(message.entry_key())
+                    .build(),
+            )
+            .await?;
+        if authored_entries.next().await.transpose()?.is_none() {
+            bail!("the local identity did not author this message");
+        }
+        let restoration = ReplicatedDeletion::restored(message_id.to_owned());
+        doc.set_bytes(
+            self.author,
+            restoration.entry_key(),
+            serde_json::to_vec(&restoration)?,
+        )
+        .await?;
+        Ok(restoration)
     }
 
     async fn insert_message(&self, conversation_id: &str, message: &ChatMessage) -> Result<()> {
@@ -5652,6 +5816,8 @@ mod tests {
             width: 1,
             height: 1,
             hash,
+            external_url: None,
+            provider_slug: None,
             data: Some(bytes),
         };
         let message = ChatMessage::new_with_attachments(node(1), String::new(), vec![attachment]);
@@ -5675,6 +5841,8 @@ mod tests {
             width: 0,
             height: 0,
             hash: hash.clone(),
+            external_url: None,
+            provider_slug: None,
             data: None,
         };
         let mut message =
@@ -6185,7 +6353,11 @@ mod tests {
         wait_for_deletion(&mut right, &later_id, MessageDeletion::Local).await?;
 
         right
-            .restore_message(conversation_id.clone(), later_id.clone())
+            .restore_message(
+                conversation_id.clone(),
+                later_id.clone(),
+                DeleteScope::Local,
+            )
             .await;
         let right_stored = right.index.conversations[&conversation_id].clone();
         let restored_messages = right.load_messages(&right_stored).await?;
@@ -6240,6 +6412,8 @@ mod tests {
             width: 1,
             height: 1,
             hash: image_hash.clone(),
+            external_url: None,
+            provider_slug: None,
             data: Some(Arc::new(image.clone())),
         };
         let message = ChatMessage::new_with_attachments(
@@ -6291,6 +6465,8 @@ mod tests {
             width: 0,
             height: 0,
             hash: hash.clone(),
+            external_url: None,
+            provider_slug: None,
             data: Some(Arc::new(bytes.clone())),
         };
         let message = ChatMessage::new_with_attachments(

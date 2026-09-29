@@ -8,6 +8,7 @@ mod dev_pair;
 mod global_hotkeys;
 mod hidden_event_loop;
 pub mod host;
+mod klipy;
 mod notifications;
 mod overlay_window;
 mod persistence;

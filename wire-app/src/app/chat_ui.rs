@@ -9,7 +9,7 @@ use super::{
         chat_surface, copy_to_clipboard, format_bytes, paint_chat_card, SidebarAvatar,
     },
     AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
-    ImagePreview, ImagePreviewAction, ImagePreviewMode,
+    ImagePreview, ImagePreviewAction, ImagePreviewMode, KlipyAnimationState,
 };
 use crate::{
     chat::{
@@ -23,7 +23,10 @@ use crate::{
         ui_font_size, ButtonTone, Palette,
     },
 };
-use egui::{Align, Align2, CornerRadius, Frame, Layout, RichText, Stroke, Ui, Vec2};
+use egui::{
+    Align, Align2, CornerRadius, Frame, Layout, PopupCloseBehavior, RectAlign, RichText, Stroke,
+    Ui, Vec2,
+};
 use egui_phosphor::regular as ph;
 use iroh::NodeId;
 use lucide_icons::Icon;
@@ -32,10 +35,19 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 use tracing::warn;
 
 const FILE_OFFER_CARD_MAX_WIDTH: f32 = 420.0;
+const KLIPY_PICKER_WIDTH: f32 = 332.0;
+const KLIPY_GIF_TILE_WIDTH: f32 = 96.0;
+const KLIPY_GIF_PREVIEW_HEIGHT: f32 = 72.0;
+const KLIPY_GIF_GRID_GAP: f32 = 8.0;
+const KLIPY_GIF_MIN_VISIBLE_ROWS: f32 = 2.0;
+const MAX_CONCURRENT_KLIPY_LOADS: usize = 4;
+const MAX_KLIPY_PREVIEWS: usize = 24;
+const MAX_KLIPY_ANIMATIONS: usize = 8;
 
 impl AppState {
     pub(super) fn ui_chat_chrome_body(
@@ -389,6 +401,7 @@ impl AppState {
     }
 
     fn ui_chat_main(&mut self, ui: &mut Ui, pal: &Palette) {
+        self.poll_klipy_events(ui.ctx());
         let selected = self
             .chat
             .selected
@@ -835,6 +848,35 @@ impl AppState {
                     if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach files").clicked() {
                         self.pick_chat_files();
                     }
+                    let gif_button = ui
+                        .small_button("GIF")
+                        .on_hover_text("Search KLIPY GIFs");
+                    let was_open = self.chat.gif_picker_open;
+                    if gif_button.clicked() {
+                        self.chat.gif_picker_open = !was_open;
+                        if self.chat.gif_picker_open && self.chat.gif_search_results.is_empty() {
+                            self.start_klipy_search(String::new(), ui.ctx());
+                        }
+                    }
+                    let mut picker_open = self.chat.gif_picker_open;
+                    let selected = egui::Popup::from_response(&gif_button)
+                        .id(egui::Id::new("klipy-gif-picker"))
+                        .open_bool(&mut picker_open)
+                        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+                        .align(RectAlign::TOP_START)
+                        .gap(6.0)
+                        .width(KLIPY_PICKER_WIDTH)
+                        .show(|ui| self.ui_klipy_gif_picker(ui, pal))
+                        .and_then(|response| response.inner);
+                    if let Some(item) = selected {
+                        picker_open = false;
+                        self.clear_klipy_previews();
+                        self.send_klipy_gif(&conversation.id, item);
+                    }
+                    if was_open && !picker_open {
+                        self.clear_klipy_previews();
+                    }
+                    self.chat.gif_picker_open = picker_open;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let button_send = chat_send_button(ui, pal).clicked();
                         if keyboard_send || button_send {
@@ -907,6 +949,7 @@ impl AppState {
             accent_color_for(peer_accent, pal.text)
         };
         let opacity = chat_delivery_opacity(state);
+        let body_klipy_gif = crate::klipy::gif_url_from_message_body(&message.body);
         let time = format_chat_timestamp(message.sent_at, chat::now_millis());
         let mut requested_deletion = None;
         let mut requested_restore = false;
@@ -975,7 +1018,9 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_max_width(640.0);
-                                if message.deletion.is_some() || !message.body.trim().is_empty() {
+                                if message.deletion.is_some()
+                                    || (!message.body.trim().is_empty() && body_klipy_gif.is_none())
+                                {
                                     let body_response = ui.add(
                                         egui::Label::new(chat_message_body_text(
                                             message, pal, opacity,
@@ -1022,7 +1067,9 @@ impl AppState {
             },
         );
         if requested_restore {
-            self.restore_chat_message(conversation_id, &message.message_id);
+            if let Some(scope) = message_restore_scope(message, own) {
+                self.restore_chat_message(conversation_id, &message.message_id, scope);
+            }
         } else if let Some(scope) = requested_deletion {
             self.delete_chat_message(conversation_id, &message.message_id, scope);
         }
@@ -1074,10 +1121,15 @@ impl AppState {
             None
         };
         let opacity = chat_delivery_opacity(state);
+        let body_klipy_gif = crate::klipy::gif_url_from_message_body(&message.body);
         let mut requested_deletion = None;
         let mut requested_restore = false;
         let now = chat::now_millis();
         let mut gutter_hover_rect: Option<egui::Rect> = None;
+        let gif_only_message = body_klipy_gif.is_some()
+            || (message.body.trim().is_empty()
+                && !message.attachments.is_empty()
+                && message.attachments.iter().all(ChatAttachment::is_klipy_gif));
 
         // Discord-cozy layout: a fixed gutter holds the 36px avatar for group
         // starts (top-aligned) and reveals a small timestamp on hover for
@@ -1189,7 +1241,9 @@ impl AppState {
                             Layout::top_down(Align::Min),
                             |ui| {
                                 ui.set_max_width(body_width);
-                                if message.deletion.is_some() || !message.body.trim().is_empty() {
+                                if message.deletion.is_some()
+                                    || (!message.body.trim().is_empty() && body_klipy_gif.is_none())
+                                {
                                     let body_response = ui.add(
                                         egui::Label::new(chat_message_body_text(
                                             message, pal, opacity,
@@ -1244,8 +1298,23 @@ impl AppState {
             }
         }
 
+        if gif_only_message {
+            row_response.response.interact(egui::Sense::click()).context_menu(|ui| {
+                chat_message_context_menu(
+                    ui,
+                    pal,
+                    message,
+                    own,
+                    &mut requested_restore,
+                    &mut requested_deletion,
+                );
+            });
+        }
+
         if requested_restore {
-            self.restore_chat_message(conversation_id, &message.message_id);
+            if let Some(scope) = message_restore_scope(message, own) {
+                self.restore_chat_message(conversation_id, &message.message_id, scope);
+            }
         } else if let Some(scope) = requested_deletion {
             self.delete_chat_message(conversation_id, &message.message_id, scope);
         }
@@ -1286,7 +1355,12 @@ impl AppState {
         });
     }
 
-    fn restore_chat_message(&mut self, conversation_id: &str, message_id: &str) {
+    fn restore_chat_message(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+        scope: DeleteScope,
+    ) {
         if let Some(message) = self
             .chat
             .timelines
@@ -1302,6 +1376,7 @@ impl AppState {
         self.cmd(Command::RestoreChatMessage {
             conversation_id: conversation_id.to_owned(),
             message_id: message_id.to_owned(),
+            scope,
         });
     }
 
@@ -1331,7 +1406,11 @@ impl AppState {
             });
             return;
         }
-        let mut message = ChatMessage::new_with_attachments(author, body, attachments);
+        let message = ChatMessage::new_with_attachments(author, body, attachments);
+        self.dispatch_chat_message(conversation_id, message);
+    }
+
+    fn dispatch_chat_message(&mut self, conversation_id: &str, mut message: ChatMessage) {
         // Stamp our current profile so strangers see a name + avatar + color.
         if !self.own_profile_name.trim().is_empty() {
             message = message.with_author_profile(
@@ -1358,6 +1437,601 @@ impl AppState {
             conversation_id: conversation_id.to_owned(),
             message,
         });
+    }
+
+    fn ensure_klipy_event_channel(&mut self) {
+        if self.chat.klipy_event_tx.is_none() || self.chat.klipy_event_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.chat.klipy_event_tx = Some(tx);
+            self.chat.klipy_event_rx = Some(rx);
+        }
+    }
+
+    fn start_klipy_search(&mut self, query: String, ctx: &egui::Context) {
+        let api_key = self.klipy_api_key.trim().to_owned();
+        if api_key.is_empty() {
+            self.chat.gif_search_error =
+                Some("Add a KLIPY API key in Settings to browse GIFs.".to_owned());
+            self.chat.gif_search_loading = false;
+            self.chat.gif_search_results.clear();
+            return;
+        }
+        let Some(customer_id) = self.our_node_id.map(|id| id.to_string()) else {
+            self.chat.gif_search_error =
+                Some("Chat is still connecting to your Wire identity.".to_owned());
+            self.chat.gif_search_loading = false;
+            return;
+        };
+        self.ensure_klipy_event_channel();
+        self.chat.gif_search_request_id = self.chat.gif_search_request_id.wrapping_add(1);
+        let request_id = self.chat.gif_search_request_id;
+        let query = if query.trim().is_empty() {
+            String::new()
+        } else {
+            query
+        };
+        self.clear_klipy_previews();
+        self.chat.gif_search_loading = true;
+        self.chat.gif_search_error = None;
+        self.chat.gif_search_results.clear();
+        let tx = self
+            .chat
+            .klipy_event_tx
+            .as_ref()
+            .expect("channel initialized")
+            .clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::klipy::search_gifs(&api_key, &customer_id, &query)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(crate::klipy::UiEvent::SearchFinished {
+                request_id,
+                query,
+                result,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_klipy_events(&mut self, ctx: &egui::Context) {
+        let events: Vec<_> = self
+            .chat
+            .klipy_event_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                crate::klipy::UiEvent::SearchFinished {
+                    request_id,
+                    query,
+                    result,
+                } => {
+                    if request_id != self.chat.gif_search_request_id {
+                        continue;
+                    }
+                    self.chat.gif_search_loading = false;
+                    match result {
+                        Ok(results) => {
+                            self.chat.gif_search_results = results;
+                            self.chat.gif_results_query = query;
+                            self.chat.gif_search_error = None;
+                        }
+                        Err(error) => {
+                            self.chat.gif_search_results.clear();
+                            self.chat.gif_search_error = Some(error);
+                        }
+                    }
+                }
+                crate::klipy::UiEvent::AnimationFinished {
+                    request_id,
+                    preview_only,
+                    url,
+                    result,
+                } => {
+                    self.chat.gif_loads_in_flight =
+                        self.chat.gif_loads_in_flight.saturating_sub(1);
+                    if !matches!(
+                        self.chat.gif_animations.get(&url),
+                        Some(KlipyAnimationState::Loading {
+                            request_id: active_id,
+                            preview_only: active_preview,
+                        }) if *active_id == request_id && *active_preview == preview_only
+                    ) {
+                        continue;
+                    }
+                    match result {
+                        Ok(frames) => {
+                            self.chat.gif_animations.insert(
+                                url,
+                                KlipyAnimationState::Ready {
+                                    frames,
+                                    frame_index: 0,
+                                    next_frame_at: 0.0,
+                                    texture: None,
+                                    last_used_frame: ctx.cumulative_frame_nr(),
+                                    preview_only,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            self.chat.gif_animations.insert(
+                                url,
+                                KlipyAnimationState::Failed {
+                                    error,
+                                    preview_only,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.start_queued_klipy_loads(ctx);
+    }
+
+    fn request_klipy_animation(&mut self, url: &str, preview_only: bool, ctx: &egui::Context) {
+        if !crate::klipy::is_klipy_media_url(url) {
+            return;
+        }
+        let replace_preview = match self.chat.gif_animations.get(url) {
+            Some(KlipyAnimationState::Queued {
+                preview_only: active_preview,
+            })
+            | Some(KlipyAnimationState::Loading {
+                preview_only: active_preview,
+                ..
+            })
+            | Some(KlipyAnimationState::Ready {
+                preview_only: active_preview,
+                ..
+            }) => !preview_only && *active_preview,
+            Some(KlipyAnimationState::Failed {
+                preview_only: failed_preview,
+                ..
+            }) => !preview_only && *failed_preview,
+            None => false,
+        };
+        if replace_preview {
+            self.chat.gif_animations.remove(url);
+        } else if self.chat.gif_animations.contains_key(url) {
+            if let Some(KlipyAnimationState::Ready {
+                last_used_frame, ..
+            }) = self.chat.gif_animations.get_mut(url)
+            {
+                *last_used_frame = ctx.cumulative_frame_nr();
+            }
+            return;
+        }
+
+        let max_entries = if preview_only {
+            MAX_KLIPY_PREVIEWS
+        } else {
+            MAX_KLIPY_ANIMATIONS
+        };
+        let entry_count = self
+            .chat
+            .gif_animations
+            .values()
+            .filter(|state| match state {
+                KlipyAnimationState::Queued {
+                    preview_only: current,
+                }
+                | KlipyAnimationState::Loading {
+                    preview_only: current,
+                    ..
+                }
+                | KlipyAnimationState::Ready {
+                    preview_only: current,
+                    ..
+                }
+                | KlipyAnimationState::Failed {
+                    preview_only: current,
+                    ..
+                } => *current == preview_only,
+            })
+            .count();
+        if entry_count >= max_entries {
+            let current_frame = ctx.cumulative_frame_nr();
+            let oldest = self
+                .chat
+                .gif_animations
+                .iter()
+                .filter_map(|(url, state)| match state {
+                    KlipyAnimationState::Ready {
+                        last_used_frame,
+                        preview_only: current,
+                        ..
+                    } if *current == preview_only
+                        && last_used_frame.saturating_add(1) < current_frame =>
+                    {
+                        Some((url.clone(), *last_used_frame))
+                    }
+                    KlipyAnimationState::Failed {
+                        preview_only: current,
+                        ..
+                    } if *current == preview_only => Some((url.clone(), 0)),
+                    _ => None,
+                })
+                .min_by_key(|(_, last_used_frame)| *last_used_frame)
+                .map(|(url, _)| url);
+            let Some(oldest) = oldest else {
+                return;
+            };
+            self.chat.gif_animations.remove(&oldest);
+        }
+        self.chat.gif_animations.insert(
+            url.to_owned(),
+            KlipyAnimationState::Queued { preview_only },
+        );
+        self.chat
+            .gif_load_queue
+            .push_back((url.to_owned(), preview_only));
+        self.start_queued_klipy_loads(ctx);
+    }
+
+    fn start_queued_klipy_loads(&mut self, ctx: &egui::Context) {
+        self.ensure_klipy_event_channel();
+        while self.chat.gif_loads_in_flight < MAX_CONCURRENT_KLIPY_LOADS {
+            let Some((url, preview_only)) = self.chat.gif_load_queue.pop_front() else {
+                break;
+            };
+            if !matches!(
+                self.chat.gif_animations.get(&url),
+                Some(KlipyAnimationState::Queued {
+                    preview_only: queued_preview,
+                }) if *queued_preview == preview_only
+            ) {
+                continue;
+            }
+            self.chat.gif_animation_request_id =
+                self.chat.gif_animation_request_id.wrapping_add(1);
+            let request_id = self.chat.gif_animation_request_id;
+            self.chat.gif_animations.insert(
+                url.clone(),
+                KlipyAnimationState::Loading {
+                    request_id,
+                    preview_only,
+                },
+            );
+            self.chat.gif_loads_in_flight += 1;
+            let tx = self
+                .chat
+                .klipy_event_tx
+                .as_ref()
+                .expect("channel initialized")
+                .clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let result = if preview_only {
+                    crate::klipy::load_preview(&url)
+                } else {
+                    crate::klipy::load_animation(&url)
+                }
+                .map_err(|error| error.to_string());
+                let _ = tx.send(crate::klipy::UiEvent::AnimationFinished {
+                    request_id,
+                    preview_only,
+                    url,
+                    result,
+                });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn klipy_gif_texture(
+        &mut self,
+        ctx: &egui::Context,
+        url: &str,
+        preview_only: bool,
+    ) -> Option<(egui::TextureHandle, u32, u32)> {
+        self.request_klipy_animation(url, preview_only, ctx);
+        let now = ctx.input(|input| input.time);
+        let state = self.chat.gif_animations.get_mut(url)?;
+        let KlipyAnimationState::Ready {
+            frames,
+            frame_index,
+            next_frame_at,
+            texture,
+            last_used_frame,
+            ..
+        } = state
+        else {
+            return None;
+        };
+        *last_used_frame = ctx.cumulative_frame_nr();
+        if frames.is_empty() {
+            return None;
+        }
+        let mut frame_changed = false;
+        if *next_frame_at == 0.0 {
+            *next_frame_at = now + f64::from(frames[*frame_index].delay_ms) / 1000.0;
+            frame_changed = true;
+        } else if now >= *next_frame_at && frames.len() > 1 {
+            *frame_index = (*frame_index + 1) % frames.len();
+            *next_frame_at = now + f64::from(frames[*frame_index].delay_ms) / 1000.0;
+            frame_changed = true;
+        }
+        let frame = &frames[*frame_index];
+        if frame_changed {
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            if let Some(texture) = texture {
+                texture.set(color_image, egui::TextureOptions::LINEAR);
+            } else {
+                *texture = Some(ctx.load_texture(
+                    format!("klipy-gif-{}", iroh_blobs::Hash::new(url.as_bytes())),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        if frames.len() > 1 {
+            let wait = (*next_frame_at - now).max(0.02);
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
+        texture
+            .as_ref()
+            .cloned()
+            .map(|texture| (texture, frame.width, frame.height))
+    }
+
+    fn gif_corner_radius(&self, ui: &Ui) -> CornerRadius {
+        if crate::window_frame::style_wants_rounded(self.window_frame_style) {
+            ui.visuals().widgets.noninteractive.corner_radius
+        } else {
+            CornerRadius::same(0)
+        }
+    }
+
+    fn ui_klipy_gif_picker(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+    ) -> Option<crate::klipy::GifItem> {
+        let mut search = false;
+        let mut selected = None;
+        let api_key_missing = self.klipy_api_key.trim().is_empty();
+        let results = self.chat.gif_search_results.clone();
+        let result_title_font = egui::FontId::proportional(ui_font_size(10.0));
+        let result_row_height = KLIPY_GIF_PREVIEW_HEIGHT
+            + ui.spacing().item_spacing.y
+            + ui.fonts_mut(|fonts| fonts.row_height(&result_title_font));
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let results_min_height = ((result_row_height * KLIPY_GIF_MIN_VISIBLE_ROWS
+            + KLIPY_GIF_GRID_GAP * (KLIPY_GIF_MIN_VISIBLE_ROWS - 1.0))
+            * pixels_per_point)
+            .ceil()
+            / pixels_per_point;
+        ui.set_min_width(KLIPY_PICKER_WIDTH);
+        ui.set_max_width(KLIPY_PICKER_WIDTH);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("GIFs").strong().color(pal.text));
+            if self.chat.gif_search_loading {
+                ui.spinner();
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let button_width = 58.0;
+            let edit_width =
+                (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(140.0);
+            let edit = ui.add_sized(
+                [edit_width, 30.0],
+                egui::TextEdit::singleline(&mut self.chat.gif_search_query)
+                    .hint_text("Search KLIPY"),
+            );
+            if edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                search = true;
+            }
+            if ui.add_sized([button_width, 30.0], egui::Button::new("Search")).clicked() {
+                search = true;
+            }
+        });
+        ui.separator();
+
+        if api_key_missing {
+            ui.label(
+                RichText::new("Add your KLIPY app key in Settings to browse GIFs.")
+                    .color(pal.dim),
+            );
+            if action_button(ui, pal, "Open Settings", ButtonTone::Secondary).clicked() {
+                self.show_settings = true;
+                ui.close();
+            }
+        } else {
+            if let Some(error) = &self.chat.gif_search_error {
+                ui.label(RichText::new(error).color(pal.err));
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("klipy-gif-results")
+                .auto_shrink([false, false])
+                .min_scrolled_height(results_min_height)
+                .max_height(250.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("klipy-gif-results-grid")
+                        .num_columns(3)
+                        .min_row_height(result_row_height)
+                        .spacing(Vec2::splat(KLIPY_GIF_GRID_GAP))
+                        .show(ui, |ui| {
+                            for (index, item) in results.iter().enumerate() {
+                                ui.vertical(|ui| {
+                                    ui.set_width(KLIPY_GIF_TILE_WIDTH);
+                                    if item.kind == "ad" {
+                                        Frame::new()
+                                            .fill(pal.panel2)
+                                            .corner_radius(7.0)
+                                            .inner_margin(egui::Margin::same(6))
+                                            .show(ui, |ui| {
+                                                ui.set_min_size(Vec2::new(84.0, 58.0));
+                                                ui.label(
+                                                    RichText::new("Advertisement")
+                                                        .color(pal.dim),
+                                                );
+                                                if item.ad_content.is_some() {
+                                                    ui.label(
+                                                        RichText::new("Preview unavailable")
+                                                            .color(pal.dim)
+                                                            .size(ui_font_size(9.0)),
+                                                    );
+                                                }
+                                            });
+                                    } else if let Some(url) = item.preview_url.as_deref() {
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            Vec2::new(
+                                                KLIPY_GIF_TILE_WIDTH,
+                                                KLIPY_GIF_PREVIEW_HEIGHT,
+                                            ),
+                                            egui::Sense::click(),
+                                        );
+                                        let corner_radius = self.gif_corner_radius(ui);
+                                        ui.painter()
+                                            .rect_filled(rect, corner_radius, pal.panel2);
+                                        if let Some((texture, width, height)) =
+                                            self.klipy_gif_texture(ui.ctx(), url, true)
+                                        {
+                                            let scale = (rect.width() / width.max(1) as f32)
+                                                .min(rect.height() / height.max(1) as f32);
+                                            let size = Vec2::new(
+                                                width as f32 * scale,
+                                                height as f32 * scale,
+                                            );
+                                            let image_rect =
+                                                egui::Rect::from_center_size(rect.center(), size);
+                                            ui.put(
+                                                image_rect,
+                                                egui::Image::new((texture.id(), size))
+                                                    .fit_to_exact_size(size)
+                                                    .corner_radius(corner_radius),
+                                            );
+                                        } else {
+                                            ui.painter().text(
+                                                rect.center(),
+                                                Align2::CENTER_CENTER,
+                                                if matches!(
+                                                    self.chat.gif_animations.get(url),
+                                                    Some(KlipyAnimationState::Failed { .. })
+                                                ) {
+                                                    "Unavailable"
+                                                } else {
+                                                    "Loading…"
+                                                },
+                                                egui::FontId::proportional(ui_font_size(10.0)),
+                                                pal.dim,
+                                            );
+                                        }
+                                        if response.clicked() && item.media_url.is_some() {
+                                            selected = Some(item.clone());
+                                        }
+                                    } else {
+                                        ui.add_sized(
+                                            [KLIPY_GIF_TILE_WIDTH, KLIPY_GIF_PREVIEW_HEIGHT],
+                                            egui::Label::new("GIF unavailable"),
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&item.title)
+                                                .color(pal.text2)
+                                                .size(ui_font_size(10.0)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&item.title);
+                                });
+                                if index % 3 == 2 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            if results.is_empty()
+                && !self.chat.gif_search_loading
+                && self.chat.gif_search_error.is_none()
+            {
+                ui.label(RichText::new("No GIFs found.").color(pal.dim));
+            }
+        }
+        if search {
+            self.start_klipy_search(self.chat.gif_search_query.clone(), ui.ctx());
+        }
+        selected
+    }
+
+    fn clear_klipy_previews(&mut self) {
+        self.chat
+            .gif_load_queue
+            .retain(|(_, preview_only)| !*preview_only);
+        self.chat.gif_animations.retain(|_, state| match state {
+            KlipyAnimationState::Queued { preview_only }
+            | KlipyAnimationState::Loading { preview_only, .. }
+            | KlipyAnimationState::Ready { preview_only, .. }
+            | KlipyAnimationState::Failed { preview_only, .. } => !*preview_only,
+        });
+    }
+
+    fn send_klipy_gif(&mut self, conversation_id: &str, item: crate::klipy::GifItem) {
+        let slug = item.slug.clone();
+        let Some(media_url) = item.media_url.clone() else {
+            self.chat.gif_search_error = Some("This GIF has no shareable media URL.".to_owned());
+            return;
+        };
+        if item.kind.eq_ignore_ascii_case("ad")
+            || slug.is_empty()
+            || slug.len() > 512
+            || !crate::klipy::is_klipy_media_url(&media_url)
+        {
+            self.chat.gif_search_error =
+                Some("This KLIPY result cannot be shared as a GIF.".to_owned());
+            return;
+        }
+        let hash = iroh_blobs::Hash::new(media_url.as_bytes()).to_string();
+        let name = if item.title.trim().is_empty() {
+            "GIF".to_owned()
+        } else {
+            item.title.trim().chars().take(200).collect()
+        };
+        let attachment = ChatAttachment {
+            kind: AttachmentKind::Image,
+            id: format!("klipy-{hash}"),
+            name,
+            media_type: "image/gif".to_owned(),
+            byte_len: item.byte_len,
+            width: item.width.max(1),
+            height: item.height.max(1),
+            hash,
+            external_url: Some(media_url),
+            provider_slug: Some(slug.clone()),
+            data: None,
+        };
+
+        let Some(author) = self.our_node_id else {
+            self.chat.gif_search_error =
+                Some("Chat is still connecting to your Wire identity.".to_owned());
+            return;
+        };
+        let message = ChatMessage::new_with_attachments(author, String::new(), vec![attachment]);
+        if let Err(error) = message.validate() {
+            warn!("could not send invalid KLIPY GIF message: {error}");
+            self.chat.gif_search_error = Some("This GIF could not be sent.".to_owned());
+            return;
+        }
+        self.dispatch_chat_message(conversation_id, message);
+
+        if let Some(customer_id) = self.our_node_id.map(|id| id.to_string()) {
+            let api_key = self.klipy_api_key.trim().to_owned();
+            let query = self.chat.gif_results_query.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = crate::klipy::track_share(&api_key, &customer_id, &slug, &query)
+                {
+                    warn!("could not report KLIPY GIF share: {error}");
+                }
+            });
+        }
+        self.chat.gif_picker_open = false;
     }
 
     fn collect_chat_image_input(&mut self, ctx: &egui::Context) {
@@ -1476,6 +2150,8 @@ impl AppState {
                             width: 0,
                             height: 0,
                             hash,
+                            external_url: None,
+                            provider_slug: None,
                             data: Some(Arc::new(bytes)),
                         });
                     }
@@ -1520,6 +2196,8 @@ impl AppState {
             width: decoded.width(),
             height: decoded.height(),
             hash: hash_string,
+            external_url: None,
+            provider_slug: None,
             data: Some(Arc::new(bytes)),
         });
     }
@@ -1722,6 +2400,73 @@ impl AppState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn ui_klipy_gif_card(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        message: &ChatMessage,
+        own: bool,
+        opacity: f32,
+        url: &str,
+        requested_restore: &mut bool,
+        requested_deletion: &mut Option<DeleteScope>,
+    ) {
+        let corner_radius = self.gif_corner_radius(ui);
+        let response = ui
+            .vertical(|ui| {
+                ui.set_max_width(ui.available_width().min(620.0));
+                if crate::klipy::is_klipy_media_url(url) {
+                    if let Some((texture, width, height)) =
+                        self.klipy_gif_texture(ui.ctx(), url, false)
+                    {
+                        let scale = (ui.available_width().min(620.0) / width.max(1) as f32)
+                            .min(180.0 / height.max(1) as f32);
+                        let size = Vec2::new(width as f32 * scale, height as f32 * scale);
+                        ui.add(
+                            egui::Image::new((texture.id(), size))
+                                .fit_to_exact_size(size)
+                                .corner_radius(corner_radius),
+                        );
+                    } else if let Some(KlipyAnimationState::Failed { error, .. }) =
+                        self.chat.gif_animations.get(url)
+                    {
+                        ui.label(
+                            RichText::new("GIF could not be loaded")
+                                .color(pal.dim.gamma_multiply(opacity))
+                                .size(ui_font_size(11.0)),
+                        )
+                        .on_hover_text(error);
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Loading GIF…")
+                                    .color(pal.dim.gamma_multiply(opacity))
+                                    .size(ui_font_size(11.0)),
+                            );
+                        });
+                    }
+                } else {
+                    ui.label(RichText::new("GIF link unavailable").color(pal.dim));
+                }
+            })
+            .response;
+        response.interact(egui::Sense::click()).context_menu(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if menu_item_button(ui, pal, Icon::Copy, "Copy GIF link", false).clicked() {
+                copy_to_clipboard(url);
+                ui.close();
+            }
+            if menu_item_button(ui, pal, Icon::RefreshCw, "Reload GIF", false).clicked() {
+                self.chat.gif_animations.remove(url);
+                ui.close();
+            }
+            ui.separator();
+            chat_message_context_menu(ui, pal, message, own, requested_restore, requested_deletion);
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn ui_message_attachments(
         &mut self,
         ui: &mut Ui,
@@ -1733,6 +2478,18 @@ impl AppState {
         requested_restore: &mut bool,
         requested_deletion: &mut Option<DeleteScope>,
     ) {
+        if let Some(url) = crate::klipy::gif_url_from_message_body(&message.body) {
+            self.ui_klipy_gif_card(
+                ui,
+                pal,
+                message,
+                own,
+                opacity,
+                url,
+                requested_restore,
+                requested_deletion,
+            );
+        }
         for (index, attachment) in message.attachments.iter().enumerate() {
             let receivers = message
                 .file_receivers
@@ -1885,6 +2642,22 @@ impl AppState {
                         requested_deletion,
                     );
                 });
+                continue;
+            }
+            if attachment.is_klipy_gif() {
+                self.ui_klipy_gif_card(
+                    ui,
+                    pal,
+                    message,
+                    own,
+                    opacity,
+                    attachment
+                        .external_url
+                        .as_deref()
+                        .expect("KLIPY GIF attachments have a media URL"),
+                    requested_restore,
+                    requested_deletion,
+                );
                 continue;
             }
             if self
@@ -2595,7 +3368,7 @@ fn chat_message_context_menu(
     requested_deletion: &mut Option<DeleteScope>,
 ) {
     ui.spacing_mut().item_spacing.y = 2.0;
-    if message.deletion == Some(MessageDeletion::Local) {
+    if message_restore_scope(message, own).is_some() {
         if menu_item_button(ui, pal, Icon::RotateCcw, "Restore message", false).clicked() {
             *requested_restore = true;
             ui.close();
@@ -2610,6 +3383,14 @@ fn chat_message_context_menu(
             *requested_deletion = Some(scope);
             ui.close();
         }
+    }
+}
+
+fn message_restore_scope(message: &ChatMessage, own: bool) -> Option<DeleteScope> {
+    match message.deletion {
+        Some(MessageDeletion::Local) => Some(DeleteScope::Local),
+        Some(MessageDeletion::Everyone) if own => Some(DeleteScope::Everyone),
+        _ => None,
     }
 }
 
@@ -3002,6 +3783,7 @@ mod tests {
             file_receivers: std::collections::BTreeMap::new(),
             stopped_file_offers: std::collections::BTreeSet::new(),
             deletion: None,
+            replicated_restoration: false,
         };
 
         assert!(messages_share_compact_group(

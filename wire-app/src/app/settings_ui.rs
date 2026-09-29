@@ -402,6 +402,26 @@ impl AppState {
                                             }
                                         }
                                     });
+                                ui.add_space(8.0);
+                                settings_field_label(
+                                    ui,
+                                    &pal,
+                                    "KLIPY API key",
+                                    Some("Used on this device to search, load and share GIFs."),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.klipy_api_key)
+                                        .password(true)
+                                        .hint_text("Enter your KLIPY app key")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new("Powered by KLIPY")
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.0)),
+                                    );
+                                });
 
                                 settings_divider(ui);
                                 settings_section_heading(

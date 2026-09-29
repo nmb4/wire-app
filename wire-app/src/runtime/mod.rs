@@ -341,6 +341,7 @@ pub(crate) enum Command {
     RestoreChatMessage {
         conversation_id: String,
         message_id: String,
+        scope: DeleteScope,
     },
     ClearChatHistory {
         conversation_id: String,

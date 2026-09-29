@@ -43,7 +43,7 @@ use egui::{Frame, Rect, Vec2};
 use egui_phosphor::regular as ph;
 use iroh::{KeyParsingError, NodeId};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -289,6 +289,7 @@ struct AppState {
     chat_retention: RetentionPolicy,
     chat_style: ChatStyle,
     max_image_bytes: Option<u64>,
+    klipy_api_key: String,
     start_with_system: bool,
     saved_start_with_system: bool,
     show_system_usage: bool,
@@ -326,6 +327,19 @@ struct ChatUiState {
     attachment_requests: BTreeSet<String>,
     conversations_with_older_messages: BTreeSet<String>,
     image_preview: Option<ImagePreview>,
+    gif_picker_open: bool,
+    gif_search_query: String,
+    gif_search_request_id: u64,
+    gif_search_loading: bool,
+    gif_search_results: Vec<crate::klipy::GifItem>,
+    gif_results_query: String,
+    gif_search_error: Option<String>,
+    klipy_event_tx: Option<mpsc::Sender<crate::klipy::UiEvent>>,
+    klipy_event_rx: Option<mpsc::Receiver<crate::klipy::UiEvent>>,
+    gif_animations: BTreeMap<String, KlipyAnimationState>,
+    gif_load_queue: VecDeque<(String, bool)>,
+    gif_loads_in_flight: usize,
+    gif_animation_request_id: u64,
     error: Option<String>,
     service_error: Option<String>,
     show_group_editor: bool,
@@ -334,6 +348,28 @@ struct ChatUiState {
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
     friend_candidate_name: String,
+}
+
+enum KlipyAnimationState {
+    Queued {
+        preview_only: bool,
+    },
+    Loading {
+        request_id: u64,
+        preview_only: bool,
+    },
+    Failed {
+        error: String,
+        preview_only: bool,
+    },
+    Ready {
+        frames: Vec<crate::klipy::GifFrame>,
+        frame_index: usize,
+        next_frame_at: f64,
+        texture: Option<egui::TextureHandle>,
+        last_used_frame: u64,
+        preview_only: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -589,6 +625,8 @@ struct Settings {
     #[serde(default)]
     max_image_bytes: Option<u64>,
     #[serde(default)]
+    klipy_api_key: String,
+    #[serde(default)]
     start_with_system: bool,
     #[serde(default)]
     show_system_usage: bool,
@@ -612,6 +650,7 @@ impl Default for Settings {
             chat_retention: RetentionPolicy::Unlimited,
             chat_style: ChatStyle::default(),
             max_image_bytes: None,
+            klipy_api_key: String::new(),
             start_with_system: false,
             show_system_usage: false,
             share_system_audio: true,
@@ -1013,6 +1052,7 @@ impl App {
             chat_retention: settings.chat_retention,
             chat_style: settings.chat_style,
             max_image_bytes: settings.max_image_bytes,
+            klipy_api_key: settings.klipy_api_key,
             start_with_system: settings.start_with_system,
             saved_start_with_system: settings.start_with_system,
             show_system_usage: settings.show_system_usage,
@@ -1998,24 +2038,7 @@ impl AppState {
                             id.clone(),
                             conversation_title.clone(),
                             author,
-                            if message.body.trim().is_empty() {
-                                match message.attachments.as_slice() {
-                                    [attachment]
-                                        if attachment.kind == chat::AttachmentKind::FileOffer =>
-                                    {
-                                        format!("File: {}", attachment.name)
-                                    }
-                                    [attachment]
-                                        if attachment.kind == chat::AttachmentKind::InlineFile =>
-                                    {
-                                        format!("Text file: {}", attachment.name)
-                                    }
-                                    [_] => "Image".to_owned(),
-                                    attachments => format!("{} attachments", attachments.len()),
-                                }
-                            } else {
-                                ellipsize(message.body.trim(), 180)
-                            },
+                            message_notification_preview(&message),
                         );
                     }
                 }
@@ -2728,6 +2751,7 @@ impl AppState {
             chat_retention: self.chat_retention,
             chat_style: self.chat_style,
             max_image_bytes: self.max_image_bytes,
+            klipy_api_key: self.klipy_api_key.clone(),
             start_with_system: self.saved_start_with_system,
             show_system_usage: self.show_system_usage,
             share_system_audio: self.share_system_audio,
@@ -2885,6 +2909,52 @@ impl AppState {
             .sort_by(|left, right| left.name.cmp(&right.name));
         save_friends(&self.friends);
         self.sync_friends_with_worker();
+    }
+}
+
+fn message_notification_preview(message: &ChatMessage) -> String {
+    let body = message.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let file_names = message
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.kind == chat::AttachmentKind::FileOffer)
+        .map(|attachment| {
+            let name = attachment
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if name.is_empty() {
+                "unnamed file".to_owned()
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !file_names.is_empty() {
+        let file_label = if file_names.len() == 1 {
+            format!("File: {}", file_names[0])
+        } else {
+            format!("Files: {}", file_names.join(", "))
+        };
+        return if body.is_empty() {
+            file_label
+        } else {
+            format!("{file_label} — {}", ellipsize(&body, 120))
+        };
+    }
+
+    if !body.is_empty() {
+        return ellipsize(&body, 180);
+    }
+
+    match message.attachments.as_slice() {
+        [attachment] if attachment.kind == chat::AttachmentKind::InlineFile => {
+            format!("Text file: {}", attachment.name)
+        }
+        [_] => "Image".to_owned(),
+        attachments => format!("{} attachments", attachments.len()),
     }
 }
 
@@ -3081,6 +3151,7 @@ mod layout_tests {
             file_receivers: BTreeMap::new(),
             stopped_file_offers: BTreeSet::new(),
             deletion: None,
+            replicated_restoration: false,
         };
 
         assert!(should_mark_conversation_unseen(
