@@ -24,6 +24,87 @@ use wire::{
 };
 
 impl AppState {
+    /// Where recordings live, plus a way to get there.
+    ///
+    /// Without this the files would exist somewhere only the logs mention.
+    fn ui_recordings_folder_row(&mut self, ui: &mut Ui, pal: &Palette) {
+        settings_field_label(ui, pal, "Recordings folder", None);
+        let label = match crate::recording::recordings_dir() {
+            Some(dir) => dir.display().to_string(),
+            None => "No data directory available".to_owned(),
+        };
+        // A long path must not widen the dialog, so it is truncated and shows
+        // the full value on hover.
+        ui.add(
+            egui::Label::new(RichText::new(label.clone()).color(pal.dim).size(ui_font_size(11.0)))
+                .truncate(),
+        )
+        .on_hover_text(label);
+
+        if let Some(last) = &self.last_recording {
+            let mut detail = format!(
+                "Last recording: {} · {} · {}",
+                last.started_at,
+                super::widgets::format_duration_ms(last.duration_ms),
+                if last.captured == 1 {
+                    "1 speaker".to_owned()
+                } else {
+                    format!("{} speakers", last.captured)
+                }
+            );
+            if last.silent > 0 {
+                // Silence is normal (someone muted all call), but worth stating so
+                // a missing file does not look like a lost one.
+                detail.push_str(&format!(
+                    " · {} said nothing",
+                    if last.silent == 1 {
+                        "1 person".to_owned()
+                    } else {
+                        format!("{} people", last.silent)
+                    }
+                ));
+            }
+            ui.label(
+                RichText::new(detail)
+                    .color(pal.dim)
+                    .size(ui_font_size(10.5)),
+            );
+            if !last.failed.is_empty() {
+                ui.label(
+                    RichText::new(format!("Missing files for: {}", last.failed.join(", ")))
+                        .color(pal.err)
+                        .size(ui_font_size(10.5)),
+                );
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if action_button(ui, pal, "Open recordings", ButtonTone::Secondary).clicked() {
+                self.reveal_recordings();
+            }
+            let has_last = self.last_recording.is_some();
+            if ui
+                .add_enabled_ui(has_last, |ui| {
+                    action_button(ui, pal, "Open last recording", ButtonTone::Secondary)
+                })
+                .inner
+                .clicked()
+            {
+                if let Some(target) = self.last_recording.as_ref().map(|last| last.dir.clone()) {
+                    if let Err(error) = crate::recording::reveal_in_file_manager(&target) {
+                        let message = format!("{error:#}");
+                        tracing::warn!("could not open the recording folder: {message}");
+                        self.notifications.error(
+                            "recordings-folder",
+                            "Could not open the folder",
+                            message,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn ui_settings_window(&mut self, ctx: &egui::Context) {
         let can_close = self.configured;
         let pal = Palette::for_theme(self.theme);
@@ -586,6 +667,56 @@ impl AppState {
                                 settings_section_heading(
                                     ui,
                                     &pal,
+                                    "Call recording",
+                                    "Save every speaker to a separate file.",
+                                );
+                                Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(Stroke::new(1.0_f32, pal.line))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        let mut automatic = self.record_calls_automatically;
+                                        if ui
+                                            .checkbox(
+                                                &mut automatic,
+                                                RichText::new("Record every call automatically")
+                                                    .color(pal.text2)
+                                                    .size(ui_font_size(12.0)),
+                                            )
+                                            .on_hover_text(
+                                                "Start recording as soon as a call connects, and \
+                                                 stop when the last person leaves",
+                                            )
+                                            .changed()
+                                        {
+                                            self.set_record_calls_automatically(automatic);
+                                        }
+                                        ui.label(
+                                            RichText::new(
+                                                "Every participant is written to their own file, so \
+                                                 each one can be transcribed on its own and put \
+                                                 back together by timestamp.",
+                                            )
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                        ui.label(
+                                            RichText::new(
+                                                "People you call are not told that this device is \
+                                                 recording. Only you see the REC indicator.",
+                                            )
+                                            .color(pal.dim)
+                                            .size(ui_font_size(10.5)),
+                                        );
+                                        ui.add_space(4.0);
+                                        self.ui_recordings_folder_row(ui, &pal);
+                                    });
+
+                                settings_divider(ui);
+                                settings_section_heading(
+                                    ui,
+                                    &pal,
                                     "Screen sharing",
                                     "Balance clarity, motion and bandwidth.",
                                 );
@@ -776,6 +907,9 @@ impl AppState {
                                 });
                                 self.cmd(Command::SetChatRetention {
                                     retention: self.chat_retention,
+                                });
+                                self.cmd(Command::SetRecordCallsAutomatically {
+                                    enabled: self.record_calls_automatically,
                                 });
                                 self.chat.inline_file_data.clear();
                                 self.chat.attachment_textures = Default::default();

@@ -71,6 +71,17 @@ pub(crate) enum Event {
     SystemAudioToggled(bool),
     SystemAudioFailed(String),
     SharingFailed(String),
+    /// The recording state changed, or a recording could not start.
+    CallRecordingToggled {
+        active: bool,
+        /// Set while active: where the files are being written.
+        dir: Option<std::path::PathBuf>,
+    },
+    /// A recording finished and every file was finalized.
+    CallRecordingStopped {
+        summary: crate::recording::RecordingSummary,
+    },
+    CallRecordingFailed(String),
     PreviewFrame {
         width: u32,
         height: u32,
@@ -284,6 +295,14 @@ pub(crate) enum Command {
         share_system_audio: bool,
     },
     SetSystemAudio {
+        enabled: bool,
+    },
+    /// Start or stop recording, one file per speaker.
+    SetCallRecording {
+        enabled: bool,
+    },
+    /// Persist the "record every call automatically" preference.
+    SetRecordCallsAutomatically {
         enabled: bool,
     },
     SetWatching {

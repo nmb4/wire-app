@@ -105,6 +105,8 @@ pub(crate) enum NotificationAction {
     OpenCalls,
     AcceptCall(String),
     DeclineCall(String),
+    /// Show the folder holding the recordings on disk.
+    OpenRecordingsFolder,
 }
 
 #[derive(Clone)]
@@ -613,6 +615,44 @@ impl NotificationService {
             progress: None,
             action: None,
             buttons: Vec::new(),
+        });
+    }
+
+    /// Announce a finished recording, with a way straight to the files.
+    pub(crate) fn recording_saved(&self, title: impl Into<String>, body: impl Into<String>) {
+        self.push(NotificationSpec {
+            group_key: Some("call-recording".to_owned()),
+            kind: NotificationKind::Success,
+            title: title.into(),
+            body: body.into(),
+            progress: None,
+            action: Some(NotificationAction::OpenRecordingsFolder),
+            buttons: vec![ActionButton {
+                label: "Show files".to_owned(),
+                action: NotificationAction::OpenRecordingsFolder,
+                emphasized: true,
+            }],
+        });
+    }
+
+    /// Report a recording that finished, but not completely.
+    pub(crate) fn recording_incomplete(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.push(NotificationSpec {
+            group_key: Some("call-recording".to_owned()),
+            kind: NotificationKind::Error,
+            title: title.into(),
+            body: body.into(),
+            progress: None,
+            action: Some(NotificationAction::OpenRecordingsFolder),
+            buttons: vec![ActionButton {
+                label: "Show files".to_owned(),
+                action: NotificationAction::OpenRecordingsFolder,
+                emphasized: true,
+            }],
         });
     }
 
