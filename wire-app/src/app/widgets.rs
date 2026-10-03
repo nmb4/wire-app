@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use tracing::warn;
 use wire::audio::VolumeHandle;
 
-pub(super) fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     if bytes >= 1024 * 1024 * 1024 {

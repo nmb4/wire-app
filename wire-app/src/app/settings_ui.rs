@@ -1,12 +1,12 @@
 //! Settings and update dialogs.
 
-#[cfg(windows)]
-use super::UpdateStatus;
 use super::{
     profile_ui::paint_profile_avatar,
     widgets::{floating_dialog_header, format_bytes, painted_volume_slider},
     AppState, ChatStyle, DEFAULT,
 };
+#[cfg(windows)]
+use super::{PeerUpdateTransfer, UpdateStatus};
 use crate::{
     chat::RetentionPolicy,
     runtime::Command,
@@ -798,6 +798,129 @@ impl AppState {
                         });
                     });
             });
+    }
+
+    /// Accept or decline an executable offered by a connected friend.
+    ///
+    /// Nothing is fetched until the user confirms, so a peer can never push a
+    /// binary onto this machine by itself.
+    #[cfg(windows)]
+    pub(super) fn ui_peer_update_prompt(&mut self, ctx: &egui::Context) {
+        let Some(peer) = self.peer_update.active else {
+            self.show_peer_update_prompt = false;
+            return;
+        };
+        // A finished transfer must not be discarded just because presence has
+        // not caught up yet; only a peer that vanished before anything started
+        // closes the panel.
+        let transfer_in_flight = self
+            .peer_update
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.peer == peer);
+        if !transfer_in_flight && !self.peer_update.candidates.contains_key(&peer) {
+            self.peer_update.reset();
+            self.show_peer_update_prompt = false;
+            return;
+        }
+
+        let pal = Palette::for_theme(self.theme);
+        let peer_name = self.peer_display_name(peer);
+        let mut open = self.show_peer_update_prompt;
+        let mut start = false;
+        let mut later = false;
+        floating_panel(
+            "Update from a peer",
+            &pal,
+            self.pane_constrain_rect(),
+            420.0,
+        )
+        .open(&mut open)
+        .show(ctx, |ui| {
+            match self.peer_update.transfer.clone() {
+                Some(transfer) => {
+                    let percent = transfer.percent();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Receiving from {peer_name} · {percent}%"));
+                    });
+                    ui.add(egui::ProgressBar::new(percent as f32 / 100.0).desired_height(6.0));
+                }
+                None => {
+                    ui.label(format!("{peer_name} is running a newer Wire."));
+                    match &self.peer_update.offer {
+                        Some(offer) => {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(offer.describe(crate::APP_VERSION))
+                                    .color(pal.text2)
+                                    .size(ui_font_size(12.0)),
+                            );
+                            ui.label(
+                                RichText::new("Wire restarts once the transfer is verified.")
+                                    .color(pal.dim)
+                                    .size(ui_font_size(11.5)),
+                            );
+                        }
+                        None => {
+                            ui.label("Asking for their executable…");
+                        }
+                    }
+                    if let Some(error) = &self.peer_update.error {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(error).color(pal.err));
+                    }
+                    ui.add_space(10.0);
+                    // Nothing to accept until the peer has answered, and an
+                    // offer that is not runnable here must not be startable.
+                    let can_start = self.peer_update.offer.as_ref().is_some_and(|offer| {
+                        offer.is_usable_for(crate::APP_VERSION) && offer.is_runnable_here()
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(can_start, |ui| {
+                            if action_button(ui, &pal, "Update and restart", ButtonTone::Primary)
+                                .clicked()
+                            {
+                                start = true;
+                            }
+                        });
+                        // Deliberately outside the gate above: declining has to stay
+                        // reachable in every state, including the error states where
+                        // there is no valid offer to accept.
+                        if action_button(ui, &pal, "Not now", ButtonTone::Secondary).clicked() {
+                            later = true;
+                        }
+                    });
+                }
+            }
+            if transfer_in_flight {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Keep Wire open until the transfer finishes.")
+                        .color(pal.dim)
+                        .size(ui_font_size(11.0)),
+                );
+            }
+        });
+        if later {
+            open = false;
+            self.peer_update.reset();
+        }
+        self.show_peer_update_prompt = open;
+        if start {
+            self.peer_update.transfer = Some(PeerUpdateTransfer {
+                peer,
+                received: 0,
+                total: self
+                    .peer_update
+                    .offer
+                    .as_ref()
+                    .map(|offer| offer.total_bytes)
+                    .unwrap_or(0),
+            });
+            self.show_peer_update_prompt = false;
+            self.cmd(Command::DownloadPeerUpdate { peer });
+        }
     }
 
     #[cfg(windows)]

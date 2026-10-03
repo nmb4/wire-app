@@ -78,6 +78,32 @@ pub(crate) enum Event {
         actual_fps: f64,
         encode_time_ms: f64,
     },
+    /// A peer answered with the executable it is willing to share.
+    #[cfg(windows)]
+    PeerUpdateOffer {
+        peer: NodeId,
+        offer: crate::peer_update::UpdateOffer,
+    },
+    /// Bytes of a peer-to-peer update have landed in the staging file.
+    #[cfg(windows)]
+    PeerUpdateProgress {
+        peer: NodeId,
+        received: u64,
+        total: u64,
+    },
+    /// A verified peer-to-peer update is staged and ready to install.
+    #[cfg(windows)]
+    PeerUpdateReady {
+        peer: NodeId,
+        version: String,
+        staged: crate::update::StagedUpdate,
+    },
+    /// A peer-to-peer update could not be fetched, verified, or staged.
+    #[cfg(windows)]
+    PeerUpdateFailed {
+        peer: NodeId,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +371,15 @@ pub(crate) enum Command {
     },
     ClearChatHistory {
         conversation_id: String,
+    },
+    #[cfg(windows)]
+    FetchPeerUpdateOffer {
+        peer: NodeId,
+    },
+    /// Transfer a peer's executable, verify it, and stage it for install.
+    #[cfg(windows)]
+    DownloadPeerUpdate {
+        peer: NodeId,
     },
 }
 

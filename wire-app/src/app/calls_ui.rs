@@ -577,6 +577,9 @@ impl AppState {
             }
 
             #[cfg(windows)]
+            // The hosted release path only. Peer-to-peer updates are driven from
+            // the title-bar control, which appears while a friend with a newer
+            // build is connected.
             let available_update = match &self.update_status {
                 UpdateStatus::Available(release) => Some(release.clone()),
                 _ => None,
