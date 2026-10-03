@@ -14,6 +14,35 @@ use crate::{
 pub const HEIGHT: f32 = 32.0;
 const ICON_SIZE: f32 = 14.0;
 const BUTTON_SIZE: f32 = HEIGHT;
+/// Left inset of the optional peer-update control, plus its own width.
+const UPDATE_BUTTON_INSET: f32 = 8.0;
+
+/// An optional control rendered left of the window buttons.
+///
+/// Used by the peer-to-peer update flow: it appears only while a friend running
+/// a newer build is reachable, and drives the accept / decline decision.
+#[derive(Clone, Copy)]
+pub struct UpdateButton<'a> {
+    pub label: &'a str,
+    pub tooltip: &'a str,
+    /// Dimmed while a transfer is in flight, with the progress shown in `label`.
+    pub busy: bool,
+}
+
+impl UpdateButton<'_> {
+    /// Fixed width so swapping `v0.7.5` for a progress percentage cannot make
+    /// the control resize and shove the window controls around mid-transfer.
+    const fn width() -> f32 {
+        UPDATE_BUTTON_INSET * 2.0 + ICON_SIZE + 6.0 + LABEL_BUDGET as f32 * CHAR_WIDTH
+    }
+}
+
+/// Characters the label budget covers, and the average glyph advance used to
+/// size it. Budget covers a full `v1.12.345` version and a `100%` progress
+/// reading; the caller truncates anything longer, and the control is
+/// right-anchored so leftover slack is invisible.
+pub(super) const LABEL_BUDGET: usize = 9;
+const CHAR_WIDTH: f32 = 5.5;
 
 #[allow(clippy::too_many_arguments)]
 pub fn ui(
@@ -25,7 +54,8 @@ pub fn ui(
     show_system_usage: bool,
     always_on_top: &mut bool,
     rounded: bool,
-) {
+    update_button: Option<UpdateButton<'_>>,
+) -> bool {
     let painter = ui.painter();
 
     let title_bar_response = ui.interact(
@@ -52,8 +82,15 @@ pub fn ui(
             "CPU {:.0}%   GPU {}   RAM {:.0} MB",
             resources.cpu_percent, gpu, memory_mib
         );
+        // Keep the readout clear of the window buttons and of the update
+        // control, whose width is fixed rather than content-driven.
+        let reserved = BUTTON_SIZE * 4.0
+            + 12.0
+            + update_button
+                .map(|_| UpdateButton::width() + UPDATE_BUTTON_INSET)
+                .unwrap_or(0.0);
         painter.text(
-            title_bar_rect.right_center() - Vec2::new(BUTTON_SIZE * 4.0 + 12.0, 0.0),
+            title_bar_rect.right_center() - Vec2::new(reserved, 0.0),
             Align2::RIGHT_CENTER,
             resource_text,
             egui::FontId::monospace(11.0),
@@ -71,6 +108,7 @@ pub fn ui(
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
+    let mut update_clicked = false;
     ui.scope_builder(
         UiBuilder::new()
             .max_rect(title_bar_rect)
@@ -78,8 +116,63 @@ pub fn ui(
         |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             window_controls(ui, pal, always_on_top, rounded);
+            // Laid out last in a right-to-left pass, so the update control lands
+            // immediately left of the window controls.
+            if let Some(button) = update_button {
+                update_clicked = update_control(ui, pal, button, rounded).clicked();
+            }
         },
     );
+    update_clicked
+}
+
+/// The peer-update entry point in the title bar.
+///
+/// Deliberately an icon plus version rather than a wide button: the title bar
+/// is 32px tall and shares its row with the window controls, so the control
+/// stays out of the way until a newer friend is actually reachable.
+fn update_control(
+    ui: &mut Ui,
+    pal: &Palette,
+    button: UpdateButton<'_>,
+    rounded: bool,
+) -> egui::Response {
+    let size = Vec2::new(UpdateButton::width(), 24.0);
+    // A busy control is still clickable so the prompt stays reachable, but the
+    // tooltip explains that nothing happens until the transfer lands.
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    let fill = if hovered { pal.panel2 } else { pal.accent_dim };
+    let icon_color = if button.busy { pal.text2 } else { pal.accent };
+    ui.painter().rect_filled(
+        rect,
+        if rounded {
+            egui::CornerRadius::same(5)
+        } else {
+            egui::CornerRadius::ZERO
+        },
+        fill,
+    );
+
+    let icon_x = rect.left() + UPDATE_BUTTON_INSET + ICON_SIZE * 0.5;
+    ui.painter().text(
+        egui::pos2(icon_x, rect.center().y),
+        Align2::CENTER_CENTER,
+        char::from(Icon::TrendingUp),
+        lucide(ICON_SIZE),
+        icon_color,
+    );
+    // Truncate rather than trust the budget: an unexpected label must not paint
+    // over the window controls.
+    let label: String = button.label.chars().take(LABEL_BUDGET).collect();
+    ui.painter().text(
+        egui::pos2(icon_x + ICON_SIZE * 0.5 + 6.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(11.5, kh_family()),
+        if hovered { pal.text } else { pal.text2 },
+    );
+    response.on_hover_text(button.tooltip)
 }
 
 fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded: bool) {
@@ -186,4 +279,60 @@ fn title_bar_icon_button(
     );
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::kh_family;
+
+    fn context(size: Vec2) -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        // Tests do not load Wire's custom heading font.
+        fonts.families.insert(
+            kh_family(),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let _ = ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        });
+        ctx
+    }
+
+    /// The control must fit every label it can render inside its fixed budget: an
+    /// overflow would paint the percentage over the window buttons.
+    #[test]
+    fn the_update_control_fits_its_widest_label() {
+        let ctx = context(Vec2::new(1100.0, 720.0));
+        let width = UpdateButton::width();
+        // Labels the control actually renders are truncated to the budget, so every
+        // candidate must fit the widest untruncated one.
+        for label in ["v0.7.5", "100%", "v1.12.345"] {
+            let galley = ctx.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(
+                    label.to_owned(),
+                    egui::FontId::new(11.5, kh_family()),
+                    Color32::WHITE,
+                )
+            });
+            let text_left = UPDATE_BUTTON_INSET + ICON_SIZE + 6.0;
+            assert!(
+                text_left + galley.size().x <= width,
+                "{label:?} ({:?} wide) overflows the {width}px control",
+                galley.size().x
+            );
+        }
+    }
+
+    /// A fixed width keeps the window controls from shifting when the label
+    /// changes from a version to a progress percentage.
+    #[test]
+    fn the_update_control_never_resizes_with_its_label() {
+        let width = UpdateButton::width();
+        assert_eq!(width, UpdateButton::width());
+        assert!(width > UPDATE_BUTTON_INSET * 2.0 + ICON_SIZE + 6.0);
+    }
 }

@@ -50,7 +50,19 @@ impl AppState {
                             )
                         })
                         .unwrap_or_else(|| "Wire".to_owned());
-                    title_bar::ui(
+                    // Built as owned text so the borrow only has to outlive the `ui` call
+                    // below, not the enclosing closure.
+                    #[cfg(windows)]
+                    let update_text = self.title_bar_update_button();
+                    #[cfg(windows)]
+                    let update_button = update_text.as_ref().map(|text| title_bar::UpdateButton {
+                        label: &text.label,
+                        tooltip: &text.tooltip,
+                        busy: text.busy,
+                    });
+                    #[cfg(not(windows))]
+                    let update_button = None;
+                    let update_clicked = title_bar::ui(
                         ui,
                         title_bar_rect,
                         pal,
@@ -59,7 +71,14 @@ impl AppState {
                         self.show_system_usage,
                         always_on_top,
                         rounded,
+                        update_button,
                     );
+                    #[cfg(windows)]
+                    if update_clicked {
+                        if let Some((peer, _)) = self.peer_update.best_candidate() {
+                            self.begin_peer_update(ctx, peer);
+                        }
+                    }
 
                     let mut body_rect = app_rect;
                     body_rect.min.y = title_bar_rect.max.y;

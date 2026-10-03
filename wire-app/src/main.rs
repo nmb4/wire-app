@@ -342,6 +342,10 @@ fn main() -> Result<(), eframe::Error> {
         }
     }
     wire::net::prepare_config_dir();
+    // A crashed or interrupted update can leave a verified executable sitting
+    // next to the install; it is inert but large, so clear it on launch.
+    #[cfg(windows)]
+    wire_app_lib::sweep_stale_staged_updates();
     let frame_style = App::initial_window_frame_style();
     let rounded = window_frame::style_wants_rounded(frame_style);
     let mut options = NativeOptions::default();

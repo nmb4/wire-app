@@ -11,11 +11,13 @@ mod widgets;
 
 #[cfg(windows)]
 use self::calls_ui::native_parent_hwnd;
-use self::widgets::{ellipsize, format_bytes, track_pane_viewport};
+#[cfg(windows)]
+pub(crate) use self::widgets::format_bytes;
+use self::widgets::{ellipsize, track_pane_viewport};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use crate::tray::{TrayAction, TrayController};
 #[cfg(windows)]
-use crate::update::{self, ReleaseInfo};
+use crate::update::{self, compare_versions, ReleaseInfo};
 use crate::{
     activation::ActivationWatcher,
     autostart,
@@ -279,6 +281,10 @@ struct AppState {
     update_status: UpdateStatus,
     #[cfg(windows)]
     show_update_prompt: bool,
+    #[cfg(windows)]
+    peer_update: PeerUpdateState,
+    #[cfg(windows)]
+    show_peer_update_prompt: bool,
     resource_monitor: ResourceMonitor,
     dev_pair: Option<DevPairState>,
     dev_auto_share: bool,
@@ -540,7 +546,155 @@ enum UpdateStatus {
 #[cfg(windows)]
 enum UpdateMessage {
     CheckFinished(anyhow::Result<Option<ReleaseInfo>>),
-    DownloadFinished(anyhow::Result<PathBuf>),
+    DownloadFinished(anyhow::Result<update::StagedUpdate>),
+}
+
+/// Peers reachable right now that advertise a newer Wire build.
+///
+/// Fed by presence, so this reflects live connectivity: a friend that goes
+/// offline drops out of the set and the title-bar control disappears again.
+#[cfg(windows)]
+#[derive(Default)]
+struct PeerUpdateState {
+    /// Peer -> the newer version it advertises.
+    candidates: BTreeMap<NodeId, String>,
+    /// The peer whose update flow the user is currently driving, if any.
+    active: Option<NodeId>,
+    /// A peer answered with concrete metadata.
+    offer: Option<crate::peer_update::UpdateOffer>,
+    /// Where an in-flight transfer stands. `None` means nothing is moving.
+    transfer: Option<PeerUpdateTransfer>,
+    error: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct PeerUpdateTransfer {
+    peer: NodeId,
+    received: u64,
+    total: u64,
+}
+
+#[cfg(windows)]
+impl PeerUpdateTransfer {
+    /// Progress as a whole percentage, 0 until the peer reports a size.
+    fn percent(&self) -> u32 {
+        self.received
+            .saturating_mul(100)
+            .checked_div(self.total)
+            .unwrap_or(0)
+            .min(100) as u32
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod peer_update_tests {
+    use super::*;
+
+    #[test]
+    fn progress_percentage_is_zero_until_a_size_is_known() {
+        let mut transfer = PeerUpdateTransfer {
+            peer: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            received: 0,
+            total: 0,
+        };
+        assert_eq!(transfer.percent(), 0);
+        transfer.total = 200;
+        transfer.received = 50;
+        assert_eq!(transfer.percent(), 25);
+        transfer.received = 200;
+        assert_eq!(transfer.percent(), 100);
+    }
+
+    fn peer(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn the_highest_newer_version_is_the_one_offered() {
+        let mut state = PeerUpdateState::default();
+        let old_peer = peer(1);
+        let new_peer = peer(2);
+        // Presence arrives in arbitrary order; the user should be offered the
+        // newest build available, not whichever friend reported first.
+        state.candidates.insert(old_peer, "0.7.5".to_owned());
+        state.candidates.insert(new_peer, "0.8.0".to_owned());
+        let (chosen, version) = state.best_candidate().expect("a candidate must exist");
+        assert_eq!(chosen, new_peer);
+        assert_eq!(version, "0.8.0");
+    }
+
+    #[test]
+    fn no_candidates_means_nothing_is_offered() {
+        let state = PeerUpdateState::default();
+        assert!(state.best_candidate().is_none());
+        assert!(!state.is_active(peer(1)));
+    }
+
+    #[test]
+    fn resetting_clears_the_active_flow_including_a_stalled_transfer() {
+        let mut state = PeerUpdateState::default();
+        state.active = Some(peer(1));
+        state.transfer = Some(PeerUpdateTransfer {
+            peer: peer(1),
+            received: 5,
+            total: 10,
+        });
+        state.error = Some("boom".to_owned());
+        // Candidates are presence-derived and must survive a flow reset.
+        state.candidates.insert(peer(2), "0.8.0".to_owned());
+        state.reset();
+        assert!(state.active.is_none());
+        assert!(state.transfer.is_none());
+        assert!(state.error.is_none());
+        assert_eq!(state.best_candidate().map(|(peer, _)| peer), Some(peer(2)));
+    }
+
+    #[test]
+    fn a_progress_report_never_exceeds_one_hundred_percent() {
+        // A peer could over-report; the bar must still be a valid 0..=100 value.
+        let transfer = PeerUpdateTransfer {
+            peer: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            received: 5_000,
+            total: 100,
+        };
+        assert_eq!(transfer.percent(), 100);
+    }
+}
+
+/// Owned title-bar text, so `title_bar::ui` can borrow it for one frame.
+#[cfg(windows)]
+struct TitleBarUpdateText {
+    label: String,
+    tooltip: String,
+    busy: bool,
+}
+
+#[cfg(windows)]
+impl PeerUpdateState {
+    /// Highest version any reachable friend offers, if it beats the local one.
+    fn best_candidate(&self) -> Option<(NodeId, &String)> {
+        self.candidates
+            .iter()
+            .max_by(|(left_peer, left), (right_peer, right)| {
+                compare_versions(left, right).then_with(|| right_peer.cmp(left_peer))
+            })
+            .map(|(peer, version)| (*peer, version))
+    }
+
+    fn is_active(&self, peer: NodeId) -> bool {
+        self.active == Some(peer)
+    }
+
+    /// Clear everything once a transfer finished (successfully or not), so the
+    /// next flow starts from a clean slate.
+    fn reset(&mut self) {
+        self.active = None;
+        self.offer = None;
+        self.transfer = None;
+        self.error = None;
+    }
 }
 
 struct AutostartMessage {
@@ -1042,6 +1196,10 @@ impl App {
             update_status: UpdateStatus::Idle,
             #[cfg(windows)]
             show_update_prompt: false,
+            #[cfg(windows)]
+            peer_update: PeerUpdateState::default(),
+            #[cfg(windows)]
+            show_peer_update_prompt: false,
             resource_monitor: ResourceMonitor::start(),
             dev_pair: DevPairState::from_env(),
             dev_auto_share: std::env::var_os("WIRE_DEV_AUTO_SHARE").is_some(),
@@ -1292,10 +1450,15 @@ impl AppState {
         }
         self.notifications.show(ctx, self.theme);
         #[cfg(windows)]
+        if self.show_peer_update_prompt {
+            self.ui_peer_update_prompt(ctx);
+        }
+        #[cfg(windows)]
         {
             let force_hide = self.show_settings
                 || !self.configured
                 || self.show_update_prompt
+                || self.show_peer_update_prompt
                 || contacts_visible
                 || self.show_capture_picker
                 || self.show_profile_editor
@@ -1310,6 +1473,187 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Keep the peer-update candidate set in step with presence.
+    ///
+    /// A friend advertising a newer build becomes a candidate; the same friend
+    /// going offline (or falling back to our version) removes it, which also
+    /// takes the title-bar control away again.
+    #[cfg(windows)]
+    fn sync_peer_update_candidates(&mut self, peer: NodeId) {
+        let status = self.friend_status.get(&peer);
+        let online = matches!(
+            status,
+            Some(status) if matches!(status.availability, Availability::Online)
+        );
+        let newer = status
+            .and_then(|status| status.client_version.as_deref())
+            .is_some_and(|version| update::is_version_newer(version, crate::APP_VERSION));
+        if online && newer {
+            let version = status
+                .and_then(|status| status.client_version.clone())
+                .unwrap_or_default();
+            let is_new_candidate = self.peer_update.candidates.insert(peer, version).is_none();
+            if is_new_candidate {
+                info!(
+                    peer = %peer.fmt_short(),
+                    "a friend advertised a newer Wire version; the title bar now offers it"
+                );
+            }
+        } else {
+            self.peer_update.candidates.remove(&peer);
+        }
+        // A candidate that leaves is deliberately not reset here. The progress
+        // panel auto-closes only once nothing has started, and the title-bar
+        // control stays up for as long as a transfer is in flight, so a failure
+        // remains visible. Resetting on presence would silently swallow it.
+    }
+
+    /// The title-bar control, present only while a newer friend is reachable.
+    #[cfg(windows)]
+    fn title_bar_update_button(&self) -> Option<TitleBarUpdateText> {
+        // Checked before the candidate list so an in-flight transfer keeps the
+        // control even if its sender has dropped off presence: the button is how
+        // the user gets back to the progress and error state.
+        let transfer = self
+            .peer_update
+            .transfer
+            .as_ref()
+            .filter(|transfer| self.peer_update.active == Some(transfer.peer));
+        if let Some(transfer) = transfer {
+            let peer = transfer.peer;
+            let name = self.peer_display_name(peer);
+            let version = self
+                .peer_update
+                .candidates
+                .get(&peer)
+                .cloned()
+                .unwrap_or_else(|| "a newer".to_owned());
+            return Some(TitleBarUpdateText {
+                // Progress replaces the version in the same fixed-width slot.
+                label: format!("{}%", transfer.percent()),
+                tooltip: format!("Receiving Wire v{version} from {name}"),
+                busy: true,
+            });
+        }
+        let (peer, version) = self.peer_update.best_candidate()?;
+        let name = self.peer_display_name(peer);
+        Some(TitleBarUpdateText {
+            label: version.clone(),
+            tooltip: format!("{name} is running Wire v{version}. Click to update."),
+            busy: false,
+        })
+    }
+
+    /// Open the accept flow for a candidate peer.
+    #[cfg(windows)]
+    fn begin_peer_update(&mut self, ctx: &egui::Context, peer: NodeId) {
+        if self.peer_update.transfer.is_some() {
+            // Every transfer writes the same staging file, so starting a second
+            // one would clobber the first mid-flight. The running progress is
+            // already on screen; just bring its panel forward.
+            self.show_peer_update_prompt = true;
+            return;
+        }
+        info!(
+            peer = %peer.fmt_short(),
+            "asking a peer running a newer Wire version for its executable"
+        );
+        self.peer_update.active = Some(peer);
+        self.peer_update.offer = None;
+        self.peer_update.transfer = None;
+        self.peer_update.error = None;
+        self.show_peer_update_prompt = true;
+        self.cmd(Command::FetchPeerUpdateOffer { peer });
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn on_peer_update_offer(&mut self, peer: NodeId, offer: crate::peer_update::UpdateOffer) {
+        if !self.peer_update.is_active(peer) {
+            return;
+        }
+        if !offer.is_usable_for(crate::APP_VERSION) {
+            self.peer_update.error = Some(format!(
+                "{} is already running v{} or newer",
+                self.peer_display_name(peer),
+                offer.version
+            ));
+            self.show_peer_update_prompt = true;
+            return;
+        }
+        if !offer.is_runnable_here() {
+            self.peer_update.error = Some(format!(
+                "{} sent a build for {}, which cannot run here",
+                self.peer_display_name(peer),
+                offer.platform
+            ));
+            self.show_peer_update_prompt = true;
+            return;
+        }
+        self.peer_update.offer = Some(offer);
+        self.peer_update.error = None;
+        self.show_peer_update_prompt = true;
+    }
+
+    #[cfg(windows)]
+    fn on_peer_update_progress(&mut self, peer: NodeId, received: u64, total: u64) {
+        if !self.peer_update.is_active(peer) {
+            return;
+        }
+        self.peer_update.transfer = Some(PeerUpdateTransfer {
+            peer,
+            received,
+            total,
+        });
+        self.show_peer_update_prompt = true;
+    }
+
+    #[cfg(windows)]
+    fn on_peer_update_ready(
+        &mut self,
+        ctx: &egui::Context,
+        peer: NodeId,
+        version: String,
+        staged: crate::update::StagedUpdate,
+    ) {
+        if !self.peer_update.is_active(peer) {
+            // A finished transfer nobody is waiting on must not sit on disk.
+            let _ = std::fs::remove_file(staged.path());
+            return;
+        }
+        if let Err(error) = update::install_and_relaunch(&staged) {
+            // The helper never started, so nothing will consume the staged file.
+            // Leaving it in place risks a later stray attempt installing it.
+            let _ = std::fs::remove_file(staged.path());
+            self.peer_update.error = Some(format!(
+                "Downloaded and verified Wire v{version}, but could not restart into it: {error:#}"
+            ));
+            self.peer_update.reset();
+            self.show_peer_update_prompt = true;
+            return;
+        }
+        info!(peer = %peer.fmt_short(), version = %version, "restarting into the received update");
+        self.peer_update.reset();
+        self.show_peer_update_prompt = false;
+        self.exit_requested = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    #[cfg(windows)]
+    fn on_peer_update_failed(&mut self, peer: NodeId, error: String) {
+        if !self.peer_update.is_active(peer) {
+            return;
+        }
+        self.notifications.error(
+            "peer-update-error",
+            "Could not get the update",
+            error.clone(),
+        );
+        self.peer_update.error = Some(error);
+        self.peer_update.transfer = None;
+        self.show_peer_update_prompt = true;
     }
 
     #[cfg(windows)]
@@ -1345,6 +1689,8 @@ impl AppState {
 
     #[cfg(windows)]
     fn process_update_events(&mut self, ctx: &egui::Context) {
+        // Service events (including the peer-update stream) are drained by
+        // `process_events`, which runs in the same frame.
         while let Ok(message) = self.update_rx.try_recv() {
             match message {
                 UpdateMessage::CheckFinished(Ok(Some(release))) => {
@@ -1357,13 +1703,16 @@ impl AppState {
                 UpdateMessage::CheckFinished(Err(error)) => {
                     self.update_status = UpdateStatus::Error(error.to_string());
                 }
-                UpdateMessage::DownloadFinished(Ok(path)) => {
-                    match update::relaunch_after_download(&path) {
+                UpdateMessage::DownloadFinished(Ok(staged)) => {
+                    match update::install_and_relaunch(&staged) {
                         Ok(_) => {
                             self.exit_requested = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         Err(error) => {
+                            // The helper never started, so the staged file would
+                            // otherwise be left behind next to the install.
+                            let _ = std::fs::remove_file(staged.path());
                             self.update_status = UpdateStatus::Error(format!(
                                 "Downloaded the update, but could not relaunch it: {error}",
                             ));
@@ -1502,19 +1851,33 @@ impl AppState {
                         update.profile.accent_color.clone(),
                         "presence",
                     );
-                    #[cfg(windows)]
-                    let peer_is_newer = update.client_version.as_deref().is_some_and(|version| {
-                        update::is_version_newer(version, crate::APP_VERSION)
-                    });
                     self.friend_status.insert(peer, update);
                     #[cfg(windows)]
-                    if peer_is_newer {
-                        info!(
-                            peer = %peer.fmt_short(),
-                            "friend advertised a newer Wire version; checking for updates"
-                        );
-                        self.start_update_check(ctx);
-                    }
+                    self.sync_peer_update_candidates(peer);
+                }
+                #[cfg(windows)]
+                Event::PeerUpdateOffer { peer, offer } => {
+                    self.on_peer_update_offer(peer, offer);
+                }
+                #[cfg(windows)]
+                Event::PeerUpdateProgress {
+                    peer,
+                    received,
+                    total,
+                } => {
+                    self.on_peer_update_progress(peer, received, total);
+                }
+                #[cfg(windows)]
+                Event::PeerUpdateReady {
+                    peer,
+                    version,
+                    staged,
+                } => {
+                    self.on_peer_update_ready(ctx, peer, version, staged);
+                }
+                #[cfg(windows)]
+                Event::PeerUpdateFailed { peer, error } => {
+                    self.on_peer_update_failed(peer, error);
                 }
                 Event::GroupCallEntered(call) => {
                     self.mark_group_call_seen(call.call_id.clone());
@@ -2244,7 +2607,13 @@ impl AppState {
                 accent_color,
             } => {
                 if let Ok(peer) = NodeId::from_str(&peer) {
-                    self.learn_peer_snapshot(peer, display_name, avatar_hash, accent_color, "invite");
+                    self.learn_peer_snapshot(
+                        peer,
+                        display_name,
+                        avatar_hash,
+                        accent_color,
+                        "invite",
+                    );
                 }
             }
             ChatNotification::RetentionSweep => {
@@ -2919,7 +3288,11 @@ impl AppState {
 }
 
 fn message_notification_preview(message: &ChatMessage) -> String {
-    let body = message.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = message
+        .body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let file_names = message
         .attachments
         .iter()

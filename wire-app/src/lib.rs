@@ -11,6 +11,8 @@ pub mod host;
 mod klipy;
 mod notifications;
 mod overlay_window;
+#[cfg(windows)]
+mod peer_update;
 mod persistence;
 mod profile;
 mod resource_monitor;
@@ -34,6 +36,15 @@ mod screen_capture;
 pub mod theme;
 #[cfg(windows)]
 mod update;
+
+/// Remove update executables staged by a previous run that never installed.
+///
+/// Called once at startup. A staging file left by a crash or a failed relaunch is
+/// inert, but each is a full release binary and they would otherwise accumulate.
+#[cfg(windows)]
+pub fn sweep_stale_staged_updates() {
+    update::sweep_stale_staged_files();
+}
 mod video_decode;
 #[cfg(windows)]
 mod win_capture;

@@ -1,7 +1,7 @@
 //! Network, call, chat, and capture orchestration on the worker runtime.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
@@ -29,8 +29,8 @@ use super::{
 use crate::{
     chat,
     client_status::{
-        Availability, ClientStatusProtocol, GroupCallAnnouncement, CLIENT_STATUS_ALPN,
-        PRESENCE_REFRESH_INTERVAL,
+        AllowedPeers, Availability, ClientStatusProtocol, GroupCallAnnouncement,
+        CLIENT_STATUS_ALPN, PRESENCE_REFRESH_INTERVAL,
     },
     profile::{self, FetchedProfile, ProfileProtocol, ServedProfile, PROFILE_ALPN},
 };
@@ -40,6 +40,74 @@ enum CallInfo {
     Connecting(RtcConnection),
     Incoming(RtcConnection),
     Active(RtcConnection),
+}
+
+/// Transfer a peer's executable into the staging file, then verify it.
+///
+/// Verification runs on its own thread: hashing a full release binary on a
+/// runtime worker would stall every other task, including audio and video.
+#[cfg(windows)]
+async fn run_peer_update_download(
+    endpoint: Endpoint,
+    peer: NodeId,
+    offer: crate::peer_update::UpdateOffer,
+    event_tx: EventPublisher,
+) -> Result<()> {
+    let staged = crate::update::StagedUpdate::plan()?;
+    let destination = staged.path().to_path_buf();
+    let expected_sha256 = offer.sha256.clone();
+
+    let received =
+        crate::peer_update::download_update(&endpoint, peer, &destination, |received, total| {
+            event_tx.publish(Event::PeerUpdateProgress {
+                peer,
+                received,
+                total,
+            });
+        })
+        .await;
+
+    // A half-written executable next to the running one is worse than none: a
+    // later attempt or a stray restart could treat it as installable. Drop it on
+    // any failure, including a checksum mismatch.
+    let received = match received {
+        Ok(offer) => offer,
+        Err(error) => {
+            let _ = std::fs::remove_file(&destination);
+            return Err(error);
+        }
+    };
+
+    let verify_target = staged.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || verify_target.verify(&expected_sha256))
+        .await
+        .context("the update verification task did not finish")?
+    {
+        let _ = std::fs::remove_file(&destination);
+        return Err(error);
+    }
+
+    // Deliberately the only gap in the chain: between this verification and the
+    // relaunch helper, the staged file sits on local disk for as long as the
+    // user takes to read the prompt. Closing that fully would mean holding a lock
+    // across the handover; anyone who can write to the install directory could
+    // replace the executable directly anyway.
+
+    info!(
+        peer = %peer.fmt_short(),
+        version = %offer.version,
+        "verified a peer-to-peer update and staged it for install"
+    );
+    // `EventPublisher::send` cannot report a gone presenter, so a staged file
+    // nobody will install is reaped by the startup sweep instead.
+    event_tx
+        .send(Event::PeerUpdateReady {
+            peer,
+            version: received.version,
+            staged,
+        })
+        .await;
+    Ok(())
 }
 
 pub(super) struct Worker {
@@ -78,8 +146,17 @@ pub(super) struct Worker {
     deafened: bool,
     chat: chat::ChatService,
     client_status: ClientStatusProtocol,
+    /// Shared contact gate for presence and executable transfer.
+    allowed_peers: AllowedPeers,
     profile_protocol: ProfileProtocol,
     profile_fetches: JoinSet<(NodeId, Result<FetchedProfile>)>,
+    /// Peer-to-peer update transfers, one task per in-flight download. Always
+    /// present so the select loop does not need a platform-specific arm; only
+    /// Windows ever spawns into it.
+    peer_updates: JoinSet<(NodeId, Result<()>)>,
+    /// Peers with a transfer in flight, so a repeated click cannot start a
+    /// second download writing to the same staging file.
+    pending_peer_updates: BTreeSet<NodeId>,
     local_group_call: Option<GroupCallAnnouncement>,
     peer_group_calls: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
 }
@@ -157,7 +234,7 @@ impl Worker {
         command_rx: async_channel::Receiver<Command>,
     ) -> Result<Self> {
         info!("binding Wire networking endpoint");
-        let endpoint = wire::net::bind_endpoint_with_alpns([
+        let mut alpns = vec![
             iroh_blobs::ALPN.to_vec(),
             iroh_docs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
@@ -165,31 +242,36 @@ impl Worker {
             CLIENT_STATUS_ALPN.to_vec(),
             PROFILE_ALPN.to_vec(),
             wire::remote_logs::LOGS_ALPN.to_vec(),
-        ])
-        .await?;
+        ];
+        #[cfg(windows)]
+        alpns.push(crate::peer_update::PEER_UPDATE_ALPN.to_vec());
+        let endpoint = wire::net::bind_endpoint_with_alpns(alpns).await?;
         info!(node = %endpoint.node_id().fmt_short(), "Wire endpoint bound; opening chat storage");
         let handler = RtcProtocol::new(endpoint.clone());
         let logs_protocol = wire::remote_logs::LogsProtocol::new(endpoint.node_id());
-        let client_status = ClientStatusProtocol::new(endpoint.clone());
+        let allowed_peers = AllowedPeers::default();
+        let client_status = ClientStatusProtocol::new(endpoint.clone(), allowed_peers.clone());
         // Profiles ride on presence: seed the heartbeat snapshot (and the
         // public fetch protocol + chat snapshots) from local disk.
         let own_profile = profile::load_own_profile();
         let own_avatar = profile::load_avatar_bytes();
         client_status.set_own_profile(own_profile.snapshot());
-        let profile_protocol = ProfileProtocol::new(ServedProfile::from_own(
-            &own_profile,
-            own_avatar,
-        ));
+        let profile_protocol =
+            ProfileProtocol::new(ServedProfile::from_own(&own_profile, own_avatar));
         let config_dir = wire::net::config_dir().context("missing Wire config directory")?;
         let mut chat_protocols = chat::ChatService::build(endpoint.clone(), &config_dir).await?;
         chat_protocols.service.set_own_profile(
-            (!own_profile.display_name.trim().is_empty())
-                .then(|| own_profile.display_name.clone()),
+            (!own_profile.display_name.trim().is_empty()).then(|| own_profile.display_name.clone()),
             own_profile.avatar_hash.clone(),
             own_profile.accent_color.clone(),
         );
         info!("chat storage opened; starting protocol router");
-        let _router = Router::builder(endpoint.clone())
+        // Presence and executable transfer share one contact gate, so a single
+        // `SetFriends` keeps both in sync.
+        #[cfg(windows)]
+        let update_protocol = crate::peer_update::PeerUpdateProtocol::new(allowed_peers.clone());
+        #[cfg(windows)]
+        let router = Router::builder(endpoint.clone())
             .accept(RtcProtocol::ALPN, handler.clone())
             .accept(iroh_blobs::ALPN, chat_protocols.provider.clone())
             .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
@@ -198,8 +280,18 @@ impl Worker {
             .accept(CLIENT_STATUS_ALPN, client_status.clone())
             .accept(PROFILE_ALPN, profile_protocol.clone())
             .accept(wire::remote_logs::LOGS_ALPN, logs_protocol)
-            .spawn()
-            .await?;
+            .accept(crate::peer_update::PEER_UPDATE_ALPN, update_protocol);
+        #[cfg(not(windows))]
+        let router = Router::builder(endpoint.clone())
+            .accept(RtcProtocol::ALPN, handler.clone())
+            .accept(iroh_blobs::ALPN, chat_protocols.provider.clone())
+            .accept(iroh_docs::ALPN, chat_protocols.docs.clone())
+            .accept(iroh_gossip::ALPN, chat_protocols.gossip.clone())
+            .accept(chat::CHAT_ALPN, chat_protocols.invites.clone())
+            .accept(CLIENT_STATUS_ALPN, client_status.clone())
+            .accept(PROFILE_ALPN, profile_protocol.clone())
+            .accept(wire::remote_logs::LOGS_ALPN, logs_protocol);
+        let _router = router.spawn().await?;
         info!("Wire protocol router started");
         let (video_frame_tx, _) = tokio::sync::broadcast::channel(32);
         let (keyframe_tx, _) = tokio::sync::broadcast::channel(16);
@@ -242,8 +334,11 @@ impl Worker {
             deafened: false,
             chat: chat_protocols.service,
             client_status,
+            allowed_peers,
             profile_protocol,
             profile_fetches: JoinSet::new(),
+            peer_updates: JoinSet::new(),
+            pending_peer_updates: Default::default(),
         })
     }
 
@@ -370,6 +465,12 @@ impl Worker {
                     }
                     self.emit(Event::ClientStatus(status)).await?;
                 }
+                Some(joined) = self.peer_updates.join_next(), if !self.peer_updates.is_empty() => {
+                    // Dispatched through a method because `select!` arms cannot be
+                    // `#[cfg]`-ed: the arm must exist on every platform, while
+                    // the events it reports only exist on Windows.
+                    self.on_peer_update_finished(joined).await;
+                }
                 Some(joined) = self.profile_fetches.join_next(), if !self.profile_fetches.is_empty() => {
                     let Ok((peer, result)) = joined else {
                         warn!("profile fetch task was cancelled or panicked");
@@ -408,6 +509,39 @@ impl Worker {
             self.stop_capture().await;
         }
         Ok(())
+    }
+
+    /// Report a finished peer-to-peer update transfer.
+    #[cfg(windows)]
+    async fn on_peer_update_finished(
+        &mut self,
+        joined: std::result::Result<(NodeId, Result<()>), tokio::task::JoinError>,
+    ) {
+        let Ok((peer, result)) = joined else {
+            warn!("peer update task was cancelled or panicked");
+            return;
+        };
+        // Clear first: a failure must not leave the peer marked busy, or the UI
+        // would refuse every retry until restart.
+        self.pending_peer_updates.remove(&peer);
+        if let Err(error) = result {
+            warn!(peer = %peer.fmt_short(), "peer update failed: {error:#}");
+            self.emit(Event::PeerUpdateFailed {
+                peer,
+                error: format!("{error:#}"),
+            })
+            .await
+            .ok();
+        }
+    }
+
+    /// Windows-only task set; never populated elsewhere, so there is nothing to
+    /// report.
+    #[cfg(not(windows))]
+    async fn on_peer_update_finished(
+        &mut self,
+        _joined: std::result::Result<(NodeId, anyhow::Result<()>), tokio::task::JoinError>,
+    ) {
     }
 
     async fn handle_incoming(&mut self, conn: RtcConnection) -> Result<()> {
@@ -1158,7 +1292,7 @@ impl Worker {
                 }
             }
             Command::SetFriends { friends } => {
-                self.client_status.replace_peers(friends.clone());
+                self.allowed_peers.replace(friends.clone());
                 self.client_status.announce_online(friends);
             }
             Command::SetOwnProfile {
@@ -1167,17 +1301,13 @@ impl Worker {
                 accent_color,
             } => {
                 let snapshot = profile::ProfileSnapshot {
-                    display_name: (!display_name.trim().is_empty())
-                        .then_some(display_name.clone()),
+                    display_name: (!display_name.trim().is_empty()).then_some(display_name.clone()),
                     avatar_hash: avatar_hash.clone(),
                     accent_color: accent_color.clone(),
                 };
                 self.client_status.set_own_profile(snapshot);
-                self.chat.set_own_profile(
-                    Some(display_name.clone()),
-                    avatar_hash,
-                    accent_color,
-                );
+                self.chat
+                    .set_own_profile(Some(display_name.clone()), avatar_hash, accent_color);
                 self.refresh_served_profile();
                 // Re-announce so friends learn the new identity immediately.
                 self.client_status.refresh_allowed_peers();
@@ -1223,6 +1353,79 @@ impl Worker {
             }
             Command::ClearChatHistory { conversation_id } => {
                 self.chat.clear_history(conversation_id).await;
+            }
+            #[cfg(windows)]
+            Command::FetchPeerUpdateOffer { peer } => {
+                let endpoint = self.endpoint.clone();
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let event = match crate::peer_update::fetch_offer(&endpoint, peer).await {
+                        Ok(offer) => Event::PeerUpdateOffer { peer, offer },
+                        Err(error) => {
+                            warn!(peer = %peer.fmt_short(), "peer update offer failed: {error:#}");
+                            Event::PeerUpdateFailed {
+                                peer,
+                                error: format!("{error:#}"),
+                            }
+                        }
+                    };
+                    let _ = event_tx.send(event).await;
+                });
+            }
+            #[cfg(windows)]
+            Command::DownloadPeerUpdate { peer } => {
+                // One transfer per peer: a second click while bytes are moving
+                // must not race the staging file.
+                if !self.pending_peer_updates.insert(peer) {
+                    return Ok(());
+                }
+                let endpoint = self.endpoint.clone();
+                let event_tx = self.event_tx.clone();
+                // Cheap first: confirm the peer really offers something newer
+                // before writing tens of megabytes to disk.
+                let offer = match crate::peer_update::fetch_offer(&endpoint, peer).await {
+                    Ok(offer)
+                        if offer.is_usable_for(crate::APP_VERSION) && offer.is_runnable_here() =>
+                    {
+                        offer
+                    }
+                    Ok(offer) => {
+                        self.pending_peer_updates.remove(&peer);
+                        // A binary built for another platform cannot run here, so
+                        // installing it would break a working install.
+                        let error = if !offer.is_runnable_here() {
+                            format!(
+                                "{} sent a Wire build for {}, which cannot run on {}",
+                                peer.fmt_short(),
+                                offer.platform,
+                                crate::peer_update::current_platform()
+                            )
+                        } else {
+                            format!(
+                                "{} is already running v{} or newer",
+                                peer.fmt_short(),
+                                offer.version
+                            )
+                        };
+                        let _ = event_tx.send(Event::PeerUpdateFailed { peer, error }).await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        self.pending_peer_updates.remove(&peer);
+                        warn!(peer = %peer.fmt_short(), "peer update offer failed: {error:#}");
+                        let _ = event_tx
+                            .send(Event::PeerUpdateFailed {
+                                peer,
+                                error: format!("{error:#}"),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                };
+                self.peer_updates.spawn(async move {
+                    let result = run_peer_update_download(endpoint, peer, offer, event_tx).await;
+                    (peer, result)
+                });
             }
             Command::Call { node_id } => {
                 if self.active_calls.contains_key(&node_id) {

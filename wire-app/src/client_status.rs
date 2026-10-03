@@ -172,10 +172,36 @@ impl StatusPacket {
     }
 }
 
+/// The set of peers allowed to reach Wire's private protocols.
+///
+/// Presence and peer-to-peer executable transfer share one gate so a node that
+/// is not a saved contact can neither read our heartbeat nor pull our binary.
+#[derive(Clone, Debug, Default)]
+pub struct AllowedPeers(Arc<RwLock<BTreeSet<NodeId>>>);
+
+impl AllowedPeers {
+    fn lock(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<NodeId>> {
+        self.0.read().expect("allowed peers lock poisoned")
+    }
+
+    /// Replace the whole contact set (called whenever the friends list changes).
+    pub fn replace(&self, peers: BTreeSet<NodeId>) {
+        *self.0.write().expect("allowed peers lock poisoned") = peers;
+    }
+
+    pub fn contains(&self, peer: NodeId) -> bool {
+        self.lock().contains(&peer)
+    }
+
+    pub fn snapshot(&self) -> BTreeSet<NodeId> {
+        self.lock().clone()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientStatusProtocol {
     endpoint: Endpoint,
-    allowed_peers: Arc<RwLock<BTreeSet<NodeId>>>,
+    allowed_peers: AllowedPeers,
     update_tx: Sender<StatusUpdate>,
     update_rx: Receiver<StatusUpdate>,
     active_group_calls: Arc<RwLock<Vec<GroupCallAnnouncement>>>,
@@ -184,11 +210,11 @@ pub struct ClientStatusProtocol {
 }
 
 impl ClientStatusProtocol {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(endpoint: Endpoint, allowed_peers: AllowedPeers) -> Self {
         let (update_tx, update_rx) = async_channel::bounded(64);
         Self {
             endpoint,
-            allowed_peers: Arc::new(RwLock::new(BTreeSet::new())),
+            allowed_peers,
             update_tx,
             update_rx,
             active_group_calls: Arc::new(RwLock::new(Vec::new())),
@@ -230,13 +256,6 @@ impl ClientStatusProtocol {
             .collect()
     }
 
-    pub fn replace_peers(&self, peers: BTreeSet<NodeId>) {
-        *self
-            .allowed_peers
-            .write()
-            .expect("client status peer lock poisoned") = peers;
-    }
-
     pub async fn next_update(&self) -> Result<StatusUpdate> {
         Ok(self.update_rx.recv().await?)
     }
@@ -262,7 +281,8 @@ impl ClientStatusProtocol {
                     active_group_calls,
                     own_profile,
                 )
-                .await {
+                .await
+                {
                     Ok(packet) => {
                         let current = probe_health
                             .lock()
@@ -320,20 +340,11 @@ impl ClientStatusProtocol {
     }
 
     pub fn refresh_allowed_peers(&self) {
-        let peers = self
-            .allowed_peers
-            .read()
-            .expect("client status peer lock poisoned")
-            .clone();
-        self.announce_online(peers);
+        self.announce_online(self.allowed_peers.snapshot());
     }
 
     pub async fn broadcast_offline(&self) {
-        let peers = self
-            .allowed_peers
-            .read()
-            .expect("client status peer lock poisoned")
-            .clone();
+        let peers = self.allowed_peers.snapshot();
         if peers.is_empty() {
             return;
         }
@@ -373,10 +384,7 @@ impl ClientStatusProtocol {
     }
 
     fn peer_is_allowed(&self, peer: NodeId) -> bool {
-        self.allowed_peers
-            .read()
-            .expect("client status peer lock poisoned")
-            .contains(&peer)
+        self.allowed_peers.contains(peer)
     }
 }
 
@@ -596,6 +604,22 @@ mod tests {
         health.observed_inbound();
         assert!(!health.failed(generation));
         assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn allowed_peers_are_shared_and_replaced_wholesale() {
+        let allowed = AllowedPeers::default();
+        let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        // A shared handle means one peer-set update reaches every protocol that
+        // gates on it (presence today, executable transfer next).
+        let mirror = allowed.clone();
+        allowed.replace([a].into_iter().collect());
+        assert!(mirror.contains(a));
+        assert!(!mirror.contains(b));
+        mirror.replace([b].into_iter().collect());
+        assert!(!allowed.contains(a));
+        assert_eq!(allowed.snapshot().len(), 1);
     }
 
     #[test]
