@@ -45,6 +45,20 @@ use std::{
 use tracing::{info, warn};
 use wire::audio::{AudioLevelHandle, VolumeHandle};
 
+/// Explain what the record control will do, in the state it is currently in.
+fn recording_hover_text(active: bool, in_call: bool, automatic: bool) -> String {
+    if active {
+        return "Stop recording. Each speaker is saved to a separate file".to_owned();
+    }
+    if !in_call {
+        return "Join a call before recording".to_owned();
+    }
+    if automatic {
+        return "Start recording now (calls are also recorded automatically)".to_owned();
+    }
+    "Record this call, one file per speaker".to_owned()
+}
+
 impl AppState {
     pub(super) fn ui_capture_picker(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut open = self.show_capture_picker;
@@ -803,7 +817,7 @@ impl AppState {
         }
 
         // Keep the control cluster centered at every window width.
-        let desired_controls_width: f32 = if in_call { 245.0 } else { 142.0 };
+        let desired_controls_width: f32 = if in_call { 303.0 } else { 142.0 };
         let controls_width = desired_controls_width.min(rect.width().max(0.0));
         let controls_left = (rect.center().x - controls_width / 2.0).clamp(
             rect.left(),
@@ -877,6 +891,35 @@ impl AppState {
                 {
                     self.toggle_sharing_from_ui();
                 }
+                ui.add_space(8.0);
+                // Staying stoppable matters more than staying available: a
+                // recording can outlive its call, and it must never become
+                // impossible to turn off.
+                let recordable = in_call || self.recording_active;
+                let recording = ui
+                    .add_enabled_ui(recordable, |ui| {
+                        dock_control(
+                            ui,
+                            pal,
+                            if self.recording_active {
+                                Icon::Square
+                            } else {
+                                Icon::Circle
+                            },
+                            self.recording_active,
+                        )
+                    })
+                    .inner;
+                if recording
+                    .on_hover_text(recording_hover_text(
+                        self.recording_active,
+                        in_call,
+                        self.record_calls_automatically,
+                    ))
+                    .clicked()
+                {
+                    self.toggle_call_recording();
+                }
                 if in_call {
                     ui.add_space(12.0);
                     v_sep(ui, pal.line);
@@ -894,6 +937,67 @@ impl AppState {
                     }
                 }
             });
+        });
+
+        // The recording clock sits above the control cluster rather than inside
+        // it, so the cluster keeps its known width and centering.
+        if self.recording_active {
+            self.recording_indicator(ui, pal, rect);
+        }
+    }
+
+    /// A persistent REC pill with the elapsed time and the speaker count.
+    ///
+    /// Recording must be obvious while it is happening, not just at the moment
+    /// it is switched on, so this stays on screen for the whole recording.
+    fn recording_indicator(&mut self, ui: &mut Ui, pal: &Palette, dock: egui::Rect) {
+        let elapsed = self
+            .recording_since
+            .map(|since| super::widgets::format_duration_ms(since.elapsed().as_millis() as u64))
+            .unwrap_or_else(|| "0:00".to_owned());
+        let detail = self
+            .recording_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+
+        const INDICATOR_HEIGHT: f32 = 26.0;
+        let width = 132.0_f32.min(dock.width().max(0.0));
+        let center = dock.center();
+        let bottom = (center.y - 30.0).max(dock.top() + INDICATOR_HEIGHT);
+        let top = bottom - INDICATOR_HEIGHT;
+        let rect = egui::Rect::from_min_max(
+            egui::pos2((center.x - width / 2.0).max(dock.left()), top),
+            egui::pos2(
+                (center.x + width / 2.0).min(dock.right()),
+                bottom.min(dock.bottom()),
+            ),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
+            Frame::new()
+                .fill(chat_surface(pal))
+                .stroke(Stroke::new(1.0_f32, pal.err))
+                .corner_radius(CornerRadius::same(13))
+                .inner_margin(egui::Margin::symmetric(10, 0))
+                .show(ui, |ui| {
+                    ui.set_min_height(INDICATOR_HEIGHT);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        dot(ui, pal.err, 7.0);
+                        ui.label(
+                            RichText::new(format!("REC {elapsed}"))
+                                .color(pal.text)
+                                .size(ui_font_size(11.5)),
+                        );
+                    });
+                });
+        })
+        .response
+        .on_hover_text(if detail.is_empty() {
+            "Recording this call, one file per speaker".to_owned()
+        } else {
+            format!("Recording this call, one file per speaker\n{detail}")
         });
     }
 

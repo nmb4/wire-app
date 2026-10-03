@@ -39,9 +39,10 @@ use crate::{
     video_decode::DecodedFrameData,
     window_frame,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::NativeOptions;
 use egui::{Frame, Rect, Vec2};
+use widgets::format_duration_ms;
 use egui_phosphor::regular as ph;
 use iroh::{KeyParsingError, NodeId};
 use std::{
@@ -203,6 +204,20 @@ enum StreamSource {
 
 const STREAM_GRID_GAP: f32 = 6.0;
 
+/// The most recent finished recording, kept so the user can go back to it.
+#[derive(Clone, Debug)]
+struct LastRecording {
+    dir: PathBuf,
+    started_at: String,
+    duration_ms: u64,
+    /// Speakers that produced a file.
+    captured: usize,
+    /// Speakers who were in the call but never said anything.
+    silent: usize,
+    /// Speakers whose file could not be written or finalized.
+    failed: Vec<String>,
+}
+
 struct AppState {
     configured: bool,
     show_settings: bool,
@@ -232,6 +247,15 @@ struct AppState {
     sharing_active: bool,
     share_system_audio: bool,
     system_audio_active: bool,
+    /// A call is being recorded, one file per speaker.
+    recording_active: bool,
+    recording_dir: Option<PathBuf>,
+    /// When the active recording started, for the elapsed indicator.
+    recording_since: Option<std::time::Instant>,
+    /// Wall-clock start of the last finished recording, so the post-call
+    /// summary can say when the meeting happened.
+    last_recording: Option<LastRecording>,
+    record_calls_automatically: bool,
     capture_error: Option<String>,
     show_capture_picker: bool,
     capture_targets: Vec<crate::screen_capture::CaptureTarget>,
@@ -786,6 +810,9 @@ struct Settings {
     show_system_usage: bool,
     #[serde(default = "enabled_by_default")]
     share_system_audio: bool,
+    /// Off by default: recording a call is a decision, not a default.
+    #[serde(default)]
+    record_calls_automatically: bool,
 }
 
 fn default_ui_sound_volume() -> f32 {
@@ -808,6 +835,7 @@ impl Default for Settings {
             start_with_system: false,
             show_system_usage: false,
             share_system_audio: true,
+            record_calls_automatically: false,
         }
     }
 }
@@ -1152,6 +1180,11 @@ impl App {
             sharing_active: false,
             share_system_audio: settings.share_system_audio,
             system_audio_active: false,
+            recording_active: false,
+            recording_dir: None,
+            recording_since: None,
+            last_recording: None,
+            record_calls_automatically: settings.record_calls_automatically,
             capture_error: None,
             show_capture_picker: false,
             capture_targets: Vec::new(),
@@ -1229,6 +1262,11 @@ impl App {
         });
         state.cmd(Command::SetChatRetention {
             retention: state.chat_retention,
+        });
+        // Sent unconditionally: auto-recording must be honoured from the first
+        // call after a restart, not only after the settings dialog is opened.
+        state.cmd(Command::SetRecordCallsAutomatically {
+            enabled: state.record_calls_automatically,
         });
         state.sync_friends_with_worker();
         state.sync_own_profile_to_worker();
@@ -1343,7 +1381,9 @@ impl AppState {
             // Keep the optional process resource readout current while the rest of the UI is idle.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
-        if window_visible && self.has_visible_call() {
+        if window_visible && (self.has_visible_call() || self.recording_active) {
+            // The recording clock has to keep ticking while the rest of the UI
+            // is idle, otherwise the elapsed time freezes on the last frame.
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         self.track_pane_viewport(ctx);
@@ -1776,6 +1816,7 @@ impl AppState {
                     self.show_settings = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                NotificationAction::OpenRecordingsFolder => self.reveal_recordings(),
             }
         }
     }
@@ -2172,6 +2213,75 @@ impl AppState {
                 }
                 Event::SystemAudioToggled(active) => {
                     self.system_audio_active = active && self.sharing_active;
+                }
+                Event::CallRecordingToggled { active, dir } => {
+                    self.recording_active = active;
+                    self.recording_dir = dir;
+                    if active {
+                        self.recording_since = Some(std::time::Instant::now());
+                    } else {
+                        self.recording_since = None;
+                    }
+                }
+                Event::CallRecordingStopped { summary } => {
+                    let captured = summary
+                        .speakers
+                        .iter()
+                        .filter(|speaker| speaker.file_name.is_some())
+                        .count();
+                    let failed: Vec<String> = summary
+                        .speakers
+                        .iter()
+                        .filter_map(|speaker| {
+                            speaker
+                                .error
+                                .as_ref()
+                                .map(|error| format!("{}: {error}", speaker.name))
+                        })
+                        .collect();
+                    // A speaker can have both a file and a finalize error, so the
+                    // two counts are not simply complementary.
+                    let silent = summary
+                        .speakers
+                        .len()
+                        .saturating_sub(captured + failed.len());
+                    let duration = format_duration_ms(summary.duration_ms);
+                    let speakers_label = if captured == 1 {
+                        "1 speaker".to_owned()
+                    } else {
+                        format!("{captured} speakers")
+                    };
+                    let body = format!(
+                        "{duration} · {speakers_label} saved to {}",
+                        summary.dir.display()
+                    );
+                    let last = LastRecording {
+                        dir: summary.dir.clone(),
+                        started_at: summary.started_at.clone(),
+                        duration_ms: summary.duration_ms,
+                        captured,
+                        silent,
+                        failed: failed.clone(),
+                    };
+                    self.last_recording = Some(last);
+                    if failed.is_empty() {
+                        self.notifications
+                            .recording_saved("Call recording saved", body);
+                    } else {
+                        // Some audio is still on disk, so this is a warning about
+                        // the files that are missing, not a total failure.
+                        self.notifications.recording_incomplete(
+                            "Recording finished with errors",
+                            format!("{body}\n\n{}", failed.join("\n")),
+                        );
+                    }
+                }
+                Event::CallRecordingFailed(message) => {
+                    self.recording_active = false;
+                    self.recording_dir = None;
+                    self.recording_since = None;
+                    self.notifications
+                        .error("call-recording", "Could not record the call", message);
                 }
                 Event::SystemAudioFailed(message) => {
                     self.system_audio_active = false;
@@ -2698,6 +2808,68 @@ impl AppState {
             .any(|state| matches!(state, CallState::Active))
     }
 
+    /// Recording needs a live call: without one there is no remote audio to
+    /// separate, and the local microphone alone is rarely the point.
+    fn can_record_call(&self) -> bool {
+        self.has_active_call() && self.our_node_id.is_some()
+    }
+
+    /// Toggle recording from the dock control.
+    ///
+    /// The state only changes once the worker confirms, so the indicator never
+    /// claims to be recording audio that is not being captured.
+    fn toggle_call_recording(&mut self) {
+        if self.recording_active {
+            self.play_control_sound(false);
+            self.cmd(Command::SetCallRecording { enabled: false });
+            return;
+        }
+        if !self.can_record_call() {
+            self.notifications.info(
+                "call-recording",
+                "Join a call before recording",
+            );
+            return;
+        }
+        self.play_control_sound(true);
+        self.cmd(Command::SetCallRecording { enabled: true });
+    }
+
+    /// Open the recordings folder in the file manager.
+    fn reveal_recordings(&mut self) {
+        if let Err(error) = self.reveal_recordings_dir() {
+            let message = format!("{error:#}");
+            warn!("could not open the recordings folder: {message}");
+            self.notifications
+                .error("recordings-folder", "Could not open the folder", message);
+        }
+    }
+
+    fn reveal_recordings_dir(&self) -> anyhow::Result<()> {
+        let dir = self.recordings_root()?;
+        crate::recording::reveal_in_file_manager(&dir)
+    }
+
+    /// The folder recordings live in, created if it is not there yet.
+    fn recordings_root(&self) -> anyhow::Result<PathBuf> {
+        let dir = crate::recording::recordings_dir()
+            .ok_or_else(|| anyhow::anyhow!("no Wire data directory is available"))?;
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+        }
+        Ok(dir)
+    }
+
+    fn set_record_calls_automatically(&mut self, enabled: bool) {
+        if self.record_calls_automatically == enabled {
+            return;
+        }
+        self.record_calls_automatically = enabled;
+        self.persist_settings();
+        self.cmd(Command::SetRecordCallsAutomatically { enabled });
+    }
+
     fn open_capture_picker(&mut self) {
         match crate::screen_capture::list_capture_targets() {
             Ok(targets) => {
@@ -3124,6 +3296,7 @@ impl AppState {
             start_with_system: self.saved_start_with_system,
             show_system_usage: self.show_system_usage,
             share_system_audio: self.share_system_audio,
+            record_calls_automatically: self.record_calls_automatically,
         });
     }
 

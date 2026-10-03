@@ -142,6 +142,16 @@ impl AudioContext {
         self.capture.create_opus_track().await
     }
 
+    /// Feed microphone samples to an extra sink alongside the call encoders.
+    ///
+    /// Recording uses this to capture the local voice without opening another
+    /// encoder, and without depending on how many call tracks are live. The
+    /// sink receives the same post-processing, pre-mute samples the encoders
+    /// see, so muting never removes the local voice from a recording.
+    pub async fn add_capture_sink(&self, sink: impl AudioSink) -> Result<()> {
+        self.capture.add_sink(sink).await
+    }
+
     pub async fn play_track(&self, track: MediaTrack) -> Result<()> {
         self.playback.add_track(track).await?;
         Ok(())

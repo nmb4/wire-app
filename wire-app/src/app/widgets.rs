@@ -28,6 +28,21 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// A clock-style duration for recording indicators and summaries.
+pub(super) fn format_duration_ms(millis: u64) -> String {
+    let total_seconds = millis / 1000;
+    let (hours, minutes, seconds) = (
+        total_seconds / 3_600,
+        (total_seconds % 3_600) / 60,
+        total_seconds % 60,
+    );
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 pub(super) fn section_card<R>(
     ui: &mut Ui,
     pal: &Palette,

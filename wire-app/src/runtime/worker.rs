@@ -159,6 +159,27 @@ pub(super) struct Worker {
     pending_peer_updates: BTreeSet<NodeId>,
     local_group_call: Option<GroupCallAnnouncement>,
     peer_group_calls: BTreeMap<NodeId, Vec<GroupCallAnnouncement>>,
+    /// Live per-speaker recording, or `None` when nothing is being recorded.
+    recording: Option<crate::recording::RecordingSession>,
+    /// Whether the live recording was started by the auto-record preference.
+    /// A recording the user asked for by hand outlives that preference.
+    recording_automatic: bool,
+    /// Record every call without being asked. Off by default: recording is a
+    /// deliberate act, not something to discover after the fact.
+    record_calls_automatically: bool,
+    /// Display names learned from presence, so recordings can be labelled with
+    /// something a person recognizes instead of a node id.
+    peer_names: BTreeMap<NodeId, String>,
+    own_name: String,
+    /// Each active peer's voice track and the call generation it belongs to,
+    /// kept so recording can be turned on in the middle of a call. Resubscribing
+    /// is cheap and does not disturb playback.
+    peer_voice_tracks: BTreeMap<NodeId, (u64, MediaTrack)>,
+    /// Voice tracks are handed back from the call tasks, which are the only
+    /// place a track becomes known. Funnelling both call directions through one
+    /// place keeps the recording hook in a single spot.
+    voice_track_tx: async_channel::Sender<(NodeId, u64, MediaTrack)>,
+    voice_track_rx: async_channel::Receiver<(NodeId, u64, MediaTrack)>,
 }
 
 impl Worker {
@@ -295,6 +316,7 @@ impl Worker {
         info!("Wire protocol router started");
         let (video_frame_tx, _) = tokio::sync::broadcast::channel(32);
         let (keyframe_tx, _) = tokio::sync::broadcast::channel(16);
+        let (voice_track_tx, voice_track_rx) = async_channel::unbounded();
         let (capture_failure_tx, capture_failure_rx) = async_channel::unbounded();
         Ok(Self {
             command_rx,
@@ -339,12 +361,21 @@ impl Worker {
             profile_fetches: JoinSet::new(),
             peer_updates: JoinSet::new(),
             pending_peer_updates: Default::default(),
+            recording: None,
+            recording_automatic: false,
+            record_calls_automatically: false,
+            peer_names: Default::default(),
+            own_name: profile::load_own_profile().display_name,
+            peer_voice_tracks: Default::default(),
+            voice_track_tx,
+            voice_track_rx,
         })
     }
 
     /// Refresh the served profile from disk (used when the UI edits identity).
     fn refresh_served_profile(&mut self) {
         let own = profile::load_own_profile();
+        self.own_name = own.display_name.clone();
         let avatar = profile::load_avatar_bytes();
         self.client_status.set_own_profile(own.snapshot());
         self.chat.set_own_profile(
@@ -354,6 +385,174 @@ impl Worker {
         );
         self.profile_protocol
             .set_served(ServedProfile::from_own(&own, avatar));
+    }
+
+    /// What to call a speaker in a recording file.
+    ///
+    /// A profile name is preferred, a short node id beats a blank label, and
+    /// the local user is always marked so their file is unambiguous.
+    fn speaker_name(&self, node_id: NodeId) -> String {
+        if node_id == self.endpoint.node_id() {
+            return if self.own_name.trim().is_empty() {
+                "You".to_owned()
+            } else {
+                format!("{} (you)", self.own_name.trim())
+            };
+        }
+        self.peer_names
+            .get(&node_id)
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| node_id.fmt_short().to_string())
+    }
+
+    /// Start recording, then attach every speaker already in the call.
+    async fn start_recording(&mut self, automatic: bool) -> Result<()> {
+        if self.recording.is_some() {
+            return Ok(());
+        }
+        let root = crate::recording::recordings_dir().context("no Wire data directory")?;
+        let mut session = crate::recording::RecordingSession::start(&root)?;
+
+        // The local microphone is a file of its own and does not depend on any
+        // call being connected.
+        if let Some(audio) = self.audio_context.clone() {
+            let node_id = self.endpoint.node_id();
+            let name = self.speaker_name(node_id);
+            session
+                .attach_microphone(&audio, node_id, name)
+                .await
+                .context("could not start recording the microphone")?;
+        } else {
+            warn!("recording started without a microphone: audio is not configured yet");
+        }
+
+        // Peers already in the call get their file immediately; anyone who
+        // joins later is attached as their track arrives.
+        let active: Vec<(NodeId, u64, MediaTrack)> = self
+            .peer_voice_tracks
+            .iter()
+            .map(|(node_id, (generation, track))| (*node_id, *generation, track.clone()))
+            .collect();
+        for (node_id, generation, track) in active {
+            self.attach_recorder_for(node_id, generation, track);
+        }
+
+        let dir = session.dir().to_path_buf();
+        self.recording = Some(session);
+        self.recording_automatic = automatic;
+        info!(
+            automatic,
+            dir = %dir.display(),
+            "recording every speaker to a separate file"
+        );
+        self.emit(Event::CallRecordingToggled {
+            active: true,
+            dir: Some(dir),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// A peer's voice track arrived. Keep it so recording can start mid-call,
+    /// and give the peer a file straight away if it is already running.
+    fn on_voice_track(&mut self, node_id: NodeId, generation: u64, track: MediaTrack) {
+        // A track from a superseded call must not overwrite the live one, or a
+        // recording would keep decoding audio nobody is hearing.
+        if !self.call_is_current(node_id, generation) {
+            debug!(
+                node = %node_id.fmt_short(),
+                generation,
+                "ignored a voice track from a stale call"
+            );
+            return;
+        }
+        self.peer_voice_tracks
+            .insert(node_id, (generation, track.clone()));
+        self.attach_recorder_for(node_id, generation, track);
+    }
+
+    /// Attach one peer to the running recording, if there is one.
+    ///
+    /// A peer who is already being recorded keeps their single file: a new
+    /// track is handed to the existing recorder instead of starting a second one.
+    fn attach_recorder_for(&mut self, node_id: NodeId, generation: u64, track: MediaTrack) {
+        let name = self.speaker_name(node_id);
+        let Some(session) = self.recording.as_mut() else {
+            return;
+        };
+        if session.has_speaker(node_id) {
+            session.replace_participant_track(node_id, generation, track);
+            return;
+        }
+        if let Err(error) = session.attach_participant(node_id, name, generation, track) {
+            warn!(peer = %node_id.fmt_short(), "could not record this participant: {error:#}");
+        }
+    }
+
+    /// Stop recording, finalize every file, and report where they landed.
+    async fn stop_recording(&mut self) {
+        let Some(session) = self.recording.take() else {
+            return;
+        };
+        self.recording_automatic = false;
+        let peer_names = self.peer_names.clone();
+        // Finalizing renames each file to its display name and writes the
+        // manifest, so it must not run on the runtime's async tasks.
+        let summary = match tokio::task::spawn_blocking(move || session.finish(&peer_names)).await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                warn!("the recording finalizer did not finish: {error}");
+                return;
+            }
+        };
+        self.emit(Event::CallRecordingToggled {
+            active: false,
+            dir: None,
+        })
+        .await
+        .ok();
+        self.emit(Event::CallRecordingStopped { summary })
+            .await
+            .ok();
+    }
+
+    async fn set_recording(&mut self, enabled: bool) {
+        if enabled {
+            if let Err(error) = self.start_recording(false).await {
+                let detail = format!("Could not start recording: {error:#}");
+                warn!("{detail}");
+                self.emit(Event::CallRecordingFailed(detail)).await.ok();
+            }
+        } else {
+            self.stop_recording().await;
+        }
+    }
+
+    /// Auto-record follows the lifetime of a call, so a meeting is captured from
+    /// the first word to the last without anyone touching a control.
+    async fn maybe_auto_record(&mut self) {
+        if self.record_calls_automatically
+            && self.recording.is_none()
+            && !self.active_calls.is_empty()
+        {
+            if let Err(error) = self.start_recording(true).await {
+                let detail = format!("Could not start recording automatically: {error:#}");
+                warn!("{detail}");
+                self.emit(Event::CallRecordingFailed(detail)).await.ok();
+            }
+        }
+    }
+
+    /// End an auto-started recording when its call is over.
+    ///
+    /// A recording the user started by hand is theirs to stop, so switching the
+    /// preference off must not cut one short.
+    async fn stop_auto_recording(&mut self) {
+        if self.record_calls_automatically && self.recording_automatic {
+            self.stop_recording().await;
+        }
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -412,6 +611,7 @@ impl Worker {
                     self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
                     self.stream_volumes.remove(&node_id);
+                    self.peer_voice_tracks.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     self.emit(Event::SetCallState(node_id, CallState::Aborted))
@@ -457,6 +657,17 @@ impl Worker {
                 }
                 status = self.client_status.next_update() => {
                     let status = status?;
+                    // Names learned here are the best labels available for
+                    // recording files, which are named when they are closed.
+                    if let Some(name) = status
+                        .profile
+                        .display_name
+                        .as_ref()
+                        .map(|name| crate::profile::sanitize_display_name(name))
+                        .filter(|name| !name.is_empty())
+                    {
+                        self.peer_names.insert(status.peer, name);
+                    }
                     if matches!(status.availability, Availability::Online) {
                         self.peer_group_calls
                             .insert(status.peer, status.active_group_calls.clone());
@@ -500,6 +711,11 @@ impl Worker {
                         self.handle_capture_failure(message).await;
                     }
                 }
+                arrived = self.voice_track_rx.recv() => {
+                    if let Ok((node_id, generation, track)) = arrived {
+                        self.on_voice_track(node_id, generation, track);
+                    }
+                }
             }
         }
         info!("Wire worker runtime is stopping");
@@ -507,6 +723,11 @@ impl Worker {
         self.close_active_call_transports();
         if self.sharing_active {
             self.stop_capture().await;
+        }
+        // Finalize before the runtime tears down: dropping a session here would
+        // leave WAV files without their size header, which most readers reject.
+        if self.recording.is_some() {
+            self.stop_recording().await;
         }
         Ok(())
     }
@@ -615,6 +836,7 @@ impl Worker {
                 self.call_generations.remove(&node_id);
                 self.volumes.remove(&node_id);
                 self.stream_volumes.remove(&node_id);
+                self.peer_voice_tracks.remove(&node_id);
                 self.cleanup_after_call_end().await;
                 self.emit(Event::SetCallState(node_id, CallState::Aborted))
                     .await?;
@@ -677,6 +899,7 @@ impl Worker {
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
             .await?;
+        self.maybe_auto_record().await;
         let audio_context = self
             .audio_context
             .clone()
@@ -686,13 +909,16 @@ impl Worker {
         let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
+        let voice_track_tx = self.voice_track_tx.clone();
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
 
             let fut = async {
                 audio_context
-                    .play_track_with_volume_and_level(track, volume.clone(), level.clone())
+                    .play_track_with_volume_and_level(track.clone(), volume.clone(), level.clone())
                     .await?;
+                // Hand the voice track back so it can be recorded, now or later.
+                let _ = voice_track_tx.send((node_id, generation, track)).await;
                 let capture_track = audio_context.capture_track().await?;
                 audio_conn.send_track(capture_track).await?;
                 if let Some(system_audio_track) = system_audio_track {
@@ -745,6 +971,7 @@ impl Worker {
             .insert(node_id, CallInfo::Active(conn.clone()));
         self.emit(Event::SetCallState(node_id, CallState::Active))
             .await?;
+        self.maybe_auto_record().await;
         let audio_context = self
             .audio_context
             .clone()
@@ -754,6 +981,7 @@ impl Worker {
         let system_audio_track = self.system_audio.as_ref().map(|share| share.track());
 
         let audio_conn = conn.clone();
+        let voice_track_tx = self.voice_track_tx.clone();
         self.call_tasks.spawn(async move {
             info!("starting connection with {}", node_id.fmt_short());
 
@@ -775,6 +1003,11 @@ impl Worker {
                         TrackKind::Audio => {
                             if first_audio {
                                 first_audio = false;
+                                // Hand the voice track back so it can be recorded,
+                                // now or later in the call.
+                                let _ = voice_track_tx
+                                    .send((node_id, generation, remote_track.clone()))
+                                    .await;
                                 audio_context
                                     .play_track_with_volume_and_level(
                                         remote_track,
@@ -950,6 +1183,9 @@ impl Worker {
         if self.active_calls.is_empty() && self.sharing_active {
             self.stop_capture().await;
         }
+        // Auto-recording spans the call, so the last participant leaving is what
+        // ends it. A recording the user started by hand is left alone.
+        self.stop_auto_recording().await;
     }
 
     fn close_active_call_transports(&self) {
@@ -1198,6 +1434,22 @@ impl Worker {
                         generation,
                         watching,
                     });
+                }
+            }
+            Command::SetCallRecording { enabled } => {
+                self.set_recording(enabled).await;
+            }
+            Command::SetRecordCallsAutomatically { enabled } => {
+                if self.record_calls_automatically == enabled {
+                    return Ok(());
+                }
+                self.record_calls_automatically = enabled;
+                // Turning it on mid-call records from here; turning it off ends
+                // only the recordings the preference itself started.
+                if enabled {
+                    self.maybe_auto_record().await;
+                } else {
+                    self.stop_auto_recording().await;
                 }
             }
             Command::SetMuted { muted } => {

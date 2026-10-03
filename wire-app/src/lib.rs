@@ -15,6 +15,7 @@ mod overlay_window;
 mod peer_update;
 mod persistence;
 mod profile;
+mod recording;
 mod resource_monitor;
 mod runtime;
 mod sounds;
