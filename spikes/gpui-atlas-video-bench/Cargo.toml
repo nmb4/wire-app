@@ -1,0 +1,34 @@
+[package]
+name = "gpui-atlas-video-bench"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+exclude = ["vendor/gpui-ce"]
+
+[dependencies]
+# Pinned to gpui-ce main @ 254b5dbd47cbb5acbcc5bbdcbb322a339276c88a (2026-10-04).
+# `package =` renames are needed because the crates are published as
+# `gpui-ce` / `gpui_ce_*` (lib name `gpui`); the brief's `gpui = { git = ... }`
+# shorthand does not resolve against this workspace layout.
+gpui = { package = "gpui-ce", git = "https://github.com/gpui-ce/gpui-ce", rev = "254b5dbd47cbb5acbcc5bbdcbb322a339276c88a" }
+gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", rev = "254b5dbd47cbb5acbcc5bbdcbb322a339276c88a" }
+# NOTE: the brief suggested `features = ["font-kit"]` on gpui_platform, but no
+# such feature exists at the pinned rev (checked crates/gpui_platform and
+# crates/gpui manifests); text uses the default fontique/parley stack.
+image = "0.25.1"
+smallvec = "1.6"
+
+# Local Step-2 fork (in-place atlas tile via content_version). Patch keys must
+# be real package names, hence gpui-ce / gpui_ce_* rather than the brief's
+# shorthand. Unchanged workspace members resolve from git at the pinned rev.
+[patch."https://github.com/gpui-ce/gpui-ce"]
+gpui-ce = { path = "vendor/gpui-ce/crates/gpui" }
+gpui_ce_windows = { path = "vendor/gpui-ce/crates/gpui_windows" }
+gpui_ce_macos = { path = "vendor/gpui-ce/crates/gpui_macos" }
+gpui_ce_macros = { path = "vendor/gpui-ce/crates/gpui_macros" }
+gpui_ce_platform = { path = "vendor/gpui-ce/crates/gpui_platform" }
+gpui_ce_shared_string = { path = "vendor/gpui-ce/crates/gpui_shared_string" }
+gpui_ce_linux = { path = "vendor/gpui-ce/crates/gpui_linux" }
+gpui_ce_web = { path = "vendor/gpui-ce/crates/gpui_web" }
+gpui_ce_wgpu = { path = "vendor/gpui-ce/crates/gpui_wgpu" }

@@ -1,0 +1,3 @@
+# Bench build artifacts (the root /target ignore does not cover this detached
+# workspace). The vendor tree itself IS committed (patched fork).
+target/
