@@ -1,9 +1,11 @@
 //! Application frame and mode navigation.
 
 use super::{
+    calls_ui::RECORDING_BAND_HEIGHT,
     widgets::{
-        chat_hairline, chat_segment_button, chat_surface, participant_bar_height, CHROME_RADIUS,
-        CHROME_SIDE_INSET,
+        chat_hairline, chat_segment_button, chat_surface, participant_bar_height,
+        participant_strip_width, CHROME_RADIUS, CHROME_SIDE_INSET, PARTICIPANT_STRIP_PAD_BOTTOM,
+        PARTICIPANT_STRIP_PAD_TOP, PARTICIPANT_STRIP_PAD_X,
     },
     AppMode, AppState, StreamViewMode,
 };
@@ -112,10 +114,24 @@ impl AppState {
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
         let show_participants = self.has_visible_call();
         let top_height = TOP_BAR_HEIGHT.min(body.height());
-        let dock_top = (body.max.y - DOCK_HEIGHT).max(body.min.y + top_height);
+        // A running recording claims a band of its own at the top of the dock so
+        // the clock never has to overlap the controls underneath it.
+        let dock_height = DOCK_HEIGHT
+            + if self.recording_active {
+                RECORDING_BAND_HEIGHT
+            } else {
+                0.0
+            };
+        let dock_top = (body.max.y - dock_height).max(body.min.y + top_height);
         let participant_space = (dock_top - (body.min.y + top_height)).max(0.0);
+        // The strip and the band reserved for it are sized from the same chip
+        // width, so they can never disagree about how many rows there are.
         let participant_bar_height = if show_participants {
-            participant_bar_height(body.width(), self.calls.len() + 1, participant_space)
+            participant_bar_height(
+                participant_strip_width(body.width()),
+                self.calls.len(),
+                participant_space,
+            )
         } else {
             0.0
         };
@@ -168,10 +184,10 @@ impl AppState {
                         bottom: 2,
                     })
                     .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 2,
-                        bottom: 6,
+                        left: PARTICIPANT_STRIP_PAD_X,
+                        right: PARTICIPANT_STRIP_PAD_X,
+                        top: PARTICIPANT_STRIP_PAD_TOP,
+                        bottom: PARTICIPANT_STRIP_PAD_BOTTOM,
                     })
                     .show(ui, |ui| self.ui_call_participant_bar(ui, pal, ctx));
             });

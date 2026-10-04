@@ -773,8 +773,12 @@ pub fn toolbar_ghost_icon_button(
     response
 }
 
+/// Size of the square ghost icon buttons in the top bar.
+pub const GHOST_BUTTON_SIZE: f32 = 34.0;
+
 pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(GHOST_BUTTON_SIZE), egui::Sense::click());
     if response.hovered() || response.has_focus() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(10), pal.panel2);
@@ -792,8 +796,14 @@ pub fn ghost_icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str) -> egui:
     );
     response
 }
+/// Size of the round dock control buttons.
+pub const DOCK_CONTROL_SIZE: f32 = 42.0;
+
+/// Size of the dock's "Leave" button.
+pub const DOCK_LEAVE_SIZE: Vec2 = Vec2::new(78.0, 36.0);
+
 pub fn dock_icon_btn(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) -> egui::Response {
-    let size = Vec2::splat(42.0);
+    let size = Vec2::splat(DOCK_CONTROL_SIZE);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let enabled = ui.is_enabled();
     let fill = if !enabled {
@@ -840,7 +850,7 @@ pub fn dock_control(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) 
 }
 
 pub fn leave_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
-    let size = Vec2::new(78.0, 36.0);
+    let size = DOCK_LEAVE_SIZE;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let fill = if response.hovered() {
         Color32::from_rgb(0xd1, 0x7c, 0x67)

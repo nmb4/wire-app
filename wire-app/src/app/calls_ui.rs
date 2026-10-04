@@ -6,7 +6,6 @@ use super::{
     friend_call_enabled,
     profile_ui::{
         accent_color_for, paint_profile_avatar, paint_stream_owner_avatar, two_line_avatar_size,
-        SELF_CARD_HEIGHT,
     },
     save_friends,
     widgets::{
@@ -28,7 +27,8 @@ use crate::{
     theme::{
         action_button, action_button_full, button_tone_style, compact_v_sep, dock_control, dot,
         ghost_icon_button, kh_family, leave_button, lucide, menu_item_button, sans,
-        toolbar_ghost_icon_button, ui_font_size, v_sep, ButtonTone, Palette,
+        toolbar_ghost_icon_button, ui_font_size, v_sep, ButtonTone, Palette, DOCK_CONTROL_SIZE,
+        DOCK_LEAVE_SIZE, GHOST_BUTTON_SIZE,
     },
     video_decode::DecodedFrameData,
 };
@@ -234,95 +234,64 @@ impl AppState {
             .max_height(bar_height)
             .show(ui, |ui| {
                 ui.set_min_width(bar_width);
-                ui.vertical_centered(|ui| {
-                    let columns = participant_bar_columns(bar_width);
-                    let item_count = calls.len() + 1;
-                    for row_start in (0..item_count).step_by(columns) {
-                        let row_end = (row_start + columns).min(item_count);
-                        let width_id = ui.id().with(("participant-row-width", row_start));
-                        let cached_width = ui
-                            .ctx()
-                            .data_mut(|data| data.get_temp::<f32>(width_id))
-                            .unwrap_or(0.0);
-                        let lead = ((bar_width - cached_width) * 0.5).max(0.0);
-                        let mut content_rect = egui::Rect::NOTHING;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
-                            if lead > 0.0 {
-                                ui.add_space(lead);
-                            }
-                            for index in row_start..row_end {
-                                let response =
-                                    if let Some((node_id, state)) = calls.get(index).copied() {
-                                        self.ui_participant_chip(ui, pal, ctx, node_id, state)
-                                    } else {
-                                        self.ui_self_participant_chip(ui, pal, ctx)
-                                    };
-                                content_rect = content_rect.union(response.rect);
-                            }
-                        });
-                        let measured_width = content_rect.width();
-                        if measured_width.is_finite() && measured_width > 0.0 {
-                            ui.ctx().data_mut(|data| {
-                                data.insert_temp(width_id, measured_width);
-                            });
-                            if (measured_width - cached_width).abs() > 0.5 {
-                                ui.ctx().request_repaint();
-                            }
-                        }
-                        if row_end < item_count {
-                            ui.add_space(PARTICIPANT_GAP);
-                        }
+                // `bar_width` is already the strip's content width, so the
+                // column count here and the reserved band height in
+                // `ui_chrome_body` are derived from the same number.
+                let columns = participant_bar_columns(bar_width);
+                for (index, row) in calls.chunks(columns).enumerate() {
+                    self.ui_participant_row(ui, pal, ctx, row, bar_width, index);
+                    if (index + 1) * columns < calls.len() {
+                        ui.add_space(PARTICIPANT_GAP);
                     }
-                });
+                }
             });
     }
 
-    fn ui_self_participant_chip(
+    /// One row of participant chips, centered inside the strip.
+    ///
+    /// Chips are content-sized, so the row's width is only known after it is
+    /// painted. The offset therefore comes from the width measured on a
+    /// previous frame — but it is *clamped* to the strip, so a cold or stale
+    /// measurement can never shove the row off the window and clip it. A row
+    /// with no measurement yet starts flush left and centres on the next frame.
+    fn ui_participant_row(
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
         ctx: &egui::Context,
-    ) -> egui::Response {
-        let name = self.own_label();
-        let initial = crate::profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
-        let avatar = self.own_avatar_texture(ctx);
-        Frame::new()
-            .fill(chat_surface(pal))
-            .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
-            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
-            .inner_margin(CHIP_INNER_MARGIN)
-            .show(ui, |ui| {
-                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
-                    ui.add_space(CHIP_IDENTITY_GAP);
-                    chip_name_label(ui, &name, pal.text2);
-                    ui.add_space(CHIP_IDENTITY_GAP);
-                    let level = self
-                        .local_audio_level
-                        .as_ref()
-                        .map(load_audio_level)
-                        .unwrap_or(0.0);
-                    voice_level_meter(ui, pal, level).on_hover_text(if self.muted {
-                        "Microphone muted"
-                    } else {
-                        "Your microphone level"
-                    });
-                    if self.sharing_active {
-                        ui.add_space(CHIP_IDENTITY_GAP);
-                        chip_status_icon(
-                            ui,
-                            pal.ok,
-                            Icon::ScreenShare,
-                            "You are sharing your screen",
-                        );
-                    }
-                });
-            })
-            .response
+        row: &[(NodeId, CallState)],
+        bar_width: f32,
+        row_index: usize,
+    ) {
+        let width_id = ui.id().with(("participant-row-width", row_index));
+        let known_width = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<f32>(width_id))
+            .map(|cached| cached.min(bar_width));
+        let lead = known_width.map_or(0.0, |cached| (bar_width - cached) * 0.5);
+
+        let mut content_rect = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
+            if lead > 0.0 {
+                ui.add_space(lead);
+            }
+            for &(node_id, state) in row {
+                let response = self.ui_participant_chip(ui, pal, ctx, node_id, state);
+                content_rect = content_rect.union(response.rect);
+            }
+        });
+        let measured = content_rect.width();
+        if measured.is_finite() && measured > 0.0 {
+            let changed = known_width.is_none_or(|cached| (cached - measured).abs() > 0.5);
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(width_id, measured));
+            if changed {
+                // Re-centre immediately rather than leaving the row visibly
+                // off-centre until the next natural repaint.
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn ui_participant_chip(
@@ -503,14 +472,59 @@ impl AppState {
             .response
     }
 
-    pub(super) fn ui_top_bar_content(&mut self, ui: &mut Ui, _ctx: &egui::Context, pal: &Palette) {
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            self.ui_mode_switcher(ui, pal);
+    /// Mode switcher plus the call status chip.
+    ///
+    /// Laid out inside the width the top bar reserved for it, and every label
+    /// truncates, so a narrow window shrinks the chip instead of letting the
+    /// trailing settings/contacts icons overlap it.
+    fn ui_top_bar_leading(&mut self, ui: &mut Ui, pal: &Palette) {
+        self.ui_mode_switcher(ui, pal);
 
-            // Compact active-call indicator — same chrome language as the mode switcher.
-            if let Some((prefix, name, suffix, color, detail)) = self.active_call_indicator(pal) {
-                ui.add_space(8.0);
-                let chip = Frame::new()
+        // Compact active-call indicator — same chrome language as the mode switcher.
+        if let Some((prefix, name, suffix, color, detail)) = self.active_call_indicator(pal) {
+            ui.add_space(8.0);
+            let chip = Frame::new()
+                .fill(chat_surface(pal))
+                .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+                .corner_radius(CornerRadius::same(CHROME_RADIUS))
+                .inner_margin(egui::Margin::symmetric(12, 3))
+                .show(ui, |ui| {
+                    ui.set_min_height(CHROME_CONTROL_HEIGHT);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        dot(ui, color, 6.0);
+                        ui.add_space(7.0);
+                        chip_text(ui, &prefix, pal.text2);
+                        if let Some((name, name_color)) = name {
+                            chip_text(ui, &name, name_color);
+                        }
+                        if !suffix.is_empty() {
+                            chip_text(ui, &suffix, pal.text2);
+                        }
+                        if self.sharing_active {
+                            chip_text(
+                                ui,
+                                if self.system_audio_active {
+                                    "· sharing audio"
+                                } else {
+                                    "· sharing"
+                                },
+                                pal.accent,
+                            );
+                        }
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_text(detail);
+            if chip.clicked() && self.app_mode != AppMode::Calls {
+                self.app_mode = AppMode::Calls;
+            }
+        } else if self.app_mode == AppMode::Calls {
+            // Idle "Ready" stays plain (no pill). Active states use the brighter chip.
+            ui.add_space(10.0);
+            if self.sharing_active {
+                Frame::new()
                     .fill(chat_surface(pal))
                     .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
                     .corner_radius(CornerRadius::same(CHROME_RADIUS))
@@ -518,95 +532,67 @@ impl AppState {
                     .show(ui, |ui| {
                         ui.set_min_height(CHROME_CONTROL_HEIGHT);
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            dot(ui, color, 6.0);
-                            ui.add_space(7.0);
-                            ui.label(
-                                RichText::new(prefix)
-                                    .color(pal.text2)
-                                    .size(ui_font_size(12.0)),
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            dot(ui, pal.accent, 6.0);
+                            chip_text(
+                                ui,
+                                if self.system_audio_active {
+                                    "Sharing screen + audio"
+                                } else {
+                                    "Sharing screen"
+                                },
+                                pal.text2,
                             );
-                            if let Some((name, name_color)) = name {
-                                ui.label(
-                                    RichText::new(name)
-                                        .color(name_color)
-                                        .size(ui_font_size(12.0)),
-                                );
-                            }
-                            if !suffix.is_empty() {
-                                ui.label(
-                                    RichText::new(suffix)
-                                        .color(pal.text2)
-                                        .size(ui_font_size(12.0)),
-                                );
-                            }
-                            if self.sharing_active {
-                                ui.label(
-                                    RichText::new(if self.system_audio_active {
-                                        "· sharing audio"
-                                    } else {
-                                        "· sharing"
-                                    })
-                                    .color(pal.accent)
-                                    .size(ui_font_size(11.5)),
-                                );
-                            }
                         });
-                    })
-                    .response
-                    .interact(egui::Sense::click())
-                    .on_hover_text(detail);
-                if chip.clicked() && self.app_mode != AppMode::Calls {
-                    self.app_mode = AppMode::Calls;
-                }
-            } else if self.app_mode == AppMode::Calls {
-                // Idle "Ready" stays plain (no pill). Active states use the brighter chip.
-                ui.add_space(10.0);
-                if self.sharing_active {
-                    Frame::new()
-                        .fill(chat_surface(pal))
-                        .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
-                        .corner_radius(CornerRadius::same(CHROME_RADIUS))
-                        .inner_margin(egui::Margin::symmetric(12, 3))
-                        .show(ui, |ui| {
-                            ui.set_min_height(CHROME_CONTROL_HEIGHT);
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 7.0;
-                                dot(ui, pal.accent, 6.0);
-                                ui.label(
-                                    RichText::new(if self.system_audio_active {
-                                        "Sharing screen + audio"
-                                    } else {
-                                        "Sharing screen"
-                                    })
-                                    .color(pal.text2)
-                                    .size(ui_font_size(12.0)),
-                                );
-                            });
-                        });
-                } else if self.our_node_id.is_some() {
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 7.0;
-                        dot(ui, pal.ok, 6.0);
-                        ui.label(
-                            RichText::new("Ready")
-                                .color(pal.text2)
-                                .size(ui_font_size(12.0)),
-                        );
                     });
-                } else {
-                    ui.label(RichText::new("Connecting…").weak());
-                }
+            } else if self.our_node_id.is_some() {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    dot(ui, pal.ok, 6.0);
+                    chip_text(ui, "Ready", pal.text2);
+                });
+            } else {
+                ui.add(egui::Label::new(RichText::new("Connecting…").weak()).truncate());
             }
+        }
+    }
 
+    pub(super) fn ui_top_bar_content(&mut self, ui: &mut Ui, _ctx: &egui::Context, pal: &Palette) {
+        #[cfg(windows)]
+        // The hosted release path only. Peer-to-peer updates are driven from
+        // the title-bar control, which appears while a friend with a newer
+        // build is connected.
+        let available_update = match &self.update_status {
+            UpdateStatus::Available(release) => Some(release.clone()),
+            _ => None,
+        };
+
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            // The trailing icons keep their size; the call chip is the flexible
+            // part. Reserving the trailing room up front stops the icons being
+            // painted on top of the call text once the window gets narrow.
+            let mut trailing = 2.0 * GHOST_BUTTON_SIZE + ui.spacing().item_spacing.x;
             #[cfg(windows)]
-            // The hosted release path only. Peer-to-peer updates are driven from
-            // the title-bar control, which appears while a friend with a newer
-            // build is connected.
-            let available_update = match &self.update_status {
-                UpdateStatus::Available(release) => Some(release.clone()),
-                _ => None,
-            };
+            if let Some(release) = available_update.as_ref() {
+                trailing += ui
+                    .painter()
+                    .layout_no_wrap(
+                        format!("Update v{}", release.version),
+                        sans(ui_font_size(13.0)),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                    + 2.0 * 10.0
+                    + ui.spacing().item_spacing.x;
+            }
+            let leading_width = (ui.available_width() - trailing).max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(leading_width, ui.available_height()),
+                Layout::left_to_right(Align::Center),
+                |ui| self.ui_top_bar_leading(ui, pal),
+            );
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost_icon_button(ui, pal, ph::GEAR_SIX)
                     .on_hover_text("Settings")
@@ -782,28 +768,47 @@ impl AppState {
             .count();
         let in_call = active_calls > 0 || self.local_group_call.is_some();
 
+        // Recording gets its own band above the controls. The dock grows to make
+        // room for it, so the clock can never be painted on top of the buttons
+        // it is meant to annotate.
+        let (recording_band, controls_rect) = if self.recording_active {
+            let band = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.right(), rect.min.y + RECORDING_BAND_HEIGHT),
+            );
+            (
+                band,
+                egui::Rect::from_min_max(egui::pos2(rect.left(), band.max.y), rect.max),
+            )
+        } else {
+            (egui::Rect::NOTHING, rect)
+        };
+
         // Discord-style self card on the left, vertically centered with the
         // controls and inset from the window edges so it never touches the
         // rounded corner. Hide the whole card on narrow windows and fall
         // back to an avatar-only badge on medium widths so it never overlaps
         // the centered controls.
-        let dock_width = rect.width();
+        let dock_width = controls_rect.width();
         if dock_width >= 520.0 {
-            const CARD_SLOT_HEIGHT: f32 = 46.0;
             const CARD_EDGE_INSET: f32 = 6.0;
             let card_width: f32 = if dock_width >= 700.0 { 196.0 } else { 56.0 };
-            let slot_bottom = (rect.center().y + CARD_SLOT_HEIGHT / 2.0).min(rect.max.y - 2.0);
-            let slot_top = (slot_bottom - CARD_SLOT_HEIGHT).max(rect.top());
-            let slot_right = (rect.min.x + CARD_EDGE_INSET + card_width).min(rect.right());
+            // The slot is the card's own measured height, so the card can never
+            // be taller than the room the dock gives it.
+            let card_height = super::profile_ui::self_card_height(ui);
+            let slot_bottom =
+                (controls_rect.center().y + card_height / 2.0).min(controls_rect.max.y - 2.0);
+            let slot_top = (slot_bottom - card_height).max(controls_rect.top());
+            let slot_right =
+                (controls_rect.min.x + CARD_EDGE_INSET + card_width).min(controls_rect.right());
             let left_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + CARD_EDGE_INSET, slot_top),
+                egui::pos2(controls_rect.min.x + CARD_EDGE_INSET, slot_top),
                 egui::pos2(slot_right, slot_bottom),
             );
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
                 if dock_width >= 700.0 {
-                    // Center the self card inside the 46px slot.
-                    ui.add_space(((left_rect.height() - SELF_CARD_HEIGHT) * 0.5).max(0.0));
+                    ui.add_space(((left_rect.height() - card_height) * 0.5).max(0.0));
                     self.ui_self_user_card(ui, pal, ctx);
                 } else {
                     let avatar = self.own_avatar_texture(ctx);
@@ -819,22 +824,22 @@ impl AppState {
         }
 
         // Keep the control cluster centered at every window width.
-        let desired_controls_width: f32 = if in_call { 303.0 } else { 142.0 };
-        let controls_width = desired_controls_width.min(rect.width().max(0.0));
-        let controls_left = (rect.center().x - controls_width / 2.0).clamp(
-            rect.left(),
-            (rect.right() - controls_width).max(rect.left()),
+        let desired_controls_width = dock_controls_width(in_call);
+        let controls_width = desired_controls_width.min(controls_rect.width().max(0.0));
+        let controls_left = (controls_rect.center().x - controls_width / 2.0).clamp(
+            controls_rect.left(),
+            (controls_rect.right() - controls_width).max(controls_rect.left()),
         );
-        let controls_rect = egui::Rect::from_min_max(
-            egui::pos2(controls_left, rect.top()),
+        let cluster_rect = egui::Rect::from_min_max(
+            egui::pos2(controls_left, controls_rect.top()),
             egui::pos2(
-                (controls_left + controls_width).min(rect.right()),
-                rect.bottom(),
+                (controls_left + controls_width).min(controls_rect.right()),
+                controls_rect.bottom(),
             ),
         );
 
-        ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
-            ui.set_clip_rect(ui.clip_rect().intersect(controls_rect));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(cluster_rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(cluster_rect));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 if dock_control(
@@ -941,18 +946,18 @@ impl AppState {
             });
         });
 
-        // The recording clock sits above the control cluster rather than inside
-        // it, so the cluster keeps its known width and centering.
+        // The recording clock lives in the band the dock reserved for it, so it
+        // sits beside the controls instead of over them.
         if self.recording_active {
-            self.recording_indicator(ui, pal, rect);
+            self.recording_indicator(ui, pal, recording_band);
         }
     }
 
-    /// A persistent REC pill with the elapsed time and the speaker count.
+    /// A persistent REC pill with the elapsed time and the recording folder.
     ///
     /// Recording must be obvious while it is happening, not just at the moment
     /// it is switched on, so this stays on screen for the whole recording.
-    fn recording_indicator(&mut self, ui: &mut Ui, pal: &Palette, dock: egui::Rect) {
+    fn recording_indicator(&mut self, ui: &mut Ui, pal: &Palette, band: egui::Rect) {
         let elapsed = self
             .recording_since
             .map(|since| super::widgets::format_duration_ms(since.elapsed().as_millis() as u64))
@@ -963,17 +968,10 @@ impl AppState {
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
 
-        const INDICATOR_HEIGHT: f32 = 26.0;
-        let width = 132.0_f32.min(dock.width().max(0.0));
-        let center = dock.center();
-        let bottom = (center.y - 30.0).max(dock.top() + INDICATOR_HEIGHT);
-        let top = bottom - INDICATOR_HEIGHT;
-        let rect = egui::Rect::from_min_max(
-            egui::pos2((center.x - width / 2.0).max(dock.left()), top),
-            egui::pos2(
-                (center.x + width / 2.0).min(dock.right()),
-                bottom.min(dock.bottom()),
-            ),
+        let width = 132.0_f32.min(band.width().max(0.0));
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(band.center().x, band.center().y),
+            egui::vec2(width, RECORDING_PILL_HEIGHT),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(rect));
@@ -983,7 +981,7 @@ impl AppState {
                 .corner_radius(CornerRadius::same(13))
                 .inner_margin(egui::Margin::symmetric(10, 0))
                 .show(ui, |ui| {
-                    ui.set_min_height(INDICATOR_HEIGHT);
+                    ui.set_min_height(RECORDING_PILL_HEIGHT);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         dot(ui, pal.err, 7.0);
@@ -2149,6 +2147,41 @@ impl AppState {
 
 const PARTICIPANT_AVATAR_SIZE: f32 = 26.0;
 
+/// Height of the REC pill itself.
+const RECORDING_PILL_HEIGHT: f32 = 26.0;
+
+/// Extra dock height reserved for the recording clock. `ui_chrome_body` grows
+/// the dock by this much while a call is being recorded, so the clock has a band
+/// of its own instead of landing on top of the control cluster.
+pub(super) const RECORDING_BAND_HEIGHT: f32 = RECORDING_PILL_HEIGHT + 4.0;
+
+/// Gap between the round dock controls.
+const DOCK_CONTROL_GAP: f32 = 8.0;
+
+/// Gap between the control cluster and the Leave group.
+const DOCK_GROUP_GAP: f32 = 12.0;
+
+/// Width of the separator drawn between the controls and Leave.
+const DOCK_SEPARATOR_WIDTH: f32 = 1.0;
+
+/// Number of round controls in the dock cluster (mute, deafen, share, record).
+const DOCK_CONTROL_COUNT: usize = 4;
+
+/// Width the dock's centered control cluster actually occupies.
+///
+/// This has to match the real widget metrics: the cluster is clipped to a
+/// centered box of this width, so an under-estimate silently cuts controls off
+/// the edge of the window and throws the cluster off-center.
+pub(super) fn dock_controls_width(in_call: bool) -> f32 {
+    let controls = DOCK_CONTROL_COUNT as f32 * DOCK_CONTROL_SIZE
+        + (DOCK_CONTROL_COUNT - 1) as f32 * DOCK_CONTROL_GAP;
+    if in_call {
+        controls + 2.0 * DOCK_GROUP_GAP + DOCK_SEPARATOR_WIDTH + DOCK_LEAVE_SIZE.x
+    } else {
+        controls
+    }
+}
+
 const PARTICIPANT_ACTION_HEIGHT: f32 = 26.0;
 
 const CHIP_IDENTITY_GAP: f32 = 8.0;
@@ -2166,6 +2199,13 @@ const CHIP_INNER_MARGIN: egui::Margin = egui::Margin {
 
 fn chip_name_label(ui: &mut Ui, text: &str, color: Color32) {
     chip_optical_label(ui, text, color, 12.0);
+}
+
+/// A top-bar label that ellipsizes instead of pushing its neighbours out of the
+/// bar. Used for the call status chip, which is the flexible element in a row of
+/// fixed-size controls.
+fn chip_text(ui: &mut Ui, text: &str, color: Color32) {
+    ui.add(egui::Label::new(RichText::new(text).color(color).size(ui_font_size(12.0))).truncate());
 }
 
 fn chip_status_label(ui: &mut Ui, text: &str, color: Color32) {
@@ -2245,11 +2285,11 @@ fn chip_icon_button(
     response
 }
 
-fn load_audio_level(level: &AudioLevelHandle) -> f32 {
+pub(super) fn load_audio_level(level: &AudioLevelHandle) -> f32 {
     f32::from_bits(level.load(Ordering::Relaxed)).clamp(0.0, 1.0)
 }
 
-fn voice_level_meter(ui: &mut Ui, pal: &Palette, level: f32) -> egui::Response {
+pub(super) fn voice_level_meter(ui: &mut Ui, pal: &Palette, level: f32) -> egui::Response {
     const BAR_COUNT: usize = 5;
     const GAP: f32 = 2.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(25.0, 14.0), egui::Sense::hover());
@@ -2924,6 +2964,28 @@ mod tests {
         assert_eq!(stream_grid_dims(2, Vec2::new(1200.0, 400.0)), (2, 1));
         assert_eq!(stream_grid_dims(2, Vec2::new(400.0, 1200.0)), (1, 2));
         assert_eq!(stream_grid_dims(4, Vec2::new(800.0, 800.0)), (2, 2));
+    }
+
+    #[test]
+    fn the_dock_cluster_is_wide_enough_for_every_control() {
+        // The cluster is clipped to a centered box of this width, so it has to
+        // cover all four round controls plus the Leave group. An under-estimate
+        // cuts the record control off the window edge.
+        let idle = dock_controls_width(false);
+        let in_call = dock_controls_width(true);
+        assert_eq!(
+            idle,
+            DOCK_CONTROL_COUNT as f32 * DOCK_CONTROL_SIZE
+                + (DOCK_CONTROL_COUNT - 1) as f32 * DOCK_CONTROL_GAP
+        );
+        assert!(
+            idle >= 4.0 * DOCK_CONTROL_SIZE,
+            "idle dock must fit four controls, got {idle}"
+        );
+        assert!(
+            in_call >= idle + 2.0 * DOCK_GROUP_GAP + DOCK_SEPARATOR_WIDTH + DOCK_LEAVE_SIZE.x,
+            "the Leave group must fit inside the reserved cluster width"
+        );
     }
 
     #[test]

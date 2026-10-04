@@ -78,17 +78,51 @@ pub(super) const CHROME_CONTROL_HEIGHT: f32 = 36.0;
 /// Side inset for bottom chrome (participants + call dock) so content clears the frame.
 pub(super) const CHROME_SIDE_INSET: i8 = 14;
 
-pub(super) fn participant_bar_height(width: f32, participant_count: usize, max_height: f32) -> f32 {
+/// Horizontal padding the participant strip's frame adds inside its chrome inset.
+pub(super) const PARTICIPANT_STRIP_PAD_X: i8 = 10;
+
+/// Vertical padding above the participant strip's first row.
+pub(super) const PARTICIPANT_STRIP_PAD_TOP: i8 = 2;
+
+/// Vertical padding below the participant strip's last row.
+pub(super) const PARTICIPANT_STRIP_PAD_BOTTOM: i8 = 6;
+
+/// Total vertical space the strip's frame consumes: its own bottom margin plus
+/// the top and bottom inner padding above.
+///
+/// One number, so the band `ui_chrome_body` reserves and the frame the strip
+/// actually draws inside can never drift apart.
+pub(super) const PARTICIPANT_STRIP_PAD_Y: f32 =
+    (PARTICIPANT_STRIP_PAD_TOP + PARTICIPANT_STRIP_PAD_BOTTOM + 2) as f32;
+
+/// Content width available to the participant chips.
+///
+/// Both the strip's reserved height and the column count are derived from this,
+/// so the layout can never mix up "body width" with "chip row width" and
+/// reserve a band for a different number of columns than it actually lays out.
+pub(super) fn participant_strip_width(body_width: f32) -> f32 {
+    (body_width - 2.0 * (f32::from(CHROME_SIDE_INSET) + PARTICIPANT_STRIP_PAD_X as f32)).max(1.0)
+}
+
+/// Number of rows the given chips need in a strip of this content width.
+pub(super) fn participant_bar_rows(strip_width: f32, participant_count: usize) -> usize {
+    if participant_count == 0 {
+        return 0;
+    }
+    participant_count.div_ceil(participant_bar_columns(strip_width))
+}
+
+pub(super) fn participant_bar_height(
+    strip_width: f32,
+    participant_count: usize,
+    max_height: f32,
+) -> f32 {
     if participant_count == 0 || max_height <= 0.0 {
         return 0.0;
     }
-
-    let columns = participant_bar_columns(width);
-    let rows = participant_count.div_ceil(columns);
-    let content_height =
-        rows as f32 * PARTICIPANT_CHIP_HEIGHT + rows.saturating_sub(1) as f32 * PARTICIPANT_GAP;
-    // Participant frame: 4/6 outer margin plus 8/8 inner margin.
-    (content_height + 26.0).min(max_height)
+    let rows = participant_bar_rows(strip_width, participant_count) as f32;
+    let content_height = rows * PARTICIPANT_CHIP_HEIGHT + (rows - 1.0).max(0.0) * PARTICIPANT_GAP;
+    (content_height + PARTICIPANT_STRIP_PAD_Y).min(max_height)
 }
 
 pub(super) fn video_display_size(available: Vec2, aspect: f32, _fill_window: bool) -> Vec2 {
@@ -616,10 +650,9 @@ pub(super) fn ellipsize(text: &str, max_chars: usize) -> String {
     shortened
 }
 
-pub(super) fn participant_bar_columns(width: f32) -> usize {
-    let chrome_width = 2.0 * (f32::from(CHROME_SIDE_INSET) + 10.0);
-    let inner_width = (width - chrome_width).max(1.0);
-    ((inner_width + PARTICIPANT_GAP) / (PARTICIPANT_CARD_SLOT_WIDTH + PARTICIPANT_GAP))
+/// Chips that fit side by side in a participant strip of this content width.
+pub(super) fn participant_bar_columns(strip_width: f32) -> usize {
+    ((strip_width + PARTICIPANT_GAP) / (PARTICIPANT_CARD_SLOT_WIDTH + PARTICIPANT_GAP))
         .floor()
         .max(1.0) as usize
 }
@@ -629,7 +662,13 @@ pub(super) const PARTICIPANT_CHIP_HEIGHT: f32 = 40.0;
 
 pub(super) const PARTICIPANT_GAP: f32 = 8.0;
 
-pub(super) const PARTICIPANT_CARD_SLOT_WIDTH: f32 = 250.0;
+/// Smallest slot a participant chip is assumed to need when choosing how many
+/// fit side by side.
+///
+/// Chips are content-sized, so this is only a wrap-point heuristic. It has to
+/// be at least as wide as a real chip (long name plus the End control) or the
+/// last column runs past the strip and gets clipped by the window edge.
+pub(super) const PARTICIPANT_CARD_SLOT_WIDTH: f32 = 284.0;
 
 #[cfg(test)]
 mod tests {
@@ -729,10 +768,48 @@ mod tests {
 
     #[test]
     fn participant_bar_adds_rows_as_the_window_narrows() {
-        assert_eq!(participant_bar_height(900.0, 3, 500.0), 66.0);
-        assert_eq!(participant_bar_height(560.0, 3, 500.0), 114.0);
-        assert_eq!(participant_bar_height(320.0, 3, 500.0), 162.0);
-        assert_eq!(participant_bar_height(320.0, 3, 100.0), 100.0);
+        // Strip content widths, i.e. body width minus the chrome inset.
+        // 412pt is the narrowest strip Wire's minimum window size allows.
+        assert_eq!(participant_bar_height(1000.0, 3, 500.0), 50.0);
+        assert_eq!(participant_bar_height(700.0, 3, 500.0), 98.0);
+        assert_eq!(participant_bar_height(412.0, 3, 500.0), 146.0);
+        assert_eq!(participant_bar_height(412.0, 3, 100.0), 100.0);
+        assert_eq!(participant_bar_height(1000.0, 0, 500.0), 0.0);
+    }
+
+    #[test]
+    fn strip_width_and_reserved_height_agree_on_the_column_count() {
+        // The reserved band and the laid-out rows must come from one width, or
+        // the strip reserves room for rows it never draws.
+        for body_width in [460.0, 560.0, 604.0, 900.0, 1600.0] {
+            let strip = participant_strip_width(body_width);
+            let rows = participant_bar_rows(strip, 3);
+            let reserved = participant_bar_height(strip, 3, 5000.0);
+            let needed = rows as f32 * PARTICIPANT_CHIP_HEIGHT
+                + (rows as f32 - 1.0).max(0.0) * PARTICIPANT_GAP
+                + PARTICIPANT_STRIP_PAD_Y;
+            assert!(
+                (reserved - needed).abs() < 0.001,
+                "body {body_width}: reserved {reserved}, needed {needed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_chip_never_forces_a_row_past_the_strip_edge() {
+        // A rendered chip (avatar + name + meter + volume + End) is about 272pt
+        // wide. Whenever the column count says two fit, two of them plus the gap
+        // must genuinely fit, otherwise the trailing End control is clipped by
+        // the window edge.
+        let widest_chip = 272.0_f32;
+        for strip_width in (284..=1400).map(|value| value as f32) {
+            let columns = participant_bar_columns(strip_width);
+            let needed = columns as f32 * widest_chip + (columns - 1) as f32 * PARTICIPANT_GAP;
+            assert!(
+                needed <= strip_width,
+                "strip {strip_width}: {columns} columns need {needed}"
+            );
+        }
     }
 
     #[test]
