@@ -7,6 +7,7 @@ mod chat_ui;
 mod chrome;
 mod profile_ui;
 mod settings_ui;
+mod ui_capture;
 mod widgets;
 
 #[cfg(windows)]
@@ -323,6 +324,8 @@ struct AppState {
     start_with_system: bool,
     saved_start_with_system: bool,
     show_system_usage: bool,
+    /// Dev-only screenshot harness (`WIRE_UI_CAPTURE`).
+    ui_capture: Option<ui_capture::UiCapture>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,6 +381,8 @@ struct ChatUiState {
     group_members: BTreeSet<NodeId>,
     friend_candidate: Option<NodeId>,
     friend_candidate_name: String,
+    /// Set each frame by the chat layout: true when only one pane fits.
+    narrow_layout: bool,
 }
 
 enum KlipyAnimationState {
@@ -1131,7 +1136,8 @@ impl App {
         let devices =
             wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
         let saved_settings = load_settings();
-        let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some();
+        let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some()
+            || std::env::var_os(ui_capture::ENV).is_some();
         let has_saved_settings = saved_settings
             .as_ref()
             .map(|settings| settings.configured)
@@ -1247,6 +1253,7 @@ impl App {
             start_with_system: settings.start_with_system,
             saved_start_with_system: settings.start_with_system,
             show_system_usage: settings.show_system_usage,
+            ui_capture: ui_capture::UiCapture::from_env(),
         };
 
         if has_saved_settings {
@@ -1395,6 +1402,7 @@ impl AppState {
 
         self.process_notification_actions(ctx);
         self.process_events(ctx);
+        self.drive_ui_capture(ctx);
         self.mark_visible_conversation_seen(ctx);
         if self.notifications.take_sound_request() {
             self.play_sound(Sound::Notification);
