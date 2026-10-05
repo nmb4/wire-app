@@ -26,9 +26,8 @@ use crate::{
     sounds::Sound,
     theme::{
         action_button, action_button_full, button_tone_style, compact_v_sep, dock_control, dot,
-        ghost_icon_button, kh_family, leave_button, lucide, menu_item_button, sans,
-        toolbar_ghost_icon_button, ui_font_size, v_sep, ButtonTone, Palette, DOCK_CONTROL_SIZE,
-        DOCK_LEAVE_SIZE, GHOST_BUTTON_SIZE,
+        kh_family, leave_button, lucide, menu_item_button, sans, toolbar_ghost_icon_button,
+        ui_font_size, v_sep, ButtonTone, Palette, DOCK_CONTROL_SIZE, DOCK_LEAVE_SIZE,
     },
     video_decode::DecodedFrameData,
 };
@@ -43,7 +42,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
-use tracing::{info, warn};
+use tracing::info;
 use wire::audio::{AudioLevelHandle, VolumeHandle};
 
 /// Explain what the record control will do, in the state it is currently in.
@@ -234,64 +233,97 @@ impl AppState {
             .max_height(bar_height)
             .show(ui, |ui| {
                 ui.set_min_width(bar_width);
-                // `bar_width` is already the strip's content width, so the
-                // column count here and the reserved band height in
-                // `ui_chrome_body` are derived from the same number.
-                let columns = participant_bar_columns(bar_width);
-                for (index, row) in calls.chunks(columns).enumerate() {
-                    self.ui_participant_row(ui, pal, ctx, row, bar_width, index);
-                    if (index + 1) * columns < calls.len() {
-                        ui.add_space(PARTICIPANT_GAP);
+                ui.vertical_centered(|ui| {
+                    // The chrome reserves rows from this same content width,
+                    // including the self identity restored by the alignment pass.
+                    let columns = participant_bar_columns(bar_width);
+                    let item_count = calls.len() + 1;
+                    for row_start in (0..item_count).step_by(columns) {
+                        let row_end = (row_start + columns).min(item_count);
+                        let width_id = ui.id().with(("participant-row-width", row_start));
+                        let cached_width = ui
+                            .ctx()
+                            .data_mut(|data| data.get_temp::<f32>(width_id))
+                            .unwrap_or(0.0);
+                        let lead = ((bar_width - cached_width) * 0.5).max(0.0);
+                        let mut content_rect = egui::Rect::NOTHING;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
+                            if lead > 0.0 {
+                                ui.add_space(lead);
+                            }
+                            for index in row_start..row_end {
+                                let response =
+                                    if let Some((node_id, state)) = calls.get(index).copied() {
+                                        self.ui_participant_chip(ui, pal, ctx, node_id, state)
+                                    } else {
+                                        self.ui_self_participant_chip(ui, pal, ctx)
+                                    };
+                                content_rect = content_rect.union(response.rect);
+                            }
+                        });
+                        let measured_width = content_rect.width();
+                        if measured_width.is_finite() && measured_width > 0.0 {
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(width_id, measured_width);
+                            });
+                            if (measured_width - cached_width).abs() > 0.5 {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        if row_end < item_count {
+                            ui.add_space(PARTICIPANT_GAP);
+                        }
                     }
-                }
+                });
             });
     }
 
-    /// One row of participant chips, centered inside the strip.
-    ///
-    /// Chips are content-sized, so the row's width is only known after it is
-    /// painted. The offset therefore comes from the width measured on a
-    /// previous frame — but it is *clamped* to the strip, so a cold or stale
-    /// measurement can never shove the row off the window and clip it. A row
-    /// with no measurement yet starts flush left and centres on the next frame.
-    fn ui_participant_row(
+    fn ui_self_participant_chip(
         &mut self,
         ui: &mut Ui,
         pal: &Palette,
         ctx: &egui::Context,
-        row: &[(NodeId, CallState)],
-        bar_width: f32,
-        row_index: usize,
-    ) {
-        let width_id = ui.id().with(("participant-row-width", row_index));
-        let known_width = ui
-            .ctx()
-            .data_mut(|data| data.get_temp::<f32>(width_id))
-            .map(|cached| cached.min(bar_width));
-        let lead = known_width.map_or(0.0, |cached| (bar_width - cached) * 0.5);
-
-        let mut content_rect = egui::Rect::NOTHING;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = PARTICIPANT_GAP;
-            if lead > 0.0 {
-                ui.add_space(lead);
-            }
-            for &(node_id, state) in row {
-                let response = self.ui_participant_chip(ui, pal, ctx, node_id, state);
-                content_rect = content_rect.union(response.rect);
-            }
-        });
-        let measured = content_rect.width();
-        if measured.is_finite() && measured > 0.0 {
-            let changed = known_width.is_none_or(|cached| (cached - measured).abs() > 0.5);
-            ui.ctx()
-                .data_mut(|data| data.insert_temp(width_id, measured));
-            if changed {
-                // Re-centre immediately rather than leaving the row visibly
-                // off-centre until the next natural repaint.
-                ui.ctx().request_repaint();
-            }
-        }
+    ) -> egui::Response {
+        let name = self.own_label();
+        let initial = crate::profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
+        let avatar = self.own_avatar_texture(ctx);
+        Frame::new()
+            .fill(chat_surface(pal))
+            .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
+            .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
+            .inner_margin(CHIP_INNER_MARGIN)
+            .show(ui, |ui| {
+                ui.set_height(PARTICIPANT_CHIP_HEIGHT);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(PARTICIPANT_CHIP_HEIGHT);
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
+                    ui.add_space(CHIP_IDENTITY_GAP);
+                    chip_name_label(ui, &name, pal.text2);
+                    ui.add_space(CHIP_IDENTITY_GAP);
+                    let level = self
+                        .local_audio_level
+                        .as_ref()
+                        .map(load_audio_level)
+                        .unwrap_or(0.0);
+                    voice_level_meter(ui, pal, level).on_hover_text(if self.muted {
+                        "Microphone muted"
+                    } else {
+                        "Your microphone level"
+                    });
+                    if self.sharing_active {
+                        ui.add_space(CHIP_IDENTITY_GAP);
+                        chip_status_icon(
+                            ui,
+                            pal.ok,
+                            Icon::ScreenShare,
+                            "You are sharing your screen",
+                        );
+                    }
+                });
+            })
+            .response
     }
 
     fn ui_participant_chip(
@@ -487,9 +519,9 @@ impl AppState {
                 .fill(chat_surface(pal))
                 .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
                 .corner_radius(CornerRadius::same(CHROME_RADIUS))
-                .inner_margin(egui::Margin::symmetric(12, 3))
+                .inner_margin(egui::Margin::symmetric(12, 0))
                 .show(ui, |ui| {
-                    ui.set_min_height(CHROME_CONTROL_HEIGHT);
+                    ui.set_height(CHROME_CONTROL_HEIGHT);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         dot(ui, color, 6.0);
@@ -528,9 +560,9 @@ impl AppState {
                     .fill(chat_surface(pal))
                     .stroke(Stroke::new(1.0_f32, chat_hairline(pal)))
                     .corner_radius(CornerRadius::same(CHROME_RADIUS))
-                    .inner_margin(egui::Margin::symmetric(12, 3))
+                    .inner_margin(egui::Margin::symmetric(12, 0))
                     .show(ui, |ui| {
-                        ui.set_min_height(CHROME_CONTROL_HEIGHT);
+                        ui.set_height(CHROME_CONTROL_HEIGHT);
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 7.0;
                             dot(ui, pal.accent, 6.0);
@@ -571,7 +603,7 @@ impl AppState {
             // The trailing icons keep their size; the call chip is the flexible
             // part. Reserving the trailing room up front stops the icons being
             // painted on top of the call text once the window gets narrow.
-            let mut trailing = 2.0 * GHOST_BUTTON_SIZE + ui.spacing().item_spacing.x;
+            let mut trailing = 2.0 * 32.0 + 4.0;
             #[cfg(windows)]
             if let Some(release) = available_update.as_ref() {
                 trailing += ui
@@ -594,13 +626,14 @@ impl AppState {
             );
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ghost_icon_button(ui, pal, ph::GEAR_SIX)
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if super::widgets::chrome_icon_button(ui, pal, Icon::Settings, 32.0, 16.0)
                     .on_hover_text("Settings")
                     .clicked()
                 {
                     self.show_settings = true;
                 }
-                if ghost_icon_button(ui, pal, ph::ADDRESS_BOOK)
+                if super::widgets::chrome_icon_button(ui, pal, Icon::BookUser, 32.0, 16.0)
                     .on_hover_text("Contacts and calling")
                     .clicked()
                 {
@@ -623,19 +656,33 @@ impl AppState {
                         }
                     }
                 }
-                if self.app_mode == AppMode::Text {
+                if self.app_mode == AppMode::Text && ui.available_width() > 120.0 {
+                    // Quiet status: a dot plus a short word, only loud on error.
                     let (status, color) = if self.chat.service_error.is_some() {
                         ("Chat unavailable", pal.err)
                     } else if self.our_node_id.is_some() {
-                        ("Chat ready", pal.ok)
+                        ("Online", pal.dim)
                     } else {
                         ("Connecting…", pal.dim)
                     };
+                    ui.add_space(8.0);
                     let status =
-                        ui.label(RichText::new(status).color(color).size(ui_font_size(12.0)));
+                        ui.label(RichText::new(status).color(color).size(ui_font_size(11.5)));
                     if let Some(error) = &self.chat.service_error {
                         status.on_hover_text(error);
                     }
+                    ui.add_space(2.0);
+                    dot(
+                        ui,
+                        if self.chat.service_error.is_some() {
+                            pal.err
+                        } else if self.our_node_id.is_some() {
+                            pal.ok
+                        } else {
+                            pal.dim2
+                        },
+                        6.0,
+                    );
                 }
             });
         });
@@ -759,7 +806,7 @@ impl AppState {
         None
     }
 
-    pub(super) fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette, ctx: &egui::Context) {
+    pub(super) fn ui_dock_content(&mut self, ui: &mut Ui, pal: &Palette, _ctx: &egui::Context) {
         let rect = ui.max_rect();
         let active_calls = self
             .calls
@@ -789,40 +836,6 @@ impl AppState {
         // rounded corner. Hide the whole card on narrow windows and fall
         // back to an avatar-only badge on medium widths so it never overlaps
         // the centered controls.
-        let dock_width = controls_rect.width();
-        if dock_width >= 520.0 {
-            const CARD_EDGE_INSET: f32 = 6.0;
-            let card_width: f32 = if dock_width >= 700.0 { 196.0 } else { 56.0 };
-            // The slot is the card's own measured height, so the card can never
-            // be taller than the room the dock gives it.
-            let card_height = super::profile_ui::self_card_height(ui);
-            let slot_bottom =
-                (controls_rect.center().y + card_height / 2.0).min(controls_rect.max.y - 2.0);
-            let slot_top = (slot_bottom - card_height).max(controls_rect.top());
-            let slot_right =
-                (controls_rect.min.x + CARD_EDGE_INSET + card_width).min(controls_rect.right());
-            let left_rect = egui::Rect::from_min_max(
-                egui::pos2(controls_rect.min.x + CARD_EDGE_INSET, slot_top),
-                egui::pos2(slot_right, slot_bottom),
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
-                if dock_width >= 700.0 {
-                    ui.add_space(((left_rect.height() - card_height) * 0.5).max(0.0));
-                    self.ui_self_user_card(ui, pal, ctx);
-                } else {
-                    let avatar = self.own_avatar_texture(ctx);
-                    let name = self.own_label();
-                    let initial = crate::profile::display_name_initial(&name)
-                        .unwrap_or_else(|| "Y".to_owned());
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(((left_rect.height() - 32.0) * 0.5).max(0.0));
-                        paint_profile_avatar(ui, pal, avatar, &initial, 32.0);
-                    });
-                }
-            });
-        }
-
         // Keep the control cluster centered at every window width.
         let desired_controls_width = dock_controls_width(in_call);
         let controls_width = desired_controls_width.min(controls_rect.width().max(0.0));
@@ -1656,7 +1669,7 @@ impl AppState {
             );
         }
 
-        let roomy = area.height() >= 150.0;
+        let roomy = area.height() >= 200.0;
         let has_capture_error = self.capture_error.is_some();
         let stopped_streams = self.stopped_stream_nodes();
         let showing_stopped =
@@ -1681,7 +1694,31 @@ impl AppState {
         let block_size = Vec2::new((area.width() - 24.0).min(440.0), block_height);
         let block_rect = egui::Rect::from_center_size(area.center(), block_size);
 
+        if !roomy {
+            // Too short for the full block: one centered line, never
+            // spilling outside the stage.
+            let text = if has_capture_error {
+                "Screen sharing needs access"
+            } else if self.sharing_active {
+                "Starting your screen share…"
+            } else if showing_stopped {
+                stopped_title.as_str()
+            } else {
+                "Nothing is being shared"
+            };
+            let galley = super::widgets::truncated_galley(
+                ui,
+                text,
+                egui::FontId::proportional(ui_font_size(12.0)),
+                pal.dim,
+                (area.width() - 24.0).max(1.0),
+            );
+            ui.painter()
+                .galley(area.center() - galley.size() * 0.5, galley, pal.dim);
+            return;
+        }
         ui.scope_builder(egui::UiBuilder::new().max_rect(block_rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(area));
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 let (icon_rect, _) =
                     ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());

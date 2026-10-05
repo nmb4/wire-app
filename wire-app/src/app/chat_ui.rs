@@ -20,27 +20,30 @@ use crate::{
     client_status::Availability,
     runtime::Command,
     theme::{
-        action_button, ghost_icon_button, kh_family, lucide, menu_item_button, toolbar_button,
-        ui_font_size, ButtonTone, Palette,
+        action_button, kh_family, lucide, menu_item_button, toolbar_button, ui_font_size,
+        ButtonTone, Palette,
     },
 };
 use egui::{
     Align, Align2, CornerRadius, Frame, Layout, PopupCloseBehavior, RectAlign, RichText, Stroke,
     Ui, Vec2,
 };
-use egui_phosphor::regular as ph;
 use iroh::NodeId;
 use lucide_icons::Icon;
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tracing::warn;
 
 const FILE_OFFER_CARD_MAX_WIDTH: f32 = 420.0;
+/// Below this content width the chat shows the list or the open
+/// conversation, never both side by side.
+const NARROW_CHAT_WIDTH: f32 = 640.0;
+/// Bubble messages never grow wider than this, even on huge windows.
+const BUBBLE_MAX_WIDTH: f32 = 620.0;
+const BUBBLE_AVATAR: f32 = 28.0;
+const BUBBLE_AVATAR_GAP: f32 = 8.0;
+/// Composer controls (attach, GIF, send) share one height so their
+/// centers line up with a single-line text field.
+const COMPOSER_CONTROL: f32 = 32.0;
 const KLIPY_PICKER_WIDTH: f32 = 332.0;
 const KLIPY_GIF_TILE_WIDTH: f32 = 96.0;
 const KLIPY_GIF_PREVIEW_HEIGHT: f32 = 72.0;
@@ -62,17 +65,43 @@ impl AppState {
         let top =
             egui::Rect::from_min_max(body.min, egui::pos2(body.max.x, body.min.y + TOP_HEIGHT));
         let content = egui::Rect::from_min_max(egui::pos2(body.min.x, top.max.y), body.max);
-        let sidebar_width = (content.width() * 0.27)
-            .clamp(220.0, 310.0)
-            .min(content.width() * 0.46);
+        // Narrow windows show one pane at a time: the list, or the open chat
+        // with a back button. Squeezing both made each unusable.
+        let narrow = content.width() < NARROW_CHAT_WIDTH;
+        let has_selection = self
+            .chat
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.chat.conversations.contains_key(id));
+        let show_sidebar = !narrow || !has_selection;
+        let show_main = !narrow || has_selection;
+        let sidebar_width = if !show_main {
+            content.width()
+        } else if !show_sidebar {
+            0.0
+        } else {
+            (content.width() * 0.26).clamp(232.0, 300.0)
+        };
         let sidebar = egui::Rect::from_min_max(
             content.min + Vec2::new(12.0, 10.0),
-            egui::pos2(content.min.x + sidebar_width - 6.0, content.max.y - 12.0),
+            egui::pos2(
+                content.min.x + sidebar_width - if show_main { 6.0 } else { 12.0 },
+                content.max.y - 12.0,
+            ),
         );
         let main = egui::Rect::from_min_max(
-            egui::pos2(content.min.x + sidebar_width + 6.0, content.min.y),
+            egui::pos2(
+                content.min.x
+                    + if show_sidebar {
+                        sidebar_width + 6.0
+                    } else {
+                        12.0
+                    },
+                content.min.y,
+            ),
             content.max,
         );
+        self.chat.narrow_layout = narrow;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(top), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(top));
@@ -81,19 +110,23 @@ impl AppState {
                 .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| self.ui_top_bar_content(ui, ctx, pal));
         });
-        paint_chat_card(ui, sidebar, pal, 18);
-        let sidebar_inner = sidebar.shrink2(Vec2::new(12.0, 12.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_inner), |ui| {
-            ui.set_clip_rect(ui.clip_rect().intersect(sidebar_inner));
-            self.ui_chat_sidebar(ui, pal);
-        });
-        ui.scope_builder(egui::UiBuilder::new().max_rect(main), |ui| {
-            ui.set_clip_rect(ui.clip_rect().intersect(main));
-            Frame::new()
-                .fill(pal.bg)
-                .inner_margin(egui::Margin::same(0))
-                .show(ui, |ui| self.ui_chat_main(ui, pal));
-        });
+        if show_sidebar {
+            paint_chat_card(ui, sidebar, pal, 16);
+            let sidebar_inner = sidebar.shrink2(Vec2::new(10.0, 10.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_inner), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(sidebar_inner));
+                self.ui_chat_sidebar(ui, pal);
+            });
+        }
+        if show_main {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(main), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(main));
+                Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::same(0))
+                    .show(ui, |ui| self.ui_chat_main(ui, pal));
+            });
+        }
         if self.chat.show_group_editor {
             self.ui_group_editor(ctx, pal);
         }
@@ -106,8 +139,8 @@ impl AppState {
     }
 
     fn ui_chat_sidebar(&mut self, ui: &mut Ui, pal: &Palette) {
-        const FOOTER_HEIGHT: f32 = 62.0;
-        const FOOTER_GAP: f32 = 10.0;
+        const FOOTER_HEIGHT: f32 = 50.0;
+        const FOOTER_GAP: f32 = 12.0;
         let bounds = ui.max_rect();
         let has_identity = self.our_node_id.is_some();
         let footer_space = if has_identity {
@@ -125,29 +158,30 @@ impl AppState {
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(list));
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("CONVERSATIONS")
-                        .family(kh_family())
-                        .color(pal.text2)
-                        .size(12.0),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ghost_icon_button(ui, pal, ph::PLUS)
-                        .on_hover_text("Create a group")
-                        .clicked()
-                        && self.our_node_id.is_some()
-                    {
-                        self.chat.show_group_editor = true;
-                    }
-                });
-            });
-            ui.add_space(2.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 30.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.add_space(8.0);
+                    sidebar_section_label(ui, pal, "Conversations");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if chat_lucide_icon_button(ui, pal, Icon::Plus)
+                            .on_hover_text("Create a group")
+                            .clicked()
+                            && self.our_node_id.is_some()
+                        {
+                            self.chat.show_group_editor = true;
+                        }
+                    });
+                },
+            );
+            ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
                 .id_salt("chat-conversations")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     let friends = self.friends.clone();
                     // Resolve profile pictures for everyone listed here so
                     // unknown senders fetch avatars while visible.
@@ -202,7 +236,7 @@ impl AppState {
                                 }
                             }
                         }
-                        ui.add_space(3.0);
+                        ui.add_space(2.0);
                     }
 
                     let known_peers = self
@@ -214,13 +248,11 @@ impl AppState {
                         unknown_direct_conversations(&self.chat.conversations, &known_peers);
                     if !unknown_directs.is_empty() {
                         ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("UNKNOWN")
-                                .family(kh_family())
-                                .color(pal.dim)
-                                .size(11.0),
-                        );
-                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            sidebar_section_label(ui, pal, "Unknown");
+                        });
+                        ui.add_space(6.0);
                     }
                     for (id, peer) in unknown_directs {
                         let selected = self.chat.selected.as_deref() == Some(id.as_str());
@@ -250,7 +282,7 @@ impl AppState {
                         {
                             self.chat.selected = Some(id);
                         }
-                        ui.add_space(3.0);
+                        ui.add_space(2.0);
                     }
 
                     let groups: Vec<_> = self
@@ -262,13 +294,11 @@ impl AppState {
                         .collect();
                     if !groups.is_empty() {
                         ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("GROUPS")
-                                .family(kh_family())
-                                .color(pal.dim)
-                                .size(11.0),
-                        );
-                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            sidebar_section_label(ui, pal, "Groups");
+                        });
+                        ui.add_space(6.0);
                     }
                     for group in groups {
                         let selected = self.chat.selected.as_deref() == Some(group.id.as_str());
@@ -328,71 +358,93 @@ impl AppState {
                             self.acknowledge_missed_group_calls(&group.id);
                             self.chat.selected = Some(group.id);
                         }
-                        ui.add_space(3.0);
+                        ui.add_space(2.0);
                     }
                 });
         });
 
         if let Some(node_id) = self.our_node_id {
-            let footer_bottom = bounds.max.y - 2.0;
+            let footer_bottom = bounds.max.y;
             let footer = egui::Rect::from_min_max(
                 egui::pos2(bounds.min.x, footer_bottom - FOOTER_HEIGHT),
                 egui::pos2(bounds.max.x, footer_bottom),
             );
-            paint_chat_card(ui, footer, pal, 14);
-            let footer_inner = footer.shrink2(Vec2::new(11.0, 8.0));
+            let footer_response = ui.interact(
+                footer,
+                ui.id().with("sidebar-self-card"),
+                egui::Sense::click(),
+            );
+            let hot = footer_response.hovered();
+            ui.painter().rect_filled(
+                footer,
+                CornerRadius::same(10),
+                if hot {
+                    chat_selected_surface(pal)
+                } else {
+                    egui::Color32::TRANSPARENT
+                },
+            );
+            ui.painter().hline(
+                footer.x_range(),
+                footer.top() - FOOTER_GAP * 0.5,
+                Stroke::new(1.0_f32, chat_hairline(pal)),
+            );
             let ctx_clone = ui.ctx().clone();
             let own_name = self.own_label();
             let own_initial =
                 crate::profile::display_name_initial(&own_name).unwrap_or_else(|| "Y".to_owned());
             let own_avatar = self.own_avatar_texture(&ctx_clone);
-            let mut open_editor = false;
-            ui.scope_builder(egui::UiBuilder::new().max_rect(footer_inner), |ui| {
-                ui.set_clip_rect(footer);
-                // Two-line identity row: the picture spans the name + ID.
-                let avatar_size = two_line_avatar_size(
-                    ui,
-                    &egui::FontId::proportional(ui_font_size(12.5)),
-                    &egui::FontId::monospace(ui_font_size(10.5)),
-                );
-                ui.horizontal(|ui| {
-                    paint_profile_avatar(ui, pal, own_avatar, &own_initial, avatar_size);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(
-                            RichText::new(&own_name)
-                                .color(pal.text)
-                                .size(ui_font_size(12.5)),
-                        );
-                        ui.label(
-                            RichText::new(node_id.fmt_short().to_string())
-                                .monospace()
-                                .color(pal.dim)
-                                .size(ui_font_size(10.5)),
-                        );
-                    });
+            let mut open_editor = footer_response
+                .on_hover_text("Edit your profile (name + picture)")
+                .clicked();
+            const AVATAR: f32 = 34.0;
+            let inner = footer.shrink2(Vec2::new(8.0, 0.0));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.set_clip_rect(footer);
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    paint_profile_avatar(ui, pal, own_avatar, &own_initial, AVATAR);
+                    let text_width = (ui.available_width() - 40.0).max(20.0);
+                    let (text_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(text_width, AVATAR), egui::Sense::hover());
+                    let name = crate::app::widgets::truncated_galley(
+                        ui,
+                        &own_name,
+                        egui::FontId::proportional(ui_font_size(12.5)),
+                        pal.text,
+                        text_width,
+                    );
+                    let id = crate::app::widgets::truncated_galley(
+                        ui,
+                        &node_id.fmt_short().to_string(),
+                        egui::FontId::monospace(ui_font_size(10.0)),
+                        pal.dim,
+                        text_width,
+                    );
+                    let block = name.size().y + id.size().y - 2.0;
+                    let top = text_rect.center().y - block * 0.5;
+                    let name_h = name.size().y;
+                    ui.painter()
+                        .galley(egui::pos2(text_rect.left(), top), name, pal.text);
+                    ui.painter().galley(
+                        egui::pos2(text_rect.left(), top + name_h - 2.0),
+                        id,
+                        pal.dim,
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if chat_lucide_icon_button(ui, pal, Icon::Copy)
                             .on_hover_text("Copy my ID")
                             .clicked()
                         {
                             copy_to_clipboard(&node_id.to_string());
+                            open_editor = false;
                         }
                     });
-                });
-                // Clicking the self card opens the profile editor.
-                let footer_response = ui.interact(
-                    footer_inner,
-                    ui.id().with("sidebar-self-card"),
-                    egui::Sense::click(),
-                );
-                if footer_response
-                    .on_hover_text("Edit your profile (name + picture)")
-                    .clicked()
-                {
-                    open_editor = true;
-                }
-            });
+                },
+            );
             if open_editor {
                 self.profile_edit_name = self.own_profile_name.clone();
                 self.profile_edit_error = None;
@@ -466,21 +518,25 @@ impl AppState {
         let ctx_clone = ui.ctx().clone();
         let header_avatar = header_peer.and_then(|peer| self.peer_avatar_texture(&ctx_clone, peer));
 
-        const HEADER: f32 = 72.0;
-        const GAP: f32 = 10.0;
+        const HEADER: f32 = 60.0;
+        const GAP: f32 = 8.0;
+        const COMPOSER_PAD: f32 = 8.0;
         self.collect_chat_image_input(ui.ctx());
-        let composer_rows = composer_visual_rows(
-            &self.chat.composer,
-            (ui.available_width() - 80.0).max(120.0),
-        );
-        let editor_height = 10.0 + composer_rows as f32 * 20.0;
-        let composer_height = editor_height
-            + 64.0
-            + if self.chat.preparing_file_offers > 0 {
-                20.0
-            } else {
-                0.0
-            };
+        // One row: attach + GIF on the left, the editor, send on the right.
+        let editor_width =
+            (ui.available_width() - 12.0 - 2.0 * COMPOSER_PAD - 3.0 * COMPOSER_CONTROL - 40.0)
+                .max(80.0);
+        let composer_rows = composer_visual_rows(&self.chat.composer, editor_width).min(8);
+        let line_height = ui
+            .ctx()
+            .fonts_mut(|fonts| fonts.row_height(&egui::TextStyle::Body.resolve(ui.style())));
+        let editor_height = (composer_rows as f32 * line_height + 8.0).max(COMPOSER_CONTROL);
+        let status_height = if self.chat.preparing_file_offers > 0 || self.chat.error.is_some() {
+            18.0
+        } else {
+            0.0
+        };
+        let composer_height = editor_height + 2.0 * COMPOSER_PAD + status_height;
         let preview_height =
             if self.chat.draft_attachments.is_empty() && self.chat.draft_files.is_empty() {
                 0.0
@@ -515,187 +571,204 @@ impl AppState {
             egui::pos2(surface_rect.max.x, message_bottom),
         );
 
-        paint_chat_card(ui, header, pal, 18);
-        let header_inner = header.shrink2(Vec2::new(18.0, 12.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(header_inner), |ui| {
-            ui.set_clip_rect(header);
-            let show_call = ui.available_width() >= 430.0;
-            // Top-aligned like compact rows: the avatar meets the title,
-            // not the vertical middle of the whole title+subtitle block.
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                // The picture spans the title + status block.
-                let header_avatar_size = two_line_avatar_size(
-                    ui,
-                    &egui::FontId::proportional(ui_font_size(15.0)),
-                    &egui::FontId::proportional(ui_font_size(11.5)),
-                );
-                paint_profile_avatar(ui, pal, header_avatar, &header_initial, header_avatar_size);
-                let group_members = matches!(conversation.kind, ConversationKind::Group)
-                    .then(|| self.group_members_for(&conversation));
-                let group_member_summary = group_members
-                    .as_ref()
-                    .map(|members| format_group_member_summary(members));
-                ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - 160.0).max(80.0));
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    // Direct peers render in their accent color, matching
-                    // message author names; groups stay theme text.
-                    let title_color = match conversation.direct_peer() {
-                        Some(peer) => accent_color_for(self.peer_accent_hex(peer), pal.text),
-                        None => pal.text,
-                    };
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&display_title)
-                                .color(title_color)
-                                .size(ui_font_size(15.0)),
-                        )
-                        .truncate(),
-                    );
-                    let subtitle = match &conversation.kind {
-                        ConversationKind::Direct { peer_id } => NodeId::from_str(peer_id)
-                            .ok()
-                            .and_then(|peer| self.friend_status.get(&peer))
-                            .map(|status| match status.availability {
-                                Availability::Online => "Online".to_owned(),
-                                Availability::Offline => "Offline".to_owned(),
-                            })
-                            .unwrap_or_else(|| "Connection status unknown".to_owned()),
-                        ConversationKind::Group => group_member_summary
-                            .clone()
-                            .unwrap_or_else(|| "No members".to_owned()),
-                    };
-                    let subtitle_response = ui.add(
-                        egui::Label::new(
-                            RichText::new(&subtitle)
-                                .color(pal.dim)
-                                .size(ui_font_size(11.5)),
-                        )
-                        .truncate()
-                        .sense(egui::Sense::click()),
-                    );
-                    if matches!(conversation.kind, ConversationKind::Group) {
-                        let hover = group_member_summary
-                            .as_deref()
-                            .unwrap_or("Show group members");
-                        if subtitle_response.on_hover_text(hover).clicked() {
-                            self.chat.show_group_members = true;
-                        }
+        paint_chat_card(ui, header, pal, 16);
+        let header_inner = header.shrink2(Vec2::new(12.0, 0.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(header_inner)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.set_clip_rect(header);
+                let narrow = self.chat.narrow_layout;
+                let show_call = ui.available_width() >= 420.0;
+                {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if narrow
+                        && chat_lucide_icon_button(ui, pal, Icon::ChevronLeft)
+                            .on_hover_text("All conversations")
+                            .clicked()
+                    {
+                        self.chat.selected = None;
                     }
-                });
-                let mut clear_history = false;
-                let mut open_members = false;
-                let direct_peer = conversation.direct_peer();
-                let active_group_call = matches!(conversation.kind, ConversationKind::Group)
-                    .then(|| self.group_call_for(&conversation.id))
-                    .flatten();
-                let peer_is_friend = direct_peer.is_some_and(|peer| self.is_friend(peer));
-                let mut friend_to_add = None;
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let menu_response = ui
-                        .menu_button(
-                            RichText::new(char::from(Icon::EllipsisVertical))
-                                .font(lucide(16.0))
-                                .color(pal.text2),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                if matches!(conversation.kind, ConversationKind::Group)
-                                    && menu_item_button(ui, pal, Icon::Users, "Members", false)
-                                        .clicked()
-                                {
-                                    open_members = true;
-                                    ui.close();
+                    let header_avatar_size = 36.0;
+                    paint_profile_avatar(
+                        ui,
+                        pal,
+                        header_avatar,
+                        &header_initial,
+                        header_avatar_size,
+                    );
+                    let group_members = matches!(conversation.kind, ConversationKind::Group)
+                        .then(|| self.group_members_for(&conversation));
+                    let group_member_summary = group_members
+                        .as_ref()
+                        .map(|members| format_group_member_summary(members));
+                    let reserved = if show_call { 150.0 } else { 44.0 };
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(
+                            (ui.available_width() - reserved).max(60.0),
+                            header_avatar_size,
+                        ),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            // Direct peers render in their accent color, matching
+                            // message author names; groups stay theme text.
+                            let title_color = match conversation.direct_peer() {
+                                Some(peer) => {
+                                    accent_color_for(self.peer_accent_hex(peer), pal.text)
                                 }
-                                if !show_call && !peer_is_friend {
-                                    if let Some(peer) = direct_peer {
-                                        if menu_item_button(
-                                            ui,
-                                            pal,
-                                            Icon::UserPlus,
-                                            "Add friend",
-                                            false,
-                                        )
-                                        .clicked()
-                                        {
-                                            friend_to_add = Some(peer);
-                                            ui.close();
-                                        }
-                                    }
+                                None => pal.text,
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&display_title)
+                                        .color(title_color)
+                                        .size(ui_font_size(14.0)),
+                                )
+                                .truncate(),
+                            );
+                            let subtitle = match &conversation.kind {
+                                ConversationKind::Direct { peer_id } => NodeId::from_str(peer_id)
+                                    .ok()
+                                    .and_then(|peer| self.friend_status.get(&peer))
+                                    .map(|status| match status.availability {
+                                        Availability::Online => "Online".to_owned(),
+                                        Availability::Offline => "Offline".to_owned(),
+                                    })
+                                    .unwrap_or_else(|| "Connection status unknown".to_owned()),
+                                ConversationKind::Group => group_member_summary
+                                    .clone()
+                                    .unwrap_or_else(|| "No members".to_owned()),
+                            };
+                            let subtitle_response = ui.add(
+                                egui::Label::new(
+                                    RichText::new(&subtitle)
+                                        .color(pal.dim)
+                                        .size(ui_font_size(11.0)),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            );
+                            if matches!(conversation.kind, ConversationKind::Group) {
+                                let hover = group_member_summary
+                                    .as_deref()
+                                    .unwrap_or("Show group members");
+                                if subtitle_response.on_hover_text(hover).clicked() {
+                                    self.chat.show_group_members = true;
                                 }
-                                if menu_item_button(ui, pal, Icon::Trash2, "Clear history", true)
-                                    .on_hover_text(
-                                        "Permanently delete this chat history for everyone",
+                            }
+                        },
+                    );
+                    let mut clear_history = false;
+                    let mut open_members = false;
+                    let direct_peer = conversation.direct_peer();
+                    let active_group_call = matches!(conversation.kind, ConversationKind::Group)
+                        .then(|| self.group_call_for(&conversation.id))
+                        .flatten();
+                    let peer_is_friend = direct_peer.is_some_and(|peer| self.is_friend(peer));
+                    let mut friend_to_add = None;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let menu_trigger = chat_lucide_icon_button(ui, pal, Icon::EllipsisVertical);
+                        let menu_response = menu_trigger.clone();
+                        egui::Popup::menu(&menu_trigger).show(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            if matches!(conversation.kind, ConversationKind::Group)
+                                && menu_item_button(ui, pal, Icon::Users, "Members", false)
+                                    .clicked()
+                            {
+                                open_members = true;
+                                ui.close();
+                            }
+                            if !show_call && !peer_is_friend {
+                                if let Some(peer) = direct_peer {
+                                    if menu_item_button(
+                                        ui,
+                                        pal,
+                                        Icon::UserPlus,
+                                        "Add friend",
+                                        false,
                                     )
                                     .clicked()
-                                {
-                                    clear_history = true;
-                                    ui.close();
+                                    {
+                                        friend_to_add = Some(peer);
+                                        ui.close();
+                                    }
                                 }
-                            },
-                        )
-                        .response;
-                    menu_response.on_hover_text("Chat actions");
-                    if show_call {
-                        if let Some(peer) = direct_peer {
-                            if peer_is_friend {
-                                if action_button(ui, pal, "Start call", ButtonTone::Secondary)
-                                    .on_hover_text("Start a separate voice call")
+                            }
+                            if menu_item_button(ui, pal, Icon::Trash2, "Clear history", true)
+                                .on_hover_text("Permanently delete this chat history for everyone")
+                                .clicked()
+                            {
+                                clear_history = true;
+                                ui.close();
+                            }
+                        });
+                        menu_response.on_hover_text("Chat actions");
+                        if show_call {
+                            if let Some(peer) = direct_peer {
+                                if peer_is_friend {
+                                    if action_button(ui, pal, "Start call", ButtonTone::Secondary)
+                                        .on_hover_text("Start a separate voice call")
+                                        .clicked()
+                                    {
+                                        self.cmd(Command::Call { node_id: peer });
+                                        self.app_mode = AppMode::Calls;
+                                    }
+                                } else if action_button(ui, pal, "Add friend", ButtonTone::Primary)
+                                    .on_hover_text("Save this sender using their full node ID")
                                     .clicked()
                                 {
-                                    self.cmd(Command::Call { node_id: peer });
-                                    self.app_mode = AppMode::Calls;
+                                    friend_to_add = Some(peer);
                                 }
-                            } else if action_button(ui, pal, "Add friend", ButtonTone::Primary)
-                                .on_hover_text("Save this sender using their full node ID")
-                                .clicked()
-                            {
-                                friend_to_add = Some(peer);
-                            }
-                        } else if matches!(conversation.kind, ConversationKind::Group) {
-                            let already_joined = self
-                                .local_group_call
-                                .as_ref()
-                                .is_some_and(|call| call.conversation_id == conversation.id);
-                            let label = if already_joined {
-                                "Open call"
-                            } else if active_group_call.is_some() {
-                                "Join call"
-                            } else {
-                                "Start call"
-                            };
-                            if action_button(ui, pal, label, ButtonTone::Primary)
-                                .on_hover_text(if active_group_call.is_some() {
-                                    "Join the active group call"
+                            } else if matches!(conversation.kind, ConversationKind::Group) {
+                                let already_joined = self
+                                    .local_group_call
+                                    .as_ref()
+                                    .is_some_and(|call| call.conversation_id == conversation.id);
+                                let label = if already_joined {
+                                    "Open call"
+                                } else if active_group_call.is_some() {
+                                    "Join call"
                                 } else {
-                                    "Ring group members who are currently online"
-                                })
-                                .clicked()
-                            {
-                                if already_joined {
-                                    self.app_mode = AppMode::Calls;
-                                } else {
-                                    self.enter_group_call(&conversation, active_group_call.clone());
+                                    "Start call"
+                                };
+                                if action_button(ui, pal, label, ButtonTone::Primary)
+                                    .on_hover_text(if active_group_call.is_some() {
+                                        "Join the active group call"
+                                    } else {
+                                        "Ring group members who are currently online"
+                                    })
+                                    .clicked()
+                                {
+                                    if already_joined {
+                                        self.app_mode = AppMode::Calls;
+                                    } else {
+                                        self.enter_group_call(
+                                            &conversation,
+                                            active_group_call.clone(),
+                                        );
+                                    }
                                 }
                             }
                         }
+                    });
+                    if let Some(peer) = friend_to_add {
+                        self.chat.friend_candidate = Some(peer);
+                        // Prefill a learned profile name so adding a stranger
+                        // doesn't freeze their "Peer …" fallback as the contact.
+                        self.chat.friend_candidate_name =
+                            self.peer_profile_name(peer).unwrap_or_default().to_owned();
                     }
-                });
-                if let Some(peer) = friend_to_add {
-                    self.chat.friend_candidate = Some(peer);
-                    // Prefill a learned profile name so adding a stranger
-                    // doesn't freeze their "Peer …" fallback as the contact.
-                    self.chat.friend_candidate_name =
-                        self.peer_profile_name(peer).unwrap_or_default().to_owned();
+                    if open_members {
+                        self.chat.show_group_members = true;
+                    }
+                    if clear_history {
+                        self.clear_chat_history(&conversation.id);
+                    }
                 }
-                if open_members {
-                    self.chat.show_group_members = true;
-                }
-                if clear_history {
-                    self.clear_chat_history(&conversation.id);
-                }
-            });
-        });
+            },
+        );
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(messages), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(messages));
@@ -763,7 +836,8 @@ impl AppState {
                                         messages_share_compact_group(message, next)
                                     });
                                 ui.add_space(match self.chat_style {
-                                    ChatStyle::Bubbles => 9.0,
+                                    ChatStyle::Bubbles if next_is_grouped => 3.0,
+                                    ChatStyle::Bubbles => 14.0,
                                     ChatStyle::Compact if next_is_grouped => 2.0,
                                     ChatStyle::Compact => 14.0,
                                 });
@@ -828,26 +902,30 @@ impl AppState {
             });
         }
 
-        paint_chat_card(ui, composer, pal, 22);
-        let composer_inner = composer.shrink2(Vec2::new(14.0, 10.0));
+        paint_chat_card(ui, composer, pal, 16);
+        let composer_inner = composer.shrink(COMPOSER_PAD);
         ui.scope_builder(egui::UiBuilder::new().max_rect(composer_inner), |ui| {
-            ui.set_clip_rect(ui.clip_rect().intersect(composer_inner));
-            let edit = ui.add_sized(
-                [ui.available_width(), editor_height],
-                egui::TextEdit::multiline(&mut self.chat.composer)
-                    .hint_text(format!("Message {display_title}"))
-                    .desired_rows(composer_rows)
-                    .desired_width(f32::INFINITY)
-                    .frame(false),
+            ui.set_clip_rect(ui.clip_rect().intersect(composer));
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+            let row = egui::Rect::from_min_size(
+                composer_inner.min,
+                Vec2::new(composer_inner.width(), editor_height),
             );
-            let keyboard_send = edit.has_focus()
-                && ui.input(|input| !input.modifiers.shift && input.key_pressed(egui::Key::Enter));
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.horizontal(|ui| {
+            let mut keyboard_send = false;
+            let mut button_send = false;
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(row)
+                    // Controls sit at the bottom so they stay put while a
+                    // long draft grows upwards.
+                    .layout(Layout::left_to_right(Align::Max)),
+                |ui| {
                     if composer_ghost_icon_button(ui, pal, Icon::Plus, "Attach files").clicked() {
                         self.pick_chat_files();
                     }
-                    let gif_button = ui.small_button("GIF").on_hover_text("Search KLIPY GIFs");
+                    let gif_button =
+                        composer_text_button(ui, pal, "GIF", self.chat.gif_picker_open)
+                            .on_hover_text("Search KLIPY GIFs");
                     let was_open = self.chat.gif_picker_open;
                     if gif_button.clicked() {
                         self.chat.gif_picker_open = !was_open;
@@ -861,7 +939,7 @@ impl AppState {
                         .open_bool(&mut picker_open)
                         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                         .align(RectAlign::TOP_START)
-                        .gap(6.0)
+                        .gap(10.0)
                         .width(KLIPY_PICKER_WIDTH)
                         .show(|ui| self.ui_klipy_gif_picker(ui, pal))
                         .and_then(|response| response.inner);
@@ -874,27 +952,52 @@ impl AppState {
                         self.clear_klipy_previews();
                     }
                     self.chat.gif_picker_open = picker_open;
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let button_send = chat_send_button(ui, pal).clicked();
-                        if keyboard_send || button_send {
-                            self.send_chat_composer(&conversation.id);
-                        }
-                    });
-                });
-            });
-            if let Some(error) = self.chat.error.take() {
-                ui.add(
-                    egui::Label::new(RichText::new(error).color(pal.err).size(ui_font_size(10.5)))
+                    ui.add_space(6.0);
+                    let edit_width = (ui.available_width() - COMPOSER_CONTROL - 10.0).max(40.0);
+                    let edit = ui.add_sized(
+                        [edit_width, editor_height],
+                        egui::TextEdit::multiline(&mut self.chat.composer)
+                            .hint_text(format!("Message {display_title}"))
+                            .desired_rows(composer_rows)
+                            .desired_width(edit_width)
+                            .vertical_align(Align::Center)
+                            .margin(egui::Margin::symmetric(2, 4))
+                            .frame(false),
+                    );
+                    keyboard_send = edit.has_focus()
+                        && ui.input(|input| {
+                            !input.modifiers.shift && input.key_pressed(egui::Key::Enter)
+                        });
+                    ui.add_space(6.0);
+                    let can_send = !self.chat.composer.trim().is_empty()
+                        || !self.chat.draft_attachments.is_empty()
+                        || !self.chat.draft_files.is_empty();
+                    button_send = chat_send_button(ui, pal, can_send).clicked();
+                },
+            );
+            if keyboard_send || button_send {
+                self.send_chat_composer(&conversation.id);
+            }
+            let status = egui::Rect::from_min_max(
+                egui::pos2(composer_inner.min.x + 6.0, row.max.y),
+                composer_inner.max,
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(status), |ui| {
+                if let Some(error) = self.chat.error.take() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(error).color(pal.err).size(ui_font_size(10.5)),
+                        )
                         .truncate(),
-                );
-            }
-            if self.chat.preparing_file_offers > 0 {
-                ui.label(
-                    RichText::new("Preparing file…")
-                        .color(pal.dim)
-                        .size(ui_font_size(10.5)),
-                );
-            }
+                    );
+                } else if self.chat.preparing_file_offers > 0 {
+                    ui.label(
+                        RichText::new("Preparing file…")
+                            .color(pal.dim)
+                            .size(ui_font_size(10.5)),
+                    );
+                }
+            });
         });
         self.ui_image_preview(ui.ctx(), pal);
     }
@@ -908,7 +1011,9 @@ impl AppState {
         starts_group: bool,
     ) {
         match self.chat_style {
-            ChatStyle::Bubbles => self.ui_bubble_chat_message(ui, pal, conversation_id, message),
+            ChatStyle::Bubbles => {
+                self.ui_bubble_chat_message(ui, pal, conversation_id, message, starts_group)
+            }
             ChatStyle::Compact => {
                 self.ui_compact_chat_message(ui, pal, conversation_id, message, starts_group)
             }
@@ -921,6 +1026,7 @@ impl AppState {
         pal: &Palette,
         conversation_id: &str,
         message: &ChatMessage,
+        starts_group: bool,
     ) {
         let own = self
             .our_node_id
@@ -965,6 +1071,11 @@ impl AppState {
         } else {
             None
         };
+        // Bubble column width: never wider than the timeline minus the
+        // avatar gutter, and capped so lines stay readable on wide windows.
+        let gutter = BUBBLE_AVATAR + BUBBLE_AVATAR_GAP;
+        let column_width = (ui.available_width() - gutter).clamp(80.0, BUBBLE_MAX_WIDTH);
+        let bubble_inner_max = (column_width - 24.0).max(40.0);
         ui.with_layout(
             if own {
                 Layout::right_to_left(Align::Min)
@@ -972,35 +1083,58 @@ impl AppState {
                 Layout::left_to_right(Align::Min)
             },
             |ui| {
-                paint_profile_avatar(ui, pal, bubble_avatar, &bubble_initial, 28.0);
-                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                // Avatar only on the first message of a burst; continuations
+                // keep the gutter so bubbles stay on one edge.
+                if starts_group {
+                    paint_profile_avatar(ui, pal, bubble_avatar, &bubble_initial, BUBBLE_AVATAR);
+                } else {
+                    ui.add_space(BUBBLE_AVATAR);
+                }
+                ui.add_space(BUBBLE_AVATAR_GAP);
                 ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width().min(680.0), 0.0),
+                    Vec2::new(column_width, 0.0),
                     Layout::top_down(if own { Align::Max } else { Align::Min }),
                     |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                RichText::new(&author)
-                                    .strong()
-                                    .color(author_color.gamma_multiply(opacity))
-                                    .size(ui_font_size(11.5)),
+                        ui.set_max_width(column_width);
+                        if starts_group {
+                            // Name and time share one baseline: same font,
+                            // different color and weight.
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(column_width, BUBBLE_AVATAR - 8.0),
+                                if own {
+                                    Layout::right_to_left(Align::Center)
+                                } else {
+                                    Layout::left_to_right(Align::Center)
+                                },
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let name = RichText::new(&author)
+                                        .color(author_color.gamma_multiply(opacity))
+                                        .size(ui_font_size(12.0));
+                                    let time_text = RichText::new(&time)
+                                        .color(pal.dim2.gamma_multiply(opacity))
+                                        .size(ui_font_size(11.0));
+                                    if own {
+                                        if message.deletion.is_none() {
+                                            chat_delivery_status_icon(
+                                                ui,
+                                                pal,
+                                                state,
+                                                detail.as_deref(),
+                                                opacity,
+                                            );
+                                        }
+                                        ui.label(time_text);
+                                        ui.label(name);
+                                    } else {
+                                        ui.label(name);
+                                        ui.label(time_text);
+                                    }
+                                },
                             );
-                            ui.label(
-                                RichText::new(&time)
-                                    .color(pal.dim.gamma_multiply(opacity))
-                                    .size(ui_font_size(10.5)),
-                            );
-                            if own && message.deletion.is_none() {
-                                chat_delivery_status_icon(
-                                    ui,
-                                    pal,
-                                    state,
-                                    detail.as_deref(),
-                                    opacity,
-                                );
-                            }
-                        });
+                            ui.add_space(4.0);
+                        }
                         let bubble = Frame::new()
                             .fill(if own {
                                 chat_selected_surface(pal).gamma_multiply(opacity)
@@ -1011,10 +1145,10 @@ impl AppState {
                                 1.0_f32,
                                 chat_hairline(pal).gamma_multiply(opacity),
                             ))
-                            .corner_radius(CornerRadius::same(14))
-                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .corner_radius(bubble_corners(own, starts_group))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
                             .show(ui, |ui| {
-                                ui.set_max_width(640.0);
+                                ui.set_max_width(bubble_inner_max);
                                 if message.deletion.is_some()
                                     || (!message.body.trim().is_empty() && body_klipy_gif.is_none())
                                 {
@@ -1049,7 +1183,48 @@ impl AppState {
                                     );
                                 }
                             });
-                        bubble.response.context_menu(|ui| {
+                        let bubble_response = bubble.response;
+                        // Continuations show their time on hover, beside the
+                        // bubble, instead of repeating the header.
+                        if !starts_group && bubble_response.hovered() {
+                            let galley = ui.painter().layout_no_wrap(
+                                format_chat_time(message.sent_at),
+                                egui::FontId::proportional(ui_font_size(10.0)),
+                                pal.dim2,
+                            );
+                            let rect = bubble_response.rect;
+                            let pos = if own {
+                                egui::pos2(rect.left() - 8.0 - galley.size().x, rect.center().y)
+                            } else {
+                                egui::pos2(rect.right() + 8.0, rect.center().y)
+                            };
+                            ui.painter().galley(
+                                egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
+                                galley,
+                                pal.dim2,
+                            );
+                        }
+                        if own
+                            && !starts_group
+                            && message.deletion.is_none()
+                            && !matches!(state, DeliveryState::Delivered)
+                        {
+                            let rect = bubble_response.rect;
+                            let status_rect = egui::Rect::from_center_size(
+                                egui::pos2(rect.left() - 12.0, rect.bottom() - 10.0),
+                                Vec2::splat(14.0),
+                            );
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(status_rect), |ui| {
+                                chat_delivery_status_icon(
+                                    ui,
+                                    pal,
+                                    state,
+                                    detail.as_deref(),
+                                    opacity,
+                                );
+                            });
+                        }
+                        bubble_response.context_menu(|ui| {
                             chat_message_context_menu(
                                 ui,
                                 pal,
@@ -3289,22 +3464,31 @@ fn image_preview_default_size(viewport: Vec2) -> Vec2 {
         .max(IMAGE_PREVIEW_MIN_SIZE)
 }
 
-fn chat_send_button(ui: &mut Ui, pal: &Palette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::click());
-    let fill = if response.hovered() {
-        pal.text2
+fn chat_send_button(ui: &mut Ui, pal: &Palette, enabled: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(COMPOSER_CONTROL), egui::Sense::click());
+    let hot = enabled && (response.hovered() || response.has_focus());
+    let (fill, icon) = if enabled {
+        (
+            if hot {
+                crate::theme::mix_rgb(pal.accent, egui::Color32::WHITE, 0.08)
+            } else {
+                pal.accent
+            },
+            pal.bg,
+        )
     } else {
-        pal.text
+        (pal.panel2, pal.dim2)
     };
-    ui.painter().circle_filled(rect.center(), 19.0, fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         char::from(Icon::ArrowUp),
-        lucide(19.0),
-        pal.bg,
+        lucide(16.0),
+        icon,
     );
-    response.on_hover_text("Send message")
+    response.on_hover_text("Send message (Enter)")
 }
 
 fn composer_ghost_icon_button(
@@ -3313,19 +3497,82 @@ fn composer_ghost_icon_button(
     icon: Icon,
     label: &str,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(36.0), egui::Sense::click());
-    if response.hovered() {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(COMPOSER_CONTROL), egui::Sense::click());
+    let hot = response.hovered() || response.has_focus();
+    if hot {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(9), pal.panel2);
+            .rect_filled(rect, CornerRadius::same(10), pal.panel2);
     }
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         char::from(icon),
-        lucide(20.0),
-        pal.text2,
+        lucide(17.0),
+        if hot { pal.text } else { pal.text2 },
     );
     response.on_hover_text(label)
+}
+
+/// Short text control in the composer row (e.g. "GIF"), same height as the
+/// icon buttons so all controls share a centerline.
+fn composer_text_button(ui: &mut Ui, pal: &Palette, label: &str, active: bool) -> egui::Response {
+    let font = egui::FontId::new(11.0, kh_family());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, pal.text2);
+    let size = Vec2::new(
+        (galley.size().x + 16.0).max(COMPOSER_CONTROL),
+        COMPOSER_CONTROL,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hot = response.hovered() || response.has_focus();
+    if hot || active {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(10),
+            if active { pal.accent_dim } else { pal.panel2 },
+        );
+    }
+    let color = if active {
+        pal.accent
+    } else if hot {
+        pal.text
+    } else {
+        pal.text2
+    };
+    let text_rect = rect.shrink2(Vec2::new(8.0, 9.0));
+    ui.painter().rect_stroke(
+        text_rect.expand2(Vec2::new(3.0, 2.0)),
+        CornerRadius::same(4),
+        Stroke::new(1.2_f32, color),
+        egui::StrokeKind::Middle,
+    );
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, color);
+    response
+}
+
+/// Bubble corners: the corner nearest the avatar is tight on the first
+/// message of a burst (a "tail"), and every continuation stays fully round.
+fn bubble_corners(own: bool, starts_group: bool) -> CornerRadius {
+    const ROUND: u8 = 14;
+    const TAIL: u8 = 4;
+    match (own, starts_group) {
+        (false, true) => CornerRadius {
+            nw: TAIL,
+            ne: ROUND,
+            sw: ROUND,
+            se: ROUND,
+        },
+        (true, true) => CornerRadius {
+            nw: ROUND,
+            ne: TAIL,
+            sw: ROUND,
+            se: ROUND,
+        },
+        _ => CornerRadius::same(ROUND),
+    }
 }
 
 fn chat_delivery_opacity(state: DeliveryState) -> f32 {
@@ -3574,9 +3821,12 @@ fn owner_file_offer_status(
     }
 }
 
+/// Consecutive messages from one author within five minutes form a burst
+/// (one header/avatar). Minute buckets used to split 13:59 / 14:00.
 fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -> bool {
+    const BURST_WINDOW_MS: i64 = 5 * 60_000;
     previous.author_id == current.author_id
-        && previous.sent_at.div_euclid(60_000) == current.sent_at.div_euclid(60_000)
+        && (0..=BURST_WINDOW_MS).contains(&(current.sent_at - previous.sent_at))
 }
 
 #[cfg(test)]
@@ -3759,7 +4009,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_chat_groups_only_same_author_in_same_minute() {
+    fn chat_bursts_group_same_author_within_five_minutes() {
         let message = |author: &str, sent_at| ChatMessage {
             version: 1,
             message_id: format!("{author}-{sent_at}"),
@@ -3782,9 +4032,15 @@ mod tests {
             &message("alice", 60_001),
             &message("alice", 119_999),
         ));
-        assert!(!messages_share_compact_group(
+        // Crossing a minute boundary no longer splits a burst...
+        assert!(messages_share_compact_group(
             &message("alice", 119_999),
             &message("alice", 120_000),
+        ));
+        // ...but a pause longer than five minutes does.
+        assert!(!messages_share_compact_group(
+            &message("alice", 0),
+            &message("alice", 5 * 60_000 + 1),
         ));
         assert!(!messages_share_compact_group(
             &message("alice", 60_001),
@@ -3829,7 +4085,7 @@ mod tests {
     #[test]
     fn receiver_file_offer_status_keeps_recovery_details_out_of_the_primary_row() {
         let transfer = FileTransferUiState {
-            path: Some(PathBuf::from("archive.zip")),
+            path: Some(std::path::PathBuf::from("archive.zip")),
             received: 64,
             total: 100,
             phase: Some(FileTransferPhase::Paused("connection lost".to_owned())),
@@ -3863,4 +4119,14 @@ mod tests {
             (Some("Owner offline".to_owned()), None)
         );
     }
+}
+
+/// Small uppercase label for sidebar sections, in the display face.
+fn sidebar_section_label(ui: &mut Ui, pal: &Palette, text: &str) {
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .family(kh_family())
+            .color(pal.dim)
+            .size(11.0),
+    );
 }

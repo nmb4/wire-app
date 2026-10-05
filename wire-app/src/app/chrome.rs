@@ -110,7 +110,7 @@ impl AppState {
             return;
         }
         const TOP_BAR_HEIGHT: f32 = 54.0;
-        const DOCK_HEIGHT: f32 = 66.0;
+        const DOCK_HEIGHT: f32 = 64.0;
         let immersive = self.stream_view_mode != StreamViewMode::Normal;
         let show_participants = self.has_visible_call();
         let top_height = TOP_BAR_HEIGHT.min(body.height());
@@ -129,7 +129,7 @@ impl AppState {
         let participant_bar_height = if show_participants {
             participant_bar_height(
                 participant_strip_width(body.width()),
-                self.calls.len(),
+                self.calls.len() + 1,
                 participant_space,
             )
         } else {
@@ -197,14 +197,11 @@ impl AppState {
         ui.scope_builder(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
             Frame::new()
                 .fill(pal.bg)
-                .outer_margin(egui::Margin {
-                    left: CHROME_SIDE_INSET,
-                    right: CHROME_SIDE_INSET,
-                    top: 0,
-                    bottom: 2,
-                })
-                .inner_margin(egui::Margin::symmetric(12, 4))
-                .show(ui, |ui| self.ui_dock_content(ui, pal, ctx));
+                .inner_margin(egui::Margin::symmetric(12, 0))
+                .show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    self.ui_dock_content(ui, pal, ctx)
+                });
         });
     }
 
@@ -217,11 +214,12 @@ impl AppState {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.set_height(super::widgets::CHROME_CONTROL_HEIGHT - 6.0);
                     let text_active = self.app_mode == AppMode::Text;
                     if chat_segment_button(
                         ui,
                         pal,
-                        "Text chats",
+                        "Chats",
                         text_active,
                         !self.chat.unseen.is_empty(),
                     )
@@ -236,8 +234,7 @@ impl AppState {
                             .values()
                             .flatten()
                             .any(|call| call.ended_at_ms.is_none());
-                    if chat_segment_button(ui, pal, "Voice calls", calls_active, call_available)
-                        .clicked()
+                    if chat_segment_button(ui, pal, "Calls", calls_active, call_available).clicked()
                     {
                         self.app_mode = AppMode::Calls;
                     }

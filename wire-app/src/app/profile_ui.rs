@@ -405,93 +405,6 @@ impl AppState {
         }
     }
 
-    /// Discord-style self card for the bottom control bar: avatar (click to
-    /// edit profile), display name, online dot, own microphone level.
-    pub fn ui_self_user_card(&mut self, ui: &mut egui::Ui, pal: &Palette, ctx: &egui::Context) {
-        let name = self.own_label();
-        let avatar = self.own_avatar_texture(ctx);
-        let initials = profile::display_name_initial(&name).unwrap_or_else(|| "Y".to_owned());
-        let level = self
-            .local_audio_level
-            .as_ref()
-            .map(super::calls_ui::load_audio_level)
-            .unwrap_or(0.0);
-        // Two-line identity row: the picture spans the name and online line.
-        let text_height = self_card_text_height(ui);
-        let response = egui::Frame::new()
-            .fill(pal.panel)
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(7, SELF_CARD_MARGIN_Y as i8))
-            .show(ui, |ui| {
-                ui.set_height(text_height);
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    paint_profile_avatar(ui, pal, avatar, &initials, text_height);
-                    // The status dot and its label share one flush line. Both
-                    // text blocks get explicit rects: `ui.horizontal` would
-                    // inherit the style's `interact_size.y` minimum and silently
-                    // grow the card past the height the dock reserves for it.
-                    let status_height = ui.ctx().fonts_mut(|fonts| {
-                        fonts.row_height(&FontId::proportional(ui_font_size(10.5)))
-                    });
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), text_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(truncate_name(&name, 16))
-                                        .color(pal.text)
-                                        .size(ui_font_size(12.0)),
-                                )
-                                .truncate(),
-                            );
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), status_height),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    let (dot, _) = ui.allocate_exact_size(
-                                        Vec2::splat(7.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(dot.center(), 3.5, pal.ok);
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new("Online")
-                                                .color(pal.dim)
-                                                .size(ui_font_size(10.5)),
-                                        )
-                                        .truncate(),
-                                    );
-                                },
-                            );
-                        },
-                    );
-                    super::calls_ui::voice_level_meter(ui, pal, level).on_hover_text(
-                        if self.muted {
-                            "Your microphone is muted"
-                        } else {
-                            "Your microphone level"
-                        },
-                    );
-                });
-            })
-            .response
-            .interact(egui::Sense::click());
-        if response
-            .on_hover_text("Edit your profile (name + picture)")
-            .clicked()
-        {
-            self.profile_edit_name = self.own_profile_name.clone();
-            self.profile_edit_accent = self.own_accent_color.clone().unwrap_or_default();
-            self.profile_edit_error = None;
-            self.show_profile_editor = true;
-        }
-    }
-
     /// Modal editor for display name + avatar picture.
     pub fn ui_profile_editor(&mut self, ctx: &egui::Context) {
         if !self.show_profile_editor {
@@ -649,31 +562,6 @@ pub fn two_line_avatar_size(ui: &egui::Ui, primary: &FontId, secondary: &FontId)
         .ctx()
         .fonts_mut(|fonts| fonts.row_height(primary) + fonts.row_height(secondary));
     rows.round()
-}
-
-/// Vertical padding the self card's frame adds around its content.
-pub const SELF_CARD_MARGIN_Y: f32 = 3.0;
-
-/// Height of the self card's two-line text block (name plus status) for the
-/// current font metrics.
-///
-/// The avatar spans both lines, so this single number sizes the card's content,
-/// its avatar, and the slot the dock reserves for it.
-fn self_card_text_height(ui: &egui::Ui) -> f32 {
-    ui.ctx().fonts_mut(|fonts| {
-        fonts.row_height(&FontId::proportional(ui_font_size(12.0)))
-            + fonts.row_height(&FontId::proportional(ui_font_size(10.5)))
-    })
-}
-
-/// Total height the self card occupies: its text block plus the frame's
-/// vertical margins.
-///
-/// The dock centers the card inside a slot of exactly this height. Deriving
-/// both numbers from the same font metrics is what keeps the card from being
-/// clipped by its own slot.
-pub fn self_card_height(ui: &egui::Ui) -> f32 {
-    self_card_text_height(ui) + SELF_CARD_MARGIN_Y * 2.0
 }
 
 /// Avatar badge pinned to a stream tile corner, deliberately overflowing the
@@ -1053,14 +941,6 @@ impl AppState {
         });
         ui.add_space(2.0);
     }
-}
-
-fn truncate_name(name: &str, max: usize) -> String {
-    if name.chars().count() <= max {
-        return name.to_owned();
-    }
-    let truncated: String = name.chars().take(max.saturating_sub(1)).collect();
-    format!("{truncated}…")
 }
 
 fn chat_now_millis() -> i64 {

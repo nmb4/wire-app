@@ -73,7 +73,7 @@ pub(super) const CHROME_RADIUS: u8 = 14;
 
 pub(super) const CHROME_INNER_RADIUS: u8 = 11;
 
-pub(super) const CHROME_CONTROL_HEIGHT: f32 = 36.0;
+pub(super) const CHROME_CONTROL_HEIGHT: f32 = 32.0;
 
 /// Side inset for bottom chrome (participants + call dock) so content clears the frame.
 pub(super) const CHROME_SIDE_INSET: i8 = 14;
@@ -476,8 +476,21 @@ fn floating_panel_heading(ui: &mut Ui, pal: &Palette, title: &str, subtitle: &st
 }
 
 pub(super) fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
-    if response.hovered() || response.has_focus() {
+    chrome_icon_button(ui, pal, icon, 30.0, 15.0)
+}
+
+/// Square ghost button with a centered Lucide glyph. All icon buttons in the
+/// chrome go through here so hover surfaces and glyph centering match.
+pub(super) fn chrome_icon_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    icon: Icon,
+    size: f32,
+    glyph: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    let hot = response.hovered() || response.has_focus();
+    if hot {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(9), chat_hover_surface(pal));
     }
@@ -485,12 +498,8 @@ pub(super) fn chat_lucide_icon_button(ui: &mut Ui, pal: &Palette, icon: Icon) ->
         rect.center(),
         Align2::CENTER_CENTER,
         char::from(icon),
-        lucide(15.0),
-        if response.hovered() {
-            pal.text
-        } else {
-            pal.text2
-        },
+        lucide(glyph),
+        if hot { pal.text } else { pal.text2 },
     );
     response
 }
@@ -502,29 +511,32 @@ pub(super) fn chat_segment_button(
     selected: bool,
     unseen: bool,
 ) -> egui::Response {
+    let font = FontId::proportional(ui_font_size(12.0));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, pal.text);
+    // Content-sized with fixed padding; room on the right for the dot.
+    let width = galley.size().x + 28.0;
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(100.0, CHROME_CONTROL_HEIGHT),
+        Vec2::new(width, CHROME_CONTROL_HEIGHT - 6.0),
         egui::Sense::click(),
     );
+    let hot = response.hovered() || response.has_focus();
     let fill = if selected {
         chat_selected_surface(pal)
-    } else if response.hovered() {
+    } else if hot {
         chat_hover_surface(pal)
     } else {
         Color32::TRANSPARENT
     };
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(CHROME_INNER_RADIUS), fill);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        egui::FontId::new(ui_font_size(12.0), egui::FontFamily::Proportional),
-        if selected { pal.text } else { pal.text2 },
-    );
+        .rect_filled(rect, CornerRadius::same(CHROME_INNER_RADIUS - 2), fill);
+    let color = if selected || hot { pal.text } else { pal.dim };
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, color);
     if unseen {
         ui.painter()
-            .circle_filled(rect.right_top() + Vec2::new(-8.0, 8.0), 3.5, pal.accent);
+            .circle_filled(rect.right_center() - Vec2::new(7.0, 0.0), 3.0, pal.accent);
     }
     response
 }
@@ -545,36 +557,32 @@ pub(super) fn chat_navigation_button(
     unseen: bool,
     avatar: Option<SidebarAvatar>,
 ) -> egui::Response {
-    let height = if subtitle.is_some() { 54.0 } else { 42.0 };
+    // Every row has the same height and avatar size, with or without a
+    // subtitle, so the list reads as one rhythm.
+    const ROW_HEIGHT: f32 = 44.0;
+    const AVATAR: f32 = 30.0;
+    let height = ROW_HEIGHT;
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(1.0), height),
         egui::Sense::click(),
     );
+    let hot = response.hovered() || response.has_focus();
     let fill = if selected {
-        // Soft light wash for the open chat — no accent marker bar.
-        mix_color(pal.panel2, Color32::WHITE, 0.08)
-    } else if response.hovered() {
+        mix_color(pal.panel2, Color32::WHITE, 0.07)
+    } else if hot {
         chat_hover_surface(pal)
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     let text_right = if unseen {
-        rect.right() - 28.0
+        rect.right() - 26.0
     } else {
-        rect.right() - 12.0
+        rect.right() - 10.0
     };
-    let label_font = FontId::proportional(ui_font_size(13.0));
+    let label_font = FontId::proportional(ui_font_size(12.5));
     let subtitle_font = FontId::proportional(ui_font_size(10.5));
-    // Optional leading avatar so contacts and unknown senders show the
-    // learned profile picture instead of an initial baked into the label.
-    // Two-line rows grow the circle to span both lines; one-line rows keep
-    // the compact list size.
-    let avatar_size = if subtitle.is_some() {
-        super::profile_ui::two_line_avatar_size(ui, &label_font, &subtitle_font)
-    } else {
-        26.0
-    };
+    let avatar_size = AVATAR;
     let text_left = if let Some(avatar) = &avatar {
         let center = egui::pos2(rect.left() + 8.0 + avatar_size * 0.5, rect.center().y);
         let avatar_rect = Rect::from_center_size(center, Vec2::splat(avatar_size));
@@ -591,53 +599,47 @@ pub(super) fn chat_navigation_button(
                 center,
                 Align2::CENTER_CENTER,
                 &avatar.initial,
-                FontId::new(avatar_size * 0.42, kh_family()),
+                FontId::new(avatar_size * 0.4, kh_family()),
                 pal.text2,
             );
         }
         rect.left() + 8.0 + avatar_size + 10.0
     } else {
-        rect.left() + 14.0
+        rect.left() + 12.0
     };
-    let text_rect = egui::Rect::from_min_max(
-        egui::pos2(text_left, rect.top() + 6.0),
-        egui::pos2(text_right, rect.bottom() - 6.0),
-    );
-    ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-            ui.set_max_width(text_rect.width());
-            if subtitle.is_some() {
-                // Two stacked lines sit flush and centered on the avatar.
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let block_top = rect.center().y - avatar_size * 0.5;
-                ui.add_space((block_top - text_rect.top()).max(0.0));
-            } else {
-                let label_row = ui.ctx().fonts_mut(|fonts| fonts.row_height(&label_font));
-                ui.add_space(((text_rect.height() - label_row) * 0.5).max(0.0));
-            }
-            ui.add(
-                egui::Label::new(
-                    RichText::new(label)
-                        .color(if selected { pal.text } else { pal.text2 })
-                        .font(label_font),
-                )
-                .truncate()
-                .selectable(false),
-            );
-            if let Some(subtitle) = subtitle {
-                ui.add(
-                    egui::Label::new(RichText::new(subtitle).color(pal.dim).font(subtitle_font))
-                        .truncate()
-                        .selectable(false),
-                );
-            }
-        });
-    });
+    // Paint text directly from measured galleys: the name/subtitle block is
+    // centered on the row as a unit, so one-line and two-line rows share
+    // the same optical center.
+    let max_text = (text_right - text_left).max(1.0);
+    let name_color = if selected || hot { pal.text } else { pal.text2 };
+    let name = truncated_galley(ui, label, label_font, name_color, max_text);
+    let sub = subtitle.map(|text| truncated_galley(ui, text, subtitle_font, pal.dim, max_text));
+    let block_h = name.size().y + sub.as_ref().map_or(0.0, |g| g.size().y - 2.0);
+    let mut y = rect.center().y - block_h * 0.5;
+    ui.painter()
+        .galley(egui::pos2(text_left, y), name.clone(), name_color);
+    y += name.size().y - 2.0;
+    if let Some(sub) = sub {
+        ui.painter().galley(egui::pos2(text_left, y), sub, pal.dim);
+    }
     if unseen {
         ui.painter()
             .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
     }
     response
+}
+
+/// Single-line galley shortened with an ellipsis to fit `max_width`.
+pub(super) fn truncated_galley(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 pub(super) fn ellipsize(text: &str, max_chars: usize) -> String {
