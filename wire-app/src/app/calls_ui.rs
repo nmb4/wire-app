@@ -236,6 +236,9 @@ impl AppState {
             .show(ui, |ui| {
                 ui.set_min_width(bar_width);
                 ui.vertical_centered(|ui| {
+                    // Row gaps are explicit below, so inherited vertical
+                    // spacing must not add height the chrome did not reserve.
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     // The chrome reserves rows from this same content width,
                     // including the self identity restored by the alignment pass.
                     let columns = participant_bar_columns(bar_width);

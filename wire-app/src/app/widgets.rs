@@ -121,7 +121,9 @@ pub(super) fn participant_bar_height(
         return 0.0;
     }
     let rows = participant_bar_rows(strip_width, participant_count) as f32;
-    let content_height = rows * PARTICIPANT_CHIP_HEIGHT + (rows - 1.0).max(0.0) * PARTICIPANT_GAP;
+    // Each chip's one-point frame stroke sits outside its content rectangle.
+    let content_height =
+        rows * (PARTICIPANT_CHIP_HEIGHT + 2.0) + (rows - 1.0).max(0.0) * PARTICIPANT_GAP;
     (content_height + PARTICIPANT_STRIP_PAD_Y).min(max_height)
 }
 
@@ -772,9 +774,9 @@ mod tests {
     fn participant_bar_adds_rows_as_the_window_narrows() {
         // Strip content widths, i.e. body width minus the chrome inset.
         // 412pt is the narrowest strip Wire's minimum window size allows.
-        assert_eq!(participant_bar_height(1000.0, 3, 500.0), 50.0);
-        assert_eq!(participant_bar_height(700.0, 3, 500.0), 98.0);
-        assert_eq!(participant_bar_height(412.0, 3, 500.0), 146.0);
+        assert_eq!(participant_bar_height(1000.0, 3, 500.0), 52.0);
+        assert_eq!(participant_bar_height(700.0, 3, 500.0), 102.0);
+        assert_eq!(participant_bar_height(412.0, 3, 500.0), 152.0);
         assert_eq!(participant_bar_height(412.0, 3, 100.0), 100.0);
         assert_eq!(participant_bar_height(1000.0, 0, 500.0), 0.0);
     }
@@ -787,12 +789,45 @@ mod tests {
             let strip = participant_strip_width(body_width);
             let rows = participant_bar_rows(strip, 3);
             let reserved = participant_bar_height(strip, 3, 5000.0);
-            let needed = rows as f32 * PARTICIPANT_CHIP_HEIGHT
+            let needed = rows as f32 * (PARTICIPANT_CHIP_HEIGHT + 2.0)
                 + (rows as f32 - 1.0).max(0.0) * PARTICIPANT_GAP
                 + PARTICIPANT_STRIP_PAD_Y;
             assert!(
                 (reserved - needed).abs() < 0.001,
                 "body {body_width}: reserved {reserved}, needed {needed}"
+            );
+        }
+    }
+
+    #[test]
+    fn participant_band_covers_egui_frame_strokes_and_explicit_row_gaps() {
+        for count in 1..=4 {
+            let ctx = egui::Context::default();
+            let mut painted = Rect::NOTHING;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for row in 0..count {
+                        let chip = egui::Frame::new()
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::WHITE))
+                            .show(ui, |ui| {
+                                ui.allocate_exact_size(
+                                    Vec2::new(200.0, PARTICIPANT_CHIP_HEIGHT),
+                                    egui::Sense::hover(),
+                                );
+                            });
+                        painted = painted.union(chip.response.rect);
+                        if row + 1 < count {
+                            ui.add_space(PARTICIPANT_GAP);
+                        }
+                    }
+                });
+            });
+            let needed = painted.height() + PARTICIPANT_STRIP_PAD_Y;
+            let reserved = participant_bar_height(412.0, count, 5000.0);
+            assert!(
+                (reserved - needed).abs() < 0.001,
+                "{count} rows: reserved {reserved}, egui painted {needed}"
             );
         }
     }
