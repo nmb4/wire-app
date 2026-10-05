@@ -129,6 +129,13 @@ If the answer to an important question is no, either address it or make the limi
   Android-specific code or workflow maintenance as part of unrelated work;
   treat Android enablement as separately scoped product and platform work.
 
+## UI work
+
+Before changing the egui UI, read `docs/ui-improvement-guide.md`. Capture
+before/after screenshots with `scripts/ui-capture.sh <out-dir> [filter]`
+(renders fixture scenes headlessly; needs the gitignored `wire-app/fonts/`
+for accurate typography).
+
 ## Wire Kanban Board (kan.bn)
 
 The project's tasks live on a Kan board named **Wire**.
