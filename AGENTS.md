@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## Version control
+
+This repository uses standard Git. Do not use GitButler, the `but` CLI, or
+GitButler skills for this repository. Do not run `but setup` or re-enable
+GitButler workspace management. Use normal Git commands for branches,
+commits, merges, pushes, and other version-control operations.
+
 ## Foresight
 
 Work iteratively. The goal is not to one-shot tasks; the goal is to make them right.
