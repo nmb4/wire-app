@@ -43,6 +43,8 @@ use std::{
     time::Duration,
 };
 use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 use wire::audio::{AudioLevelHandle, VolumeHandle};
 
 /// Explain what the record control will do, in the state it is currently in.

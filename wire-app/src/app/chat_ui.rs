@@ -30,6 +30,8 @@ use egui::{
 };
 use iroh::NodeId;
 use lucide_icons::Icon;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tracing::warn;
 
