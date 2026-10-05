@@ -9614,7 +9614,7 @@ dependencies = [
 
 [[package]]
 name = "wire-app"
-version = "0.7.3"
+version = "0.7.6"
 dependencies = [
  "anyhow",
  "arboard",

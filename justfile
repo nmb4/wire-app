@@ -139,10 +139,16 @@ upload dry_run="":
         Remove-Item -LiteralPath $responseFile -Force -ErrorAction SilentlyContinue
     }
 
+# Run a local HTTP server to serve the dist directory
+serve:
+    bunx serve .\dist -p 3000
+
 # Bump, package, and upload. Example: just release minor --dry-run
 release part="patch" dry_run="":
     just bump-version {{ part }}
     just package
+    just serve
+
     
 # Pack wire-app/assets/new-icon.png into multi-res icon.ico + icon.png.
 # Requires Pillow:  python -m pip install Pillow
