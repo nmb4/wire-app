@@ -1,0 +1,10 @@
+# OptMem stores fixed-width byte records (memory/LOG.txt, memory/TREE/*) and
+# a Python file with a shebang: line-ending conversion would corrupt record
+# alignment and break execution, so those paths are byte-exact, always.
+.optmem/** -text
+
+# Shell entry points must be LF (bash cannot run CRLF scripts on any OS);
+# the cmd entry point keeps CRLF. Overrides core.autocrlf on either platform.
+/scripts/memo text eol=lf
+/scripts/*.sh text eol=lf
+/scripts/memo.cmd text eol=crlf

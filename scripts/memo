@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Project-local OptMem entry point (macOS, Linux, Windows Git Bash).
+# Runs the vendored tool (.optmem/memo) with a Python 3 found on this machine
+# and keeps the store in .optmem/memory. Nothing is installed user-wide:
+# no ~/.optmem, no PATH change, no persistent environment variables.
+# cmd.exe / PowerShell: use scripts\memo.cmd instead.
+#
+# usage: scripts/memo <init|wake|note|nap|recall|zoom|forget|config|import> [args...]
+# docs:  https://github.com/VictorTaelin/OptMem
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tool="$root/.optmem/memo"
+store="$root/.optmem/memory"
+
+if [[ ! -f "$tool" ]]; then
+  echo "scripts/memo: missing $tool (vendored OptMem tool not installed)" >&2
+  exit 1
+fi
+
+# Pin the store even though the tool already defaults to it: if the tool file
+# is ever replaced by an upstream update, this keeps every run project-local.
+export MEMORY_DIR="${MEMORY_DIR:-$store}"
+
+# Candidate interpreters, most reliable first. On Windows the `py` launcher is
+# preferred because bare `python`/`python3` may be a Microsoft Store alias.
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) prefixes=("py -3" python3 python) ;;
+  *) prefixes=(python3 python) ;;
+esac
+
+for prefix in "${prefixes[@]}"; do
+  # Word-splitting $prefix is intentional: it is one or more argv words.
+  # The probe exits 0 only for an actual Python 3.
+  if $prefix -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' \
+    >/dev/null 2>&1; then
+    exec $prefix "$tool" "$@"
+  fi
+done
+
+echo "scripts/memo: OptMem needs Python 3, but none was found." >&2
+echo "Install it from https://www.python.org/downloads/ and run again." >&2
+exit 1

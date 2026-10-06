@@ -1,0 +1,1 @@
+OptMem here is project-local: tool .optmem/memo, wrappers scripts/memo (bash) and scripts\memo.cmd (cmd), store .optmem/memory, never ~/.optmem; the repo is public, so memories must never contain secrets.                                                                                   
