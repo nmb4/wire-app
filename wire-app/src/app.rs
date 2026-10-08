@@ -5,6 +5,7 @@
 mod calls_ui;
 mod chat_ui;
 mod chrome;
+mod confirm_ui;
 mod profile_ui;
 mod settings_ui;
 mod ui_capture;
@@ -232,6 +233,9 @@ struct AppState {
     service: ServiceClient,
     our_node_id: Option<NodeId>,
     devices: wire::audio::Devices,
+    /// Tracks the settings dialog's open edge so audio devices are
+    /// re-enumerated each time it opens (headsets plugged in later appear).
+    settings_was_open: bool,
     audio_config: UiAudioConfig,
     video_config: VideoConfig,
     calls: BTreeMap<NodeId, CallState>,
@@ -274,18 +278,25 @@ struct AppState {
     own_avatar_hash: Option<String>,
     own_avatar_bytes: Option<Vec<u8>>,
     own_avatar_texture: Option<egui::TextureHandle>,
+    /// Set once our avatar was looked up and found missing or undecodable.
+    own_avatar_missing: bool,
     own_accent_color: Option<String>,
     /// Remote profiles learned via presence, chat snapshots, invites, and the
     /// public profile fetch protocol. This is what lets unknown senders show
     /// a name + avatar instead of a raw peer ID.
     peer_profiles: BTreeMap<NodeId, PeerProfile>,
-    peer_avatar_textures: BTreeMap<NodeId, egui::TextureHandle>,
+    /// Decoded peer avatars. `None` records "no usable picture" so the UI
+    /// does not re-read and re-decode the file every frame; profile events
+    /// clear the entry.
+    peer_avatar_textures: BTreeMap<NodeId, Option<egui::TextureHandle>>,
     peer_avatar_bytes: BTreeMap<NodeId, Vec<u8>>,
     pending_profile_fetches: BTreeMap<NodeId, i64>,
     profile_edit_name: String,
     profile_edit_accent: String,
     profile_edit_error: Option<String>,
     show_profile_editor: bool,
+    /// Destructive action awaiting confirmation (clear history, remove friend).
+    pending_confirm: Option<confirm_ui::PendingConfirm>,
     /// Active avatar crop session (image picked, framing not yet confirmed).
     avatar_crop: Option<profile_ui::AvatarCropState>,
     theme: Theme,
@@ -373,7 +384,9 @@ struct ChatUiState {
     gif_load_queue: VecDeque<(String, bool)>,
     gif_loads_in_flight: usize,
     gif_animation_request_id: u64,
-    error: Option<String>,
+    /// Composer status-line error and when it was raised. It stays visible
+    /// for `CHAT_ERROR_TTL` (or until the next send) instead of one frame.
+    error: Option<(String, std::time::Instant)>,
     service_error: Option<String>,
     show_group_editor: bool,
     show_group_members: bool,
@@ -383,6 +396,46 @@ struct ChatUiState {
     friend_candidate_name: String,
     /// Set each frame by the chat layout: true when only one pane fits.
     narrow_layout: bool,
+    /// Conversation whose composer last received automatic focus; a change
+    /// of selection moves the caret into the new composer once.
+    composer_focused_for: Option<String>,
+}
+
+/// Stable id of the chat composer, so global shortcuts can tell whether
+/// typing focus is in the composer or in some other field.
+pub(super) fn chat_composer_id() -> egui::Id {
+    egui::Id::new("chat-composer")
+}
+
+const CHAT_ERROR_TTL: Duration = Duration::from_secs(6);
+
+impl ChatUiState {
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some((message.into(), std::time::Instant::now()));
+    }
+
+    /// The current composer error, dropping it once it has expired.
+    fn visible_error(&mut self) -> Option<(&str, Duration)> {
+        let expired = self
+            .error
+            .as_ref()
+            .is_some_and(|(_, raised)| raised.elapsed() >= CHAT_ERROR_TTL);
+        if expired {
+            self.error = None;
+        }
+        self.error
+            .as_ref()
+            .map(|(message, raised)| (message.as_str(), CHAT_ERROR_TTL.saturating_sub(raised.elapsed())))
+    }
+}
+
+/// Audio device names for the settings pickers. A failed enumeration leaves
+/// the lists empty ("System default" still works) instead of aborting startup.
+fn list_audio_devices() -> wire::audio::Devices {
+    wire::audio::AudioContext::list_devices_sync().unwrap_or_else(|error| {
+        warn!("failed to list audio devices: {error:#}");
+        wire::audio::Devices::default()
+    })
 }
 
 enum KlipyAnimationState {
@@ -1133,8 +1186,7 @@ impl App {
     ) -> Result<(), eframe::Error> {
         let mut options = options;
         options.wgpu_options.on_surface_error = Arc::new(wgpu_surface_error_action);
-        let devices =
-            wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
+        let devices = list_audio_devices();
         let saved_settings = load_settings();
         let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some()
             || std::env::var_os(ui_capture::ENV).is_some();
@@ -1170,6 +1222,7 @@ impl App {
             service,
             our_node_id: None,
             devices,
+            settings_was_open: false,
             audio_config: settings.audio,
             video_config: settings.video,
             calls: Default::default(),
@@ -1207,6 +1260,7 @@ impl App {
             own_avatar_hash: own_profile.avatar_hash.clone(),
             own_avatar_bytes,
             own_avatar_texture: None,
+            own_avatar_missing: false,
             own_accent_color: own_profile.accent_color.clone(),
             peer_profiles,
             peer_avatar_textures: BTreeMap::new(),
@@ -1216,6 +1270,7 @@ impl App {
             profile_edit_accent: own_profile.accent_color.clone().unwrap_or_default(),
             profile_edit_error: None,
             show_profile_editor: false,
+            pending_confirm: None,
             avatar_crop: None,
             theme: settings.theme,
             window_frame_style: settings.window_frame_style,
@@ -1481,7 +1536,12 @@ impl AppState {
         if contacts_visible && !self.show_settings && self.configured {
             self.ui_contacts_window(ctx);
         }
-        if self.show_settings || !self.configured {
+        let settings_open = self.show_settings || !self.configured;
+        if settings_open && !self.settings_was_open {
+            self.devices = list_audio_devices();
+        }
+        self.settings_was_open = settings_open;
+        if settings_open {
             self.ui_settings_window(ctx);
         }
         if self.show_capture_picker {
@@ -1492,6 +1552,7 @@ impl AppState {
         // crop editor sits above it.
         self.ui_profile_editor(ctx);
         self.ui_avatar_crop_editor(ctx);
+        self.ui_confirm_dialog(ctx, &pal);
         #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
@@ -1514,6 +1575,7 @@ impl AppState {
                 || self.chat.show_group_editor
                 || self.chat.show_group_members
                 || self.chat.friend_candidate.is_some()
+                || self.pending_confirm.is_some()
                 || self.chat.image_preview.is_some();
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
@@ -2772,7 +2834,7 @@ impl AppState {
             ChatNotification::Error(error) => {
                 self.notifications
                     .error("chat-error", "Messages need attention", error.clone());
-                self.chat.error = Some(error);
+                self.chat.set_error(error);
             }
         }
     }

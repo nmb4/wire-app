@@ -306,6 +306,11 @@ fn reset_scene_state(state: &mut AppState) {
     state.show_contacts = false;
     state.show_profile_editor = false;
     state.chat.show_group_editor = false;
+    state.chat.group_name.clear();
+    state.chat.group_members.clear();
+    state.chat.friend_candidate = None;
+    state.chat.error = None;
+    state.pending_confirm = None;
     state.calls.clear();
     state.local_group_call = None;
     state.chat.selected = state
@@ -435,11 +440,50 @@ const SCENES: &[Scene] = &[
     Scene {
         name: "profile-editor",
         size: DEFAULT,
-        apply: |s| s.show_profile_editor = true,
+        apply: |s| {
+            if !s.show_profile_editor {
+                s.open_profile_editor();
+            }
+        },
     },
     Scene {
         name: "group-editor",
         size: DEFAULT,
         apply: |s| s.chat.show_group_editor = true,
+    },
+    Scene {
+        name: "group-editor-filled",
+        size: DEFAULT,
+        apply: |s| {
+            s.chat.show_group_editor = true;
+            s.chat.group_name = "Game night".to_owned();
+            s.chat.group_members.insert(fixture_peer(1));
+            s.chat.group_members.insert(fixture_peer(3));
+        },
+    },
+    Scene {
+        name: "add-friend",
+        size: DEFAULT,
+        apply: |s| s.chat.friend_candidate = Some(fixture_peer(9)),
+    },
+    Scene {
+        name: "confirm-clear-history",
+        size: DEFAULT,
+        apply: |s| {
+            s.pending_confirm = Some(super::confirm_ui::PendingConfirm::ClearChatHistory {
+                conversation_id: "fixture".to_owned(),
+                title: "Mira".to_owned(),
+            })
+        },
+    },
+    Scene {
+        name: "text-error",
+        size: DEFAULT,
+        apply: |s| {
+            if s.chat.error.is_none() {
+                s.chat
+                    .set_error("Could not open missing-report.pdf: the file was moved or deleted");
+            }
+        },
     },
 ];

@@ -356,7 +356,8 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
     visuals.widgets.inactive.weak_bg_fill = pal.panel2;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
+    // Also the resting text-field border: `line_br` stays visible on every theme.
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
     visuals.widgets.inactive.expansion = 0.0;
@@ -382,6 +383,9 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
     visuals.widgets.open.expansion = 0.0;
 
     visuals.selection.bg_fill = pal.accent_dim;
+    // Focused text fields and selected list entries use the accent instead
+    // of egui's default light blue.
+    visuals.selection.stroke = Stroke::new(1.0_f32, pal.accent);
     visuals.window_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.window_corner_radius = CornerRadius::same(10);
     visuals.menu_corner_radius = CornerRadius::same(8);

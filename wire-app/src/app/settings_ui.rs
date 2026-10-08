@@ -153,118 +153,60 @@ impl AppState {
                                     ui,
                                     &pal,
                                     "Profile",
-                                    "Your display name and picture, shown to everyone you message or call.",
+                                    "Your display name, picture and name color.",
                                 );
                                 Frame::new()
                                     .fill(pal.panel2)
                                     .stroke(Stroke::new(1.0_f32, pal.line))
                                     .corner_radius(CornerRadius::same(7))
-                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
                                     .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 12.0;
                                             let avatar = self.own_avatar_texture(ctx);
-                                            let preview_name =
-                                                crate::profile::sanitize_display_name(
-                                                    &self.profile_edit_name,
-                                                );
-                                            let preview_name = if preview_name.is_empty() {
-                                                self.own_label()
-                                            } else {
-                                                preview_name
-                                            };
+                                            let name = self.own_label();
                                             let initials =
-                                                crate::profile::display_name_initial(&preview_name)
+                                                crate::profile::display_name_initial(&name)
                                                     .unwrap_or_else(|| "?".to_owned());
-                                            paint_profile_avatar(
-                                                ui, &pal, avatar, &initials, 56.0,
-                                            );
-                                            ui.vertical(|ui| {
-                                                if action_button(
-                                                    ui,
-                                                    &pal,
-                                                    "Choose picture…",
-                                                    ButtonTone::Secondary,
-                                                )
-                                                .on_hover_text(
-                                                    "PNG, JPEG, GIF or WebP up to 8 MiB",
-                                                )
-                                                .clicked()
-                                                {
-                                                    if let Some(path) = rfd::FileDialog::new()
-                                                        .set_title("Choose profile picture")
-                                                        .add_filter(
-                                                            "Images",
-                                                            &[
-                                                                "png", "jpg", "jpeg", "gif",
-                                                                "webp", "bmp",
-                                                            ],
-                                                        )
-                                                        .pick_file()
-                                                    {
-                                                        self.set_own_avatar_from_file(ctx, &path);
-                                                    }
-                                                }
-                                                if self.own_avatar_hash.is_some() {
+                                            paint_profile_avatar(ui, &pal, avatar, &initials, 40.0);
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
                                                     if action_button(
                                                         ui,
                                                         &pal,
-                                                        "Remove",
+                                                        "Edit profile",
                                                         ButtonTone::Secondary,
                                                     )
                                                     .clicked()
                                                     {
-                                                        self.clear_own_avatar();
+                                                        self.open_profile_editor();
                                                     }
-                                                }
-                                            });
-                                        });
-                                        ui.add_space(6.0);
-                                        settings_field_label(ui, &pal, "Display name", None);
-                                        if ui
-                                            .add(
-                                                egui::TextEdit::singleline(
-                                                    &mut self.profile_edit_name,
-                                                )
-                                                .hint_text("e.g. Ada Lovelace")
-                                                .desired_width(f32::INFINITY),
-                                            )
-                                            .changed()
-                                        {
-                                            self.profile_edit_error = None;
-                                        }
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}/32",
-                                                crate::profile::sanitize_display_name(
-                                                    &self.profile_edit_name
-                                                )
-                                                .chars()
-                                                .count()
-                                            ))
-                                            .color(pal.dim)
-                                            .size(ui_font_size(10.5)),
-                                        );
-                                        ui.add_space(6.0);
-                                        self.ui_accent_picker(ui, &pal);
-                                        if let Some(error) = &self.profile_edit_error {
-                                            ui.label(
-                                                RichText::new(error)
-                                                    .color(pal.err)
-                                                    .size(ui_font_size(11.5)),
+                                                    ui.with_layout(
+                                                        Layout::top_down(Align::Min),
+                                                        |ui| {
+                                                            ui.add_space(2.0);
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(&name)
+                                                                        .color(pal.text)
+                                                                        .size(ui_font_size(13.0)),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                            ui.label(
+                                                                RichText::new(
+                                                                    "Shown to everyone you message or call",
+                                                                )
+                                                                .color(pal.dim)
+                                                                .size(ui_font_size(10.5)),
+                                                            );
+                                                        },
+                                                    );
+                                                },
                                             );
-                                        }
-                                        ui.add_space(4.0);
-                                        if action_button(
-                                            ui,
-                                            &pal,
-                                            "Save profile",
-                                            ButtonTone::Primary,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.save_own_profile_edit();
-                                        }
+                                        });
                                     });
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -413,7 +355,7 @@ impl AppState {
                                         }
                                         ui.label(
                                             RichText::new(
-                                                "Removes bubbles and groups consecutive messages from the same sender within one minute.",
+                                                "Removes bubbles and groups consecutive messages from the same sender within five minutes.",
                                             )
                                             .color(pal.dim)
                                             .size(ui_font_size(10.5)),

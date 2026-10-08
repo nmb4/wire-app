@@ -4,7 +4,13 @@
 //! arrive via `StatusUpdate.profile`, chat message snapshots, and invites,
 //! while avatar *bytes* are fetched on demand through `wire/profile/1`.
 
-use super::{widgets::floating_panel, AppState, Friend};
+use super::{
+    widgets::{
+        dialog_body, dialog_footer, dialog_window, floating_dialog_header, floating_panel,
+        form_label, form_text_input,
+    },
+    AppState, Friend,
+};
 use crate::{
     profile::{self, PeerProfile},
     runtime::Command,
@@ -142,6 +148,7 @@ impl AppState {
                 {
                     if let Some(bytes) = profile::load_peer_avatar_bytes(peer) {
                         self.peer_avatar_bytes.insert(peer, bytes);
+                        self.peer_avatar_textures.remove(&peer);
                     }
                 } else {
                     // A new hash means a new picture: drop any cooldown left
@@ -263,6 +270,7 @@ impl AppState {
         });
         // File bytes are written at pick time; just refresh the texture.
         self.own_avatar_texture = None;
+        self.own_avatar_missing = false;
         self.sync_own_profile_to_worker();
         self.play_control_sound(true);
         true
@@ -306,6 +314,7 @@ impl AppState {
                 self.own_avatar_bytes = Some(png);
                 self.own_avatar_hash = Some(hash);
                 self.own_avatar_texture = None;
+                self.own_avatar_missing = false;
                 profile::save_own_profile(&profile::OwnProfile {
                     display_name: self.own_profile_name.clone(),
                     avatar_hash: self.own_avatar_hash.clone(),
@@ -325,6 +334,7 @@ impl AppState {
         self.own_avatar_bytes = None;
         self.own_avatar_hash = None;
         self.own_avatar_texture = None;
+        self.own_avatar_missing = false;
         profile::save_own_profile(&profile::OwnProfile {
             display_name: self.own_profile_name.clone(),
             avatar_hash: None,
@@ -335,7 +345,7 @@ impl AppState {
 
     /// Cached texture for our own avatar, decoded on demand.
     pub fn own_avatar_texture(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
-        if self.own_avatar_texture.is_none() {
+        if self.own_avatar_texture.is_none() && !self.own_avatar_missing {
             // Load from disk once per process if the in-memory copy is empty
             // (e.g. avatar set by a previous run).
             if self.own_avatar_bytes.is_none() {
@@ -347,6 +357,7 @@ impl AppState {
                         Some(ctx.load_texture("own-avatar", image, Default::default()));
                 }
             }
+            self.own_avatar_missing = self.own_avatar_texture.is_none();
         }
         self.own_avatar_texture.clone()
     }
@@ -358,8 +369,8 @@ impl AppState {
         ctx: &egui::Context,
         peer: NodeId,
     ) -> Option<TextureHandle> {
-        if let Some(texture) = self.peer_avatar_textures.get(&peer) {
-            return Some(texture.clone());
+        if let Some(cached) = self.peer_avatar_textures.get(&peer) {
+            return cached.clone();
         }
         if self.peer_avatar_bytes.get(&peer).is_none() {
             if let Some(bytes) = profile::load_peer_avatar_bytes(peer) {
@@ -370,10 +381,11 @@ impl AppState {
             if let Some(image) = decode_avatar_image(&bytes) {
                 let texture =
                     ctx.load_texture(format!("peer-avatar-{peer}"), image, Default::default());
-                self.peer_avatar_textures.insert(peer, texture.clone());
+                self.peer_avatar_textures.insert(peer, Some(texture.clone()));
                 return Some(texture);
             }
         }
+        self.peer_avatar_textures.insert(peer, None);
         // Opportunistic fetch: we know a hash (or want a name) but have no
         // bytes yet.
         if self.peer_profiles.contains_key(&peer) {
@@ -405,6 +417,15 @@ impl AppState {
         }
     }
 
+    /// Open the profile editor seeded with the saved identity, so Cancel
+    /// discards edits and the preview shows the real name.
+    pub(super) fn open_profile_editor(&mut self) {
+        self.profile_edit_name = self.own_profile_name.clone();
+        self.profile_edit_accent = self.own_accent_color.clone().unwrap_or_default();
+        self.profile_edit_error = None;
+        self.show_profile_editor = true;
+    }
+
     /// Modal editor for display name + avatar picture.
     pub fn ui_profile_editor(&mut self, ctx: &egui::Context) {
         if !self.show_profile_editor {
@@ -417,21 +438,21 @@ impl AppState {
         let mut pick_avatar = false;
         let mut remove_avatar = false;
         let mut save = false;
-        floating_panel("Your profile", &pal, pane_rect, 440.0)
-            .id(egui::Id::new("profile-editor"))
+        let (window, width) = dialog_window("profile-editor", &pal, pane_rect, 440.0);
+        window
             .enabled(self.avatar_crop.is_none())
-            .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_width(ui.available_width());
-                egui::Frame::new().inner_margin(0.0).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Shown to everyone you message or call.")
-                            .color(pal.dim)
-                            .size(ui_font_size(11.0)),
-                    );
-                    ui.add_space(12.0);
+                ui.set_width(width);
+                cancel |= floating_dialog_header(
+                    ui,
+                    &pal,
+                    "YOUR PROFILE",
+                    "Shown to everyone you message or call",
+                    Some("Close"),
+                );
+                dialog_body(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.spacing_mut().item_spacing.x = 14.0;
                         let avatar = self.own_avatar_texture(ctx);
                         let preview_name = profile::sanitize_display_name(&self.profile_edit_name);
                         let preview_name = if preview_name.is_empty() {
@@ -443,6 +464,7 @@ impl AppState {
                             .unwrap_or_else(|| "?".to_owned());
                         paint_profile_avatar(ui, &pal, avatar, &initials, 56.0);
                         ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
                             if action_button(ui, &pal, "Choose picture…", ButtonTone::Secondary)
                                 .on_hover_text("PNG, JPEG, GIF or WebP up to 8 MiB")
                                 .clicked()
@@ -457,43 +479,34 @@ impl AppState {
                             }
                         });
                     });
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("Display name")
-                            .color(pal.text2)
-                            .size(ui_font_size(12.0)),
+                    ui.add_space(14.0);
+                    let count = profile::sanitize_display_name(&self.profile_edit_name)
+                        .chars()
+                        .count();
+                    form_label(ui, &pal, "Display name", Some(&format!("{count}/32 characters")));
+                    let name = form_text_input(
+                        ui,
+                        &pal,
+                        &mut self.profile_edit_name,
+                        "e.g. Ada Lovelace",
                     );
-                    let changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.profile_edit_name)
-                                .hint_text("e.g. Ada Lovelace")
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed();
-                    if changed {
+                    if name.changed() {
                         self.profile_edit_error = None;
                     }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}/32",
-                            profile::sanitize_display_name(&self.profile_edit_name)
-                                .chars()
-                                .count()
-                        ))
-                        .color(pal.dim)
-                        .size(ui_font_size(10.5)),
-                    );
-                    ui.add_space(8.0);
+                    if name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        save = true;
+                    }
+                    ui.add_space(12.0);
                     self.ui_accent_picker(ui, &pal);
                     if let Some(error) = &self.profile_edit_error {
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(error)
                                 .color(pal.err)
                                 .size(ui_font_size(11.5)),
                         );
                     }
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
+                    dialog_footer(ui, |ui| {
                         if action_button(ui, &pal, "Save", ButtonTone::Primary).clicked() {
                             save = true;
                         }
@@ -503,6 +516,9 @@ impl AppState {
                     });
                 });
             });
+        if self.avatar_crop.is_none() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
         if pick_avatar {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Choose profile picture")
@@ -910,8 +926,11 @@ impl AppState {
             let changed = ui
                 .add(
                     egui::TextEdit::singleline(&mut self.profile_edit_accent)
-                        .hint_text("#5865F2")
-                        .desired_width(110.0),
+                        .hint_text(egui::RichText::new("#5865F2").color(pal.dim2))
+                        .margin(egui::Margin::symmetric(8, 5))
+                        .background_color(pal.panel)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(96.0),
                 )
                 .changed();
             if changed {

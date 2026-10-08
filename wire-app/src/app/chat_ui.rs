@@ -1,13 +1,16 @@
 //! Chat views, composer actions, attachments, and group dialogs.
 
 use super::{
+    chat_composer_id,
+    confirm_ui::PendingConfirm,
     format_group_member_summary,
     profile_ui::{accent_color_for, paint_profile_avatar, two_line_avatar_size},
     unknown_direct_conversations,
     widgets::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
-        chat_surface, copy_to_clipboard, floating_panel, floating_panel_frame, format_bytes,
-        paint_chat_card, SidebarAvatar,
+        chat_surface, copy_to_clipboard, dialog_body, dialog_footer, dialog_window,
+        floating_dialog_header, floating_panel, floating_panel_frame, form_label, form_text_input,
+        format_bytes, member_toggle_row, paint_chat_card, SidebarAvatar,
     },
     AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
     ImagePreview, ImagePreviewAction, ImagePreviewMode, KlipyAnimationState,
@@ -448,9 +451,7 @@ impl AppState {
                 },
             );
             if open_editor {
-                self.profile_edit_name = self.own_profile_name.clone();
-                self.profile_edit_error = None;
-                self.show_profile_editor = true;
+                self.open_profile_editor();
             }
         }
     }
@@ -464,31 +465,7 @@ impl AppState {
             .and_then(|id| self.chat.conversations.get(id))
             .cloned();
         let Some(conversation) = selected else {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    let unavailable = self.chat.service_error.as_deref();
-                    ui.label(
-                        RichText::new(if unavailable.is_some() {
-                            "Chat is unavailable"
-                        } else {
-                            "Choose a conversation"
-                        })
-                        .color(if unavailable.is_some() {
-                            pal.err
-                        } else {
-                            pal.text
-                        })
-                        .size(ui_font_size(18.0)),
-                    );
-                    ui.label(
-                        RichText::new(
-                            unavailable.unwrap_or("Messages are available independently of calls."),
-                        )
-                        .color(pal.dim)
-                        .size(ui_font_size(12.5)),
-                    );
-                });
-            });
+            self.ui_chat_empty_state(ui, pal);
             return;
         };
         let display_title = conversation
@@ -533,7 +510,8 @@ impl AppState {
             .ctx()
             .fonts_mut(|fonts| fonts.row_height(&egui::TextStyle::Body.resolve(ui.style())));
         let editor_height = (composer_rows as f32 * line_height + 8.0).max(COMPOSER_CONTROL);
-        let status_height = if self.chat.preparing_file_offers > 0 || self.chat.error.is_some() {
+        let has_error = self.chat.visible_error().is_some();
+        let status_height = if self.chat.preparing_file_offers > 0 || has_error {
             18.0
         } else {
             0.0
@@ -766,7 +744,10 @@ impl AppState {
                         self.chat.show_group_members = true;
                     }
                     if clear_history {
-                        self.clear_chat_history(&conversation.id);
+                        self.pending_confirm = Some(PendingConfirm::ClearChatHistory {
+                            conversation_id: conversation.id.clone(),
+                            title: display_title.clone(),
+                        });
                     }
                 }
             },
@@ -959,6 +940,7 @@ impl AppState {
                     let edit = ui.add_sized(
                         [edit_width, editor_height],
                         egui::TextEdit::multiline(&mut self.chat.composer)
+                            .id(chat_composer_id())
                             .hint_text(format!("Message {display_title}"))
                             .desired_rows(composer_rows)
                             .desired_width(edit_width)
@@ -966,6 +948,11 @@ impl AppState {
                             .margin(egui::Margin::symmetric(2, 4))
                             .frame(false),
                     );
+                    if self.chat.composer_focused_for.as_deref() != Some(conversation.id.as_str())
+                    {
+                        self.chat.composer_focused_for = Some(conversation.id.clone());
+                        edit.request_focus();
+                    }
                     keyboard_send = edit.has_focus()
                         && ui.input(|input| {
                             !input.modifiers.shift && input.key_pressed(egui::Key::Enter)
@@ -985,13 +972,15 @@ impl AppState {
                 composer_inner.max,
             );
             ui.scope_builder(egui::UiBuilder::new().max_rect(status), |ui| {
-                if let Some(error) = self.chat.error.take() {
+                if let Some((error, remaining)) = self.chat.visible_error() {
                     ui.add(
                         egui::Label::new(
                             RichText::new(error).color(pal.err).size(ui_font_size(10.5)),
                         )
                         .truncate(),
-                    );
+                    )
+                    .on_hover_text(error);
+                    ui.ctx().request_repaint_after(remaining);
                 } else if self.chat.preparing_file_offers > 0 {
                     ui.label(
                         RichText::new("Preparing file…")
@@ -1519,7 +1508,7 @@ impl AppState {
         });
     }
 
-    fn clear_chat_history(&mut self, conversation_id: &str) {
+    pub(super) fn clear_chat_history(&mut self, conversation_id: &str) {
         if let Some(timeline) = self.chat.timelines.get_mut(conversation_id) {
             for message in timeline.drain(..) {
                 self.chat.delivery.remove(&message.message_id);
@@ -1565,9 +1554,10 @@ impl AppState {
             return;
         }
         let Some(author) = self.our_node_id else {
-            self.chat.error = Some("Chat is still connecting to Iroh.".to_owned());
+            self.chat.set_error("Chat is still connecting to Iroh.".to_owned());
             return;
         };
+        self.chat.error = None;
         self.chat.composer.clear();
         let attachments = std::mem::take(&mut self.chat.draft_attachments);
         if !self.chat.draft_files.is_empty() {
@@ -2219,8 +2209,13 @@ impl AppState {
             }
         }
 
-        let paste_image =
-            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::V));
+        // Only paste into the draft when typing focus is in the composer (or
+        // nowhere); Ctrl+V in the GIF search or a dialog field stays there.
+        let composer_paste_target = ctx
+            .memory(|memory| memory.focused())
+            .is_none_or(|focused| focused == chat_composer_id());
+        let paste_image = composer_paste_target
+            && ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::V));
         if paste_image {
             let before = self.chat.draft_attachments.len();
             #[cfg(windows)]
@@ -2278,11 +2273,11 @@ impl AppState {
 
     fn add_chat_file_path(&mut self, path: &Path) {
         let Ok(metadata) = std::fs::metadata(path) else {
-            self.chat.error = Some(format!("Could not open {}", path.display()));
+            self.chat.set_error(format!("Could not open {}", path.display()));
             return;
         };
         if !metadata.is_file() || metadata.len() == 0 {
-            self.chat.error = Some("Choose a nonempty file.".to_owned());
+            self.chat.set_error("Choose a nonempty file.".to_owned());
             return;
         }
         if metadata.len() <= 8 * 1024 * 1024 {
@@ -2336,7 +2331,7 @@ impl AppState {
         let decoded = match image::load_from_memory(&bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
-                self.chat.error = Some(format!("{name} is not a supported image: {error}"));
+                self.chat.set_error(format!("{name} is not a supported image: {error}"));
                 return;
             }
         };
@@ -3041,54 +3036,240 @@ impl AppState {
         }
     }
 
-    fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
-        let mut open = self.chat.show_group_editor;
-        floating_panel("Create group", pal, self.pane_constrain_rect(), 400.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Group name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.chat.group_name)
-                        .hint_text("Weekend plans")
-                        .desired_width(ui.available_width()),
-                );
-                ui.add_space(8.0);
-                ui.label("Members");
-                for friend in self.friends.clone() {
-                    let Ok(node) = NodeId::from_str(friend.node_id.trim()) else {
+    /// Main pane with no conversation open: explain what to do next and
+    /// offer the action that gets the user there.
+    fn ui_chat_empty_state(&mut self, ui: &mut Ui, pal: &Palette) {
+        const BLOCK_HEIGHT: f32 = 170.0;
+        let unavailable = self.chat.service_error.clone();
+        let has_friends = !self.friends.is_empty();
+        let (icon, title, body) = if let Some(error) = unavailable.as_deref() {
+            (Icon::MessageSquareWarning, "Chat is unavailable", error.to_owned())
+        } else if !has_friends {
+            (
+                Icon::UserPlus,
+                "Start by adding a friend",
+                "Share your ID with someone, then add theirs to start chatting.".to_owned(),
+            )
+        } else {
+            (
+                Icon::MessagesSquare,
+                "Choose a conversation",
+                "Pick a friend or group on the left. Messages work without a call.".to_owned(),
+            )
+        };
+        ui.add_space(((ui.available_height() - BLOCK_HEIGHT) * 0.5).max(12.0));
+        ui.vertical_centered(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 24.0, chat_surface(pal));
+            ui.painter().circle_stroke(
+                rect.center(),
+                24.0,
+                Stroke::new(1.0_f32, chat_hairline(pal)),
+            );
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                char::from(icon),
+                lucide(20.0),
+                if unavailable.is_some() { pal.err } else { pal.text2 },
+            );
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new(title)
+                    .color(if unavailable.is_some() { pal.err } else { pal.text })
+                    .size(ui_font_size(17.0)),
+            );
+            ui.add_space(2.0);
+            ui.set_max_width(ui.available_width().min(340.0));
+            ui.add(
+                egui::Label::new(
+                    RichText::new(body)
+                        .color(pal.dim)
+                        .size(ui_font_size(12.0)),
+                )
+                .wrap(),
+            );
+            if unavailable.is_some() {
+                return;
+            }
+            ui.add_space(16.0);
+            // Center a row of buttons by measuring it first.
+            let actions: Vec<(&str, ButtonTone)> = if has_friends {
+                vec![
+                    ("New group", ButtonTone::Secondary),
+                    ("Copy my ID", ButtonTone::Secondary),
+                ]
+            } else {
+                vec![
+                    ("Add a friend", ButtonTone::Primary),
+                    ("Copy my ID", ButtonTone::Secondary),
+                ]
+            };
+            let row_width = ui.ctx().memory(|memory| {
+                memory
+                    .data
+                    .get_temp::<f32>(egui::Id::new("chat-empty-actions-width"))
+            });
+            let available = ui.available_width();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if let Some(width) = row_width {
+                    ui.add_space(((available - width) * 0.5).max(0.0));
+                }
+                let start = ui.cursor().min.x;
+                for (label, tone) in actions {
+                    let enabled = label != "Copy my ID" || self.our_node_id.is_some();
+                    let clicked = ui
+                        .add_enabled_ui(enabled, |ui| action_button(ui, pal, label, tone))
+                        .inner
+                        .clicked();
+                    if !clicked {
                         continue;
-                    };
-                    let mut selected = self.chat.group_members.contains(&node);
-                    if ui.checkbox(&mut selected, friend.name).changed() {
-                        if selected {
-                            self.chat.group_members.insert(node);
-                        } else {
-                            self.chat.group_members.remove(&node);
+                    }
+                    match label {
+                        "New group" => self.chat.show_group_editor = true,
+                        "Add a friend" => {
+                            self.app_mode = AppMode::Calls;
+                            self.show_contacts = true;
+                        }
+                        _ => {
+                            if let Some(id) = self.our_node_id {
+                                copy_to_clipboard(&id.to_string());
+                                self.notifications.success_with_body(
+                                    "copied-node-id",
+                                    "Node ID copied",
+                                    "Send it to a friend so they can add you.",
+                                );
+                            }
                         }
                     }
                 }
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
-                        self.chat.show_group_editor = false;
+                let width = ui.min_rect().right() - start;
+                ui.ctx().memory_mut(|memory| {
+                    memory
+                        .data
+                        .insert_temp(egui::Id::new("chat-empty-actions-width"), width)
+                });
+            });
+        });
+    }
+
+    fn ui_group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let mut close = false;
+        let mut create = false;
+        let pane = self.pane_constrain_rect();
+        let (window, width) = dialog_window("group-editor", pal, pane, 420.0);
+        let max_list_height = (pane.height() - 330.0).clamp(88.0, 320.0);
+        window.show(ctx, |ui| {
+            ui.set_width(width);
+            close |= floating_dialog_header(
+                ui,
+                pal,
+                "NEW GROUP",
+                "Pick a name and the friends to invite",
+                Some("Close"),
+            );
+            dialog_body(ui, |ui| {
+                form_label(ui, pal, "Group name", None);
+                let name = form_text_input(ui, pal, &mut self.chat.group_name, "Weekend plans");
+                if ui.memory(|memory| memory.focused().is_none()) {
+                    name.request_focus();
+                }
+                ui.add_space(12.0);
+                let detail = match self.chat.group_members.len() {
+                    0 => "Nobody selected yet".to_owned(),
+                    1 => "1 friend selected".to_owned(),
+                    n => format!("{n} friends selected"),
+                };
+                form_label(ui, pal, "Members", Some(&detail));
+                let friends: Vec<(NodeId, String)> = self
+                    .friends
+                    .iter()
+                    .filter_map(|friend| {
+                        NodeId::from_str(friend.node_id.trim())
+                            .ok()
+                            .map(|node| (node, friend.name.clone()))
+                    })
+                    .collect();
+                if friends.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Add friends in Contacts first. Groups can only include saved friends.",
+                            )
+                            .color(pal.dim)
+                            .size(ui_font_size(11.5)),
+                        )
+                        .wrap(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("group-editor-members")
+                        .max_height(max_list_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for (node, name) in friends {
+                                let checked = self.chat.group_members.contains(&node);
+                                let avatar = SidebarAvatar {
+                                    texture: self.peer_avatar_texture(ctx, node),
+                                    initial: self.peer_initial(node),
+                                };
+                                let status = self.friend_status.get(&node).map(|status| {
+                                    match status.availability {
+                                        Availability::Online => "Online",
+                                        Availability::Offline => "Offline",
+                                    }
+                                });
+                                if member_toggle_row(ui, pal, &name, status, checked, Some(avatar))
+                                    .clicked()
+                                {
+                                    if checked {
+                                        self.chat.group_members.remove(&node);
+                                    } else {
+                                        self.chat.group_members.insert(node);
+                                    }
+                                }
+                            }
+                        });
+                }
+                let ready = !self.chat.group_name.trim().is_empty()
+                    && !self.chat.group_members.is_empty();
+                if ready
+                    && name.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    create = true;
+                }
+                dialog_footer(ui, |ui| {
+                    let create_button = ui
+                        .add_enabled_ui(ready, |ui| {
+                            action_button(ui, pal, "Create group", ButtonTone::Primary)
+                        })
+                        .inner;
+                    if create_button.clicked() {
+                        create = true;
                     }
-                    if action_button(ui, pal, "Create", ButtonTone::Primary).clicked() {
-                        let title = self.chat.group_name.trim().to_owned();
-                        let members = self.chat.group_members.iter().copied().collect();
-                        if title.is_empty() || self.chat.group_members.is_empty() {
-                            self.chat.error = Some(
-                                "Give the group a name and choose at least one friend.".to_owned(),
-                            );
-                        } else {
-                            self.cmd(Command::CreateGroupChat { title, members });
-                            self.chat.group_name.clear();
-                            self.chat.group_members.clear();
-                            self.chat.show_group_editor = false;
-                        }
+                    create_button
+                        .on_disabled_hover_text("Give the group a name and choose at least one friend");
+                    if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
+                        close = true;
                     }
                 });
             });
-        self.chat.show_group_editor &= open;
+        });
+        if create {
+            let title = self.chat.group_name.trim().to_owned();
+            let members = self.chat.group_members.iter().copied().collect();
+            self.cmd(Command::CreateGroupChat { title, members });
+            close = true;
+        }
+        if close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.chat.group_name.clear();
+            self.chat.group_members.clear();
+            self.chat.show_group_editor = false;
+        }
     }
 
     fn ui_group_members(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -3222,46 +3403,55 @@ impl AppState {
         let Some(peer) = self.chat.friend_candidate else {
             return;
         };
-        let mut open = true;
         let mut add = false;
         let mut cancel = false;
-        floating_panel("Add friend", pal, self.pane_constrain_rect(), 400.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(format!("Peer {}", peer.fmt_short()))
-                        .monospace()
-                        .color(pal.text2),
+        let (window, width) = dialog_window("add-friend", pal, self.pane_constrain_rect(), 400.0);
+        window.show(ctx, |ui| {
+            ui.set_width(width);
+            cancel |= floating_dialog_header(
+                ui,
+                pal,
+                "ADD FRIEND",
+                &format!("Peer {} · the full node ID is saved", peer.fmt_short()),
+                Some("Close"),
+            );
+            dialog_body(ui, |ui| {
+                form_label(
+                    ui,
+                    pal,
+                    "Name",
+                    Some("How this contact appears in your lists."),
                 );
-                ui.label(
-                    RichText::new("The complete node ID will be saved automatically.")
-                        .color(pal.dim)
-                        .size(ui_font_size(11.5)),
+                let name = form_text_input(
+                    ui,
+                    pal,
+                    &mut self.chat.friend_candidate_name,
+                    &format!("Peer {}", peer.fmt_short()),
                 );
-                ui.add_space(10.0);
-                ui.label(RichText::new("Name").color(pal.text2));
-                let name = ui.add(
-                    egui::TextEdit::singleline(&mut self.chat.friend_candidate_name)
-                        .hint_text(format!("Peer {}", peer.fmt_short()))
-                        .desired_width(ui.available_width()),
-                );
+                if ui.memory(|memory| memory.focused().is_none()) {
+                    name.request_focus();
+                }
                 if name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     add = true;
                 }
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
+                dialog_footer(ui, |ui| {
                     if action_button(ui, pal, "Add friend", ButtonTone::Primary).clicked() {
                         add = true;
                     }
                     if action_button(ui, pal, "Cancel", ButtonTone::Secondary).clicked() {
                         cancel = true;
                     }
-                    if action_button(ui, pal, "Copy ID", ButtonTone::Secondary).clicked() {
-                        copy_to_clipboard(&peer.to_string());
-                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if action_button(ui, pal, "Copy ID", ButtonTone::Secondary)
+                            .on_hover_text("Copy the full node ID")
+                            .clicked()
+                        {
+                            copy_to_clipboard(&peer.to_string());
+                        }
+                    });
                 });
             });
+        });
 
         if add {
             // Empty falls back to the learned profile name (prefilled above)
@@ -3277,7 +3467,7 @@ impl AppState {
             self.add_friend_record(peer, name);
             self.chat.friend_candidate = None;
             self.chat.friend_candidate_name.clear();
-        } else if cancel || !open {
+        } else if cancel || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.chat.friend_candidate = None;
             self.chat.friend_candidate_name.clear();
         }
@@ -3691,26 +3881,54 @@ fn chat_delivery_status_icon(
     response.on_hover_text(tip);
 }
 
+/// Milliseconds to add to a UTC timestamp to get the local wall clock at
+/// that instant (DST-aware, so old messages keep their own offset).
+fn local_offset_ms(utc_ms: i64) -> i64 {
+    use chrono::{Offset, TimeZone};
+    chrono::DateTime::from_timestamp_millis(utc_ms)
+        .map(|utc| {
+            i64::from(
+                chrono::Local
+                    .offset_from_utc_datetime(&utc.naive_utc())
+                    .fix()
+                    .local_minus_utc(),
+            ) * 1000
+        })
+        .unwrap_or(0)
+}
+
+/// Local `HH:MM` for a UTC millisecond timestamp.
 fn format_chat_time(sent_at: i64) -> String {
-    let total_minutes = sent_at.div_euclid(60_000);
+    format_clock(sent_at + local_offset_ms(sent_at))
+}
+
+/// Group header timestamp in local time; see `format_chat_timestamp_local`.
+fn format_chat_timestamp(sent_at: i64, now_ms: i64) -> String {
+    format_chat_timestamp_local(
+        sent_at + local_offset_ms(sent_at),
+        now_ms + local_offset_ms(now_ms),
+    )
+}
+
+fn format_clock(local_ms: i64) -> String {
+    let total_minutes = local_ms.div_euclid(60_000);
     let hour = total_minutes.div_euclid(60).rem_euclid(24);
     let minute = total_minutes.rem_euclid(60);
     format!("{hour:02}:{minute:02}")
 }
 
 /// Discord-style group header timestamp: time for today's messages, day +
-/// time for yesterday, full date for anything older. Day boundaries use UTC
-/// day numbers, matching `format_chat_time`'s naive UTC clock.
-fn format_chat_timestamp(sent_at: i64, now_ms: i64) -> String {
+/// time for yesterday, full date for anything older. Both inputs are already
+/// shifted to local wall-clock milliseconds, so day boundaries are local.
+fn format_chat_timestamp_local(sent_at: i64, now_ms: i64) -> String {
     const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-    let time = format_chat_time(sent_at);
+    let time = format_clock(sent_at);
     let day = sent_at.div_euclid(DAY_MS);
     let today = now_ms.div_euclid(DAY_MS);
     match today - day {
         0 => format!("Today at {time}"),
         1 => format!("Yesterday at {time}"),
         _ => {
-            //naive UTC calendar date (no timezone database on this stack).
             let days = day;
             // Convert days-since-epoch to Y/M/D via Howard Hinnant's algorithm.
             let z = days + 719_468;
@@ -3857,21 +4075,21 @@ mod tests {
         const HOUR: i64 = 60 * 60 * 1000;
         const MINUTE: i64 = 60 * 1000;
         // Epoch day itself.
-        assert_eq!(format_chat_timestamp(0, 0), "Today at 00:00");
-        assert_eq!(format_chat_timestamp(0, DAY), "Yesterday at 00:00");
-        assert_eq!(format_chat_timestamp(0, 2 * DAY), "1/1/1970 00:00");
+        assert_eq!(format_chat_timestamp_local(0, 0), "Today at 00:00");
+        assert_eq!(format_chat_timestamp_local(0, DAY), "Yesterday at 00:00");
+        assert_eq!(format_chat_timestamp_local(0, 2 * DAY), "1/1/1970 00:00");
         // Same-day times stay short; the header only gains a date when old.
         let today = 10 * DAY + 19 * HOUR + 51 * MINUTE;
         assert_eq!(
-            format_chat_timestamp(10 * DAY + 8 * HOUR, today),
+            format_chat_timestamp_local(10 * DAY + 8 * HOUR, today),
             "Today at 08:00"
         );
         assert_eq!(
-            format_chat_timestamp(9 * DAY + 8 * HOUR, today),
+            format_chat_timestamp_local(9 * DAY + 8 * HOUR, today),
             "Yesterday at 08:00"
         );
         assert_eq!(
-            format_chat_timestamp(8 * DAY + 8 * HOUR, today),
+            format_chat_timestamp_local(8 * DAY + 8 * HOUR, today),
             "1/9/1970 08:00"
         );
     }
@@ -3953,6 +4171,8 @@ mod tests {
     }
 
     #[test]
+    // Measures the licensed Fraktion font; the egui fallback has other metrics.
+    #[cfg_attr(not(wire_has_font_fraktion_sans), ignore = "needs wire-app/fonts/")]
     fn name_row_reports_real_fraktion_boxes_and_baselines() {
         // Decides timestamp alignment with app fonts instead of guesses:
         // reports label-box heights and glyph baselines for the exact

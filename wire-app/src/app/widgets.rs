@@ -210,6 +210,94 @@ pub(super) fn floating_panel<'a>(
         .frame(floating_panel_frame(pal, 16))
 }
 
+/// Shell for a modal-style floating dialog without egui's native title bar.
+/// Callers draw `floating_dialog_header` first, then `dialog_body`. Returns
+/// the window and the content width to pin with `ui.set_width`.
+pub(super) fn dialog_window<'a>(
+    id: &'a str,
+    pal: &Palette,
+    viewport: Rect,
+    preferred_width: f32,
+) -> (egui::Window<'a>, f32) {
+    let width = floating_panel_width(viewport, preferred_width, 0.0);
+    let window = floating_panel(id, pal, viewport, preferred_width)
+        .title_bar(false)
+        .vscroll(false)
+        .default_width(width)
+        .min_width(width)
+        .max_width(width)
+        .frame(floating_panel_frame(pal, 0));
+    (window, width)
+}
+
+/// Padded body below a `floating_dialog_header`.
+pub(super) fn dialog_body<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 18,
+            top: 14,
+            bottom: 16,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Right-aligned action row closing a dialog. Add the primary action first:
+/// the row lays out right to left, so it ends up rightmost.
+pub(super) fn dialog_footer<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.add_space(14.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 32.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            add_contents(ui)
+        },
+    )
+    .inner
+}
+
+/// Small label above a form field, with an optional muted detail line.
+pub(super) fn form_label(ui: &mut Ui, pal: &Palette, label: &str, detail: Option<&str>) {
+    ui.label(
+        RichText::new(label)
+            .color(pal.text2)
+            .size(ui_font_size(12.0)),
+    );
+    if let Some(detail) = detail {
+        ui.add(
+            egui::Label::new(
+                RichText::new(detail)
+                    .color(pal.dim)
+                    .size(ui_font_size(10.5)),
+            )
+            .wrap(),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+/// Single-line text field with comfortable padding and a visible resting
+/// border. Focus switches the border to the accent (see `visuals_for`).
+pub(super) fn form_text_input(
+    ui: &mut Ui,
+    pal: &Palette,
+    text: &mut String,
+    hint: &str,
+) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(RichText::new(hint).color(pal.dim2))
+            .margin(egui::Margin::symmetric(10, 7))
+            .background_color(pal.panel)
+            .desired_width(ui.available_width()),
+    )
+}
+
 pub(super) fn peer_volume_slider(
     ui: &mut Ui,
     pal: &Palette,
@@ -562,7 +650,6 @@ pub(super) fn chat_navigation_button(
     // Every row has the same height and avatar size, with or without a
     // subtitle, so the list reads as one rhythm.
     const ROW_HEIGHT: f32 = 44.0;
-    const AVATAR: f32 = 30.0;
     let height = ROW_HEIGHT;
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(1.0), height),
@@ -582,9 +669,34 @@ pub(super) fn chat_navigation_button(
     } else {
         rect.right() - 10.0
     };
+    let name_color = if selected || hot { pal.text } else { pal.text2 };
+    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    if unseen {
+        ui.painter()
+            .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
+    }
+    response
+}
+
+/// Avatar diameter shared by every 44 px list row.
+const ROW_AVATAR: f32 = 30.0;
+
+/// Avatar plus a name/subtitle block, centered as a unit on a list row.
+/// Shared by sidebar navigation rows and selectable member rows.
+#[allow(clippy::too_many_arguments)]
+fn paint_row_identity(
+    ui: &Ui,
+    pal: &Palette,
+    rect: Rect,
+    label: &str,
+    subtitle: Option<&str>,
+    avatar: Option<SidebarAvatar>,
+    text_right: f32,
+    name_color: Color32,
+) {
     let label_font = FontId::proportional(ui_font_size(12.5));
     let subtitle_font = FontId::proportional(ui_font_size(10.5));
-    let avatar_size = AVATAR;
+    let avatar_size = ROW_AVATAR;
     let text_left = if let Some(avatar) = &avatar {
         let center = egui::pos2(rect.left() + 8.0 + avatar_size * 0.5, rect.center().y);
         let avatar_rect = Rect::from_center_size(center, Vec2::splat(avatar_size));
@@ -613,7 +725,6 @@ pub(super) fn chat_navigation_button(
     // centered on the row as a unit, so one-line and two-line rows share
     // the same optical center.
     let max_text = (text_right - text_left).max(1.0);
-    let name_color = if selected || hot { pal.text } else { pal.text2 };
     let name = truncated_galley(ui, label, label_font, name_color, max_text);
     let sub = subtitle.map(|text| truncated_galley(ui, text, subtitle_font, pal.dim, max_text));
     let block_h = name.size().y + sub.as_ref().map_or(0.0, |g| g.size().y - 2.0);
@@ -624,10 +735,61 @@ pub(super) fn chat_navigation_button(
     if let Some(sub) = sub {
         ui.painter().galley(egui::pos2(text_left, y), sub, pal.dim);
     }
-    if unseen {
+}
+
+/// A 44 px member row with a trailing check box, for multi-select lists such
+/// as the group editor. The whole row toggles.
+pub(super) fn member_toggle_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    subtitle: Option<&str>,
+    checked: bool,
+    avatar: Option<SidebarAvatar>,
+) -> egui::Response {
+    const ROW_HEIGHT: f32 = 44.0;
+    const CHECK: f32 = 18.0;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hot = response.hovered() || response.has_focus();
+    let fill = if checked {
+        chat_selected_surface(pal)
+    } else if hot {
+        chat_hover_surface(pal)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+    let name_color = if checked || hot { pal.text } else { pal.text2 };
+    let text_right = rect.right() - 12.0 - CHECK - 10.0;
+    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    let check = Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0 - CHECK * 0.5, rect.center().y),
+        Vec2::splat(CHECK),
+    );
+    if checked {
         ui.painter()
-            .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
+            .rect_filled(check, CornerRadius::same(5), pal.accent);
+        ui.painter().text(
+            check.center(),
+            Align2::CENTER_CENTER,
+            char::from(Icon::Check),
+            lucide(12.0),
+            pal.bg,
+        );
+    } else {
+        ui.painter().rect_stroke(
+            check,
+            CornerRadius::same(5),
+            Stroke::new(1.25_f32, if hot { pal.text2 } else { pal.line_br }),
+            egui::StrokeKind::Inside,
+        );
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, checked, label)
+    });
     response
 }
 

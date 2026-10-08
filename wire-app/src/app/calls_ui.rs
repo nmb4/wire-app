@@ -3,6 +3,7 @@
 #[cfg(target_os = "macos")]
 use super::open_screen_recording_settings;
 use super::{
+    confirm_ui::PendingConfirm,
     friend_call_enabled,
     profile_ui::{
         accent_color_for, paint_profile_avatar, paint_stream_owner_avatar, two_line_avatar_size,
@@ -12,7 +13,8 @@ use super::{
         aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
         ellipsize, floating_dialog_header, floating_panel, floating_panel_frame,
         floating_panel_width, fmt_error, fmt_node_id, paint_volume_track, participant_bar_columns,
-        peer_volume_slider, read_clipboard, section_card, video_display_size, VolumeKnob,
+        peer_volume_slider, read_clipboard, section_card, truncated_galley, video_display_size,
+        VolumeKnob,
         CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS, PARTICIPANT_CHIP_HEIGHT,
         PARTICIPANT_GAP,
     },
@@ -1077,6 +1079,19 @@ impl AppState {
             });
     }
 
+    /// Drop a saved friend by its stored node ID string.
+    pub(super) fn remove_friend(&mut self, node_id: &str) {
+        let Some(idx) = self.friends.iter().position(|friend| friend.node_id == node_id) else {
+            return;
+        };
+        if let Ok(peer) = NodeId::from_str(node_id.trim()) {
+            self.friend_status.remove(&peer);
+        }
+        self.friends.remove(idx);
+        save_friends(&self.friends);
+        self.sync_friends_with_worker();
+    }
+
     pub(super) fn ui_contacts_window(&mut self, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
@@ -1185,9 +1200,7 @@ impl AppState {
             }
         });
         if open_editor {
-            self.profile_edit_name = self.own_profile_name.clone();
-            self.profile_edit_error = None;
-            self.show_profile_editor = true;
+            self.open_profile_editor();
         }
     }
 
@@ -1319,7 +1332,7 @@ impl AppState {
                 ui.add_space(8.0);
 
                 let mut call: Option<NodeId> = None;
-                let mut remove_idx: Option<usize> = None;
+                let mut remove_request: Option<PendingConfirm> = None;
                 let mut copy_id: Option<String> = None;
 
                 if self.friends.is_empty() {
@@ -1332,7 +1345,7 @@ impl AppState {
                     );
                 }
 
-                for (idx, friend) in self.friends.clone().iter().enumerate() {
+                for friend in self.friends.clone().iter() {
                     let parsed = NodeId::from_str(friend.node_id.trim());
                     // Prefer the saved contact name, then the learned profile
                     // display name, so renamed peers still resolve.
@@ -1390,60 +1403,67 @@ impl AppState {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                // Two-line contact row: the picture spans the
-                                // name + ID/status block.
-                                let avatar_size = two_line_avatar_size(
-                                    ui,
-                                    &egui::FontId::proportional(ui_font_size(13.0)),
-                                    &egui::FontId::proportional(ui_font_size(10.5)),
-                                );
-                                ui.set_min_height(avatar_size);
-                                paint_profile_avatar(ui, &pal, avatar, &initial, avatar_size);
+                                // Fixed-height identity block painted from galleys, the
+                                // same technique as the sidebar rows: name and
+                                // ID/status are centered on the avatar as a unit.
+                                const ROW_HEIGHT: f32 = 36.0;
+                                paint_profile_avatar(ui, &pal, avatar, &initial, 32.0);
                                 let text_width = (ui.available_width() - 112.0).max(24.0);
-                                ui.allocate_ui_with_layout(
-                                    Vec2::new(text_width, 0.0),
-                                    Layout::top_down(Align::Min),
-                                    |ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&display_name)
-                                                    .color(name_color)
-                                                    .size(ui_font_size(13.0)),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&display_name);
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 5.0;
-                                            ui.label(
-                                                RichText::new(if parsed.is_err() {
-                                                    "invalid id".to_owned()
-                                                } else {
-                                                    short_id
-                                                })
-                                                .monospace()
-                                                .color(if parsed.is_err() {
-                                                    pal.err
-                                                } else {
-                                                    pal.dim
-                                                })
-                                                .size(ui_font_size(10.5)),
-                                            );
-                                            if let Some(availability) = availability {
-                                                let (label, color) = match availability {
-                                                    Availability::Online => ("Online", pal.ok),
-                                                    Availability::Offline => ("Offline", pal.dim2),
-                                                };
-                                                ui.label(
-                                                    RichText::new(format!("• {label}"))
-                                                        .color(color)
-                                                        .size(ui_font_size(10.5)),
-                                                );
-                                            }
-                                        });
-                                    },
+                                let (text_rect, text_response) = ui.allocate_exact_size(
+                                    Vec2::new(text_width, ROW_HEIGHT),
+                                    egui::Sense::hover(),
                                 );
+                                let name_galley = truncated_galley(
+                                    ui,
+                                    &display_name,
+                                    egui::FontId::proportional(ui_font_size(13.0)),
+                                    name_color,
+                                    text_width,
+                                );
+                                let mut detail = egui::text::LayoutJob::default();
+                                detail.append(
+                                    &if parsed.is_err() {
+                                        "invalid id".to_owned()
+                                    } else {
+                                        short_id
+                                    },
+                                    0.0,
+                                    egui::TextFormat::simple(
+                                        egui::FontId::monospace(ui_font_size(10.5)),
+                                        if parsed.is_err() { pal.err } else { pal.dim },
+                                    ),
+                                );
+                                if let Some(availability) = availability {
+                                    let (label, color) = match availability {
+                                        Availability::Online => ("Online", pal.ok),
+                                        Availability::Offline => ("Offline", pal.dim2),
+                                    };
+                                    detail.append(
+                                        &format!("· {label}"),
+                                        6.0,
+                                        egui::TextFormat::simple(
+                                            egui::FontId::proportional(ui_font_size(10.5)),
+                                            color,
+                                        ),
+                                    );
+                                }
+                                detail.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+                                let detail_galley = ui.fonts_mut(|fonts| fonts.layout_job(detail));
+                                let block = name_galley.size().y + detail_galley.size().y - 2.0;
+                                let top = text_rect.center().y - block * 0.5;
+                                ui.painter().galley(
+                                    egui::pos2(text_rect.left(), top),
+                                    name_galley.clone(),
+                                    name_color,
+                                );
+                                ui.painter().galley(
+                                    egui::pos2(text_rect.left(), top + name_galley.size().y - 2.0),
+                                    detail_galley,
+                                    pal.dim,
+                                );
+                                if name_galley.elided {
+                                    text_response.on_hover_text(&display_name);
+                                }
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -1476,7 +1496,10 @@ impl AppState {
                                                 )
                                                 .clicked()
                                                 {
-                                                    remove_idx = Some(idx);
+                                                    remove_request = Some(PendingConfirm::RemoveFriend {
+                                                        node_id: friend.node_id.clone(),
+                                                        name: friend.name.clone(),
+                                                    });
                                                     ui.close();
                                                 }
                                             },
@@ -1508,13 +1531,8 @@ impl AppState {
                     self.play_sound(Sound::Button2);
                     self.cmd(Command::Call { node_id: id });
                 }
-                if let Some(idx) = remove_idx {
-                    if let Ok(node_id) = NodeId::from_str(self.friends[idx].node_id.trim()) {
-                        self.friend_status.remove(&node_id);
-                    }
-                    self.friends.remove(idx);
-                    save_friends(&self.friends);
-                    self.sync_friends_with_worker();
+                if remove_request.is_some() {
+                    self.pending_confirm = remove_request;
                 }
                 if let Some(node_id) = copy_id {
                     copy_to_clipboard(&node_id);
