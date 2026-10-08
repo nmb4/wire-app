@@ -123,10 +123,7 @@ impl AudioCapture {
     }
 
     pub async fn create_opus_track(&self) -> Result<MediaTrack> {
-        let sample_rate = self.quality.sample_rate();
-        let channels = self.quality.channels() as u16;
-        let audio_format = AudioFormat::new2(sample_rate, channels);
-        let (encoder, track) = MediaTrackOpusEncoder::new(16, audio_format, self.quality)?;
+        let (encoder, track) = MediaTrackOpusEncoder::new(16, ENGINE_FORMAT, self.quality)?;
         self.add_sink(encoder).await?;
         Ok(track)
     }

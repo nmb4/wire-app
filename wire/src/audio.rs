@@ -146,8 +146,8 @@ impl AudioContext {
     ///
     /// Recording uses this to capture the local voice without opening another
     /// encoder, and without depending on how many call tracks are live. The
-    /// sink receives the same post-processing, pre-mute samples the encoders
-    /// see, so muting never removes the local voice from a recording.
+    /// sink receives the same processed samples as the call encoders, with
+    /// silence while the microphone is muted.
     pub async fn add_capture_sink(&self, sink: impl AudioSink) -> Result<()> {
         self.capture.add_sink(sink).await
     }

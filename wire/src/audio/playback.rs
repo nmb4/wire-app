@@ -365,6 +365,7 @@ fn start_playback_stream(
 ) -> Result<cpal::Stream> {
     let config = &stream_config.config;
     let format = stream_config.audio_format();
+    validate_output_format(format)?;
     #[cfg(feature = "audio-processing")]
     processor.init_playback(ENGINE_FORMAT.channel_count as usize)?;
     let resampler = device_resampler(
@@ -404,18 +405,91 @@ struct PlaybackState {
     consumer: Consumer<f32>,
 }
 
+fn validate_output_format(format: AudioFormat) -> Result<()> {
+    anyhow::ensure!(
+        matches!(format.channel_count, 1 | 2) && format.sample_rate.0 > 0,
+        "audio playback requires a mono or stereo device with a nonzero sample rate, got {format:?}"
+    );
+    Ok(())
+}
+
+impl PlaybackState {
+    fn prepare_output(
+        &mut self,
+        output_samples: usize,
+        unprocessed: &mut Vec<f32>,
+        device_input: &mut Vec<f32>,
+        resampled: &mut Vec<f32>,
+    ) -> Result<()> {
+        while resampled.len() < output_samples {
+            let missing_output = output_samples - resampled.len();
+            let required_input = required_engine_samples(missing_output, self.format)
+                .saturating_sub(unprocessed.len());
+            let before = unprocessed.len();
+            unprocessed.extend(self.consumer.pop_iter().take(required_input));
+            if unprocessed.len() == before {
+                break;
+            }
+            if let Err(error) = self.process_audio(unprocessed, device_input, resampled) {
+                // Do not replay partially processed chunks on the next callback.
+                unprocessed.clear();
+                device_input.clear();
+                resampled.clear();
+                self.resampler.reset();
+                return Err(error);
+            }
+            // Fixed-block resamplers may need another engine chunk before
+            // producing output. Pull only until this callback is full.
+        }
+        Ok(())
+    }
+
+    /// The mixer and echo canceller always use 48 kHz stereo. Only adapt to
+    /// the output device after processing complete engine frames.
+    fn process_audio(
+        &mut self,
+        unprocessed: &mut Vec<f32>,
+        device_input: &mut Vec<f32>,
+        resampled: &mut Vec<f32>,
+    ) -> Result<()> {
+        let frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
+        let mut chunks = unprocessed.chunks_exact_mut(frame_size);
+        for chunk in &mut chunks {
+            #[cfg(feature = "audio-processing")]
+            self.processor.process_render_frame(chunk)?;
+            match self.format.channel_count {
+                1 => device_input.extend(
+                    chunk
+                        .chunks_exact(2)
+                        .map(|frame| (frame[0] + frame[1]) * 0.5),
+                ),
+                2 => device_input.extend_from_slice(chunk),
+                _ => anyhow::bail!("audio playback supports one or two device channels"),
+            }
+        }
+        let remainder_len = chunks.into_remainder().len();
+        let end = unprocessed.len() - remainder_len;
+        unprocessed.copy_within(end.., 0);
+        unprocessed.truncate(remainder_len);
+
+        self.resampler.process_interleaved(
+            device_input,
+            |samples| resampled.extend_from_slice(samples),
+            None,
+            false,
+        );
+        device_input.clear();
+        Ok(())
+    }
+}
+
 fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + Default>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut state: PlaybackState,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
-    #[cfg(target_os = "macos")]
     let frame_size = ENGINE_FORMAT.sample_count(DURATION_10MS);
-    #[cfg(not(target_os = "macos"))]
-    let frame_size = state.format.sample_count(DURATION_10MS);
     let mut unprocessed: Vec<f32> = Vec::with_capacity(frame_size);
-    let mut processed: Vec<f32> = Vec::with_capacity(frame_size);
-    #[cfg(target_os = "macos")]
     let mut resample_input: Vec<f32> = Vec::with_capacity(frame_size);
     let mut resampled: Vec<f32> = Vec::with_capacity(frame_size);
     let mut tick = 0;
@@ -450,65 +524,18 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
             #[cfg(feature = "audio-processing")]
             state.processor.set_playback_delay(delay);
 
-            // CoreAudio may invoke this callback with a buffer smaller than the
-            // playback ring's latency cushion. Pulling the entire ring moves that
-            // cushion into `resampled`, where the producer can no longer see it
-            // and refills it on every callback. Only pull enough engine audio for
-            // this callback on macOS, keeping the latency bounded in the ring.
-            #[cfg(target_os = "macos")]
-            {
-                let missing_output = data.len().saturating_sub(resampled.len());
-                let required_input = required_engine_samples(missing_output, state.format)
-                    .saturating_sub(unprocessed.len());
-                unprocessed.extend(state.consumer.pop_iter().take(required_input));
-            }
-            #[cfg(not(target_os = "macos"))]
-            unprocessed.extend(state.consumer.pop_iter());
-
-            // process
-            let mut chunks = unprocessed.chunks_exact_mut(frame_size);
-            for chunk in &mut chunks {
-                #[cfg(feature = "audio-processing")]
-                state.processor.process_render_frame(chunk).unwrap();
-                processed.extend_from_slice(chunk);
-            }
-            // cleanup
-            let remainder_len = chunks.into_remainder().len();
-            let end = unprocessed.len() - remainder_len;
-            unprocessed.copy_within(end.., 0);
-            unprocessed.truncate(remainder_len);
-
-            // The mixer ring uses the 48 kHz stereo engine format. Adapt its
-            // channels to the selected macOS device before resampling; a mono
-            // Bluetooth output must not interpret interleaved stereo samples as
-            // twice as many mono frames.
-            #[cfg(target_os = "macos")]
-            {
-                match state.format.channel_count {
-                    1 => resample_input.extend(
-                        processed
-                            .chunks_exact(2)
-                            .map(|frame| (frame[0] + frame[1]) * 0.5),
-                    ),
-                    2 => resample_input.extend_from_slice(&processed),
-                    _ => unreachable!("audio device channel count validated at startup"),
+            // Leave the latency cushion in the ring, visible to the producer.
+            // This also avoids processing a whole backlog after a delayed callback.
+            if let Err(error) = state.prepare_output(data.len(), &mut unprocessed, &mut resample_input, &mut resampled) {
+                data.fill(S::default());
+                let now = Instant::now();
+                if now.duration_since(last_warning) > Duration::from_secs(1) {
+                    warn!("playback processing failed: {error:#}");
+                    last_warning = now;
                 }
-                state.resampler.process_interleaved(
-                    &resample_input,
-                    |samples| {
-                        resampled.extend_from_slice(samples);
-                    },
-                    None,
-                    false,
-                );
-                resample_input.clear();
+                tick += 1;
+                return;
             }
-            #[cfg(not(target_os = "macos"))]
-            state.resampler.process_interleaved(&processed, |samples|{
-                resampled.extend_from_slice(samples);
-            } , None, false);
-            processed.clear();
-
 
             // copy to out
             let out_len = resampled.len().min(data.len());
@@ -544,7 +571,6 @@ fn build_playback_stream<S: dasp_sample::FromSample<f32> + cpal::SizedSample + D
     )
 }
 
-#[cfg(target_os = "macos")]
 fn required_engine_samples(output_samples: usize, output_format: AudioFormat) -> usize {
     if output_samples == 0 {
         return 0;
@@ -559,7 +585,7 @@ fn required_engine_samples(output_samples: usize, output_format: AudioFormat) ->
     engine_samples.div_ceil(processor_frame_size) * processor_frame_size
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -570,5 +596,185 @@ mod tests {
             required_engine_samples(320, bluetooth_format),
             ENGINE_FORMAT.sample_count(DURATION_20MS)
         );
+    }
+
+    #[test]
+    fn unsupported_output_formats_are_errors_before_constructing_the_resampler() {
+        for format in [
+            AudioFormat::new2(48_000, 0),
+            AudioFormat::new2(48_000, 6),
+            AudioFormat::new2(0, 2),
+        ] {
+            assert!(validate_output_format(format).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "audio-processing")]
+    fn processing_error_discards_partial_audio_and_next_callback_recovers() {
+        let mut state = state_for_format(ENGINE_FORMAT, true);
+        let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(3_840).split();
+        state.consumer = consumer;
+        // Force a processor format error without needing a native audio device.
+        state.processor.init_playback(1).unwrap();
+        producer.push_slice(&[0.25; 960]);
+        let mut pending = Vec::new();
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        assert!(state
+            .prepare_output(960, &mut pending, &mut input, &mut output)
+            .is_err());
+        assert!(pending.is_empty() && input.is_empty() && output.is_empty());
+        state.processor.init_playback(2).unwrap();
+        producer.push_slice(&[0.5; 2_880]);
+        state
+            .prepare_output(960, &mut pending, &mut input, &mut output)
+            .unwrap();
+        assert!(output.len() >= 960);
+        // The FFT resampler has a startup transient after reset.
+        assert!(output.iter().any(|sample| sample.abs() > 0.4));
+        assert!(output
+            .iter()
+            .rev()
+            .take(128)
+            .all(|sample| (*sample - 0.5).abs() < 0.01));
+    }
+
+    #[test]
+    fn callbacks_leave_backlog_in_the_ring_and_keep_output_continuous() {
+        for format in [
+            AudioFormat::new2(16_000, 1),
+            AudioFormat::new2(44_100, 1),
+            AudioFormat::new2(44_100, 2),
+            ENGINE_FORMAT,
+        ] {
+            let mut state = state_for_format(format, true);
+            let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(61_440).split();
+            state.consumer = consumer;
+            assert_eq!(producer.push_slice(&vec![0.25; 30_720]), 30_720);
+            let mut pending = Vec::new();
+            let mut input = Vec::new();
+            let mut output = Vec::new();
+            let callback_samples = format.sample_count(DURATION_10MS);
+            for tick in 0..200 {
+                state
+                    .prepare_output(callback_samples, &mut pending, &mut input, &mut output)
+                    .unwrap();
+                if tick == 0 {
+                    assert!(
+                        state.consumer.occupied_len() >= 25_920,
+                        "drained the latency cushion"
+                    );
+                }
+                if tick > 10 {
+                    assert!(
+                        output.len() >= callback_samples,
+                        "{format:?}: callback {tick} underflow"
+                    );
+                }
+                assert!(
+                    output.len() <= format.sample_count(Duration::from_millis(50)),
+                    "moved backlog outside the ring"
+                );
+                let consumed = output.len().min(callback_samples);
+                output.drain(..consumed);
+                producer.push_slice(&[0.25; 960]);
+                assert!(pending.len() < 960);
+            }
+        }
+    }
+
+    fn state_for_format(format: AudioFormat, processing: bool) -> PlaybackState {
+        #[cfg(feature = "audio-processing")]
+        let processor = {
+            let processor = WebrtcAudioProcessor::new(processing).unwrap();
+            processor.init_capture(2).unwrap();
+            processor.init_playback(2).unwrap();
+            processor
+        };
+        #[cfg(not(feature = "audio-processing"))]
+        let processor = {
+            let _ = processing;
+            WebrtcAudioProcessor
+        };
+        let (_, consumer) = ringbuf::HeapRb::<f32>::new(1_920).split();
+        PlaybackState {
+            format,
+            processor,
+            consumer,
+            resampler: device_resampler(
+                NonZeroUsize::new(format.channel_count as usize).unwrap(),
+                SAMPLE_RATE.0,
+                format.sample_rate.0,
+            ),
+        }
+    }
+
+    #[test]
+    fn playback_processes_engine_frames_for_mono_and_non_48khz_devices() {
+        for format in [
+            AudioFormat::new2(16_000, 1),
+            AudioFormat::new2(44_100, 1),
+            AudioFormat::new2(44_100, 2),
+            ENGINE_FORMAT,
+        ] {
+            let mut state = state_for_format(format, true);
+            let mut pending = Vec::new();
+            let mut device_input = Vec::new();
+            let mut output = Vec::new();
+            for _ in 0..100 {
+                pending.extend_from_slice(&[0.25; 960]);
+                state
+                    .process_audio(&mut pending, &mut device_input, &mut output)
+                    .unwrap();
+                assert!(pending.is_empty());
+            }
+            let expected = format.sample_count(Duration::from_secs(1));
+            // The fixed resampler can retain one input block at the end.
+            assert!(
+                output.len() <= expected,
+                "{format:?}: {} samples",
+                output.len()
+            );
+            assert!(
+                output.len() >= expected * 9 / 10,
+                "{format:?}: {} samples",
+                output.len()
+            );
+            assert!(
+                output.iter().any(|sample| sample.abs() > 0.1),
+                "{format:?}: silent output"
+            );
+        }
+    }
+
+    #[test]
+    fn mono_downmix_preserves_timing_and_partial_engine_frames() {
+        let mut state = state_for_format(AudioFormat::new2(48_000, 1), true);
+        let mut pending = vec![0.25, 0.75].repeat(240);
+        let mut device_input = Vec::new();
+        let mut output = Vec::new();
+        state
+            .process_audio(&mut pending, &mut device_input, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+        assert_eq!(pending.len(), 480);
+        pending.extend_from_slice(&vec![0.25, 0.75].repeat(240));
+        state
+            .process_audio(&mut pending, &mut device_input, &mut output)
+            .unwrap();
+        assert!(pending.is_empty());
+        // The device resampler can buffer an input block, even at equal rates.
+        for _ in 0..40 {
+            pending.extend_from_slice(&[0.25, 0.75].repeat(480));
+            state
+                .process_audio(&mut pending, &mut device_input, &mut output)
+                .unwrap();
+        }
+        assert!((18_000..=19_680).contains(&output.len()));
+        assert!(output
+            .iter()
+            .skip(1_024)
+            .all(|sample| (*sample - 0.5).abs() < 1e-6));
     }
 }
