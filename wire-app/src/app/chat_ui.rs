@@ -2396,10 +2396,17 @@ impl AppState {
     }
 
     fn add_chat_image_bytes(&mut self, name: String, bytes: Vec<u8>) {
-        let decoded = match image::load_from_memory(&bytes) {
-            Ok(decoded) => decoded,
+        // Only the header is read here; the full decode for the preview runs
+        // in the background texture cache.
+        let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(image::ImageError::IoError)
+            .and_then(|reader| reader.into_dimensions());
+        let (width, height) = match dimensions {
+            Ok(dimensions) => dimensions,
             Err(error) => {
-                self.chat.set_error(format!("{name} is not a supported image: {error}"));
+                self.chat
+                    .set_error(format!("{name} is not a supported image: {error}"));
                 return;
             }
         };
@@ -2424,8 +2431,8 @@ impl AppState {
             name,
             media_type,
             byte_len: bytes.len() as u64,
-            width: decoded.width(),
-            height: decoded.height(),
+            width,
+            height,
             hash: hash_string,
             external_url: None,
             provider_slug: None,
@@ -2945,13 +2952,30 @@ impl AppState {
                         byte_len: attachment.byte_len,
                     });
                 }
-                let response = ui.label(
-                    RichText::new(format!(
-                        "Loading image… ({})",
-                        format_bytes(attachment.byte_len)
-                    ))
-                    .color(pal.dim.gamma_multiply(opacity)),
-                );
+                let failed = self.chat.attachment_textures.failed(&attachment.id);
+                let label = if failed {
+                    "Image unavailable".to_owned()
+                } else {
+                    format!("Loading image… ({})", format_bytes(attachment.byte_len))
+                };
+                // Reserve the final image size so the timeline does not jump
+                // once the background decode finishes.
+                let response = if attachment.width > 0 && attachment.height > 0 && !failed {
+                    let size = inline_image_size(ui, attachment);
+                    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(8), pal.panel2);
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(ui_font_size(10.5)),
+                        pal.dim.gamma_multiply(opacity),
+                    );
+                    response
+                } else {
+                    ui.label(RichText::new(label).color(pal.dim.gamma_multiply(opacity)))
+                };
                 response.context_menu(|ui| {
                     chat_message_context_menu(
                         ui,
@@ -2964,12 +2988,7 @@ impl AppState {
                 });
                 continue;
             };
-            let scale = (ui.available_width().min(620.0) / attachment.width as f32)
-                .min(180.0 / attachment.height as f32);
-            let size = Vec2::new(
-                attachment.width as f32 * scale,
-                attachment.height as f32 * scale,
-            );
+            let size = inline_image_size(ui, attachment);
             let response = ui.add(
                 egui::Image::new((texture.id(), size))
                     .fit_to_exact_size(size)
@@ -3572,6 +3591,17 @@ fn attachment_texture<'a>(
     attachment: &ChatAttachment,
 ) -> Option<&'a egui::TextureHandle> {
     textures.get_or_insert(ctx, attachment)
+}
+
+/// Display size of an image attachment inside a message: at most 620 wide
+/// and 180 tall, keeping the aspect ratio.
+fn inline_image_size(ui: &Ui, attachment: &ChatAttachment) -> Vec2 {
+    let scale = (ui.available_width().min(620.0) / attachment.width.max(1) as f32)
+        .min(180.0 / attachment.height.max(1) as f32);
+    Vec2::new(
+        attachment.width as f32 * scale,
+        attachment.height as f32 * scale,
+    )
 }
 
 fn square_attachment_preview(

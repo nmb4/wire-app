@@ -498,12 +498,46 @@ struct AttachmentTextureEntry {
     texture_bytes: usize,
 }
 
-#[derive(Default)]
+/// Decodes running in the background at once; the rest wait in a queue so a
+/// timeline full of photos cannot spawn dozens of threads.
+const MAX_CONCURRENT_IMAGE_DECODES: usize = 2;
+
+type DecodedImage = (String, Arc<Vec<u8>>, Option<(egui::ColorImage, usize)>);
+
+/// Chat image textures. Decoding happens on worker threads so a large photo
+/// never stalls the UI; callers see `None` until the texture is ready.
 struct AttachmentTextureCache {
     entries: BTreeMap<String, AttachmentTextureEntry>,
     clock: u64,
     data_bytes: usize,
     texture_bytes: usize,
+    /// Images waiting for a decode slot, in request order.
+    queued: VecDeque<(String, Arc<Vec<u8>>)>,
+    /// Images queued or decoding, so each is decoded once.
+    pending: BTreeSet<String>,
+    in_flight: usize,
+    /// Images that could not be decoded; never retried this session.
+    failed: BTreeSet<String>,
+    decoded_tx: mpsc::Sender<DecodedImage>,
+    decoded_rx: mpsc::Receiver<DecodedImage>,
+}
+
+impl Default for AttachmentTextureCache {
+    fn default() -> Self {
+        let (decoded_tx, decoded_rx) = mpsc::channel();
+        Self {
+            entries: BTreeMap::new(),
+            clock: 0,
+            data_bytes: 0,
+            texture_bytes: 0,
+            queued: VecDeque::new(),
+            pending: BTreeSet::new(),
+            in_flight: 0,
+            failed: BTreeSet::new(),
+            decoded_tx,
+            decoded_rx,
+        }
+    }
 }
 
 impl AttachmentTextureCache {
@@ -512,21 +546,29 @@ impl AttachmentTextureCache {
         ctx: &egui::Context,
         attachment: &ChatAttachment,
     ) -> Option<&egui::TextureHandle> {
+        self.collect_decoded(ctx);
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&attachment.id) {
             entry.last_used = self.clock;
         } else {
-            self.insert_data(ctx, attachment, attachment.data.as_ref()?.clone())?;
+            self.insert_data(ctx, attachment, attachment.data.as_ref()?.clone());
         }
         self.entries.get(&attachment.id).map(|entry| &entry.texture)
     }
 
+    /// True once decoding this attachment has failed.
+    fn failed(&self, id: &str) -> bool {
+        self.failed.contains(id)
+    }
+
+    /// Stores freshly received bytes, queueing a decode when no texture
+    /// exists yet.
     fn insert_data(
         &mut self,
         ctx: &egui::Context,
         attachment: &ChatAttachment,
         data: Arc<Vec<u8>>,
-    ) -> Option<()> {
+    ) {
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&attachment.id) {
             self.data_bytes = self
@@ -535,24 +577,64 @@ impl AttachmentTextureCache {
             self.data_bytes = self.data_bytes.saturating_add(data.len());
             entry.data = Some(data);
             entry.last_used = self.clock;
-        } else {
-            let decoded = image::load_from_memory(&data).ok()?.to_rgba8();
-            let size = [decoded.width() as usize, decoded.height() as usize];
-            let pixels = decoded.into_raw();
-            if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
-                return None;
+            self.evict();
+            return;
+        }
+        if self.failed.contains(&attachment.id) || !self.pending.insert(attachment.id.clone()) {
+            return;
+        }
+        self.queued.push_back((attachment.id.clone(), data));
+        self.start_decodes(ctx);
+    }
+
+    fn start_decodes(&mut self, ctx: &egui::Context) {
+        while self.in_flight < MAX_CONCURRENT_IMAGE_DECODES {
+            let Some((id, data)) = self.queued.pop_front() else {
+                break;
+            };
+            let tx = self.decoded_tx.clone();
+            let repaint = ctx.clone();
+            let thread_id = id.clone();
+            let thread_data = data.clone();
+            let spawned = std::thread::Builder::new()
+                .name("wire-image-decode".to_owned())
+                .spawn(move || {
+                    let image = decode_chat_image(&thread_data);
+                    let _ = tx.send((thread_id, thread_data, image));
+                    repaint.request_repaint();
+                });
+            match spawned {
+                Ok(_) => self.in_flight += 1,
+                Err(error) => {
+                    warn!("could not start image decode thread: {error}");
+                    self.queued.push_front((id, data));
+                    break;
+                }
             }
-            let texture_bytes = pixels.len();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+        }
+    }
+
+    /// Uploads textures for decodes that finished since the last frame.
+    fn collect_decoded(&mut self, ctx: &egui::Context) {
+        let mut finished = false;
+        while let Ok((id, data, image)) = self.decoded_rx.try_recv() {
+            finished = true;
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.pending.remove(&id);
+            let Some((color_image, texture_bytes)) = image else {
+                self.failed.insert(id);
+                continue;
+            };
             let texture = ctx.load_texture(
-                format!("chat-image-{}", attachment.id),
+                format!("chat-image-{id}"),
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
+            self.clock = self.clock.wrapping_add(1);
             self.data_bytes = self.data_bytes.saturating_add(data.len());
             self.texture_bytes = self.texture_bytes.saturating_add(texture_bytes);
             self.entries.insert(
-                attachment.id.clone(),
+                id,
                 AttachmentTextureEntry {
                     texture,
                     last_used: self.clock,
@@ -560,11 +642,20 @@ impl AttachmentTextureCache {
                     texture_bytes,
                 },
             );
+            self.evict();
         }
+        if finished {
+            self.start_decodes(ctx);
+        }
+    }
+
+    fn evict(&mut self) {
         while self.entries.len() > MAX_ATTACHMENT_TEXTURES
             || self.texture_bytes > MAX_CACHED_TEXTURE_BYTES
         {
-            let oldest = self.oldest_id(false)?;
+            let Some(oldest) = self.oldest_id(false) else {
+                break;
+            };
             if let Some(entry) = self.entries.remove(&oldest) {
                 self.data_bytes = self
                     .data_bytes
@@ -573,13 +664,16 @@ impl AttachmentTextureCache {
             }
         }
         while self.data_bytes > MAX_CACHED_ATTACHMENT_BYTES {
-            let oldest = self.oldest_id(true)?;
-            let entry = self.entries.get_mut(&oldest)?;
+            let Some(oldest) = self.oldest_id(true) else {
+                break;
+            };
+            let Some(entry) = self.entries.get_mut(&oldest) else {
+                break;
+            };
             if let Some(data) = entry.data.take() {
                 self.data_bytes = self.data_bytes.saturating_sub(data.len());
             }
         }
-        Some(())
     }
 
     fn oldest_id(&self, require_data: bool) -> Option<String> {
@@ -593,6 +687,28 @@ impl AttachmentTextureCache {
     fn data(&self, id: &str) -> Option<Arc<Vec<u8>>> {
         self.entries.get(id)?.data.clone()
     }
+}
+
+/// Decodes chat image bytes into an RGBA texture image (worker thread).
+fn decode_chat_image(data: &[u8]) -> Option<(egui::ColorImage, usize)> {
+    let decoded = match image::load_from_memory(data) {
+        Ok(decoded) => decoded.to_rgba8(),
+        Err(error) => {
+            warn!("chat image could not be decoded: {error}");
+            return None;
+        }
+    };
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let pixels = decoded.into_raw();
+    if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
+        warn!("chat image of {}x{} is too large to display", size[0], size[1]);
+        return None;
+    }
+    let texture_bytes = pixels.len();
+    Some((
+        egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+        texture_bytes,
+    ))
 }
 
 #[derive(Clone)]
@@ -2630,8 +2746,7 @@ impl AppState {
                         }
                         self.chat.inline_file_data.insert(hash, data);
                     } else {
-                        let _ = self
-                            .chat
+                        self.chat
                             .attachment_textures
                             .insert_data(ctx, &attachment, data);
                     }
