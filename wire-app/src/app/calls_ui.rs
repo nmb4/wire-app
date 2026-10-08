@@ -29,7 +29,8 @@ use crate::{
     theme::{
         action_button, action_button_full, button_tone_style, compact_v_sep, dock_control, dot,
         kh_family, leave_button, lucide, menu_item_button, sans, toolbar_ghost_icon_button,
-        ui_font_size, v_sep, ButtonTone, Palette, DOCK_CONTROL_SIZE, DOCK_LEAVE_SIZE,
+        ui_font_size, v_sep, ButtonTone, IconButtonLabel, Palette, DOCK_CONTROL_SIZE,
+        DOCK_LEAVE_SIZE,
     },
     video_decode::DecodedFrameData,
 };
@@ -635,13 +636,13 @@ impl AppState {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 if super::widgets::chrome_icon_button(ui, pal, Icon::Settings, 32.0, 16.0)
-                    .on_hover_text("Settings")
+                    .labeled("Settings")
                     .clicked()
                 {
                     self.show_settings = true;
                 }
                 if super::widgets::chrome_icon_button(ui, pal, Icon::BookUser, 32.0, 16.0)
-                    .on_hover_text("Contacts and calling")
+                    .labeled("Contacts and calling")
                     .clicked()
                 {
                     self.app_mode = AppMode::Calls;
@@ -2164,7 +2165,7 @@ impl AppState {
         if has_stream {
             let fill_selected = self.stream_view_mode == StreamViewMode::FillWindow;
             if toolbar_ghost_icon_button(ui, &pal, Icon::Expand, fill_selected)
-                .on_hover_text("Expand stream to fill the client window")
+                .labeled("Expand stream to fill the client window")
                 .clicked()
             {
                 self.set_stream_view_mode(
@@ -2179,7 +2180,7 @@ impl AppState {
 
             let fs_selected = self.stream_view_mode == StreamViewMode::Fullscreen;
             if toolbar_ghost_icon_button(ui, &pal, Icon::Fullscreen, fs_selected)
-                .on_hover_text("Enter native fullscreen (Esc to exit)")
+                .labeled("Enter native fullscreen (Esc to exit)")
                 .clicked()
             {
                 self.set_stream_view_mode(
@@ -2196,7 +2197,7 @@ impl AppState {
         if compact
             && self.stream_view_mode != StreamViewMode::Normal
             && toolbar_ghost_icon_button(ui, &pal, Icon::Minimize2, false)
-                .on_hover_text("Return to normal layout (Esc)")
+                .labeled("Return to normal layout (Esc)")
                 .clicked()
         {
             self.set_stream_view_mode(ctx, StreamViewMode::Normal);
@@ -2310,7 +2311,7 @@ fn chip_icon_button(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(PARTICIPANT_ACTION_HEIGHT), egui::Sense::click());
-    let response = response.on_hover_text(tooltip);
+    let response = response.labeled(tooltip);
     let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
     let (fill, stroke, icon_color) = if selected {
         (
@@ -2901,9 +2902,7 @@ fn stream_tile_group_icon_button(
     icon: Icon,
     tooltip: &str,
 ) -> egui::Response {
-    let response = ui
-        .interact(rect, id, egui::Sense::click())
-        .on_hover_text(tooltip);
+    let response = ui.interact(rect, id, egui::Sense::click()).labeled(tooltip);
     if response.hovered() || response.has_focus() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(6), pal.panel2);

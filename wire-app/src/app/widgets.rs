@@ -1,6 +1,8 @@
 //! Shared UI painting and layout helpers.
 
-use crate::theme::{ghost_icon_button, kh_family, lucide, sans, ui_font_size, Palette};
+use crate::theme::{
+    ghost_icon_button, kh_family, lucide, sans, ui_font_size, IconButtonLabel, Palette,
+};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Rect, RichText, Stroke,
     TextureHandle, Ui, Vec2,
@@ -529,9 +531,7 @@ pub(super) fn floating_dialog_header(
                 // subtitle wraps below the title instead of pushing it offscreen.
                 if let Some(tooltip) = close_tooltip {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        closed = ghost_icon_button(ui, pal, ph::X)
-                            .on_hover_text(tooltip)
-                            .clicked();
+                        closed = ghost_icon_button(ui, pal, ph::X).labeled(tooltip).clicked();
                         ui.allocate_ui_with_layout(
                             Vec2::new(ui.available_width(), 0.0),
                             Layout::top_down(Align::Min),

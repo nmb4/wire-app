@@ -613,6 +613,21 @@ pub fn action_button_full(
     )
 }
 
+/// Names icon-only buttons for screen readers (AccessKit) and shows the same
+/// text as the hover tooltip, so the two never drift apart.
+pub trait IconButtonLabel {
+    fn labeled(self, label: impl Into<String>) -> egui::Response;
+}
+
+impl IconButtonLabel for egui::Response {
+    fn labeled(self, label: impl Into<String>) -> egui::Response {
+        let label = label.into();
+        let enabled = self.enabled();
+        self.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+        self.on_hover_text(label)
+    }
+}
+
 pub fn toolbar_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -633,6 +648,9 @@ pub fn toolbar_button(
         32.0,
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+    });
     let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
 
     let (fill, stroke, text) = if selected {
@@ -868,6 +886,8 @@ pub fn dock_control(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) 
 pub fn leave_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
     let size = DOCK_LEAVE_SIZE;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Leave call"));
     let fill = if response.hovered() {
         Color32::from_rgb(0xd1, 0x7c, 0x67)
     } else {

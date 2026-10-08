@@ -24,7 +24,7 @@ use crate::{
     runtime::Command,
     theme::{
         action_button, kh_family, lucide, menu_item_button, toolbar_button, ui_font_size,
-        ButtonTone, Palette,
+        ButtonTone, IconButtonLabel, Palette,
     },
 };
 use egui::{
@@ -171,7 +171,7 @@ impl AppState {
                     sidebar_section_label(ui, pal, "Conversations");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if chat_lucide_icon_button(ui, pal, Icon::Plus)
-                            .on_hover_text("Create a group")
+                            .labeled("Create a group")
                             .clicked()
                             && self.our_node_id.is_some()
                         {
@@ -441,7 +441,7 @@ impl AppState {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if chat_lucide_icon_button(ui, pal, Icon::Copy)
-                            .on_hover_text("Copy my ID")
+                            .labeled("Copy my ID")
                             .clicked()
                         {
                             copy_to_clipboard(&node_id.to_string());
@@ -565,7 +565,7 @@ impl AppState {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     if narrow
                         && chat_lucide_icon_button(ui, pal, Icon::ChevronLeft)
-                            .on_hover_text("All conversations")
+                            .labeled("All conversations")
                             .clicked()
                     {
                         self.chat.selected = None;
@@ -650,6 +650,13 @@ impl AppState {
                     let mut friend_to_add = None;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let menu_trigger = chat_lucide_icon_button(ui, pal, Icon::EllipsisVertical);
+                        menu_trigger.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Chat actions",
+                            )
+                        });
                         let menu_response = menu_trigger.clone();
                         egui::Popup::menu(&menu_trigger).show(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
@@ -3458,7 +3465,7 @@ impl AppState {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if let Some(node_id) = member.node_id {
                                 if chat_lucide_icon_button(ui, pal, Icon::Copy)
-                                    .on_hover_text("Copy node ID")
+                                    .labeled("Copy node ID")
                                     .clicked()
                                 {
                                     copy_to_clipboard(&node_id.to_string());
@@ -3778,7 +3785,7 @@ fn chat_send_button(ui: &mut Ui, pal: &Palette, enabled: bool) -> egui::Response
         lucide(16.0),
         icon,
     );
-    response.on_hover_text("Send message (Enter)")
+    response.labeled("Send message (Enter)")
 }
 
 fn composer_ghost_icon_button(
@@ -3801,7 +3808,7 @@ fn composer_ghost_icon_button(
         lucide(17.0),
         if hot { pal.text } else { pal.text2 },
     );
-    response.on_hover_text(label)
+    response.labeled(label)
 }
 
 /// Short text control in the composer row (e.g. "GIF"), same height as the

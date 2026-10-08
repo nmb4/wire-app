@@ -16,6 +16,7 @@ use self::calls_ui::native_parent_hwnd;
 #[cfg(windows)]
 pub(crate) use self::widgets::format_bytes;
 use self::widgets::{ellipsize, track_pane_viewport};
+use crate::theme::IconButtonLabel;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use crate::tray::{TrayAction, TrayController};
 #[cfg(windows)]
@@ -1639,7 +1640,7 @@ impl AppState {
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
                 .show(ctx, |ui| {
                     if ghost_icon_button(ui, &pal, ph::ADDRESS_BOOK)
-                        .on_hover_text("Contacts and calling")
+                        .labeled("Contacts and calling")
                         .clicked()
                     {
                         self.show_contacts = true;
