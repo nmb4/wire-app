@@ -737,6 +737,70 @@ fn paint_row_identity(
     }
 }
 
+/// Full-width settings row: label on the left, an on/off switch on the right.
+/// The whole row toggles; `changed()` reports a flip like `ui.checkbox`.
+pub(super) fn settings_toggle(
+    ui: &mut Ui,
+    pal: &Palette,
+    value: &mut bool,
+    label: &str,
+) -> egui::Response {
+    const TRACK: Vec2 = Vec2::new(32.0, 18.0);
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        FontId::proportional(ui_font_size(12.0)),
+        pal.text2,
+        (ui.available_width() - TRACK.x - 12.0).max(40.0),
+    );
+    let height = galley.size().y.max(TRACK.y) + 10.0;
+    let (rect, mut response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *value, label)
+    });
+    let hot = response.hovered() || response.has_focus();
+    let painter = ui.painter();
+    painter.galley(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        if hot { pal.text } else { pal.text2 },
+    );
+    let on = ui.ctx().animate_bool_responsive(response.id, *value);
+    let track = Rect::from_center_size(
+        egui::pos2(rect.right() - TRACK.x * 0.5, rect.center().y),
+        TRACK,
+    );
+    let track_fill = crate::theme::mix_rgb(pal.panel, pal.accent, on);
+    painter.rect(
+        track,
+        CornerRadius::same(9),
+        track_fill,
+        Stroke::new(1.0, if *value { pal.accent } else { pal.line_br }),
+        egui::StrokeKind::Inside,
+    );
+    let knob_x = egui::lerp(track.left() + 9.0..=track.right() - 9.0, on);
+    painter.circle_filled(
+        egui::pos2(knob_x, track.center().y),
+        6.0,
+        if *value { pal.bg } else { pal.dim },
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            track.expand(2.0),
+            CornerRadius::same(11),
+            Stroke::new(1.0, pal.accent),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response
+}
+
 /// A 44 px member row with a trailing check box, for multi-select lists such
 /// as the group editor. The whole row toggles.
 pub(super) fn member_toggle_row(

@@ -4,7 +4,7 @@ use super::{
     profile_ui::paint_profile_avatar,
     widgets::{
         floating_dialog_header, floating_panel, floating_panel_frame, floating_panel_width,
-        format_bytes, painted_volume_slider,
+        format_bytes, painted_volume_slider, settings_toggle,
     },
     AppState, ChatStyle, DEFAULT,
 };
@@ -232,18 +232,8 @@ impl AppState {
                                     .corner_radius(CornerRadius::same(7))
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
-                                        ui.checkbox(
-                                            &mut self.start_with_system,
-                                            RichText::new("Start with system")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
-                                        ui.checkbox(
-                                            &mut self.show_system_usage,
-                                            RichText::new("Show system usage in title bar")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
+                                        settings_toggle(ui, &pal, &mut self.start_with_system, "Start with system");
+                                        settings_toggle(ui, &pal, &mut self.show_system_usage, "Show system usage in title bar");
                                     });
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -338,13 +328,7 @@ impl AppState {
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
                                         let mut compact = self.chat_style == ChatStyle::Compact;
-                                        if ui
-                                            .checkbox(
-                                                &mut compact,
-                                                RichText::new("Compact (Discord-like)")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            )
+                                        if settings_toggle(ui, &pal, &mut compact, "Compact (Discord-like)")
                                             .changed()
                                         {
                                             self.chat_style = if compact {
@@ -552,19 +536,9 @@ impl AppState {
                                     .show(ui, |ui| {
                                         #[cfg(feature = "audio-processing")]
                                         {
-                                            ui.checkbox(
-                                                &mut self.audio_config.processing_enabled,
-                                                RichText::new("Echo cancellation")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            );
+                                            settings_toggle(ui, &pal, &mut self.audio_config.processing_enabled, "Echo cancellation");
                                         }
-                                        ui.checkbox(
-                                            &mut self.audio_config.noise_suppression_enabled,
-                                            RichText::new("Noise suppression (RNNoise)")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
+                                        settings_toggle(ui, &pal, &mut self.audio_config.noise_suppression_enabled, "Noise suppression (RNNoise)");
                                     });
 
                                 ui.add_space(8.0);
@@ -619,13 +593,7 @@ impl AppState {
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
                                         let mut automatic = self.record_calls_automatically;
-                                        if ui
-                                            .checkbox(
-                                                &mut automatic,
-                                                RichText::new("Record every call automatically")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            )
+                                        if settings_toggle(ui, &pal, &mut automatic, "Record every call automatically")
                                             .on_hover_text(
                                                 "Start recording as soon as a call connects, and \
                                                  stop when the last person leaves",
@@ -728,13 +696,7 @@ impl AppState {
                                     });
 
                                 ui.add_space(10.0);
-                                if ui
-                                    .checkbox(
-                                        &mut self.share_system_audio,
-                                        RichText::new("Also share system audio")
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
+                                if settings_toggle(ui, &pal, &mut self.share_system_audio, "Also share system audio")
                                     .on_hover_text(
                                         "When you share a screen, send this computer's sound to the call",
                                     )
