@@ -713,7 +713,7 @@ impl AppState {
                     "Call waiting · ".to_owned(),
                     Some((name.clone(), name_color)),
                     String::new(),
-                    Color32::from_rgb(255, 200, 80),
+                    pal.warn,
                     format!("{name} is calling while you are in {}", call.title),
                 ));
             }
@@ -766,7 +766,7 @@ impl AppState {
                 "Incoming · ".to_owned(),
                 Some((primary, name_color(incoming[0]))),
                 suffix,
-                Color32::from_rgb(255, 200, 80),
+                pal.warn,
                 detail,
             ));
         }
@@ -806,7 +806,7 @@ impl AppState {
                 "Calling · ".to_owned(),
                 Some((primary, name_color(calling[0]))),
                 suffix,
-                Color32::from_rgb(120, 170, 255),
+                pal.info,
                 detail,
             ));
         }

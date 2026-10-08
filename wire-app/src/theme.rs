@@ -125,6 +125,10 @@ pub struct Palette {
     pub accent_dim: Color32,
     pub ok: Color32,
     pub err: Color32,
+    /// Attention without failure: call waiting, ringing, degraded states.
+    pub warn: Color32,
+    /// Neutral status: outgoing calls, informational notices.
+    pub info: Color32,
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +157,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0xd9, 0x9a, 0x5b, 36),
                 ok: Color32::from_rgb(0x7a, 0x9b, 0x7e),
                 err: Color32::from_rgb(0xc9, 0x6f, 0x5c),
+                warn: Color32::from_rgb(0xd9, 0xa6, 0x4e),
+                info: Color32::from_rgb(0x7f, 0x9c, 0xb8),
             },
             // terminal / html-mockup look: green accent, near-black bg
             Theme::Terminal => Self {
@@ -170,6 +176,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0x7e, 0xe7, 0x87, 36),
                 ok: Color32::from_rgb(0x7e, 0xe7, 0x87),
                 err: Color32::from_rgb(0xff, 0x6b, 0x6b),
+                warn: Color32::from_rgb(0xf2, 0xc9, 0x4c),
+                info: Color32::from_rgb(0x6c, 0xb6, 0xff),
             },
             // discord oled look: true black bg, discord blurple accent
             Theme::DiscordOled => Self {
@@ -187,6 +195,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0x58, 0x65, 0xf2, 40),
                 ok: Color32::from_rgb(0x3b, 0xa5, 0x5c),
                 err: Color32::from_rgb(0xed, 0x42, 0x45),
+                warn: Color32::from_rgb(0xf0, 0xb2, 0x32),
+                info: Color32::from_rgb(0x00, 0xa8, 0xfc),
             },
             // slate look: #080807 / #DDDDD5 based, borders = lighter tints of bg
             Theme::Slate => Self {
@@ -204,6 +214,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0xdd, 0xdd, 0xd5, 28),
                 ok: Color32::from_rgb(0x9a, 0xa8, 0x92),
                 err: Color32::from_rgb(0xc2, 0x8a, 0x7c),
+                warn: Color32::from_rgb(0xc8, 0xb0, 0x7a),
+                info: Color32::from_rgb(0x8f, 0xa3, 0xb5),
             },
         }
     }

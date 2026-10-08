@@ -1114,7 +1114,7 @@ fn render_single_group(
                 NotificationKind::IncomingCall
                 | NotificationKind::Message
                 | NotificationKind::Transfer => pal.accent,
-                NotificationKind::Info => pal.dim,
+                NotificationKind::Info => pal.info,
             };
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
             ui.painter()
