@@ -399,6 +399,8 @@ struct ChatUiState {
     /// Conversation whose composer last received automatic focus; a change
     /// of selection moves the caret into the new composer once.
     composer_focused_for: Option<String>,
+    /// Measured message heights so off-screen rows skip layout.
+    timeline_heights: chat_ui::TimelineHeights,
 }
 
 /// Stable id of the chat composer, so global shortcuts can tell whether

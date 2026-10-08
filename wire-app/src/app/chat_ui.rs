@@ -776,19 +776,13 @@ impl AppState {
                         });
                         ui.add_space(6.0);
                     }
-                    let timeline = self
-                        .chat
-                        .timelines
-                        .get(&conversation.id)
-                        .cloned()
-                        .unwrap_or_default();
                     let now = chat::now_millis();
                     let retention = self.chat_retention;
                     egui::ScrollArea::vertical()
                         .id_salt(("chat-timeline", &conversation.id))
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
-                        .show(ui, |ui| {
+                        .show_viewport(ui, |ui, viewport| {
                             // The theme defaults to 6px vertical item spacing,
                             // which egui adds between every message row on top
                             // of the explicit gaps below (continuations were
@@ -796,34 +790,53 @@ impl AppState {
                             // Discord-style rhythm is exact: 2px inside a
                             // burst, 14px between bursts, 9px for bubbles.
                             ui.spacing_mut().item_spacing.y = 0.0;
+                            let origin = ui.cursor().top();
                             ui.add_space(8.0);
-                            let visible_messages = timeline
-                                .into_iter()
-                                .filter(|message| message.visible_under(retention, now))
-                                .collect::<Vec<_>>();
-                            for (index, message) in visible_messages.iter().enumerate() {
-                                let starts_group = index == 0
-                                    || !messages_share_compact_group(
-                                        &visible_messages[index - 1],
-                                        message,
-                                    );
+                            let rows = self.plan_timeline_rows(
+                                &conversation.id,
+                                ui.available_width(),
+                                retention,
+                                now,
+                            );
+                            // Messages are only laid out when they are near
+                            // the viewport or have never been measured; the
+                            // rest reserve their last measured height.
+                            let keep = viewport.expand2(Vec2::new(0.0, viewport.height()));
+                            for row in rows {
+                                let top = ui.cursor().top() - origin;
+                                if let Some(height) = row.cached_height {
+                                    if top + height < keep.min.y || top > keep.max.y {
+                                        ui.add_space(height);
+                                        continue;
+                                    }
+                                }
+                                let Some(message) = self
+                                    .chat
+                                    .timelines
+                                    .get(&conversation.id)
+                                    .and_then(|timeline| timeline.get(row.index))
+                                    .cloned()
+                                else {
+                                    break;
+                                };
+                                let before = ui.cursor().top();
                                 self.ui_chat_message(
                                     ui,
                                     pal,
                                     &conversation.id,
-                                    message,
-                                    starts_group,
+                                    &message,
+                                    row.starts_group,
                                 );
-                                let next_is_grouped =
-                                    visible_messages.get(index + 1).is_some_and(|next| {
-                                        messages_share_compact_group(message, next)
-                                    });
                                 ui.add_space(match self.chat_style {
-                                    ChatStyle::Bubbles if next_is_grouped => 3.0,
+                                    ChatStyle::Bubbles if row.next_is_grouped => 3.0,
                                     ChatStyle::Bubbles => 14.0,
-                                    ChatStyle::Compact if next_is_grouped => 2.0,
+                                    ChatStyle::Compact if row.next_is_grouped => 2.0,
                                     ChatStyle::Compact => 14.0,
                                 });
+                                self.chat
+                                    .timeline_heights
+                                    .rows
+                                    .insert(message.message_id, ui.cursor().top() - before);
                             }
                         });
                 });
@@ -991,6 +1004,61 @@ impl AppState {
             });
         });
         self.ui_image_preview(ui.ctx(), pal);
+    }
+
+    /// Visible rows of a timeline with their grouping and, when the layout
+    /// still matches, the height measured the last time each was drawn.
+    fn plan_timeline_rows(
+        &mut self,
+        conversation_id: &str,
+        width: f32,
+        retention: chat::RetentionPolicy,
+        now: i64,
+    ) -> Vec<TimelineRow> {
+        let layout = (
+            conversation_id.to_owned(),
+            width.round() as i32,
+            self.chat_style,
+        );
+        let heights = &mut self.chat.timeline_heights;
+        if heights.layout.as_ref() != Some(&layout) {
+            heights.layout = Some(layout);
+            heights.rows.clear();
+        }
+        let Some(timeline) = self.chat.timelines.get(conversation_id) else {
+            return Vec::new();
+        };
+        let visible: Vec<usize> = timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.visible_under(retention, now))
+            .map(|(index, _)| index)
+            .collect();
+        visible
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| {
+                let message = &timeline[index];
+                let grouped_with = |other: Option<&usize>| {
+                    other.is_some_and(|&other| {
+                        let (first, second) = if other < index {
+                            (&timeline[other], message)
+                        } else {
+                            (message, &timeline[other])
+                        };
+                        messages_share_compact_group(first, second)
+                    })
+                };
+                TimelineRow {
+                    index,
+                    starts_group: !grouped_with(
+                        position.checked_sub(1).and_then(|prev| visible.get(prev)),
+                    ),
+                    next_is_grouped: grouped_with(visible.get(position + 1)),
+                    cached_height: heights.rows.get(&message.message_id).copied(),
+                }
+            })
+            .collect()
     }
 
     fn ui_chat_message(
@@ -4043,6 +4111,22 @@ fn owner_file_offer_status(
 
 /// Consecutive messages from one author within five minutes form a burst
 /// (one header/avatar). Minute buckets used to split 13:59 / 14:00.
+/// One visible timeline message as planned before drawing.
+struct TimelineRow {
+    index: usize,
+    starts_group: bool,
+    next_is_grouped: bool,
+    cached_height: Option<f32>,
+}
+
+/// Measured heights (message plus trailing gap) for the open timeline, valid
+/// for one conversation, content width and chat style.
+#[derive(Default)]
+pub(super) struct TimelineHeights {
+    layout: Option<(String, i32, ChatStyle)>,
+    rows: std::collections::HashMap<String, f32>,
+}
+
 fn messages_share_compact_group(previous: &ChatMessage, current: &ChatMessage) -> bool {
     const BURST_WINDOW_MS: i64 = 5 * 60_000;
     previous.author_id == current.author_id
