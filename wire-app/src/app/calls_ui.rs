@@ -1468,44 +1468,43 @@ impl AppState {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                                    let menu_response = ui
-                                        .menu_button(
-                                            RichText::new(char::from(Icon::EllipsisVertical))
-                                                .font(lucide(16.0))
-                                                .color(pal.text2),
-                                            |ui| {
-                                                ui.spacing_mut().item_spacing.y = 2.0;
-                                                if menu_item_button(
-                                                    ui,
-                                                    &pal,
-                                                    Icon::Copy,
-                                                    "Copy node ID",
-                                                    false,
-                                                )
-                                                .clicked()
-                                                {
-                                                    copy_id = Some(friend.node_id.clone());
-                                                    ui.close();
-                                                }
-                                                if menu_item_button(
-                                                    ui,
-                                                    &pal,
-                                                    Icon::UserMinus,
-                                                    "Remove",
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    remove_request = Some(PendingConfirm::RemoveFriend {
-                                                        node_id: friend.node_id.clone(),
-                                                        name: friend.name.clone(),
-                                                    });
-                                                    ui.close();
-                                                }
-                                            },
+                                    // Same trigger and popup as the chat header menu.
+                                    let menu_trigger = super::widgets::chat_lucide_icon_button(
+                                        ui,
+                                        &pal,
+                                        Icon::EllipsisVertical,
+                                    )
+                                    .labeled("More actions");
+                                    egui::Popup::menu(&menu_trigger).show(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        if menu_item_button(
+                                            ui,
+                                            &pal,
+                                            Icon::Copy,
+                                            "Copy node ID",
+                                            false,
                                         )
-                                        .response;
-                                    menu_response.on_hover_text("More actions");
+                                        .clicked()
+                                        {
+                                            copy_id = Some(friend.node_id.clone());
+                                            ui.close();
+                                        }
+                                        if menu_item_button(
+                                            ui,
+                                            &pal,
+                                            Icon::UserMinus,
+                                            "Remove",
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            remove_request = Some(PendingConfirm::RemoveFriend {
+                                                node_id: friend.node_id.clone(),
+                                                name: friend.name.clone(),
+                                            });
+                                            ui.close();
+                                        }
+                                    });
 
                                     let call_response = ui.add_enabled_ui(call_enabled, |ui| {
                                         if action_button(ui, &pal, "Call", ButtonTone::Primary)
