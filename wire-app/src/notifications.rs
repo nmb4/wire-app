@@ -107,6 +107,8 @@ pub(crate) enum NotificationAction {
     DeclineCall(String),
     /// Show the folder holding the recordings on disk.
     OpenRecordingsFolder,
+    /// Start a new call to this peer (node ID string).
+    CallPeer(String),
 }
 
 #[derive(Clone)]
@@ -574,6 +576,38 @@ impl NotificationService {
             progress: None,
             action: None,
             buttons: Vec::new(),
+        });
+    }
+
+    /// A call that ended without us hanging up. `call_again` adds a button
+    /// that starts a new call to the same peer.
+    pub(crate) fn call_ended(
+        &self,
+        node_id: String,
+        failure: bool,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        call_again: Option<&str>,
+    ) {
+        self.push(NotificationSpec {
+            group_key: Some(format!("call-ended:{node_id}")),
+            kind: if failure {
+                NotificationKind::Error
+            } else {
+                NotificationKind::Info
+            },
+            title: title.into(),
+            body: body.into(),
+            progress: None,
+            action: Some(NotificationAction::OpenCalls),
+            buttons: call_again
+                .map(|label| ActionButton {
+                    label: label.to_owned(),
+                    action: NotificationAction::CallPeer(node_id),
+                    emphasized: true,
+                })
+                .into_iter()
+                .collect(),
         });
     }
 

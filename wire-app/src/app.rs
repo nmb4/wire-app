@@ -35,7 +35,7 @@ use crate::{
     persistence,
     profile::{self, PeerProfile},
     resource_monitor::ResourceMonitor,
-    runtime::{CallState, Command, Event},
+    runtime::{CallEndReason, CallState, Command, Event},
     sounds::{Sound, Sounds},
     theme::{ghost_icon_button, setup_fonts, visuals_for, Palette, Theme, WindowFrameStyle},
     video_decode::DecodedFrameData,
@@ -52,7 +52,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
     time::Duration,
@@ -306,7 +306,6 @@ struct AppState {
     ui_sound_volume: f32,
     sounds: Option<Sounds>,
     notifications: NotificationService,
-    voluntary_hangups: AtomicU32,
     #[cfg(windows)]
     update_tx: mpsc::Sender<UpdateMessage>,
     #[cfg(windows)]
@@ -1397,7 +1396,6 @@ impl App {
             ui_sound_volume,
             sounds,
             notifications: NotificationService::default(),
-            voluntary_hangups: AtomicU32::new(0),
             #[cfg(windows)]
             update_tx,
             #[cfg(windows)]
@@ -2011,6 +2009,17 @@ impl AppState {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 NotificationAction::OpenRecordingsFolder => self.reveal_recordings(),
+                NotificationAction::CallPeer(node_id) => {
+                    if let Ok(node_id) = NodeId::from_str(&node_id) {
+                        if friend_call_enabled(self.calls.get(&node_id)) {
+                            self.play_sound(Sound::Button2);
+                            self.cmd(Command::Call { node_id });
+                        }
+                    }
+                    self.app_mode = AppMode::Calls;
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
     }
@@ -2148,21 +2157,21 @@ impl AppState {
                                 );
                             }
                         }
-                        CallState::Aborted => {
+                        CallState::Aborted(reason) => {
                             self.notifications.dismiss_key(&call_key);
-                            if self.voluntary_hangups.load(Ordering::Relaxed) > 0 {
-                                self.voluntary_hangups.fetch_sub(1, Ordering::Relaxed);
-                            } else if matches!(
-                                previous,
-                                Some(CallState::Calling) | Some(CallState::Incoming)
-                            ) {
-                                self.play_sound(Sound::Fail);
+                            if previous.is_some() {
+                                self.announce_call_end(node_id, reason);
                             }
+                        }
+                        CallState::Calling => {
+                            // A fresh attempt replaces the last failure notice.
+                            self.notifications
+                                .dismiss_key(&format!("call-ended:{node_id}"));
                         }
                         _ => {}
                     }
 
-                    if matches!(call_state, CallState::Aborted) {
+                    if matches!(call_state, CallState::Aborted(_)) {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
                         self.stream_volumes.remove(&node_id);
@@ -3575,9 +3584,55 @@ impl AppState {
         }
     }
 
+    /// Tells the user why a call leg ended when it was not their own doing.
+    /// Group calls only report dropped connections; members leaving or not
+    /// answering is normal there.
+    fn announce_call_end(&self, node_id: NodeId, reason: CallEndReason) {
+        let name = self.peer_display_name(node_id);
+        let in_group = self.local_group_call.is_some();
+        let id = node_id.to_string();
+        match reason {
+            CallEndReason::LocalHangup | CallEndReason::RemoteHangup => {}
+            CallEndReason::ConnectionLost => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    true,
+                    "Call dropped",
+                    format!("The connection to {name} was lost."),
+                    (!in_group).then_some("Call again"),
+                );
+            }
+            _ if in_group => {}
+            CallEndReason::Unreachable => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    true,
+                    format!("Couldn't reach {name}"),
+                    "They may be offline, or a firewall is blocking the connection.",
+                    Some("Try again"),
+                );
+            }
+            CallEndReason::Declined => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    false,
+                    "Call not answered",
+                    format!("{name} declined or ended the call."),
+                    None,
+                );
+            }
+            CallEndReason::CallerCancelled => {
+                self.notifications
+                    .call_ended(id, false, "Missed call", name, Some("Call back"));
+            }
+        }
+    }
+
     fn hang_up_call(&self, node_id: NodeId) {
         self.play_sound(Sound::Whoosh1);
-        self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
         self.cmd(Command::Abort { node_id });
     }
 
@@ -3599,7 +3654,6 @@ impl AppState {
                 .filter(|peer| *peer != node_id)
                 .collect::<Vec<_>>();
             for peer in current_peers {
-                self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
                 self.cmd(Command::Abort { node_id: peer });
             }
             self.leave_group_call();
@@ -4045,7 +4099,9 @@ mod layout_tests {
     #[test]
     fn friend_call_button_is_disabled_while_a_call_is_visible() {
         assert!(friend_call_enabled(None));
-        assert!(friend_call_enabled(Some(&CallState::Aborted)));
+        assert!(friend_call_enabled(Some(&CallState::Aborted(
+            CallEndReason::LocalHangup
+        ))));
         assert!(!friend_call_enabled(Some(&CallState::Incoming)));
         assert!(!friend_call_enabled(Some(&CallState::Calling)));
         assert!(!friend_call_enabled(Some(&CallState::Active)));

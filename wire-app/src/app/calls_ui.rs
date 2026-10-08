@@ -362,7 +362,7 @@ impl AppState {
             CallState::Incoming => (Some("incoming"), pal.accent),
             CallState::Calling => (Some("connecting"), pal.accent),
             CallState::Active => (None, pal.ok),
-            CallState::Aborted => (Some("ended"), pal.dim),
+            CallState::Aborted(_) => (Some("ended"), pal.dim),
         };
         let fill = if is_active {
             chat_selected_surface(pal)
@@ -504,7 +504,7 @@ impl AppState {
                                 self.hang_up_call(node_id);
                             }
                         }
-                        CallState::Aborted => {}
+                        CallState::Aborted(_) => {}
                     }
                 });
             })
@@ -744,7 +744,7 @@ impl AppState {
                 CallState::Active => active.push(*node_id),
                 CallState::Incoming => incoming.push(*node_id),
                 CallState::Calling => calling.push(*node_id),
-                CallState::Aborted => {}
+                CallState::Aborted(_) => {}
             }
         }
 
@@ -957,7 +957,6 @@ impl AppState {
                             self.play_sound(Sound::Whoosh1);
                         }
                         for node_id in peers {
-                            self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
                             self.cmd(Command::Abort { node_id });
                         }
                         self.leave_group_call();

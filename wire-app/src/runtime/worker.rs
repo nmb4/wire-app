@@ -24,7 +24,7 @@ use super::{
         await_video_send_stop, request_video_send_stop, run_video_recv, run_video_send,
         stop_video_send, VideoPeerTasks, VideoReceiveControl, VideoSendCommand,
     },
-    CallState, Command, Event, EventPublisher, ServiceClient, WorkerHandle,
+    CallEndReason, CallState, Command, Event, EventPublisher, ServiceClient, WorkerHandle,
 };
 use crate::{
     chat,
@@ -602,19 +602,29 @@ impl Worker {
                         debug!(node = %node_id.fmt_short(), generation, "ignored stale call completion");
                         continue;
                     }
-                    if let Err(err) = res {
+                    if let Err(err) = &res {
                         warn!("connection with {} closed: {err:?}", node_id.fmt_short());
                     } else {
                         info!("connection with {} closed", node_id.fmt_short());
                     }
+                    let close = match self.active_calls.remove(&node_id) {
+                        Some(CallInfo::Active(conn)) => conn.transport().close_reason(),
+                        _ => None,
+                    };
+                    let reason = match (&res, close) {
+                        // The task errored without the connection closing:
+                        // audio/track failure on an otherwise live link.
+                        (Err(_), None) => CallEndReason::ConnectionLost,
+                        (_, close) => CallEndReason::from_close(close, CallEndReason::RemoteHangup),
+                    };
+                    info!(node = %node_id.fmt_short(), ?reason, "call ended");
                     self.call_generations.remove(&node_id);
-                    self.active_calls.remove(&node_id);
                     self.volumes.remove(&node_id);
                     self.stream_volumes.remove(&node_id);
                     self.peer_voice_tracks.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
-                    self.emit(Event::SetCallState(node_id, CallState::Aborted))
+                    self.emit(Event::SetCallState(node_id, CallState::Aborted(reason)))
                         .await?;
                 }
                 Some(joined) = self.connect_tasks.join_next(), if !self.connect_tasks.is_empty() => {
@@ -644,7 +654,11 @@ impl Worker {
                         info!(node = %node_id.fmt_short(), generation, "incoming caller disconnected before acceptance");
                         self.call_generations.remove(&node_id);
                         self.active_calls.remove(&node_id);
-                        self.emit(Event::SetCallState(node_id, CallState::Aborted)).await?;
+                        self.emit(Event::SetCallState(
+                            node_id,
+                            CallState::Aborted(CallEndReason::CallerCancelled),
+                        ))
+                        .await?;
                     }
                 }
                 _ = self.presence_interval.tick() => {
@@ -838,8 +852,11 @@ impl Worker {
                 self.stream_volumes.remove(&node_id);
                 self.peer_voice_tracks.remove(&node_id);
                 self.cleanup_after_call_end().await;
-                self.emit(Event::SetCallState(node_id, CallState::Aborted))
-                    .await?;
+                self.emit(Event::SetCallState(
+                    node_id,
+                    CallState::Aborted(CallEndReason::Unreachable),
+                ))
+                .await?;
             }
         }
         Ok(())
@@ -865,11 +882,15 @@ impl Worker {
                     "failed to receive audio track from {}: {err:?}",
                     node_id.fmt_short()
                 );
+                let reason = CallEndReason::from_close(
+                    conn.transport().close_reason(),
+                    CallEndReason::Declined,
+                );
                 self.remove_video_peer(node_id).await;
                 self.cleanup_after_call_end().await;
                 conn.transport().close(0u32.into(), b"bye");
                 self.call_generations.remove(&node_id);
-                self.emit(Event::SetCallState(node_id, CallState::Aborted))
+                self.emit(Event::SetCallState(node_id, CallState::Aborted(reason)))
                     .await?;
             }
         }
@@ -1785,8 +1806,11 @@ impl Worker {
                     self.remove_video_peer(node_id).await;
                     conn.transport().close(0u32.into(), b"bye");
                     self.cleanup_after_call_end().await;
-                    self.emit(Event::SetCallState(node_id, CallState::Aborted))
-                        .await?;
+                    self.emit(Event::SetCallState(
+                        node_id,
+                        CallState::Aborted(CallEndReason::LocalHangup),
+                    ))
+                    .await?;
                 }
             }
             Command::Abort { node_id } => {
@@ -1813,8 +1837,11 @@ impl Worker {
                             conn.transport().close(0u32.into(), b"bye");
                         }
                     }
-                    self.emit(Event::SetCallState(node_id, CallState::Aborted))
-                        .await?;
+                    self.emit(Event::SetCallState(
+                        node_id,
+                        CallState::Aborted(CallEndReason::LocalHangup),
+                    ))
+                    .await?;
                 }
             }
         }
