@@ -883,11 +883,23 @@ impl AppState {
             ui.spacing_mut().item_spacing = Vec2::splat(6.0);
             // "Default" swatch: theme text color.
             let default_selected = current.is_none() && self.profile_edit_accent.trim().is_empty();
+            // Drawn as a letter, not a fill: the theme text color can match a
+            // preset (Amber text is the near-white preset) and the two would
+            // look identical.
             let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
-            ui.painter().circle_filled(rect.center(), 11.0, pal.text);
+            ui.painter().circle_filled(rect.center(), 11.0, pal.panel2);
+            ui.painter()
+                .circle_stroke(rect.center(), 11.0, Stroke::new(1.0_f32, pal.line_br));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "A",
+                egui::FontId::proportional(ui_font_size(12.0)),
+                pal.text,
+            );
             if default_selected {
                 ui.painter()
-                    .circle_stroke(rect.center(), 12.0, Stroke::new(2.0_f32, pal.accent));
+                    .circle_stroke(rect.center(), 13.0, Stroke::new(2.0_f32, pal.accent));
             }
             if response.on_hover_text("Default (theme text)").clicked() {
                 picked = Some(String::new());
