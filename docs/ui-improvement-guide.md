@@ -110,25 +110,33 @@ Wire should not drift into a generic Discord look. Keep:
 
 ## 6. Open items for the next pass
 
-These are visible in the current captures (`settings-*`, `profile-editor`,
-`group-editor`, `calls-idle`):
+Done since the first pass: profile editor header and footer, group editor
+member rows (`member_toggle_row`), settings toggles (`settings_toggle`) and
+selects (`select_field`), the settings profile summary, 44 px contact rows,
+and pixel-width truncation for participant chips and capture targets
+(`truncated_galley`), left-aligned wrapped text in own bubbles, a distinct
+"default" name-color swatch, and a secondary "Start call" in group chats
+(only "Join call" uses the accent). The Calls page without a call now shows
+the contacts as page content; the contacts dialog only opens on request
+during a call. Per-participant "End" moved into a ⋮ menu (ringing calls keep
+a visible "Cancel"), and the self chip shows a muted or deafened icon instead
+of a silent meter. Scenes: `calls-long-names`, `calls-contacts-oled`,
+`settings-large`, `calls-muted`, `calls-contacts-dialog`,
+`calls-idle-minimum`.
 
-- **Profile editor** cuts off Save/Cancel at the default size. It also uses
-  egui's centered native title, unlike the settings and contacts header.
-  Switch it to `floating_dialog_header` with a pinned footer.
-- **Group editor**: default egui checkboxes look out of place, and the dialog
-  has too much empty height. Use selectable member rows with avatars. Size the
-  dialog to its content.
-- **Settings**: the profile block duplicates the profile editor. Combo boxes
-  and checkboxes are egui defaults and don't match the custom controls.
-- **Contacts dialog** (`calls-idle`): rows are taller than the content needs.
-  The name sits below the avatar center because of `two_line_avatar_size`
-  combined with label spacing. Apply the sidebar-row technique.
-- **Call participant chips** still use `ellipsize` by character count. Use
-  `truncated_galley` so the truncation point depends on pixel width.
-- **Theme coverage**: only Amber has been reviewed closely. Check
-  `theme-terminal`, `theme-oled`, and `theme-slate` for contrast, especially
-  `chat_selected_surface` on OLED.
+Next for the call view: an incoming or waiting call should be a banner above
+the stage, not a chip among the participants, and without a screen share the
+participants should be large tiles instead of a strip under an empty stage.
+
+Still open:
+
+- **Theme contrast**: `dim2` is about 3:1 against `panel` in every theme
+  (Terminal 2.9:1). It is used for quiet metadata such as "Offline" and the
+  contact count. Raise it if that text has to stay readable.
+  `chat_selected_surface` is only 1.07 to 1.09:1 against `bg`, so selection
+  relies on text color and check marks rather than on the fill.
+- **Select menus** are not captured: the harness cannot open a popup. Check
+  them by hand, especially a long device name and the 10-item image limit list.
 - **Manual-only checks**: long multi-line drafts, GIF picker placement,
   resizing across 640 px with a chat open, real avatars instead of initials,
   and live video tiles.

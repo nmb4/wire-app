@@ -10,13 +10,12 @@ use super::{
     },
     save_friends,
     widgets::{
-        aspect_fit_rect, chat_hairline, chat_selected_surface, chat_surface, copy_to_clipboard,
-        ellipsize, floating_dialog_header, floating_panel, floating_panel_frame,
+        aspect_fit_rect, chat_hairline, chat_hover_surface, chat_selected_surface, chat_surface,
+        copy_to_clipboard, ellipsize, floating_dialog_header, floating_panel, floating_panel_frame,
         floating_panel_width, fmt_error, fmt_node_id, paint_volume_track, participant_bar_columns,
         peer_volume_slider, read_clipboard, section_card, truncated_galley, video_display_size,
-        VolumeKnob,
-        CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS, PARTICIPANT_CHIP_HEIGHT,
-        PARTICIPANT_GAP,
+        VolumeKnob, CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS,
+        PARTICIPANT_CHIP_HEIGHT, PARTICIPANT_GAP,
     },
     AppMode, AppState, StreamSource, StreamViewMode, TextureUploadStats, STREAM_GRID_GAP,
 };
@@ -315,11 +314,21 @@ impl AppState {
                         .as_ref()
                         .map(load_audio_level)
                         .unwrap_or(0.0);
-                    voice_level_meter(ui, pal, level).on_hover_text(if self.muted {
-                        "Microphone muted"
+                    if self.muted || self.deafened {
+                        // A silent meter looks the same as not speaking; say
+                        // why nobody hears you.
+                        let (icon, tooltip) = if self.deafened {
+                            (
+                                Icon::EarOff,
+                                "Call audio is off and your microphone is muted",
+                            )
+                        } else {
+                            (Icon::MicOff, "Your microphone is muted")
+                        };
+                        chip_status_icon(ui, pal.err, icon, tooltip);
                     } else {
-                        "Your microphone level"
-                    });
+                        voice_level_meter(ui, pal, level).on_hover_text("Your microphone level");
+                    }
                     if self.sharing_active {
                         ui.add_space(CHIP_IDENTITY_GAP);
                         chip_status_icon(
@@ -398,7 +407,7 @@ impl AppState {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     paint_profile_avatar(ui, pal, avatar, &initial, PARTICIPANT_AVATAR_SIZE);
                     ui.add_space(CHIP_IDENTITY_GAP);
-                    chip_name_label(ui, &ellipsize(&display_name, 16), name_color);
+                    chip_name_label(ui, &display_name, name_color);
                     ui.add_space(CHIP_IDENTITY_GAP);
                     voice_level_meter(ui, pal, voice_level)
                         .on_hover_text("Voice received from this participant");
@@ -498,11 +507,44 @@ impl AppState {
                                 }
                             }
                             ui.add_space(8.0);
-                            if compact_chip_button(ui, pal, "End", ButtonTone::Danger)
-                                .on_hover_text("End call with this peer")
-                                .clicked()
-                            {
-                                self.hang_up_call(node_id);
+                            if matches!(state, CallState::Calling) {
+                                // Still ringing: cancelling is the one likely
+                                // action, so it stays visible.
+                                if compact_chip_button(ui, pal, "Cancel", ButtonTone::Danger)
+                                    .on_hover_text("Stop calling this peer")
+                                    .clicked()
+                                {
+                                    self.hang_up_call(node_id);
+                                }
+                            } else {
+                                // Ending one peer is rare next to "Leave"; a red
+                                // button on every chip made it the loudest thing
+                                // in the strip.
+                                let trigger = chip_icon_button(
+                                    ui,
+                                    pal,
+                                    Icon::EllipsisVertical,
+                                    false,
+                                    "Participant actions",
+                                );
+                                let mut end = false;
+                                egui::Popup::menu(&trigger).show(|ui| {
+                                    if menu_item_button(
+                                        ui,
+                                        pal,
+                                        Icon::PhoneOff,
+                                        "End call with this person",
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        end = true;
+                                        ui.close();
+                                    }
+                                });
+                                if end {
+                                    self.hang_up_call(node_id);
+                                }
                             }
                         }
                         CallState::Aborted(_) => {}
@@ -1028,6 +1070,13 @@ impl AppState {
         pal: &Palette,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
+        if self.stream_view_mode == StreamViewMode::Normal && !self.has_visible_call() {
+            Frame::new()
+                .fill(pal.bg)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| self.ui_calls_home(ui, pal));
+            return;
+        }
         if self.stream_view_mode != StreamViewMode::Normal {
             self.ui_stream_panel(
                 ui,
@@ -1051,6 +1100,51 @@ impl AppState {
             });
     }
 
+    /// The Calls page while no call is running: the contact list is the page
+    /// content instead of a dialog over an empty stage.
+    fn ui_calls_home(&mut self, ui: &mut Ui, pal: &Palette) {
+        // A dialog request made while this page is showing (top bar, chat
+        // empty state) is already answered by the page. Left set, it would pop
+        // the dialog over the next call.
+        self.show_contacts = false;
+        egui::ScrollArea::vertical()
+            .id_salt("calls-home-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let full = ui.available_rect_before_wrap();
+                let column = full.width().min(620.0);
+                let column_rect = egui::Rect::from_min_size(
+                    egui::pos2(full.center().x - column * 0.5, full.top()),
+                    Vec2::new(column, full.height()),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(column_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| {
+                        ui.set_width(column);
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("CONTACTS")
+                                .family(kh_family())
+                                .color(pal.text)
+                                .size(16.0),
+                        );
+                        ui.label(
+                            RichText::new("Call a friend, or dial a node ID under More options.")
+                                .color(pal.dim)
+                                .size(ui_font_size(12.0)),
+                        );
+                        ui.add_space(12.0);
+                        self.ui_friends_card(ui);
+                        ui.add_space(12.0);
+                        self.ui_call_more_options(ui);
+                        ui.add_space(12.0);
+                    },
+                );
+            });
+    }
+
     /// Collapsed tools: one-off dial, copy own ID, add friend.
     fn ui_call_more_options(&mut self, ui: &mut Ui) {
         let pal = Palette::for_theme(self.theme);
@@ -1067,7 +1161,9 @@ impl AppState {
                         .size(ui_font_size(12.5)),
                 )
                 .id_salt("call-more-options")
-                .default_open(false)
+                // Without friends the add form is the only useful thing here.
+                .default_open(self.friends.is_empty())
+                .open(std::mem::take(&mut self.expand_call_options).then_some(true))
                 .show(ui, |ui| {
                     ui.add_space(6.0);
                     self.ui_identity_card(ui);
@@ -1097,7 +1193,6 @@ impl AppState {
         let pane_rect = self.pane_constrain_rect();
         let dialog_width = floating_panel_width(pane_rect, 560.0, 0.0);
         let scroll_height = (pane_rect.height() - 130.0).clamp(1.0, 700.0);
-        let can_close = self.has_active_call();
 
         floating_panel("contacts-dialog", &pal, pane_rect, 560.0)
             .title_bar(false)
@@ -1113,7 +1208,7 @@ impl AppState {
                     &pal,
                     "CONTACTS",
                     "friends and calling",
-                    can_close.then_some("Close contacts"),
+                    Some("Close contacts"),
                 ) {
                     self.show_contacts = false;
                 }
@@ -1338,7 +1433,7 @@ impl AppState {
                 if self.friends.is_empty() {
                     ui.label(
                         RichText::new(
-                            "No friends yet. Open More options below to add someone by node ID.",
+                            "No friends yet. Add someone by their node ID under More options.",
                         )
                         .color(pal.dim)
                         .size(ui_font_size(12.5)),
@@ -1394,20 +1489,30 @@ impl AppState {
                         .is_ok_and(|node_id| friend_call_enabled(self.calls.get(node_id)));
                     let call_in_progress = parsed.is_ok() && !call_enabled;
 
-                    Frame::new()
-                        .fill(chat_surface(&pal))
-                        .stroke(Stroke::new(1.0_f32, chat_hairline(&pal)))
-                        .corner_radius(CornerRadius::same(CHROME_INNER_RADIUS))
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
+                    // Same metrics as the sidebar rows: a fixed 44 px row with a
+                    // 30 px avatar, and the name and ID/status block painted from
+                    // galleys and centered on the avatar as a unit. Rows share the
+                    // card instead of each drawing their own.
+                    const ROW_HEIGHT: f32 = 44.0;
+                    let (row_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), ROW_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    if ui.rect_contains_pointer(row_rect) {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            CornerRadius::same(10),
+                            chat_hover_surface(&pal),
+                        );
+                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect.shrink2(Vec2::new(8.0, 0.0)))
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| {
+                            {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                // Fixed-height identity block painted from galleys, the
-                                // same technique as the sidebar rows: name and
-                                // ID/status are centered on the avatar as a unit.
-                                const ROW_HEIGHT: f32 = 36.0;
-                                paint_profile_avatar(ui, &pal, avatar, &initial, 32.0);
+                                paint_profile_avatar(ui, &pal, avatar, &initial, 30.0);
                                 let text_width = (ui.available_width() - 112.0).max(24.0);
                                 let (text_rect, text_response) = ui.allocate_exact_size(
                                     Vec2::new(text_width, ROW_HEIGHT),
@@ -1521,9 +1626,10 @@ impl AppState {
                                         );
                                     }
                                 });
-                            });
-                        });
-                    ui.add_space(6.0);
+                            }
+                        },
+                    );
+                    ui.add_space(2.0);
                 }
 
                 if let Some(id) = call {
@@ -2256,8 +2362,29 @@ const CHIP_INNER_MARGIN: egui::Margin = egui::Margin {
     bottom: 0,
 };
 
+/// Widest a participant name may get before it is cut with an ellipsis. Wide
+/// glyphs and narrow ones are treated alike, unlike a character count.
+/// `PARTICIPANT_CARD_SLOT_WIDTH` assumes a name no wider than this.
+const CHIP_NAME_MAX_WIDTH: f32 = 118.0;
+
 fn chip_name_label(ui: &mut Ui, text: &str, color: Color32) {
-    chip_optical_label(ui, text, color, 12.0);
+    let galley = truncated_galley(ui, text, sans(12.0), color, CHIP_NAME_MAX_WIDTH);
+    let elided = galley.elided;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x, PARTICIPANT_CHIP_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.left(),
+            rect.center().y - galley.size().y * 0.5 + CHIP_NAME_OPTICAL_Y,
+        ),
+        galley,
+        color,
+    );
+    if elided {
+        response.on_hover_text(text);
+    }
 }
 
 /// A top-bar label that ellipsizes instead of pushing its neighbours out of the
@@ -2817,14 +2944,16 @@ fn capture_target_row(
     );
 
     let text_left = rect.left() + 50.0;
-    let available_chars = ((rect.right() - text_left - 12.0) / 7.0) as usize;
-    ui.painter().text(
-        egui::pos2(text_left, rect.top() + 15.0),
-        Align2::LEFT_TOP,
-        ellipsize(&target.title, available_chars.clamp(12, 48)),
+    let title = truncated_galley(
+        ui,
+        &target.title,
         sans(12.5),
         pal.text,
+        (rect.right() - text_left - 12.0).max(1.0),
     );
+    let title_elided = title.elided;
+    ui.painter()
+        .galley(egui::pos2(text_left, rect.top() + 15.0), title, pal.text);
     let primary = if target.is_primary {
         "  ·  Primary"
     } else {
@@ -2838,7 +2967,12 @@ fn capture_target_row(
         pal.dim,
     );
 
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if title_elided {
+        response.on_hover_text(&target.title)
+    } else {
+        response
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

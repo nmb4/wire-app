@@ -720,7 +720,14 @@ impl AppState {
                                 } else {
                                     "Start call"
                                 };
-                                if action_button(ui, pal, label, ButtonTone::Primary)
+                                // Accent only when a call is waiting to be
+                                // joined; starting one matches the direct chat.
+                                let tone = if active_group_call.is_some() && !already_joined {
+                                    ButtonTone::Primary
+                                } else {
+                                    ButtonTone::Secondary
+                                };
+                                if action_button(ui, pal, label, tone)
                                     .on_hover_text(if active_group_call.is_some() {
                                         "Join the active group call"
                                     } else {
@@ -1223,6 +1230,9 @@ impl AppState {
                                             message, pal, opacity,
                                         ))
                                         .wrap()
+                                        // Own bubbles sit in a right-aligned column; wrapped
+                                        // lines still start at the left edge.
+                                        .halign(Align::Min)
                                         .selectable(true),
                                     );
                                     body_response.context_menu(|ui| {
@@ -3226,6 +3236,7 @@ impl AppState {
                         "Add a friend" => {
                             self.app_mode = AppMode::Calls;
                             self.show_contacts = true;
+                            self.expand_call_options = true;
                         }
                         _ => {
                             if let Some(id) = self.our_node_id {

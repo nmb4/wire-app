@@ -300,10 +300,13 @@ fn save_png(dir: &std::path::Path, name: &str, image: &Arc<egui::ColorImage>) {
 
 fn reset_scene_state(state: &mut AppState) {
     state.theme = Theme::Amber;
+    state.own_profile_name = "Noah".to_owned();
     state.chat_style = ChatStyle::Bubbles;
     state.app_mode = AppMode::Text;
     state.show_settings = false;
     state.show_contacts = false;
+    state.muted = false;
+    state.deafened = false;
     state.show_profile_editor = false;
     state.chat.show_group_editor = false;
     state.chat.group_name.clear();
@@ -320,6 +323,13 @@ fn reset_scene_state(state: &mut AppState) {
 
 fn select_group(state: &mut AppState) {
     state.chat.selected = Some("fixture-group-wire-dev".to_owned());
+}
+
+/// A call where both the local name and a peer name are too wide for a chip.
+fn in_call_long_names(state: &mut AppState) {
+    in_call(state);
+    state.own_profile_name = "Maximilian Alexander von Hohenberg".to_owned();
+    state.calls.insert(fixture_peer(4), CallState::Active);
 }
 
 fn in_call(state: &mut AppState) {
@@ -426,6 +436,45 @@ const SCENES: &[Scene] = &[
         name: "calls-active-large",
         size: LARGE,
         apply: in_call,
+    },
+    Scene {
+        name: "calls-muted",
+        size: DEFAULT,
+        apply: |s| {
+            in_call(s);
+            s.muted = true;
+        },
+    },
+    Scene {
+        name: "calls-contacts-dialog",
+        size: DEFAULT,
+        apply: |s| {
+            in_call(s);
+            s.show_contacts = true;
+        },
+    },
+    Scene {
+        name: "calls-idle-minimum",
+        size: MINIMUM,
+        apply: |s| s.app_mode = AppMode::Calls,
+    },
+    Scene {
+        name: "calls-long-names",
+        size: DEFAULT,
+        apply: in_call_long_names,
+    },
+    Scene {
+        name: "calls-contacts-oled",
+        size: DEFAULT,
+        apply: |s| {
+            s.app_mode = AppMode::Calls;
+            s.theme = Theme::DiscordOled;
+        },
+    },
+    Scene {
+        name: "settings-large",
+        size: LARGE,
+        apply: |s| s.show_settings = true,
     },
     Scene {
         name: "settings-default",

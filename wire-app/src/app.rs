@@ -224,7 +224,12 @@ struct LastRecording {
 struct AppState {
     configured: bool,
     show_settings: bool,
+    /// Contacts dialog over a running call. Without a call the contacts are
+    /// the Calls page itself and this stays false.
     show_contacts: bool,
+    /// Open "More options" once on the next frame, e.g. after "Add a friend"
+    /// in the chat empty state.
+    expand_call_options: bool,
     /// Last seen healthy viewport rect; floating panes are constrained to it
     /// so degenerate minimize/restore frames cannot shrink their geometry.
     pane_viewport: Rect,
@@ -1333,6 +1338,7 @@ impl App {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
             show_contacts: false,
+            expand_call_options: false,
             pane_viewport: Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0)),
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
@@ -1648,8 +1654,10 @@ impl AppState {
                 });
         }
 
+        // Without a call the contacts are the Calls page; the dialog is only
+        // for reaching them while a call fills the stage.
         let contacts_visible =
-            self.app_mode == AppMode::Calls && (self.show_contacts || !self.has_active_call());
+            self.app_mode == AppMode::Calls && self.show_contacts && self.has_visible_call();
         if contacts_visible && !self.show_settings && self.configured {
             self.ui_contacts_window(ctx);
         }
