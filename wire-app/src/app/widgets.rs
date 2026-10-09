@@ -479,7 +479,7 @@ pub(super) fn chat_surface(pal: &Palette) -> Color32 {
     pal.panel
 }
 
-fn chat_hover_surface(pal: &Palette) -> Color32 {
+pub(super) fn chat_hover_surface(pal: &Palette) -> Color32 {
     mix_color(pal.bg, pal.panel2, 0.62)
 }
 
@@ -853,6 +853,150 @@ pub(super) fn member_toggle_row(
     }
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, checked, label)
+    });
+    response
+}
+
+/// Drop-down select in the settings style: a 32 px field showing the current
+/// value with a chevron, opening the shared popup menu at the field's width.
+///
+/// `options` yields `(selected, label)` pairs and is only walked while the
+/// menu is open. Returns the index of the option the user picked.
+pub(super) fn select_field<S: AsRef<str>>(
+    ui: &mut Ui,
+    pal: &Palette,
+    name: &str,
+    selected_text: &str,
+    options: impl IntoIterator<Item = (bool, S)>,
+) -> Option<usize> {
+    const RADIUS: u8 = 7;
+    // A persistent id keeps the menu open when rows above it appear or
+    // disappear (update status, device lists).
+    let (_, rect) = ui.allocate_space(Vec2::new(
+        ui.available_width().max(1.0),
+        CHROME_CONTROL_HEIGHT,
+    ));
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("select-field", name)),
+        egui::Sense::click(),
+    );
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    let hot = response.hovered() || response.has_focus();
+    let stroke = if open || response.has_focus() {
+        pal.accent
+    } else if hot {
+        mix_color(pal.line_br, pal.text2, 0.35)
+    } else {
+        pal.line_br
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(RADIUS),
+        if hot {
+            chat_hover_surface(pal)
+        } else {
+            pal.panel
+        },
+        Stroke::new(1.0_f32, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let chevron = if open {
+        Icon::ChevronUp
+    } else {
+        Icon::ChevronDown
+    };
+    painter.text(
+        egui::pos2(rect.right() - 16.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        char::from(chevron),
+        lucide(14.0),
+        if hot || open { pal.text } else { pal.dim },
+    );
+    let text_color = if hot || open { pal.text } else { pal.text2 };
+    let galley = truncated_galley(
+        ui,
+        selected_text,
+        FontId::proportional(ui_font_size(12.0)),
+        text_color,
+        (rect.width() - 10.0 - 32.0).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        text_color,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), name)
+    });
+    let hover_text = (selected_text.chars().count() > 40).then(|| selected_text.to_owned());
+
+    let mut picked = None;
+    let popup_width = rect.width();
+    egui::Popup::menu(&response)
+        .width(popup_width)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(4.0)
+        .show(|ui| {
+            let inner = (popup_width - ui.spacing().menu_margin.sum().x).max(1.0);
+            ui.set_width(inner);
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+            egui::ScrollArea::vertical()
+                .id_salt("select-field-options")
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for (index, (selected, label)) in options.into_iter().enumerate() {
+                        if select_option_row(ui, pal, label.as_ref(), selected).clicked() {
+                            picked = Some(index);
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    if let Some(text) = hover_text {
+        response.on_hover_text(text);
+    }
+    picked
+}
+
+/// One full-width row in a `select_field` menu, with a check on the current
+/// value.
+fn select_option_row(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
+    const HEIGHT: f32 = 28.0;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), HEIGHT),
+        egui::Sense::click(),
+    );
+    let hot = response.hovered() || response.has_focus();
+    if hot {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), chat_hover_surface(pal));
+    }
+    let color = if hot || selected { pal.text } else { pal.text2 };
+    let galley = truncated_galley(
+        ui,
+        label,
+        FontId::proportional(ui_font_size(12.0)),
+        color,
+        (rect.width() - 8.0 - 28.0).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    if selected {
+        ui.painter().text(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            char::from(Icon::Check),
+            lucide(13.0),
+            pal.accent,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
     });
     response
 }
