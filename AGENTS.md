@@ -63,9 +63,12 @@ same feature combinations, so they carry the policy.
 - `unwrap_used`, `expect_used`: denied in production code for every member;
   propagate or handle the error instead.
 - `todo`, `unimplemented`, `dbg_macro`: denied for every member.
-- `await_holding_lock`, `await_holding_refcell_ref`, `let_underscore_future`:
-  denied for every member, so no lock/`RefCell` guard or future is held or
-  dropped across an `.await`.
+- `await_holding_lock` / `await_holding_refcell_ref`: denied for every member,
+  so a synchronous std lock guard or a `RefCell` borrow is not held across an
+  `.await`.
+- `let_underscore_future`: denied for every member, so a future is not
+  discarded unawaited via a `let _ =` binding. Async mutexes and awaiting
+  futures are unaffected.
 - Tests are the exception: `clippy.toml` sets `allow-unwrap-in-tests` and
   `allow-expect-in-tests`, which relaxes `#[test]`/`#[cfg(test)]`/`tests/`
   targets only, not production findings.

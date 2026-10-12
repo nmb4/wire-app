@@ -20,8 +20,9 @@ expect_used = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-# Async/lock/future correctness: never hold a guard or drop a future across an
-# `.await` point.
+# Async correctness: don't hold a synchronous std lock guard or a `RefCell`
+# borrow across an `.await` point, and don't discard a future unawaited via a
+# `let _ =` binding. Async mutexes and awaiting futures are unaffected.
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 let_underscore_future = "deny"
