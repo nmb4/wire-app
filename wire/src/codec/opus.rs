@@ -1,7 +1,8 @@
-use std::{ops::ControlFlow, time::Duration};
+use std::{num::NonZeroUsize, ops::ControlFlow, time::Duration};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use fixed_resample::{FixedResampler, ResampleQuality};
 use ringbuf::{traits::Consumer as _, HeapCons as Consumer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, error::TryRecvError};
@@ -252,6 +253,12 @@ impl AudioSource for MediaTrackOpusDecoder {
 pub struct MediaTrackOpusEncoder {
     sender: broadcast::Sender<MediaFrame>,
     encoder: OpusEncoder,
+    input_channels: usize,
+    output_channels: usize,
+    input_pending: Vec<f32>,
+    channel_input: Vec<f32>,
+    resampled_input: Vec<f32>,
+    resampler: Option<FixedResampler<f32, 2>>,
 }
 
 impl MediaTrackOpusEncoder {
@@ -284,24 +291,75 @@ impl MediaTrackOpusEncoder {
 
     fn new_with_application(
         track_channel_cap: usize,
-        _audio_format: AudioFormat,
+        audio_format: AudioFormat,
         quality: AudioQuality,
         application: opus::Application,
     ) -> Result<(Self, MediaTrack)> {
+        anyhow::ensure!(
+            matches!(audio_format.channel_count, 1 | 2) && audio_format.sample_rate.0 > 0,
+            "Opus input requires mono or stereo audio with a nonzero sample rate"
+        );
         let (sender, receiver) = broadcast::channel(track_channel_cap);
         let channels = quality.channels();
         let track = MediaTrack::new(receiver, Codec::Opus { channels }, TrackKind::Audio);
         let encoder = MediaTrackOpusEncoder {
             sender,
             encoder: OpusEncoder::new_with_application(quality, application),
+            input_channels: audio_format.channel_count as usize,
+            output_channels: channels as usize,
+            input_pending: Vec::new(),
+            channel_input: Vec::new(),
+            resampled_input: Vec::new(),
+            resampler: (audio_format.sample_rate.0 != quality.sample_rate()).then(|| {
+                FixedResampler::new(
+                    NonZeroUsize::new(channels as usize).unwrap(),
+                    audio_format.sample_rate.0,
+                    quality.sample_rate(),
+                    ResampleQuality::High,
+                    true,
+                )
+            }),
         };
+        info!(
+            input_format = ?audio_format,
+            quality = %quality,
+            output_sample_rate = quality.sample_rate(),
+            output_channels = channels as u16,
+            application = ?application,
+            "configured Opus audio track"
+        );
         Ok((encoder, track))
     }
 }
 
 impl AudioSink for MediaTrackOpusEncoder {
     fn tick(&mut self, buf: &[f32]) -> Result<ControlFlow<(), ()>> {
-        for (payload, sample_count) in self.encoder.push_slice(buf) {
+        // Capture uses engine-format audio regardless of the selected quality.
+        // Convert channels and rate before framing it for the Opus encoder.
+        self.input_pending.extend_from_slice(buf);
+        let complete = self.input_pending.len() / self.input_channels * self.input_channels;
+        for frame in self.input_pending[..complete].chunks_exact(self.input_channels) {
+            match (self.input_channels, self.output_channels) {
+                (2, 1) => self.channel_input.push((frame[0] + frame[1]) * 0.5),
+                (1, 2) => self.channel_input.extend_from_slice(&[frame[0], frame[0]]),
+                _ => self.channel_input.extend_from_slice(frame),
+            }
+        }
+        self.input_pending.copy_within(complete.., 0);
+        self.input_pending
+            .truncate(self.input_pending.len() - complete);
+        let samples = if let Some(resampler) = self.resampler.as_mut() {
+            resampler.process_interleaved(
+                &self.channel_input,
+                |samples| self.resampled_input.extend_from_slice(samples),
+                None,
+                false,
+            );
+            &self.resampled_input
+        } else {
+            &self.channel_input
+        };
+        for (payload, sample_count) in self.encoder.push_slice(samples) {
             let payload_len = payload.len();
             let frame = MediaFrame {
                 payload,
@@ -319,6 +377,8 @@ impl AudioSink for MediaTrackOpusEncoder {
                 }
             }
         }
+        self.channel_input.clear();
+        self.resampled_input.clear();
         Ok(ControlFlow::Continue(()))
     }
 }
@@ -328,6 +388,59 @@ pub struct OpusEncoder {
     samples: Vec<f32>,
     out_buf: BytesMut,
     samples_per_frame: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::ENGINE_FORMAT;
+
+    #[test]
+    fn every_quality_preserves_engine_audio_duration() {
+        for quality in [
+            AudioQuality::Low,
+            AudioQuality::Medium,
+            AudioQuality::High,
+            AudioQuality::Ultra,
+        ] {
+            let (mut encoder, mut track) =
+                MediaTrackOpusEncoder::new(128, ENGINE_FORMAT, quality).unwrap();
+            let mut packets = 0;
+            for _ in 0..100 {
+                assert!(matches!(
+                    encoder.tick(&[0.25; 1_920]).unwrap(),
+                    ControlFlow::Continue(())
+                ));
+                while track.try_recv().is_ok() {
+                    packets += 1;
+                }
+            }
+            assert!(
+                (98..=100).contains(&packets),
+                "{quality}: {packets} packets for two seconds"
+            );
+        }
+    }
+
+    #[test]
+    fn opus_timestamps_use_the_48khz_clock_for_every_quality() {
+        for quality in [
+            AudioQuality::Low,
+            AudioQuality::Medium,
+            AudioQuality::High,
+            AudioQuality::Ultra,
+        ] {
+            let mut encoder = OpusEncoder::new(quality);
+            let samples = vec![
+                0.25;
+                AudioFormat::new2(quality.sample_rate(), quality.channels() as u16)
+                    .sample_count(DURATION_20MS)
+            ];
+            let packets: Vec<_> = encoder.push_slice(&samples).collect();
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0].1, 960, "{quality}: wrong RTP clock increment");
+        }
+    }
 }
 
 impl OpusEncoder {
@@ -393,7 +506,9 @@ impl OpusEncoder {
     pub fn push_sample(&mut self, sample: f32) -> Option<(Bytes, u32)> {
         self.samples.push(sample);
         if self.samples.len() >= self.samples_per_frame {
-            let sample_count = self.samples.len() as u32;
+            // Opus RTP always uses a 48 kHz clock, independent of encoded
+            // sample rate and channel count. Every packet here spans 20 ms.
+            let sample_count = OPUS_SAMPLE_RATE / 50;
             let size = self
                 .encoder
                 .encode_float(&self.samples, &mut self.out_buf)

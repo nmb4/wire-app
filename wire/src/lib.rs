@@ -118,4 +118,96 @@ mod tests {
         router2.shutdown().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn duplex_call_delivers_audible_20ms_packets_at_every_quality() -> TestResult {
+        let (router_a, rtc_a) = build().await?;
+        let (router_b, rtc_b) = build().await?;
+        let (conn_a, conn_b) = (
+            rtc_a.connect(router_b.endpoint().node_addr().await?),
+            rtc_b.accept(),
+        )
+            .try_join()
+            .await?;
+        let conn_b = conn_b.unwrap();
+
+        for quality in [
+            AudioQuality::Low,
+            AudioQuality::Medium,
+            AudioQuality::High,
+            AudioQuality::Ultra,
+        ] {
+            let (mut encoder_a, track_a) = MediaTrackOpusEncoder::new(16, ENGINE_FORMAT, quality)?;
+            let (mut encoder_b, track_b) = MediaTrackOpusEncoder::new(16, ENGINE_FORMAT, quality)?;
+            conn_a.send_track(track_a).await?;
+            conn_b.send_track(track_b).await?;
+            let sender = tokio::spawn(async move {
+                for tick in 0..60 {
+                    let samples: Vec<_> = (0..960)
+                        .flat_map(|sample| {
+                            let value =
+                                ((tick * 960 + sample) as f32 * std::f32::consts::TAU * 440.0
+                                    / 48_000.0)
+                                    .sin()
+                                    * 0.25;
+                            [value, value]
+                        })
+                        .collect();
+                    assert!(matches!(
+                        encoder_a.tick(&samples)?,
+                        ControlFlow::Continue(())
+                    ));
+                    assert!(matches!(
+                        encoder_b.tick(&samples)?,
+                        ControlFlow::Continue(())
+                    ));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                anyhow::Ok(())
+            });
+            let received = async {
+                let (track_a, track_b) = (conn_a.recv_track(), conn_b.recv_track())
+                    .try_join()
+                    .await?;
+                async fn check(
+                    mut track: crate::rtc::MediaTrack,
+                    quality: AudioQuality,
+                ) -> anyhow::Result<()> {
+                    let mut decoder = opus::Decoder::new(48_000, quality.channels().into())?;
+                    let mut output = vec![0.0; 960 * quality.channels() as usize];
+                    let mut audible = 0;
+                    for _ in 0..30 {
+                        let frame = track.recv().await?;
+                        assert_eq!(
+                            frame.sample_count,
+                            Some(960),
+                            "{quality}: received incorrect duration"
+                        );
+                        assert_eq!(
+                            decoder.decode_float(&frame.payload, &mut output, false)?,
+                            960
+                        );
+                        if output.iter().any(|sample| sample.abs() > 0.05) {
+                            audible += 1;
+                        }
+                    }
+                    assert!(audible >= 28, "{quality}: silent remote audio");
+                    Ok(())
+                }
+                (
+                    check(track_a.unwrap(), quality),
+                    check(track_b.unwrap(), quality),
+                )
+                    .try_join()
+                    .await?;
+                anyhow::Ok(())
+            };
+            tokio::time::timeout(Duration::from_secs(5), received).await??;
+            sender.await??;
+        }
+        conn_a.transport().close(0u32.into(), b"test complete");
+        router_a.shutdown().await?;
+        router_b.shutdown().await?;
+        Ok(())
+    }
 }

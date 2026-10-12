@@ -434,13 +434,14 @@ impl Worker {
             .iter()
             .map(|(node_id, (generation, track))| (*node_id, *generation, track.clone()))
             .collect();
+        let dir = session.dir().to_path_buf();
+        // Install first: attach_recorder_for looks up this session. Attaching
+        // while it is still a local variable silently skips every existing peer.
+        self.recording = Some(session);
+        self.recording_automatic = automatic;
         for (node_id, generation, track) in active {
             self.attach_recorder_for(node_id, generation, track);
         }
-
-        let dir = session.dir().to_path_buf();
-        self.recording = Some(session);
-        self.recording_automatic = automatic;
         info!(
             automatic,
             dir = %dir.display(),
@@ -499,8 +500,7 @@ impl Worker {
         let peer_names = self.peer_names.clone();
         // Finalizing renames each file to its display name and writes the
         // manifest, so it must not run on the runtime's async tasks.
-        let summary = match tokio::task::spawn_blocking(move || session.finish(&peer_names)).await
-        {
+        let summary = match tokio::task::spawn_blocking(move || session.finish(&peer_names)).await {
             Ok(summary) => summary,
             Err(error) => {
                 warn!("the recording finalizer did not finish: {error}");
@@ -550,7 +550,7 @@ impl Worker {
     /// A recording the user started by hand is theirs to stop, so switching the
     /// preference off must not cut one short.
     async fn stop_auto_recording(&mut self) {
-        if self.record_calls_automatically && self.recording_automatic {
+        if self.recording_automatic {
             self.stop_recording().await;
         }
     }
@@ -1823,6 +1823,7 @@ impl Worker {
                     }
                     self.volumes.remove(&node_id);
                     self.stream_volumes.remove(&node_id);
+                    self.peer_voice_tracks.remove(&node_id);
                     self.remove_video_peer(node_id).await;
                     self.cleanup_after_call_end().await;
                     match state {
@@ -1846,5 +1847,162 @@ impl Worker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use wire::{
+        audio::{AudioSink, ENGINE_FORMAT},
+        codec::opus::{AudioQuality, MediaTrackOpusEncoder},
+    };
+
+    #[test]
+    fn recording_started_mid_call_attaches_existing_peers_and_can_restart() {
+        const CHILD_ENV: &str = "WIRE_RECORDING_TEST_CHILD";
+        // Isolate Wire's config directory and networking identity from the
+        // user's profile and from other tests running in this process.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::worker::recording_tests::recording_started_mid_call_attaches_existing_peers_and_can_restart",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("WIRE_CONFIG_DIR", root.path())
+                .status()
+                .unwrap();
+            assert!(result.success(), "isolated recording regression failed");
+            return;
+        }
+
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (events, receiver) = EventPublisher::new();
+                let (_commands, command_rx) = async_channel::unbounded();
+                let mut worker = Worker::start(events, command_rx).await.unwrap();
+                let mut encoders = Vec::new();
+                for (index, name) in [(1u8, "Alice"), (2u8, "Bob")] {
+                    let peer = iroh::SecretKey::from_bytes(&[index; 32]).public();
+                    let (encoder, track) =
+                        MediaTrackOpusEncoder::new(64, ENGINE_FORMAT, AudioQuality::High).unwrap();
+                    worker.peer_names.insert(peer, name.to_owned());
+                    worker.call_generations.insert(peer, 1);
+                    worker.on_voice_track(peer, 1, track);
+                    encoders.push(encoder);
+                }
+
+                for _ in 0..2 {
+                    worker.start_recording(false).await.unwrap();
+                    let session = worker.recording.as_ref().unwrap();
+                    let dir = session.dir().to_path_buf();
+                    for peer in worker.peer_voice_tracks.keys() {
+                        assert!(session.has_speaker(*peer), "existing peer was skipped");
+                    }
+                    worker.start_recording(false).await.unwrap();
+                    assert_eq!(worker.recording.as_ref().unwrap().dir(), dir);
+
+                    // Feed both real Opus tracks on their normal call clock.
+                    for frame in 0..25 {
+                        let signal: Vec<f32> = (0..960)
+                            .flat_map(|sample| {
+                                let phase =
+                                    (frame * 960 + sample) as f32 * std::f32::consts::TAU * 440.0
+                                        / 48_000.0;
+                                let value = phase.sin() * 0.25;
+                                [value, value]
+                            })
+                            .collect();
+                        for encoder in &mut encoders {
+                            assert!(matches!(
+                                encoder.tick(&signal).unwrap(),
+                                std::ops::ControlFlow::Continue(())
+                            ));
+                        }
+                        time::sleep(Duration::from_millis(20)).await;
+                    }
+                    worker.stop_recording().await;
+                    assert!(worker.recording.is_none());
+                    assert!(!worker.recording_automatic);
+                    let mut summary = None;
+                    let mut inactive = false;
+                    while let Ok(event) = receiver.try_recv() {
+                        match event {
+                            Event::CallRecordingToggled {
+                                active: false,
+                                dir: None,
+                            } => inactive = true,
+                            Event::CallRecordingStopped { summary: stopped } => {
+                                summary = Some(stopped)
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(inactive, "stop did not clear the recording UI state");
+                    let summary = summary.expect("stop did not publish the completed recording");
+                    assert_eq!(summary.speakers.len(), 2);
+                    for speaker in summary.speakers {
+                        assert!(speaker.error.is_none(), "{:?}", speaker.error);
+                        let bytes = std::fs::read(dir.join(speaker.file_name.unwrap())).unwrap();
+                        assert!(
+                            bytes[44..].chunks_exact(2).any(|sample| {
+                                i16::from_le_bytes([sample[0], sample[1]]).abs() > 100
+                            }),
+                            "{} was silent",
+                            speaker.name
+                        );
+                    }
+                    worker.stop_recording().await;
+                    assert!(
+                        receiver.try_recv().is_err(),
+                        "repeated stop emitted another event"
+                    );
+                }
+                let peer = *worker.peer_voice_tracks.keys().next().unwrap();
+                let stale_track = worker.peer_voice_tracks[&peer].1.clone();
+                worker.active_calls.insert(peer, CallInfo::Calling);
+                worker
+                    .handle_command(Command::Abort { node_id: peer })
+                    .await
+                    .unwrap();
+                assert!(!worker.peer_voice_tracks.contains_key(&peer));
+                worker.on_voice_track(peer, 1, stale_track);
+                assert!(
+                    !worker.peer_voice_tracks.contains_key(&peer),
+                    "late track resurrected aborted call"
+                );
+                worker.start_recording(false).await.unwrap();
+                assert!(!worker.recording.as_ref().unwrap().has_speaker(peer));
+                worker.record_calls_automatically = true;
+                worker
+                    .handle_command(Command::SetRecordCallsAutomatically { enabled: false })
+                    .await
+                    .unwrap();
+                assert!(
+                    worker.recording.is_some(),
+                    "preference change stopped a manual recording"
+                );
+                worker.stop_recording().await;
+                // The command updates the preference before deciding whether
+                // to stop. Session ownership must survive that transition.
+                worker.record_calls_automatically = true;
+                worker.start_recording(true).await.unwrap();
+                worker
+                    .handle_command(Command::SetRecordCallsAutomatically { enabled: false })
+                    .await
+                    .unwrap();
+                assert!(
+                    worker.recording.is_none(),
+                    "disabling auto-record left it running"
+                );
+                assert!(!worker.recording_automatic);
+                worker._router.shutdown().await.unwrap();
+            });
     }
 }

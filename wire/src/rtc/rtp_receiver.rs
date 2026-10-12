@@ -68,7 +68,7 @@ impl RtpMediaTrackReceiver {
                 } = frame;
                 let frame = MediaFrame {
                     payload: data,
-                    sample_count: Some((sample_rate as f32 / duration.as_secs_f32()) as u32),
+                    sample_count: Some((sample_rate as f64 * duration.as_secs_f64()).round() as u32),
                     skipped_frames: Some(prev_dropped_packets as u32),
                     skipped_samples: None,
                 };
