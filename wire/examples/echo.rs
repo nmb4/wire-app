@@ -75,8 +75,8 @@ async fn handle_connection(conn: Connection, opts: Opts) -> Result<()> {
 
     let flow_id = VarInt::from_u32(0);
     let session = Session::new(conn);
-    let send_flow = session.new_send_flow(flow_id).await.unwrap();
-    let mut recv_flow = session.new_receive_flow(flow_id).await.unwrap();
+    let send_flow = session.new_send_flow(flow_id).await?;
+    let mut recv_flow = session.new_receive_flow(flow_id).await?;
 
     let recv_fut = async move {
         loop {

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Device, Sample, SampleFormat,
@@ -105,15 +105,19 @@ impl AudioPlayback {
                 warn!("failed to set playback thread to realtime priority: {err:?}");
             }
             let stream = match start_playback_stream(&device, &stream_config, processor, consumer) {
-                Ok(stream) => {
-                    init_tx.send(Ok(())).unwrap();
-                    stream
-                }
+                Ok(stream) => stream,
                 Err(err) => {
-                    init_tx.send(Err(err)).unwrap();
+                    // The builder may have been dropped before it awaited
+                    // initialization, in which case there is no receiver left.
+                    let _ = init_tx.send(Err(err));
                     return;
                 }
             };
+            if init_tx.send(Ok(())).is_err() {
+                // Nobody is waiting for the stream: stop the worker instead of
+                // running the playback loop for a dropped builder.
+                return;
+            }
             playback_loop(producer, source_receiver, deafened_for_thread);
             drop(stream);
         });
@@ -365,14 +369,10 @@ fn start_playback_stream(
 ) -> Result<cpal::Stream> {
     let config = &stream_config.config;
     let format = stream_config.audio_format();
-    validate_output_format(format)?;
+    let channels = validate_output_format(format)?;
     #[cfg(feature = "audio-processing")]
     processor.init_playback(ENGINE_FORMAT.channel_count as usize)?;
-    let resampler = device_resampler(
-        NonZeroUsize::new(format.channel_count as usize).unwrap(),
-        SAMPLE_RATE.0,
-        format.sample_rate.0,
-    );
+    let resampler = device_resampler(channels, SAMPLE_RATE.0, format.sample_rate.0)?;
     let state = PlaybackState {
         consumer,
         format,
@@ -405,12 +405,18 @@ struct PlaybackState {
     consumer: Consumer<f32>,
 }
 
-fn validate_output_format(format: AudioFormat) -> Result<()> {
+fn validate_output_format(format: AudioFormat) -> Result<NonZeroUsize> {
     anyhow::ensure!(
-        matches!(format.channel_count, 1 | 2) && format.sample_rate.0 > 0,
+        format.sample_rate.0 > 0,
         "audio playback requires a mono or stereo device with a nonzero sample rate, got {format:?}"
     );
-    Ok(())
+    NonZeroUsize::new(format.channel_count as usize)
+        .filter(|channels| channels.get() <= 2)
+        .with_context(|| {
+            format!(
+                "audio playback requires a mono or stereo device with a nonzero sample rate, got {format:?}"
+            )
+        })
 }
 
 impl PlaybackState {
@@ -706,7 +712,8 @@ mod tests {
                 NonZeroUsize::new(format.channel_count as usize).unwrap(),
                 SAMPLE_RATE.0,
                 format.sample_rate.0,
-            ),
+            )
+            .unwrap(),
         }
     }
 

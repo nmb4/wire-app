@@ -1,12 +1,12 @@
 use std::{num::NonZeroUsize, ops::ControlFlow, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use fixed_resample::{FixedResampler, ResampleQuality};
 use ringbuf::{traits::Consumer as _, HeapCons as Consumer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, error::TryRecvError};
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace};
 
 use super::Codec;
 use crate::{
@@ -16,6 +16,9 @@ use crate::{
 
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub const OPUS_STREAM_PARAMS: AudioFormat = AudioFormat::new2(OPUS_SAMPLE_RATE, 2);
+
+/// Opus stereo is two channels; expose it as a `NonZeroUsize` for the resampler.
+const STEREO_CHANNELS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 const DURATION_20MS: Duration = Duration::from_millis(20);
 
@@ -30,6 +33,16 @@ impl From<OpusChannels> for ::opus::Channels {
         match value {
             OpusChannels::Mono => ::opus::Channels::Mono,
             OpusChannels::Stereo => ::opus::Channels::Stereo,
+        }
+    }
+}
+
+impl OpusChannels {
+    /// The channel count as a `NonZeroUsize` for resampler construction.
+    fn resampler_channels(self) -> NonZeroUsize {
+        match self {
+            OpusChannels::Mono => NonZeroUsize::MIN,
+            OpusChannels::Stereo => STEREO_CHANNELS,
         }
     }
 }
@@ -130,8 +143,8 @@ impl MediaTrackOpusDecoder {
             Codec::Opus { channels } => channels,
         };
         let audio_format = AudioFormat::new2(OPUS_SAMPLE_RATE, channel_count as u16);
-        let decoder =
-            opus::Decoder::new(OPUS_STREAM_PARAMS.sample_rate.0, channel_count.into()).unwrap();
+        let decoder = opus::Decoder::new(OPUS_STREAM_PARAMS.sample_rate.0, channel_count.into())
+            .context("failed to create the Opus decoder")?;
         let buffer_size = audio_format.sample_count(DURATION_20MS);
         let decode_buf = vec![0.; buffer_size];
         let audio_buf = vec![];
@@ -156,7 +169,9 @@ impl MediaTrackOpusDecoder {
         match self.audio_format.channel_count {
             1 => self.audio_buf.extend(decoded.iter().flat_map(|s| [s, s])),
             2 => self.audio_buf.extend(decoded),
-            _ => unreachable!(),
+            channels => {
+                anyhow::bail!("cannot upscale a {channels}-channel Opus frame to stereo")
+            }
         }
         Ok(sample_count)
     }
@@ -166,9 +181,14 @@ impl MediaTrackOpusDecoder {
     }
 
     pub fn advance(&mut self, n: usize) {
-        if n > self.audio_buf.len() {
-            panic!("requested advance further than buffer length");
-        }
+        // Callers only advance by samples they peeked from this buffer, so a
+        // larger `n` is a decoder-loop bug, not bad input. Fail fast rather
+        // than silently desynchronizing the audio stream.
+        assert!(
+            n <= self.audio_buf.len(),
+            "requested advance of {n} beyond buffer length {}",
+            self.audio_buf.len()
+        );
         self.audio_buf.copy_within(n.., 0);
         self.audio_buf.truncate(self.audio_buf.len() - n);
     }
@@ -312,7 +332,7 @@ impl MediaTrackOpusEncoder {
             resampled_input: Vec::new(),
             resampler: (audio_format.sample_rate.0 != quality.sample_rate()).then(|| {
                 FixedResampler::new(
-                    NonZeroUsize::new(channels as usize).unwrap(),
+                    channels.resampler_channels(),
                     audio_format.sample_rate.0,
                     quality.sample_rate(),
                     ResampleQuality::High,
@@ -452,14 +472,19 @@ impl OpusEncoder {
         let channels = quality.channels();
         let sample_rate = quality.sample_rate();
         let format = AudioFormat::new2(sample_rate, channels as u16);
+        // Opus only rejects an invalid sample rate or channel count, and both
+        // come from the fixed `AudioQuality` table, so construction cannot
+        // fail. This public constructor returns `Self`, so the error cannot be
+        // propagated; assert the invariant at the narrowest site instead.
+        #[allow(clippy::unwrap_used)]
         let mut encoder = opus::Encoder::new(sample_rate, channels.into(), application).unwrap();
         encoder
             .set_bitrate(opus::Bitrate::Bits(quality.bitrate()))
             .ok();
         debug!(
-            "initialized opus encoder: channels {} bitrate {:?} bandwidth {:?}",
+            "initialized opus encoder: channels {} bitrate {} bandwidth {:?}",
             channels as u16,
-            encoder.get_bitrate().unwrap(),
+            quality.bitrate(),
             encoder.get_bandwidth()
         );
         let mut out_buf = BytesMut::new();
@@ -509,10 +534,18 @@ impl OpusEncoder {
             // Opus RTP always uses a 48 kHz clock, independent of encoded
             // sample rate and channel count. Every packet here spans 20 ms.
             let sample_count = OPUS_SAMPLE_RATE / 50;
-            let size = self
-                .encoder
-                .encode_float(&self.samples, &mut self.out_buf)
-                .expect("failed to encode");
+            let size = match self.encoder.encode_float(&self.samples, &mut self.out_buf) {
+                Ok(size) => size,
+                Err(error) => {
+                    // The output buffer is sized for a full frame, so an
+                    // encode failure means the encoder is unusable. Drop this
+                    // frame instead of panicking the audio thread.
+                    error!("failed to encode an Opus frame, dropping it: {error}");
+                    self.samples.clear();
+                    self.out_buf.resize(self.samples_per_frame, 0);
+                    return None;
+                }
+            };
             self.samples.clear();
             let encoded = self.out_buf.split_to(size).freeze();
             self.out_buf.resize(self.samples_per_frame, 0);

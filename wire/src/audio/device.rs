@@ -157,7 +157,9 @@ pub fn find_input_stream_config(
     device: &Device,
     format: &AudioFormat,
 ) -> Result<StreamConfigWithFormat> {
-    let d = device.name().unwrap();
+    let d = device
+        .name()
+        .context("failed to read the audio device name")?;
     debug!("find capture stream config for device {d} and format {format:?}");
     let mut supported_configs: Vec<_> = device
         .supported_input_configs()
@@ -194,7 +196,9 @@ pub fn find_output_stream_config(
     device: &Device,
     format: &AudioFormat,
 ) -> Result<StreamConfigWithFormat> {
-    let d = device.name().unwrap();
+    let d = device
+        .name()
+        .context("failed to read the audio device name")?;
     debug!("find playback stream config for device {d} and format {format:?}");
     let mut supported_configs: Vec<_> = device
         .supported_output_configs()

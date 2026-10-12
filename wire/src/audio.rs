@@ -42,6 +42,12 @@ mod playback;
 pub const SAMPLE_RATE: SampleRate = SampleRate(48_000);
 pub const ENGINE_FORMAT: AudioFormat = AudioFormat::new(SAMPLE_RATE, 2);
 
+/// The engine pipeline is always 48 kHz stereo. Exposing the count as a
+/// `NonZeroUsize` lets resampler construction use the same constant the engine
+/// already relies on instead of re-checking the `Option` at each call site.
+const ENGINE_CHANNELS: NonZeroUsize =
+    NonZeroUsize::new(ENGINE_FORMAT.channel_count as usize).unwrap();
+
 const DURATION_10MS: Duration = Duration::from_millis(10);
 const DURATION_20MS: Duration = Duration::from_millis(20);
 
@@ -69,7 +75,7 @@ fn device_resampler(
     channels: NonZeroUsize,
     input_rate: u32,
     output_rate: u32,
-) -> FixedResampler<f32, 2> {
+) -> Result<FixedResampler<f32, 2>> {
     #[cfg(target_os = "macos")]
     {
         use fixed_resample::rubato::{FastFixedIn, PolynomialDegree};
@@ -84,20 +90,24 @@ fn device_resampler(
             PolynomialDegree::Linear,
             input_block_frames,
             channels.get(),
-        )
-        .expect("valid fixed device resampling ratio");
-        FixedResampler::from_custom(inner, input_rate, output_rate, true)
+        )?;
+        Ok(FixedResampler::from_custom(
+            inner,
+            input_rate,
+            output_rate,
+            true,
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        FixedResampler::new(
+        Ok(FixedResampler::new(
             channels,
             input_rate,
             output_rate,
             ResampleQuality::High,
             true,
-        )
+        ))
     }
 }
 
@@ -309,7 +319,7 @@ mod format_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn device_resampler_emits_twenty_ms_without_batching() {
-        let mut capture = device_resampler(NonZeroUsize::new(2).unwrap(), 16_000, 48_000);
+        let mut capture = device_resampler(NonZeroUsize::new(2).unwrap(), 16_000, 48_000).unwrap();
         let capture_input = vec![0.0; 320 * 2];
         let mut capture_output = 0;
         capture.process_interleaved(
@@ -320,7 +330,7 @@ mod format_tests {
         );
         assert!((960..=1_920).contains(&capture_output));
 
-        let mut playback = device_resampler(NonZeroUsize::new(1).unwrap(), 48_000, 16_000);
+        let mut playback = device_resampler(NonZeroUsize::new(1).unwrap(), 48_000, 16_000).unwrap();
         let playback_input = vec![0.0; 960];
         let mut playback_output = 0;
         playback.process_interleaved(

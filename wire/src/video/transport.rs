@@ -96,6 +96,18 @@ pub async fn send_frame<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Read a big-endian fixed-width integer from the video header at a known
+/// offset. The header buffer is always `VIDEO_FRAME_HEADER_LEN` bytes, so the
+/// offsets are in range by construction; `?` reports a truncated header
+/// instead of panicking on a network-provided frame.
+fn read_be<const N: usize>(header: &[u8], offset: usize) -> Result<[u8; N]> {
+    header
+        .get(offset..)
+        .and_then(|rest| rest.get(..N))
+        .and_then(|bytes| bytes.try_into().ok())
+        .with_context(|| format!("video frame header is truncated at offset {offset}"))
+}
+
 pub async fn recv_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<EncodedVideoFrame>> {
     let mut len_buf = [0u8; 4];
     match recv.read_exact(&mut len_buf).await {
@@ -118,11 +130,11 @@ pub async fn recv_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<Enc
     if header[3] & !VIDEO_FLAG_KEYFRAME != 0 {
         anyhow::bail!("unsupported video frame flags: {:#04x}", header[3]);
     }
-    let sequence = u64::from_be_bytes(header[4..12].try_into().unwrap());
-    let sent_at_micros = u64::from_be_bytes(header[12..20].try_into().unwrap());
-    let width = u16::from_be_bytes(header[20..22].try_into().unwrap());
-    let height = u16::from_be_bytes(header[22..24].try_into().unwrap());
-    let fps = u16::from_be_bytes(header[24..26].try_into().unwrap());
+    let sequence = u64::from_be_bytes(read_be(&header, 4)?);
+    let sent_at_micros = u64::from_be_bytes(read_be(&header, 12)?);
+    let width = u16::from_be_bytes(read_be(&header, 20)?);
+    let height = u16::from_be_bytes(read_be(&header, 22)?);
+    let fps = u16::from_be_bytes(read_be(&header, 24)?);
     let mut data = vec![0u8; len - VIDEO_FRAME_HEADER_LEN];
     recv.read_exact(&mut data).await?;
     Ok(Some(EncodedVideoFrame {

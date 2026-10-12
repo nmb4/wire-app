@@ -52,10 +52,8 @@ tracing-test = "0.2.5"
 default = ["audio-processing"]
 audio-processing = ["dep:sonora"]
 
-# Pending migration of this crate's production `unwrap`/`expect` sites, only the
-# panic-adjacent rules are enforced here. Switch to `[lints] workspace = true`
-# once the migration lands.
-[lints.clippy]
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
+# Production `unwrap`/`expect` sites are migrated to real error handling, so
+# this crate inherits the full workspace policy including `unwrap_used` and
+# `expect_used`.
+[lints]
+workspace = true

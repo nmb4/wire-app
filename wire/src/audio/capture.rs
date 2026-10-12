@@ -1,5 +1,4 @@
 use std::{
-    num::NonZeroUsize,
     ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
@@ -8,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Device, SampleFormat,
@@ -28,7 +27,7 @@ use super::{
     device_resampler,
     noise_suppression::RnnoiseSuppressor,
     update_audio_level, AudioFormat, AudioLevelHandle, WebrtcAudioProcessor, DURATION_10MS,
-    DURATION_20MS, ENGINE_FORMAT,
+    DURATION_20MS, ENGINE_CHANNELS, ENGINE_FORMAT,
 };
 use crate::{
     codec::opus::{AudioQuality, MediaTrackOpusEncoder},
@@ -92,16 +91,20 @@ impl AudioCapture {
                 processor,
                 noise_suppression_enabled,
             ) {
-                Ok(stream) => {
-                    init_tx.send(Ok(())).unwrap();
-                    stream
-                }
+                Ok(stream) => stream,
                 Err(err) => {
                     let err = err.context("failed to start capture stream");
-                    init_tx.send(Err(err)).unwrap();
+                    // The builder may have been dropped before it awaited
+                    // initialization, in which case there is no receiver left.
+                    let _ = init_tx.send(Err(err));
                     return;
                 }
             };
+            if init_tx.send(Ok(())).is_err() {
+                // Nobody is waiting for the stream: stop the worker instead of
+                // running the capture loop for a dropped builder.
+                return;
+            }
             capture_loop(consumer, sink_receiver, muted_for_thread, level_for_thread);
             drop(stream);
         });
@@ -151,12 +154,16 @@ fn start_capture_stream(
     processor.init_capture(ENGINE_FORMAT.channel_count as usize)?;
 
     let capture_format = stream_config.audio_format();
+    ensure!(
+        matches!(capture_format.channel_count, 1 | 2) && capture_format.sample_rate.0 > 0,
+        "capture requires a mono or stereo device with a nonzero sample rate, got {capture_format:?}"
+    );
 
     let resampler = device_resampler(
-        NonZeroUsize::new(ENGINE_FORMAT.channel_count as usize).unwrap(),
+        ENGINE_CHANNELS,
         capture_format.sample_rate.0,
         ENGINE_FORMAT.sample_rate.0,
-    );
+    )?;
     let state = CaptureState {
         format: capture_format,
         producer,
@@ -243,8 +250,15 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
             } else if state.format.channel_count == 2 {
                 input_buf.extend(data.iter().map(|s| s.to_sample()));
             } else {
-                // checked above.
-                unreachable!()
+                // The stream config is validated to be mono or stereo before
+                // the stream is built. If a device still reports anything else,
+                // log it and drop the callback rather than panicking the audio
+                // thread.
+                error!(
+                    "unsupported capture channel count {}, dropping callback",
+                    state.format.channel_count
+                );
+                return;
             };
 
             // resample
@@ -267,7 +281,9 @@ fn build_capture_stream<S: dasp_sample::ToSample<f32> + cpal::SizedSample + Defa
             let mut pushed = 0;
             for chunk in &mut chunks {
                 #[cfg(feature = "audio-processing")]
-                state.processor.process_capture_frame(chunk).unwrap();
+                if let Err(error) = state.processor.process_capture_frame(chunk) {
+                    error!("audio capture processing failed: {error:#}");
+                }
 
                 if let Some(suppressor) = &mut state.noise_suppressor {
                     suppressor.process_interleaved(chunk);

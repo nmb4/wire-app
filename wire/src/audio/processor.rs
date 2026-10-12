@@ -1,17 +1,17 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     time::Duration,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use sonora::{
     config::{EchoCanceller, HighPassFilter},
     AudioProcessing, Config, StreamConfig,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::SAMPLE_RATE;
 
@@ -199,7 +199,7 @@ impl WebrtcAudioProcessor {
             ))
             .build();
         processor.set_stream_delay_ms(self.total_stream_delay_ms() as i32)?;
-        *self.0.processor.lock().unwrap() = Some(ProcessorState {
+        *self.lock_processor()? = Some(ProcessorState {
             processor,
             capture_frame,
             render_frame,
@@ -208,11 +208,20 @@ impl WebrtcAudioProcessor {
         Ok(())
     }
 
+    /// Lock the processor state, reporting a poisoned mutex as an error rather
+    /// than recovering state that a panicking thread may have left inconsistent.
+    fn lock_processor(&self) -> Result<MutexGuard<'_, Option<ProcessorState>>> {
+        self.0
+            .processor
+            .lock()
+            .map_err(|_| anyhow!("audio processor state mutex is poisoned"))
+    }
+
     pub fn process_capture_frame(&self, frame: &mut [f32]) -> Result<()> {
         if !self.is_enabled() {
             return Ok(());
         }
-        if let Some(state) = self.0.processor.lock().unwrap().as_mut() {
+        if let Some(state) = self.lock_processor()?.as_mut() {
             state
                 .capture_frame
                 .process_capture(&mut state.processor, frame)?;
@@ -224,7 +233,7 @@ impl WebrtcAudioProcessor {
         if !self.is_enabled() {
             return Ok(());
         }
-        if let Some(state) = self.0.processor.lock().unwrap().as_mut() {
+        if let Some(state) = self.lock_processor()?.as_mut() {
             state
                 .render_frame
                 .process_render(&mut state.processor, frame)?;
@@ -260,11 +269,17 @@ impl WebrtcAudioProcessor {
 
     fn update_stream_delay(&self) {
         let total = self.total_stream_delay_ms();
-        if let Some(state) = self.0.processor.lock().unwrap().as_mut() {
-            state
-                .processor
-                .set_stream_delay_ms(total as i32)
-                .expect("clamped audio processor delay must be valid");
+        // This runs from the realtime audio callback and cannot propagate an
+        // error, so report the failure and leave the previous delay in place.
+        match self.lock_processor() {
+            Ok(mut guard) => {
+                if let Some(state) = guard.as_mut() {
+                    if let Err(error) = state.processor.set_stream_delay_ms(total as i32) {
+                        warn!("could not set audio processor stream delay to {total} ms: {error}");
+                    }
+                }
+            }
+            Err(error) => warn!("could not update audio processor stream delay: {error:#}"),
         }
     }
 }
