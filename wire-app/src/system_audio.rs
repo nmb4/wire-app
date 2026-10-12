@@ -462,12 +462,14 @@ mod windows {
             .context("ActivateAudioInterfaceAsync failed")?;
 
             let (lock, signal) = &*ready;
-            let mut completed = lock.lock().expect("system audio activation lock");
+            let mut completed = lock
+                .lock()
+                .map_err(|_| anyhow!("system audio activation lock poisoned"))?;
             while !*completed {
-                completed = signal
+                let (guard, _) = signal
                     .wait_timeout(completed, Duration::from_secs(3))
-                    .expect("system audio activation wait")
-                    .0;
+                    .map_err(|_| anyhow!("system audio activation wait lock poisoned"))?;
+                completed = guard;
                 if !*completed {
                     anyhow::bail!("process loopback activation timed out");
                 }
@@ -502,7 +504,10 @@ mod windows {
             _operation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
         ) -> windows::core::Result<()> {
             let (lock, signal) = &*self.0;
-            let mut completed = lock.lock().expect("system audio activation lock");
+            let Ok(mut completed) = lock.lock() else {
+                warn!("system audio activation lock poisoned; ignoring completion callback");
+                return Ok(());
+            };
             *completed = true;
             signal.notify_one();
             Ok(())

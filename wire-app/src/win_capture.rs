@@ -216,37 +216,37 @@ impl WindowsCapturer {
     pub fn try_new(target_w: u32, target_h: u32, target: Option<&CaptureTarget>) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
         let flags = CaptureFlags { tx };
-        let control = match target.map(|target| target.kind) {
-            Some(CaptureTargetKind::Display) => {
-                let target = target.expect("capture target was present");
-                let monitor = Monitor::enumerate()
-                    .context("failed to enumerate monitors")?
-                    .into_iter()
-                    .find(|monitor| monitor.as_raw_hmonitor() as usize as u32 == target.id)
-                    .context("selected monitor is no longer available")?;
-                CaptureHandler::start_free_threaded(Settings::new(
-                    monitor,
-                    CursorCaptureSettings::WithCursor,
-                    DrawBorderSettings::Default,
-                    ColorFormat::Bgra8,
-                    flags,
-                ))
-            }
-            Some(CaptureTargetKind::Window) => {
-                let target = target.expect("capture target was present");
-                let window = Window::enumerate()
-                    .context("failed to enumerate windows")?
-                    .into_iter()
-                    .find(|window| window.as_raw_hwnd() as usize as u32 == target.id)
-                    .context("selected window is no longer available")?;
-                CaptureHandler::start_free_threaded(Settings::new(
-                    window,
-                    CursorCaptureSettings::WithCursor,
-                    DrawBorderSettings::Default,
-                    ColorFormat::Bgra8,
-                    flags,
-                ))
-            }
+        let control = match target {
+            Some(target) => match target.kind {
+                CaptureTargetKind::Display => {
+                    let monitor = Monitor::enumerate()
+                        .context("failed to enumerate monitors")?
+                        .into_iter()
+                        .find(|monitor| monitor.as_raw_hmonitor() as usize as u32 == target.id)
+                        .context("selected monitor is no longer available")?;
+                    CaptureHandler::start_free_threaded(Settings::new(
+                        monitor,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::Default,
+                        ColorFormat::Bgra8,
+                        flags,
+                    ))
+                }
+                CaptureTargetKind::Window => {
+                    let window = Window::enumerate()
+                        .context("failed to enumerate windows")?
+                        .into_iter()
+                        .find(|window| window.as_raw_hwnd() as usize as u32 == target.id)
+                        .context("selected window is no longer available")?;
+                    CaptureHandler::start_free_threaded(Settings::new(
+                        window,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::Default,
+                        ColorFormat::Bgra8,
+                        flags,
+                    ))
+                }
+            },
             None => {
                 let monitor = Monitor::primary().context("failed to get primary monitor")?;
                 CaptureHandler::start_free_threaded(Settings::new(

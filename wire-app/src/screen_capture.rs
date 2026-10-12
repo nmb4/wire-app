@@ -459,9 +459,8 @@ fn init_xcap_source(
     target_h: u32,
     target: Option<&CaptureTarget>,
 ) -> Result<CaptureSource> {
-    match target.map(|target| target.kind) {
-        Some(CaptureTargetKind::Window) => {
-            let target = target.expect("capture target was present");
+    match target {
+        Some(target) if target.kind == CaptureTargetKind::Window => {
             let window = xcap::Window::all()
                 .context("failed to enumerate windows")?
                 .into_iter()
@@ -809,21 +808,21 @@ fn run_encode_loop(
                     gpu_input_dimensions = None;
                     force_keyframe_pending = true;
                 }
-                if encoder.is_none() {
-                    match FrameEncoder::try_new_with_wgc_device(&config, &gpu.device) {
+                let encoder = match encoder.as_mut() {
+                    Some(encoder) => encoder,
+                    None => match FrameEncoder::try_new_with_wgc_device(&config, &gpu.device) {
                         Ok(new_encoder) => {
-                            encoder = Some(new_encoder);
                             gpu_encoder_ready = true;
                             gpu_input_dimensions = Some(dimensions);
+                            encoder.insert(new_encoder)
                         }
                         Err(e) => {
                             warn!("GPU-native encode unavailable; using CPU fallback: {e:#}");
-                            encoder = Some(FrameEncoder::try_new_for_cpu_input(&config)?);
                             gpu_input_dimensions = None;
+                            encoder.insert(FrameEncoder::try_new_for_cpu_input(&config)?)
                         }
-                    }
-                }
-                let encoder = encoder.as_mut().expect("video encoder was initialized");
+                    },
+                };
                 if force_keyframe_pending {
                     encoder.force_keyframe();
                     force_keyframe_pending = false;

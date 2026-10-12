@@ -249,9 +249,9 @@ fn tray_guid() -> u128 {
 
 /// Turn an opaque identity string into a well-formed version 4 GUID.
 fn guid_for(identity: &str) -> u128 {
-    let mut bytes: [u8; 16] = Sha256::digest(identity.as_bytes())[..16]
-        .try_into()
-        .expect("a SHA-256 digest is longer than 16 bytes");
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
     // Stamp the RFC 4122 version and variant bits so the hash reads as a random
     // GUID instead of an arbitrary 128-bit number.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

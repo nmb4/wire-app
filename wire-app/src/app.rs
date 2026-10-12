@@ -3674,22 +3674,21 @@ impl AppState {
     }
 
     fn add_friend(&mut self) {
-        let node_id = self.new_friend_id.trim().to_string();
-        if node_id.is_empty() {
+        let raw_id = self.new_friend_id.trim().to_string();
+        if raw_id.is_empty() {
             return;
         }
-        if NodeId::from_str(&node_id).is_err() {
+        // Parse once: the parsed id is the only value that reaches the record,
+        // so there is no second, infallible parse to unwrap.
+        let Ok(node_id) = NodeId::from_str(&raw_id) else {
             return;
-        }
+        };
         let name = if self.new_friend_name.trim().is_empty() {
             "Unnamed contact".to_owned()
         } else {
             self.new_friend_name.trim().to_string()
         };
-        self.add_friend_record(
-            NodeId::from_str(&node_id).expect("node ID was validated"),
-            name,
-        );
+        self.add_friend_record(node_id, name);
         self.new_friend_name.clear();
         self.new_friend_id.clear();
     }

@@ -199,6 +199,11 @@ fn cleanup_runaway_logs(root: &std::path::Path) {
     }
 }
 
+// The directives added below are compile-time string literals for fixed
+// targets. Parsing them cannot fail at runtime, so the invariants are asserted
+// with `expect` rather than silently dropped; this is the narrowest site for
+// that assumption.
+#[allow(clippy::expect_used)]
 fn init_logging(dev_pair: Option<(&str, usize)>) {
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("warn,wire=info,wire_app_lib=info,wire_app_lib::chat=debug")
@@ -350,10 +355,14 @@ fn main() -> Result<(), eframe::Error> {
     let rounded = window_frame::style_wants_rounded(frame_style);
     let mut options = NativeOptions::default();
     options.renderer = eframe::Renderer::Wgpu;
+    options.viewport = options.viewport.with_title("Wire");
+    // An undecodable embedded icon is a packaging problem, not a reason to
+    // abort startup; fall back to the platform default window icon.
+    if let Some(icon) = load_app_icon() {
+        options.viewport = options.viewport.with_icon(icon);
+    }
     options.viewport = options
         .viewport
-        .with_title("Wire")
-        .with_icon(load_app_icon())
         .with_decorations(false)
         .with_transparent(rounded)
         .with_resizable(true)
@@ -390,14 +399,18 @@ fn main() -> Result<(), eframe::Error> {
     result
 }
 
-fn load_app_icon() -> egui::IconData {
-    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
-        .expect("app icon asset")
-        .into_rgba8();
+fn load_app_icon() -> Option<egui::IconData> {
+    let image = match image::load_from_memory(include_bytes!("../assets/icon.png")) {
+        Ok(image) => image.into_rgba8(),
+        Err(error) => {
+            tracing::warn!("embedded app icon could not be decoded: {error}");
+            return None;
+        }
+    };
     let (width, height) = image.dimensions();
-    egui::IconData {
+    Some(egui::IconData {
         rgba: image.into_raw(),
         width,
         height,
-    }
+    })
 }

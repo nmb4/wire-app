@@ -183,7 +183,7 @@ impl RecordingSession {
         }
         let slot = self.reserve_slot(node_id, name);
         let (tap, writer) =
-            start_speaker_writer(slot.file_name.clone(), self.dir.clone(), slot.state.clone());
+            start_speaker_writer(slot.file_name.clone(), self.dir.clone(), slot.state.clone())?;
         // The capture loop keeps this sink alive and ticks it once per frame;
         // it drops the tap when the stop flag is set, which closes the writer.
         audio.add_capture_sink(tap).await.with_context(|| {
@@ -214,7 +214,7 @@ impl RecordingSession {
         }
         let slot = self.reserve_slot(node_id, name);
         let (mut tap, writer) =
-            start_speaker_writer(slot.file_name.clone(), self.dir.clone(), slot.state.clone());
+            start_speaker_writer(slot.file_name.clone(), self.dir.clone(), slot.state.clone())?;
         let file_name = slot.file_name.clone();
         let source = VoiceSource::new(generation, track);
         let thread_source = source.clone();
@@ -474,20 +474,20 @@ fn start_speaker_writer(
     file_name: String,
     dir: PathBuf,
     state: Arc<TapState>,
-) -> (RecordingTap, JoinHandle<WriterOutcome>) {
+) -> Result<(RecordingTap, JoinHandle<WriterOutcome>)> {
     let (sender, receiver) = sync_channel::<Vec<f32>>(FRAME_QUEUE_CAPACITY);
     let writer_name = file_name.clone();
     let writer = std::thread::Builder::new()
         .name(format!("wire-record-writer-{writer_name}"))
         .spawn(move || write_loop(receiver, dir, writer_name))
-        .expect("recording writer thread");
-    (
+        .context("could not start the recording writer thread")?;
+    Ok((
         RecordingTap {
             sender: Some(sender),
             state,
         },
         writer,
-    )
+    ))
 }
 
 /// Tap from the capture loop: one call per 20 ms of microphone audio.

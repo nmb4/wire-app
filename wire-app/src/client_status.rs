@@ -180,21 +180,32 @@ impl StatusPacket {
 pub struct AllowedPeers(Arc<RwLock<BTreeSet<NodeId>>>);
 
 impl AllowedPeers {
-    fn lock(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<NodeId>> {
-        self.0.read().expect("allowed peers lock poisoned")
+    fn lock(&self) -> Option<std::sync::RwLockReadGuard<'_, BTreeSet<NodeId>>> {
+        match self.0.read() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                // A poisoned lock means a writer panicked mid-update. Fail
+                // closed: an unknown contact set must not grant access.
+                warn!("allowed peers lock poisoned; treating the contact set as empty");
+                None
+            }
+        }
     }
 
     /// Replace the whole contact set (called whenever the friends list changes).
     pub fn replace(&self, peers: BTreeSet<NodeId>) {
-        *self.0.write().expect("allowed peers lock poisoned") = peers;
+        match self.0.write() {
+            Ok(mut guard) => *guard = peers,
+            Err(_) => warn!("allowed peers lock poisoned; keeping the previous contact set"),
+        }
     }
 
     pub fn contains(&self, peer: NodeId) -> bool {
-        self.lock().contains(&peer)
+        self.lock().is_some_and(|peers| peers.contains(&peer))
     }
 
     pub fn snapshot(&self) -> BTreeSet<NodeId> {
-        self.lock().clone()
+        self.lock().map(|peers| peers.clone()).unwrap_or_default()
     }
 }
 
@@ -225,35 +236,42 @@ impl ClientStatusProtocol {
 
     /// Update the identity snapshot advertised with every heartbeat.
     pub fn set_own_profile(&self, profile: ProfileSnapshot) {
-        *self
-            .own_profile
-            .write()
-            .expect("client status profile lock poisoned") = profile;
+        match self.own_profile.write() {
+            Ok(mut guard) => *guard = profile,
+            Err(_) => warn!("client status profile lock poisoned; keeping the previous profile"),
+        }
     }
 
     fn own_profile(&self) -> ProfileSnapshot {
-        self.own_profile
-            .read()
-            .expect("client status profile lock poisoned")
-            .clone()
+        match self.own_profile.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("client status profile lock poisoned; advertising no profile");
+                ProfileSnapshot::default()
+            }
+        }
     }
 
     pub fn set_active_group_calls(&self, calls: Vec<GroupCallAnnouncement>) {
-        *self
-            .active_group_calls
-            .write()
-            .expect("client status call lock poisoned") = calls;
+        match self.active_group_calls.write() {
+            Ok(mut guard) => *guard = calls,
+            Err(_) => warn!("client status call lock poisoned; keeping the previous calls"),
+        }
     }
 
     fn active_group_calls(&self) -> Vec<GroupCallAnnouncement> {
         let now = now_millis();
-        self.active_group_calls
-            .read()
-            .expect("client status call lock poisoned")
-            .iter()
-            .filter(|call| group_call_is_advertisable(call, now))
-            .cloned()
-            .collect()
+        match self.active_group_calls.read() {
+            Ok(calls) => calls
+                .iter()
+                .filter(|call| group_call_is_advertisable(call, now))
+                .cloned()
+                .collect(),
+            Err(_) => {
+                warn!("client status call lock poisoned; advertising no active calls");
+                Vec::new()
+            }
+        }
     }
 
     pub async fn next_update(&self) -> Result<StatusUpdate> {
@@ -267,12 +285,16 @@ impl ClientStatusProtocol {
             let active_group_calls = self.active_group_calls();
             let own_profile = self.own_profile();
             let probe_health = self.probe_health.clone();
-            let generation = probe_health
-                .lock()
-                .expect("client status probe lock poisoned")
-                .entry(peer)
-                .or_default()
-                .begin();
+            let generation = match probe_health.lock() {
+                Ok(mut health) => health.entry(peer).or_default().begin(),
+                Err(_) => {
+                    warn!(
+                        peer = %peer.fmt_short(),
+                        "client status probe lock poisoned; skipping presence probe"
+                    );
+                    continue;
+                }
+            };
             tokio::spawn(async move {
                 match exchange(
                     &endpoint,
@@ -284,12 +306,16 @@ impl ClientStatusProtocol {
                 .await
                 {
                     Ok(packet) => {
-                        let current = probe_health
-                            .lock()
-                            .expect("client status probe lock poisoned")
-                            .entry(peer)
-                            .or_default()
-                            .succeeded(generation);
+                        let current = match probe_health.lock() {
+                            Ok(mut health) => health.entry(peer).or_default().succeeded(generation),
+                            Err(_) => {
+                                warn!(
+                                    peer = %peer.fmt_short(),
+                                    "client status probe lock poisoned; dropping probe result"
+                                );
+                                return;
+                            }
+                        };
                         if !current {
                             debug!(peer = %peer.fmt_short(), generation, "ignored stale client status response");
                             return;
@@ -311,12 +337,16 @@ impl ClientStatusProtocol {
                     }
                     Err(error) => {
                         debug!(peer = %peer.fmt_short(), "client status probe failed: {error:#}");
-                        let confirmed_offline = probe_health
-                            .lock()
-                            .expect("client status probe lock poisoned")
-                            .entry(peer)
-                            .or_default()
-                            .failed(generation);
+                        let confirmed_offline = match probe_health.lock() {
+                            Ok(mut health) => health.entry(peer).or_default().failed(generation),
+                            Err(_) => {
+                                warn!(
+                                    peer = %peer.fmt_short(),
+                                    "client status probe lock poisoned; cannot mark peer offline"
+                                );
+                                return;
+                            }
+                        };
                         if confirmed_offline {
                             debug!(
                                 peer = %peer.fmt_short(),
@@ -421,13 +451,14 @@ impl ProtocolHandler for ClientStatusProtocol {
             let (mut send, mut recv) = connection.accept_bi().await?;
             let packet: StatusPacket = read_packet(&mut recv).await?;
             packet.validate()?;
-            protocol
-                .probe_health
-                .lock()
-                .expect("client status probe lock poisoned")
-                .entry(peer)
-                .or_default()
-                .observed_inbound();
+            if let Ok(mut health) = protocol.probe_health.lock() {
+                health.entry(peer).or_default().observed_inbound();
+            } else {
+                warn!(
+                    peer = %peer.fmt_short(),
+                    "client status probe lock poisoned; ignoring inbound heartbeat"
+                );
+            }
             protocol
                 .update_tx
                 .send(StatusUpdate {

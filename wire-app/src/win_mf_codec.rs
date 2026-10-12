@@ -50,6 +50,12 @@ pub struct D3d11VideoFrame {
 }
 
 impl D3d11VideoFrame {
+    /// The frame's presentation texture.
+    ///
+    /// `texture` is only ever `None` after [`Drop`] moves it back to the pool,
+    /// and `Drop` takes `&mut self`; a `&self` accessor can never observe
+    /// `None`, so this `expect` is a real invariant.
+    #[allow(clippy::expect_used)]
     pub(crate) fn texture(&self) -> &ID3D11Texture2D {
         self.texture
             .as_ref()
@@ -128,7 +134,7 @@ impl D3d11VideoFrame {
             context.Unmap(&staging, 0);
         }
         let mut rgba = vec![0; width_usize * height_usize * 4];
-        nv12_to_rgba(&nv12, width, height, &mut rgba);
+        nv12_to_rgba(&nv12, width, height, &mut rgba)?;
         Ok(crop_rgba(&rgba, width, height, self.display_rect))
     }
 }
@@ -1693,7 +1699,10 @@ impl MfH264Encoder {
         }
         let sample = gpu.allocate_sample(timestamp, self.frame_duration)?;
         let output_texture = GpuNv12Frames::sample_texture(&sample)?;
-        let (_, _, processor, render_target) = self.gpu_processor.as_ref().unwrap();
+        let (_, _, processor, render_target) = self
+            .gpu_processor
+            .as_ref()
+            .context("GPU NV12 processor was not initialized")?;
         processor
             .convert(texture, render_target)
             .context("D3D11 BGRA-to-NV12 video processing")?;
@@ -2092,7 +2101,7 @@ impl MfH264Decoder {
         if self.rgba.len() != len {
             self.rgba.resize(len, 0);
         }
-        nv12_to_rgba(&self.nv12, w, h, &mut self.rgba);
+        nv12_to_rgba(&self.nv12, w, h, &mut self.rgba)?;
         let out = crop_rgba(&self.rgba, w, h, display_rect);
         Ok(Some(crate::video_decode::DecodedFrame {
             data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(out)),

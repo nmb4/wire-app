@@ -1082,21 +1082,16 @@ impl Worker {
             let handle = tokio::spawn(async move {
                 run_video_recv(recv_conn, nid, event_tx, recv_control_rx).await;
             });
-            let entry = self
-                .video_peers
-                .get_mut(&node_id)
-                .expect("video peer was initialized");
-            entry.recv = Some(handle);
-            entry.recv_control = Some(recv_control_tx);
+            if let Some(entry) = self.video_peers.get_mut(&node_id) {
+                entry.recv = Some(handle);
+                entry.recv_control = Some(recv_control_tx);
+            }
         }
 
         if self.sharing_active {
-            let (old_stop, old_send) = {
-                let entry = self
-                    .video_peers
-                    .get_mut(&node_id)
-                    .expect("video peer was initialized");
-                (entry.send_stop.take(), entry.send.take())
+            let (old_stop, old_send) = match self.video_peers.get_mut(&node_id) {
+                Some(entry) => (entry.send_stop.take(), entry.send.take()),
+                None => (None, None),
             };
             stop_video_send(node_id, old_stop, old_send, VideoSendCommand::Replace).await;
             let send_conn = conn.clone();
@@ -1108,12 +1103,10 @@ impl Worker {
             let handle = tokio::spawn(async move {
                 run_video_send(send_conn, frame_tx, keyframe_tx, nid, stop_rx).await;
             });
-            let entry = self
-                .video_peers
-                .get_mut(&node_id)
-                .expect("video peer was initialized");
-            entry.send = Some(handle);
-            entry.send_stop = Some(stop_tx);
+            if let Some(entry) = self.video_peers.get_mut(&node_id) {
+                entry.send = Some(handle);
+                entry.send_stop = Some(stop_tx);
+            }
         }
     }
 

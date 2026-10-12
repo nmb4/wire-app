@@ -1713,6 +1713,12 @@ impl AppState {
             return;
         };
         self.ensure_klipy_event_channel();
+        // `ensure_klipy_event_channel` just installed the sender; clone it before
+        // touching request state so a missing channel cannot strand the UI in a
+        // "searching" state.
+        let Some(tx) = self.chat.klipy_event_tx.as_ref().cloned() else {
+            return;
+        };
         self.chat.gif_search_request_id = self.chat.gif_search_request_id.wrapping_add(1);
         let request_id = self.chat.gif_search_request_id;
         let query = if query.trim().is_empty() {
@@ -1724,12 +1730,6 @@ impl AppState {
         self.chat.gif_search_loading = true;
         self.chat.gif_search_error = None;
         self.chat.gif_search_results.clear();
-        let tx = self
-            .chat
-            .klipy_event_tx
-            .as_ref()
-            .expect("channel initialized")
-            .clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let result = crate::klipy::search_gifs(&api_key, &customer_id, &query)
@@ -1920,6 +1920,11 @@ impl AppState {
 
     fn start_queued_klipy_loads(&mut self, ctx: &egui::Context) {
         self.ensure_klipy_event_channel();
+        // The sender was just installed by `ensure_klipy_event_channel`; clone it
+        // once and share clones with each spawned loader thread.
+        let Some(tx) = self.chat.klipy_event_tx.as_ref().cloned() else {
+            return;
+        };
         while self.chat.gif_loads_in_flight < MAX_CONCURRENT_KLIPY_LOADS {
             let Some((url, preview_only)) = self.chat.gif_load_queue.pop_front() else {
                 break;
@@ -1942,12 +1947,7 @@ impl AppState {
                 },
             );
             self.chat.gif_loads_in_flight += 1;
-            let tx = self
-                .chat
-                .klipy_event_tx
-                .as_ref()
-                .expect("channel initialized")
-                .clone();
+            let tx = tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 let result = if preview_only {
@@ -2898,19 +2898,18 @@ impl AppState {
                 continue;
             }
             if attachment.is_klipy_gif() {
-                self.ui_klipy_gif_card(
-                    ui,
-                    pal,
-                    message,
-                    own,
-                    opacity,
-                    attachment
-                        .external_url
-                        .as_deref()
-                        .expect("KLIPY GIF attachments have a media URL"),
-                    requested_restore,
-                    requested_deletion,
-                );
+                if let Some(url) = attachment.external_url.as_deref() {
+                    self.ui_klipy_gif_card(
+                        ui,
+                        pal,
+                        message,
+                        own,
+                        opacity,
+                        url,
+                        requested_restore,
+                        requested_deletion,
+                    );
+                }
                 continue;
             }
             if self

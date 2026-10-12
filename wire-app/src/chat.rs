@@ -1337,13 +1337,29 @@ impl ChatService {
 
     pub(crate) async fn wait_input(&mut self) -> ChatInput {
         tokio::select! {
-            incoming = self.invite_rx.recv() => ChatInput::Invite(Box::new(
-                incoming.expect("chat invitation protocol channel closed")
-            )),
-            changed = self.doc_event_rx.recv() => ChatInput::Document(
-                changed.expect("chat document event channel closed")
-            ),
-            wake = self.wake_rx.recv() => wake.expect("chat wake channel closed"),
+            // Guard each arm on `!is_closed()` so a dropped sender parks the
+            // loop on the remaining arms instead of spinning on an immediately
+            // ready `Err`. `doc_event_tx`/`wake_tx` are fields of `self`, so
+            // those channels cannot close while this `&mut self` borrow is live;
+            // handling the error explicitly keeps shutdown from panicking.
+            incoming = self.invite_rx.recv(), if !self.invite_rx.is_closed() => {
+                match incoming {
+                    Ok(incoming) => ChatInput::Invite(Box::new(incoming)),
+                    Err(_) => ChatInput::Retry,
+                }
+            },
+            changed = self.doc_event_rx.recv(), if !self.doc_event_rx.is_closed() => {
+                match changed {
+                    Ok(changed) => ChatInput::Document(changed),
+                    Err(_) => ChatInput::Retry,
+                }
+            },
+            wake = self.wake_rx.recv(), if !self.wake_rx.is_closed() => {
+                match wake {
+                    Ok(wake) => wake,
+                    Err(_) => ChatInput::Retry,
+                }
+            },
             provider = self.provider_event_rx.recv(), if !self.provider_event_rx.is_closed() => {
                 match provider {
                     Ok(event) => ChatInput::BlobProviderEvent(event),

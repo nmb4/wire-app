@@ -402,9 +402,10 @@ pub(super) async fn run_video_recv(
             stream = accept => {
                 match stream {
                     Ok((mut control_send, mut recv)) => {
-                        next_generation = next_generation
-                            .checked_add(1)
-                            .expect("video stream generation exhausted");
+                        // `next_generation` is a u64 counter for stream identity;
+                        // wrapping past 2^64 is impossible in practice, so wrap
+                        // instead of panicking on exhaustion.
+                        next_generation = next_generation.wrapping_add(1);
                         let generation = next_generation;
                         active_generation = Some(generation);
                         pending_end = None;
@@ -414,9 +415,13 @@ pub(super) async fn run_video_recv(
                             "accepted video receive stream"
                         );
                         notify_video_stream_accepted(&event_tx, node_id, generation).await;
-                        if worker.is_none() {
-                            match spawn_video_decode_worker(node_id, event_tx.clone()) {
-                                Ok(new_worker) => worker = Some(new_worker),
+                        // Lazily create the decoder, then lend it to the stream
+                        // reader. `insert` yields the reference so no fallible
+                        // "was initialized" unwrap is needed.
+                        let decoder = match worker.as_mut() {
+                            Some(decoder) => decoder,
+                            None => match spawn_video_decode_worker(node_id, event_tx.clone()) {
+                                Ok(new_worker) => worker.insert(new_worker),
                                 Err(error) => {
                                     warn!(
                                         "could not start video decoder for {}: {error:?}",
@@ -424,13 +429,13 @@ pub(super) async fn run_video_recv(
                                     );
                                     break;
                                 }
-                            }
-                        }
+                            },
+                        };
                         let stream_result = recv_video_on_stream(
                             &mut recv,
                             node_id,
                             generation,
-                            worker.as_ref().expect("video decoder was initialized"),
+                            decoder,
                             &mut control_send,
                             &mut control_rx,
                         )

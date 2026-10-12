@@ -1,6 +1,8 @@
 #[cfg(windows)]
 use rayon::prelude::*;
 
+use anyhow::Result;
+
 /// Fast BGRA8 -> NV12 conversion for hardware encoders.
 pub fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let w = width as usize;
@@ -96,7 +98,7 @@ fn avg_rgb(row0: &[u8], i0: usize, row1: &[u8], i1: usize) -> (i32, i32, i32) {
 }
 
 /// NV12 -> RGBA8 for display. Processes 2x2 blocks to reduce UV fetches.
-pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
+pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) -> Result<()> {
     let w = width as usize;
     let h = height as usize;
     let y_size = w * h;
@@ -126,14 +128,15 @@ pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32, out: &mut [u8]) {
             YuvRange::Limited,
             YuvStandardMatrix::Bt709,
             YuvConversionMode::Balanced,
-        )
-        .expect("validated NV12 frame dimensions");
+        )?;
     }
 
     #[cfg(not(windows))]
     for (block_y, out_rows) in out.chunks_mut(w * 4 * 2).enumerate() {
         convert_nv12_rows(y_plane, uv_plane, w, h, block_y * 2, out_rows);
     }
+
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -199,7 +202,7 @@ mod tests {
     fn nv12_limited_range_maps_black_and_white() {
         let nv12 = [16, 235, 16, 235, 128, 128];
         let mut rgba = [0u8; 16];
-        nv12_to_rgba(&nv12, 2, 2, &mut rgba);
+        nv12_to_rgba(&nv12, 2, 2, &mut rgba).unwrap();
         assert!(rgba[0] <= 2 && rgba[1] <= 2 && rgba[2] <= 2);
         assert!(rgba[4] >= 253 && rgba[5] >= 253 && rgba[6] >= 253);
         assert_eq!(rgba[3], 255);
