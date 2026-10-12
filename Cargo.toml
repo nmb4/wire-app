@@ -8,19 +8,23 @@ authors = ["Frando <franz@n0.computer>", "n0 team"]
 repository = "https://github.com/stardive/wire.git"
 license = "MIT OR Apache-2.0"
 
-# Focused lint policy. Members inherit this table with `[lints] workspace = true`.
+# Focused lint policy. Every member inherits this table with
+# `[lints] workspace = true`.
 #
 # These guard against avoidable panic and error-handling mistakes. They are a
 # small, high-signal set, not the whole `restriction`/`pedantic` groups. Test
-# code may still use `unwrap`/`expect` (see `clippy.toml`); `unwrap_used` and
-# `expect_used` are migrated crate by crate, and a crate opts into the full
-# table once its production sites use real error handling.
+# code may still use `unwrap`/`expect` (see `clippy.toml`).
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+# Async/lock/future correctness: never hold a guard or drop a future across an
+# `.await` point.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_future = "deny"
 
 [patch.crates-io]
 # make receive flows close on connection close: https://github.com/n0-computer/iroh-roq/pull/4

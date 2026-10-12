@@ -60,11 +60,12 @@ The root `Cargo.toml` denies a small, focused set of Clippy lints in
 `[lints] workspace = true`. The existing CI Clippy jobs already build the
 same feature combinations, so they carry the policy.
 
+- `unwrap_used`, `expect_used`: denied in production code for every member;
+  propagate or handle the error instead.
 - `todo`, `unimplemented`, `dbg_macro`: denied for every member.
-- `unwrap_used`, `expect_used`: production code must propagate or handle the
-  error. `wire-cli` inherits the full table; `wire` and `wire-app` still list
-  only the panic-adjacent rules and switch to `[lints] workspace = true` once
-  their production sites are migrated.
+- `await_holding_lock`, `await_holding_refcell_ref`, `let_underscore_future`:
+  denied for every member, so no lock/`RefCell` guard or future is held or
+  dropped across an `.await`.
 - Tests are the exception: `clippy.toml` sets `allow-unwrap-in-tests` and
   `allow-expect-in-tests`, which relaxes `#[test]`/`#[cfg(test)]`/`tests/`
   targets only, not production findings.
