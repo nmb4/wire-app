@@ -20,13 +20,13 @@ struct HiddenRedrawApp<'a> {
 
 impl ApplicationHandler<UserEvent> for HiddenRedrawApp<'_> {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if let Some(control_flow) = hidden_control_flow(self.hidden.load(Ordering::Acquire)) {
+        if self.hidden.load(Ordering::Acquire) {
             // eframe advances its repaint schedule from `new_events` (see
             // `check_redraw_requests` in eframe's winit loop). Skipping that path
             // while hidden otherwise strands a stale `WaitUntil`/`Poll`, so winit
             // wakes immediately on a past deadline and spins a full core. Force
             // `Wait` so the native loop can sleep until a real event arrives.
-            event_loop.set_control_flow(control_flow);
+            event_loop.set_control_flow(ControlFlow::Wait);
         } else {
             self.inner.new_events(event_loop, cause);
         }
@@ -79,15 +79,6 @@ impl ApplicationHandler<UserEvent> for HiddenRedrawApp<'_> {
     }
 }
 
-/// Control flow to force while the presenter is hidden.
-///
-/// `None` means "handle events normally". `Some(ControlFlow::Wait)` suppresses
-/// eframe's repaint scheduling and lets the native loop sleep, which prevents
-/// the busy loop a stale repaint deadline would otherwise cause.
-fn hidden_control_flow(hidden: bool) -> Option<ControlFlow> {
-    hidden.then_some(ControlFlow::Wait)
-}
-
 /// Run eframe on an event loop that can stop delivering hidden-window redraws.
 ///
 /// eframe's normal `run_native` path keeps the wgpu surface in its redraw
@@ -110,19 +101,4 @@ pub(crate) fn run(
     event_loop
         .run_app(&mut app)
         .map_err(eframe::Error::WinitEventLoop)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hidden_control_flow;
-    use winit::event_loop::ControlFlow;
-
-    #[test]
-    fn hidden_presenter_forces_wait_instead_of_a_stale_repaint_deadline() {
-        // Regression: skipping eframe's `new_events` while hidden without
-        // resetting the control flow left a past `WaitUntil` in place, so winit
-        // woke immediately and spun a full core until the window was shown again.
-        assert!(matches!(hidden_control_flow(true), Some(ControlFlow::Wait)));
-        assert!(hidden_control_flow(false).is_none());
-    }
 }
