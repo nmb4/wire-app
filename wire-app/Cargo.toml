@@ -107,6 +107,14 @@ wgpu = { version = "27.0.1", default-features = false, features = ["metal"] }
 default = ["audio-processing"]
 audio-processing = ["wire/audio-processing"]
 
+# Pending migration of this crate's production `unwrap`/`expect` sites, only the
+# panic-adjacent rules are enforced here. Switch to `[lints] workspace = true`
+# once the migration lands.
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
 [build-dependencies]
 winres = "0.1"
 

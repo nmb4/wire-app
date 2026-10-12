@@ -1,0 +1,8 @@
+# Clippy test-only allowances for the workspace lint policy in Cargo.toml.
+#
+# `unwrap_used`/`expect_used` are denied in production code. Tests are where
+# panicking on an unexpected value is the point, so keep the lints enabled
+# everywhere but let test code (`#[test]`, `#[cfg(test)]`, `tests/` targets)
+# use them freely. This is the narrow, tool-supported switch for that.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

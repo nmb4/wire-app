@@ -51,3 +51,11 @@ tracing-test = "0.2.5"
 [features]
 default = ["audio-processing"]
 audio-processing = ["dep:sonora"]
+
+# Pending migration of this crate's production `unwrap`/`expect` sites, only the
+# panic-adjacent rules are enforced here. Switch to `[lints] workspace = true`
+# once the migration lands.
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

@@ -53,6 +53,31 @@ GitButler skills for this repository. Do not run `but setup` or re-enable
 GitButler workspace management. Use normal Git commands for branches,
 commits, merges, pushes, and other version-control operations.
 
+## Rust lint policy
+
+The root `Cargo.toml` denies a small, focused set of Clippy lints in
+`[workspace.lints.clippy]`; a member enforces them with
+`[lints] workspace = true`. The existing CI Clippy jobs already build the
+same feature combinations, so they carry the policy.
+
+- `todo`, `unimplemented`, `dbg_macro`: denied for every member.
+- `unwrap_used`, `expect_used`: production code must propagate or handle the
+  error. `wire-cli` inherits the full table; `wire` and `wire-app` still list
+  only the panic-adjacent rules and switch to `[lints] workspace = true` once
+  their production sites are migrated.
+- Tests are the exception: `clippy.toml` sets `allow-unwrap-in-tests` and
+  `allow-expect-in-tests`, which relaxes `#[test]`/`#[cfg(test)]`/`tests/`
+  targets only, not production findings.
+- For a genuine, unavoidable invariant, add the narrowest
+  `#[allow(clippy::unwrap_used)]`/`#[allow(clippy::expect_used)]` on the item
+  with a comment explaining why. Do not widen it to a module or crate, and do
+  not swap `unwrap` for `expect` or a panic. `clippy::panic` and
+  `clippy::unreachable` are triaged case by case the same way.
+
+Formatting is enforced by CI (`cargo fmt --all -- --check`), but dev carries an
+inherited rustfmt drift of 36 locations under the pinned nightly. Treat those
+as baseline noise: do not fold a workspace-wide `cargo fmt` into feature work.
+
 ## UI work
 
 Before changing the egui UI, read `docs/ui-improvement-guide.md`. Capture

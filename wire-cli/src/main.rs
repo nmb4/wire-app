@@ -149,7 +149,13 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 while let Some(res) = join_set.join_next().await {
-                    let (node_id, res) = res.expect("task panicked");
+                    let (node_id, res) = match res {
+                        Ok(joined) => joined,
+                        Err(err) => {
+                            warn!("connection task failed to join: {err:?}");
+                            continue;
+                        }
+                    };
                     if let Err(err) = res {
                         warn!("failed to connect to {}: {err:?}", node_id.fmt_short())
                     }
@@ -269,7 +275,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle_connection(audio_ctx: AudioContext, conn: RtcConnection) {
-    let peer = conn.transport().remote_node_id().unwrap().fmt_short();
+    let peer = match conn.transport().remote_node_id() {
+        Ok(id) => id.fmt_short().to_string(),
+        Err(err) => {
+            warn!("could not determine the peer for an incoming connection: {err:?}");
+            "unknown peer".to_owned()
+        }
+    };
     if let Err(err) = handle_connection_with_audio_context(audio_ctx, conn).await {
         error!("connection from {peer} closed with error: {err:?}",)
     } else {
@@ -278,9 +290,17 @@ async fn handle_connection(audio_ctx: AudioContext, conn: RtcConnection) {
 }
 
 async fn confirm(msg: String) -> bool {
-    tokio::task::spawn_blocking(move || Confirm::new().with_prompt(msg).interact().unwrap())
-        .await
-        .unwrap()
+    match tokio::task::spawn_blocking(move || Confirm::new().with_prompt(msg).interact()).await {
+        Ok(Ok(confirmed)) => confirmed,
+        Ok(Err(err)) => {
+            warn!("confirmation prompt failed: {err}");
+            false
+        }
+        Err(err) => {
+            warn!("confirmation prompt task failed: {err}");
+            false
+        }
+    }
 }
 
 fn unix_millis() -> u64 {

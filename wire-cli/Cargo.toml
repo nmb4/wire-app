@@ -27,3 +27,8 @@ n0-future = "0.1.2"
 [features]
 default = ["audio-processing"]
 audio-processing = ["wire/audio-processing"]
+
+# Migrated first: wire-cli's production sites no longer unwrap/expect, so it
+# inherits the full workspace policy including `unwrap_used`/`expect_used`.
+[lints]
+workspace = true
