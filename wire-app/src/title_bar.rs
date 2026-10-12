@@ -6,6 +6,7 @@ use eframe::egui::{
 };
 use lucide_icons::Icon;
 
+use crate::theme::IconButtonLabel;
 use crate::{
     resource_monitor::ResourceUsage,
     theme::{kh_family, lucide, Palette},
@@ -177,7 +178,7 @@ fn update_control(
 
 fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded: bool) {
     if title_bar_icon_button(ui, pal, Icon::X, false, true, rounded)
-        .on_hover_text("Close")
+        .labeled("Close")
         .clicked()
     {
         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
@@ -191,7 +192,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
     };
     let maximize_hint = if is_maximized { "Restore" } else { "Maximize" };
     if title_bar_icon_button(ui, pal, maximize_icon, false, false, rounded)
-        .on_hover_text(maximize_hint)
+        .labeled(maximize_hint)
         .clicked()
     {
         ui.ctx()
@@ -199,7 +200,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
     }
 
     if title_bar_icon_button(ui, pal, Icon::Minus, false, false, rounded)
-        .on_hover_text("Minimize")
+        .labeled("Minimize")
         .clicked()
     {
         ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
@@ -211,7 +212,7 @@ fn window_controls(ui: &mut Ui, pal: &Palette, always_on_top: &mut bool, rounded
         "Keep on top"
     };
     if title_bar_icon_button(ui, pal, Icon::Pin, *always_on_top, false, rounded)
-        .on_hover_text(pin_hint)
+        .labeled(pin_hint)
         .clicked()
     {
         *always_on_top = !*always_on_top;

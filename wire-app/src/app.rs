@@ -5,6 +5,7 @@
 mod calls_ui;
 mod chat_ui;
 mod chrome;
+mod confirm_ui;
 mod profile_ui;
 mod settings_ui;
 mod ui_capture;
@@ -15,6 +16,7 @@ use self::calls_ui::native_parent_hwnd;
 #[cfg(windows)]
 pub(crate) use self::widgets::format_bytes;
 use self::widgets::{ellipsize, track_pane_viewport};
+use crate::theme::IconButtonLabel;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use crate::tray::{TrayAction, TrayController};
 #[cfg(windows)]
@@ -34,7 +36,7 @@ use crate::{
     persistence,
     profile::{self, PeerProfile},
     resource_monitor::ResourceMonitor,
-    runtime::{CallState, Command, Event},
+    runtime::{CallEndReason, CallState, Command, Event},
     sounds::{Sound, Sounds},
     theme::{ghost_icon_button, setup_fonts, visuals_for, Palette, Theme, WindowFrameStyle},
     video_decode::DecodedFrameData,
@@ -51,7 +53,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
     time::Duration,
@@ -222,7 +224,12 @@ struct LastRecording {
 struct AppState {
     configured: bool,
     show_settings: bool,
+    /// Contacts dialog over a running call. Without a call the contacts are
+    /// the Calls page itself and this stays false.
     show_contacts: bool,
+    /// Open "More options" once on the next frame, e.g. after "Add a friend"
+    /// in the chat empty state.
+    expand_call_options: bool,
     /// Last seen healthy viewport rect; floating panes are constrained to it
     /// so degenerate minimize/restore frames cannot shrink their geometry.
     pane_viewport: Rect,
@@ -232,6 +239,9 @@ struct AppState {
     service: ServiceClient,
     our_node_id: Option<NodeId>,
     devices: wire::audio::Devices,
+    /// Tracks the settings dialog's open edge so audio devices are
+    /// re-enumerated each time it opens (headsets plugged in later appear).
+    settings_was_open: bool,
     audio_config: UiAudioConfig,
     video_config: VideoConfig,
     calls: BTreeMap<NodeId, CallState>,
@@ -274,18 +284,25 @@ struct AppState {
     own_avatar_hash: Option<String>,
     own_avatar_bytes: Option<Vec<u8>>,
     own_avatar_texture: Option<egui::TextureHandle>,
+    /// Set once our avatar was looked up and found missing or undecodable.
+    own_avatar_missing: bool,
     own_accent_color: Option<String>,
     /// Remote profiles learned via presence, chat snapshots, invites, and the
     /// public profile fetch protocol. This is what lets unknown senders show
     /// a name + avatar instead of a raw peer ID.
     peer_profiles: BTreeMap<NodeId, PeerProfile>,
-    peer_avatar_textures: BTreeMap<NodeId, egui::TextureHandle>,
+    /// Decoded peer avatars. `None` records "no usable picture" so the UI
+    /// does not re-read and re-decode the file every frame; profile events
+    /// clear the entry.
+    peer_avatar_textures: BTreeMap<NodeId, Option<egui::TextureHandle>>,
     peer_avatar_bytes: BTreeMap<NodeId, Vec<u8>>,
     pending_profile_fetches: BTreeMap<NodeId, i64>,
     profile_edit_name: String,
     profile_edit_accent: String,
     profile_edit_error: Option<String>,
     show_profile_editor: bool,
+    /// Destructive action awaiting confirmation (clear history, remove friend).
+    pending_confirm: Option<confirm_ui::PendingConfirm>,
     /// Active avatar crop session (image picked, framing not yet confirmed).
     avatar_crop: Option<profile_ui::AvatarCropState>,
     theme: Theme,
@@ -295,7 +312,6 @@ struct AppState {
     ui_sound_volume: f32,
     sounds: Option<Sounds>,
     notifications: NotificationService,
-    voluntary_hangups: AtomicU32,
     #[cfg(windows)]
     update_tx: mpsc::Sender<UpdateMessage>,
     #[cfg(windows)]
@@ -373,7 +389,9 @@ struct ChatUiState {
     gif_load_queue: VecDeque<(String, bool)>,
     gif_loads_in_flight: usize,
     gif_animation_request_id: u64,
-    error: Option<String>,
+    /// Composer status-line error and when it was raised. It stays visible
+    /// for `CHAT_ERROR_TTL` (or until the next send) instead of one frame.
+    error: Option<(String, std::time::Instant)>,
     service_error: Option<String>,
     show_group_editor: bool,
     show_group_members: bool,
@@ -383,6 +401,48 @@ struct ChatUiState {
     friend_candidate_name: String,
     /// Set each frame by the chat layout: true when only one pane fits.
     narrow_layout: bool,
+    /// Conversation whose composer last received automatic focus; a change
+    /// of selection moves the caret into the new composer once.
+    composer_focused_for: Option<String>,
+    /// Measured message heights so off-screen rows skip layout.
+    timeline_heights: chat_ui::TimelineHeights,
+}
+
+/// Stable id of the chat composer, so global shortcuts can tell whether
+/// typing focus is in the composer or in some other field.
+pub(super) fn chat_composer_id() -> egui::Id {
+    egui::Id::new("chat-composer")
+}
+
+const CHAT_ERROR_TTL: Duration = Duration::from_secs(6);
+
+impl ChatUiState {
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some((message.into(), std::time::Instant::now()));
+    }
+
+    /// The current composer error, dropping it once it has expired.
+    fn visible_error(&mut self) -> Option<(&str, Duration)> {
+        let expired = self
+            .error
+            .as_ref()
+            .is_some_and(|(_, raised)| raised.elapsed() >= CHAT_ERROR_TTL);
+        if expired {
+            self.error = None;
+        }
+        self.error
+            .as_ref()
+            .map(|(message, raised)| (message.as_str(), CHAT_ERROR_TTL.saturating_sub(raised.elapsed())))
+    }
+}
+
+/// Audio device names for the settings pickers. A failed enumeration leaves
+/// the lists empty ("System default" still works) instead of aborting startup.
+fn list_audio_devices() -> wire::audio::Devices {
+    wire::audio::AudioContext::list_devices_sync().unwrap_or_else(|error| {
+        warn!("failed to list audio devices: {error:#}");
+        wire::audio::Devices::default()
+    })
 }
 
 enum KlipyAnimationState {
@@ -443,12 +503,46 @@ struct AttachmentTextureEntry {
     texture_bytes: usize,
 }
 
-#[derive(Default)]
+/// Decodes running in the background at once; the rest wait in a queue so a
+/// timeline full of photos cannot spawn dozens of threads.
+const MAX_CONCURRENT_IMAGE_DECODES: usize = 2;
+
+type DecodedImage = (String, Arc<Vec<u8>>, Option<(egui::ColorImage, usize)>);
+
+/// Chat image textures. Decoding happens on worker threads so a large photo
+/// never stalls the UI; callers see `None` until the texture is ready.
 struct AttachmentTextureCache {
     entries: BTreeMap<String, AttachmentTextureEntry>,
     clock: u64,
     data_bytes: usize,
     texture_bytes: usize,
+    /// Images waiting for a decode slot, in request order.
+    queued: VecDeque<(String, Arc<Vec<u8>>)>,
+    /// Images queued or decoding, so each is decoded once.
+    pending: BTreeSet<String>,
+    in_flight: usize,
+    /// Images that could not be decoded; never retried this session.
+    failed: BTreeSet<String>,
+    decoded_tx: mpsc::Sender<DecodedImage>,
+    decoded_rx: mpsc::Receiver<DecodedImage>,
+}
+
+impl Default for AttachmentTextureCache {
+    fn default() -> Self {
+        let (decoded_tx, decoded_rx) = mpsc::channel();
+        Self {
+            entries: BTreeMap::new(),
+            clock: 0,
+            data_bytes: 0,
+            texture_bytes: 0,
+            queued: VecDeque::new(),
+            pending: BTreeSet::new(),
+            in_flight: 0,
+            failed: BTreeSet::new(),
+            decoded_tx,
+            decoded_rx,
+        }
+    }
 }
 
 impl AttachmentTextureCache {
@@ -457,21 +551,29 @@ impl AttachmentTextureCache {
         ctx: &egui::Context,
         attachment: &ChatAttachment,
     ) -> Option<&egui::TextureHandle> {
+        self.collect_decoded(ctx);
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&attachment.id) {
             entry.last_used = self.clock;
         } else {
-            self.insert_data(ctx, attachment, attachment.data.as_ref()?.clone())?;
+            self.insert_data(ctx, attachment, attachment.data.as_ref()?.clone());
         }
         self.entries.get(&attachment.id).map(|entry| &entry.texture)
     }
 
+    /// True once decoding this attachment has failed.
+    fn failed(&self, id: &str) -> bool {
+        self.failed.contains(id)
+    }
+
+    /// Stores freshly received bytes, queueing a decode when no texture
+    /// exists yet.
     fn insert_data(
         &mut self,
         ctx: &egui::Context,
         attachment: &ChatAttachment,
         data: Arc<Vec<u8>>,
-    ) -> Option<()> {
+    ) {
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&attachment.id) {
             self.data_bytes = self
@@ -480,24 +582,64 @@ impl AttachmentTextureCache {
             self.data_bytes = self.data_bytes.saturating_add(data.len());
             entry.data = Some(data);
             entry.last_used = self.clock;
-        } else {
-            let decoded = image::load_from_memory(&data).ok()?.to_rgba8();
-            let size = [decoded.width() as usize, decoded.height() as usize];
-            let pixels = decoded.into_raw();
-            if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
-                return None;
+            self.evict();
+            return;
+        }
+        if self.failed.contains(&attachment.id) || !self.pending.insert(attachment.id.clone()) {
+            return;
+        }
+        self.queued.push_back((attachment.id.clone(), data));
+        self.start_decodes(ctx);
+    }
+
+    fn start_decodes(&mut self, ctx: &egui::Context) {
+        while self.in_flight < MAX_CONCURRENT_IMAGE_DECODES {
+            let Some((id, data)) = self.queued.pop_front() else {
+                break;
+            };
+            let tx = self.decoded_tx.clone();
+            let repaint = ctx.clone();
+            let thread_id = id.clone();
+            let thread_data = data.clone();
+            let spawned = std::thread::Builder::new()
+                .name("wire-image-decode".to_owned())
+                .spawn(move || {
+                    let image = decode_chat_image(&thread_data);
+                    let _ = tx.send((thread_id, thread_data, image));
+                    repaint.request_repaint();
+                });
+            match spawned {
+                Ok(_) => self.in_flight += 1,
+                Err(error) => {
+                    warn!("could not start image decode thread: {error}");
+                    self.queued.push_front((id, data));
+                    break;
+                }
             }
-            let texture_bytes = pixels.len();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+        }
+    }
+
+    /// Uploads textures for decodes that finished since the last frame.
+    fn collect_decoded(&mut self, ctx: &egui::Context) {
+        let mut finished = false;
+        while let Ok((id, data, image)) = self.decoded_rx.try_recv() {
+            finished = true;
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.pending.remove(&id);
+            let Some((color_image, texture_bytes)) = image else {
+                self.failed.insert(id);
+                continue;
+            };
             let texture = ctx.load_texture(
-                format!("chat-image-{}", attachment.id),
+                format!("chat-image-{id}"),
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
+            self.clock = self.clock.wrapping_add(1);
             self.data_bytes = self.data_bytes.saturating_add(data.len());
             self.texture_bytes = self.texture_bytes.saturating_add(texture_bytes);
             self.entries.insert(
-                attachment.id.clone(),
+                id,
                 AttachmentTextureEntry {
                     texture,
                     last_used: self.clock,
@@ -505,11 +647,20 @@ impl AttachmentTextureCache {
                     texture_bytes,
                 },
             );
+            self.evict();
         }
+        if finished {
+            self.start_decodes(ctx);
+        }
+    }
+
+    fn evict(&mut self) {
         while self.entries.len() > MAX_ATTACHMENT_TEXTURES
             || self.texture_bytes > MAX_CACHED_TEXTURE_BYTES
         {
-            let oldest = self.oldest_id(false)?;
+            let Some(oldest) = self.oldest_id(false) else {
+                break;
+            };
             if let Some(entry) = self.entries.remove(&oldest) {
                 self.data_bytes = self
                     .data_bytes
@@ -518,13 +669,16 @@ impl AttachmentTextureCache {
             }
         }
         while self.data_bytes > MAX_CACHED_ATTACHMENT_BYTES {
-            let oldest = self.oldest_id(true)?;
-            let entry = self.entries.get_mut(&oldest)?;
+            let Some(oldest) = self.oldest_id(true) else {
+                break;
+            };
+            let Some(entry) = self.entries.get_mut(&oldest) else {
+                break;
+            };
             if let Some(data) = entry.data.take() {
                 self.data_bytes = self.data_bytes.saturating_sub(data.len());
             }
         }
-        Some(())
     }
 
     fn oldest_id(&self, require_data: bool) -> Option<String> {
@@ -538,6 +692,28 @@ impl AttachmentTextureCache {
     fn data(&self, id: &str) -> Option<Arc<Vec<u8>>> {
         self.entries.get(id)?.data.clone()
     }
+}
+
+/// Decodes chat image bytes into an RGBA texture image (worker thread).
+fn decode_chat_image(data: &[u8]) -> Option<(egui::ColorImage, usize)> {
+    let decoded = match image::load_from_memory(data) {
+        Ok(decoded) => decoded.to_rgba8(),
+        Err(error) => {
+            warn!("chat image could not be decoded: {error}");
+            return None;
+        }
+    };
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let pixels = decoded.into_raw();
+    if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
+        warn!("chat image of {}x{} is too large to display", size[0], size[1]);
+        return None;
+    }
+    let texture_bytes = pixels.len();
+    Some((
+        egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+        texture_bytes,
+    ))
 }
 
 #[derive(Clone)]
@@ -1133,8 +1309,7 @@ impl App {
     ) -> Result<(), eframe::Error> {
         let mut options = options;
         options.wgpu_options.on_surface_error = Arc::new(wgpu_surface_error_action);
-        let devices =
-            wire::audio::AudioContext::list_devices_sync().expect("failed to list audio devices");
+        let devices = list_audio_devices();
         let saved_settings = load_settings();
         let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some()
             || std::env::var_os(ui_capture::ENV).is_some();
@@ -1163,6 +1338,7 @@ impl App {
             configured: has_saved_settings,
             show_settings: !has_saved_settings,
             show_contacts: false,
+            expand_call_options: false,
             pane_viewport: Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0)),
             stream_view_mode: StreamViewMode::Normal,
             remote_node_id: Default::default(),
@@ -1170,6 +1346,7 @@ impl App {
             service,
             our_node_id: None,
             devices,
+            settings_was_open: false,
             audio_config: settings.audio,
             video_config: settings.video,
             calls: Default::default(),
@@ -1207,6 +1384,7 @@ impl App {
             own_avatar_hash: own_profile.avatar_hash.clone(),
             own_avatar_bytes,
             own_avatar_texture: None,
+            own_avatar_missing: false,
             own_accent_color: own_profile.accent_color.clone(),
             peer_profiles,
             peer_avatar_textures: BTreeMap::new(),
@@ -1216,6 +1394,7 @@ impl App {
             profile_edit_accent: own_profile.accent_color.clone().unwrap_or_default(),
             profile_edit_error: None,
             show_profile_editor: false,
+            pending_confirm: None,
             avatar_crop: None,
             theme: settings.theme,
             window_frame_style: settings.window_frame_style,
@@ -1224,7 +1403,6 @@ impl App {
             ui_sound_volume,
             sounds,
             notifications: NotificationService::default(),
-            voluntary_hangups: AtomicU32::new(0),
             #[cfg(windows)]
             update_tx,
             #[cfg(windows)]
@@ -1468,7 +1646,7 @@ impl AppState {
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
                 .show(ctx, |ui| {
                     if ghost_icon_button(ui, &pal, ph::ADDRESS_BOOK)
-                        .on_hover_text("Contacts and calling")
+                        .labeled("Contacts and calling")
                         .clicked()
                     {
                         self.show_contacts = true;
@@ -1476,12 +1654,19 @@ impl AppState {
                 });
         }
 
+        // Without a call the contacts are the Calls page; the dialog is only
+        // for reaching them while a call fills the stage.
         let contacts_visible =
-            self.app_mode == AppMode::Calls && (self.show_contacts || !self.has_active_call());
+            self.app_mode == AppMode::Calls && self.show_contacts && self.has_visible_call();
         if contacts_visible && !self.show_settings && self.configured {
             self.ui_contacts_window(ctx);
         }
-        if self.show_settings || !self.configured {
+        let settings_open = self.show_settings || !self.configured;
+        if settings_open && !self.settings_was_open {
+            self.devices = list_audio_devices();
+        }
+        self.settings_was_open = settings_open;
+        if settings_open {
             self.ui_settings_window(ctx);
         }
         if self.show_capture_picker {
@@ -1492,6 +1677,7 @@ impl AppState {
         // crop editor sits above it.
         self.ui_profile_editor(ctx);
         self.ui_avatar_crop_editor(ctx);
+        self.ui_confirm_dialog(ctx, &pal);
         #[cfg(windows)]
         if self.show_update_prompt {
             self.ui_update_prompt(ctx);
@@ -1514,6 +1700,7 @@ impl AppState {
                 || self.chat.show_group_editor
                 || self.chat.show_group_members
                 || self.chat.friend_candidate.is_some()
+                || self.pending_confirm.is_some()
                 || self.chat.image_preview.is_some();
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
@@ -1831,6 +2018,17 @@ impl AppState {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 NotificationAction::OpenRecordingsFolder => self.reveal_recordings(),
+                NotificationAction::CallPeer(node_id) => {
+                    if let Ok(node_id) = NodeId::from_str(&node_id) {
+                        if friend_call_enabled(self.calls.get(&node_id)) {
+                            self.play_sound(Sound::Button2);
+                            self.cmd(Command::Call { node_id });
+                        }
+                    }
+                    self.app_mode = AppMode::Calls;
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
     }
@@ -1968,21 +2166,21 @@ impl AppState {
                                 );
                             }
                         }
-                        CallState::Aborted => {
+                        CallState::Aborted(reason) => {
                             self.notifications.dismiss_key(&call_key);
-                            if self.voluntary_hangups.load(Ordering::Relaxed) > 0 {
-                                self.voluntary_hangups.fetch_sub(1, Ordering::Relaxed);
-                            } else if matches!(
-                                previous,
-                                Some(CallState::Calling) | Some(CallState::Incoming)
-                            ) {
-                                self.play_sound(Sound::Fail);
+                            if previous.is_some() {
+                                self.announce_call_end(node_id, reason);
                             }
+                        }
+                        CallState::Calling => {
+                            // A fresh attempt replaces the last failure notice.
+                            self.notifications
+                                .dismiss_key(&format!("call-ended:{node_id}"));
                         }
                         _ => {}
                     }
 
-                    if matches!(call_state, CallState::Aborted) {
+                    if matches!(call_state, CallState::Aborted(_)) {
                         self.calls.remove(&node_id);
                         self.volumes.remove(&node_id);
                         self.stream_volumes.remove(&node_id);
@@ -2566,8 +2764,7 @@ impl AppState {
                         }
                         self.chat.inline_file_data.insert(hash, data);
                     } else {
-                        let _ = self
-                            .chat
+                        self.chat
                             .attachment_textures
                             .insert_data(ctx, &attachment, data);
                     }
@@ -2772,7 +2969,7 @@ impl AppState {
             ChatNotification::Error(error) => {
                 self.notifications
                     .error("chat-error", "Messages need attention", error.clone());
-                self.chat.error = Some(error);
+                self.chat.set_error(error);
             }
         }
     }
@@ -3396,9 +3593,55 @@ impl AppState {
         }
     }
 
+    /// Tells the user why a call leg ended when it was not their own doing.
+    /// Group calls only report dropped connections; members leaving or not
+    /// answering is normal there.
+    fn announce_call_end(&self, node_id: NodeId, reason: CallEndReason) {
+        let name = self.peer_display_name(node_id);
+        let in_group = self.local_group_call.is_some();
+        let id = node_id.to_string();
+        match reason {
+            CallEndReason::LocalHangup | CallEndReason::RemoteHangup => {}
+            CallEndReason::ConnectionLost => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    true,
+                    "Call dropped",
+                    format!("The connection to {name} was lost."),
+                    (!in_group).then_some("Call again"),
+                );
+            }
+            _ if in_group => {}
+            CallEndReason::Unreachable => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    true,
+                    format!("Couldn't reach {name}"),
+                    "They may be offline, or a firewall is blocking the connection.",
+                    Some("Try again"),
+                );
+            }
+            CallEndReason::Declined => {
+                self.play_sound(Sound::Fail);
+                self.notifications.call_ended(
+                    id,
+                    false,
+                    "Call not answered",
+                    format!("{name} declined or ended the call."),
+                    None,
+                );
+            }
+            CallEndReason::CallerCancelled => {
+                self.notifications
+                    .call_ended(id, false, "Missed call", name, Some("Call back"));
+            }
+        }
+    }
+
     fn hang_up_call(&self, node_id: NodeId) {
         self.play_sound(Sound::Whoosh1);
-        self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
         self.cmd(Command::Abort { node_id });
     }
 
@@ -3420,7 +3663,6 @@ impl AppState {
                 .filter(|peer| *peer != node_id)
                 .collect::<Vec<_>>();
             for peer in current_peers {
-                self.voluntary_hangups.fetch_add(1, Ordering::Relaxed);
                 self.cmd(Command::Abort { node_id: peer });
             }
             self.leave_group_call();
@@ -3866,7 +4108,9 @@ mod layout_tests {
     #[test]
     fn friend_call_button_is_disabled_while_a_call_is_visible() {
         assert!(friend_call_enabled(None));
-        assert!(friend_call_enabled(Some(&CallState::Aborted)));
+        assert!(friend_call_enabled(Some(&CallState::Aborted(
+            CallEndReason::LocalHangup
+        ))));
         assert!(!friend_call_enabled(Some(&CallState::Incoming)));
         assert!(!friend_call_enabled(Some(&CallState::Calling)));
         assert!(!friend_call_enabled(Some(&CallState::Active)));

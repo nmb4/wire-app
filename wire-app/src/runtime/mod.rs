@@ -130,7 +130,42 @@ pub(crate) enum CallState {
     Incoming,
     Calling,
     Active,
-    Aborted,
+    Aborted(CallEndReason),
+}
+
+/// Why a one-to-one call leg ended, so the UI can tell a hang-up from a
+/// failure instead of silently dropping the call card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallEndReason {
+    /// We hung up, declined, or left the call.
+    LocalHangup,
+    /// The other side closed an established call.
+    RemoteHangup,
+    /// The callee rejected the call before it was established.
+    Declined,
+    /// No connection to the peer could be established.
+    Unreachable,
+    /// The connection broke (timeout, reset, transport error).
+    ConnectionLost,
+    /// The caller gave up before we answered.
+    CallerCancelled,
+}
+
+impl CallEndReason {
+    /// Classifies a closed connection: an application close from the peer is
+    /// deliberate, our own close is a local hang-up, anything else is a
+    /// network failure.
+    pub(crate) fn from_close(
+        error: Option<iroh::endpoint::ConnectionError>,
+        remote_close: CallEndReason,
+    ) -> Self {
+        use iroh::endpoint::ConnectionError;
+        match error {
+            None | Some(ConnectionError::ApplicationClosed(_)) => remote_close,
+            Some(ConnectionError::LocallyClosed) => Self::LocalHangup,
+            Some(_) => Self::ConnectionLost,
+        }
+    }
 }
 
 type UpdateCallback = Arc<dyn Fn() + Send + Sync>;

@@ -125,6 +125,10 @@ pub struct Palette {
     pub accent_dim: Color32,
     pub ok: Color32,
     pub err: Color32,
+    /// Attention without failure: call waiting, ringing, degraded states.
+    pub warn: Color32,
+    /// Neutral status: outgoing calls, informational notices.
+    pub info: Color32,
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +157,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0xd9, 0x9a, 0x5b, 36),
                 ok: Color32::from_rgb(0x7a, 0x9b, 0x7e),
                 err: Color32::from_rgb(0xc9, 0x6f, 0x5c),
+                warn: Color32::from_rgb(0xd9, 0xa6, 0x4e),
+                info: Color32::from_rgb(0x7f, 0x9c, 0xb8),
             },
             // terminal / html-mockup look: green accent, near-black bg
             Theme::Terminal => Self {
@@ -170,6 +176,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0x7e, 0xe7, 0x87, 36),
                 ok: Color32::from_rgb(0x7e, 0xe7, 0x87),
                 err: Color32::from_rgb(0xff, 0x6b, 0x6b),
+                warn: Color32::from_rgb(0xf2, 0xc9, 0x4c),
+                info: Color32::from_rgb(0x6c, 0xb6, 0xff),
             },
             // discord oled look: true black bg, discord blurple accent
             Theme::DiscordOled => Self {
@@ -187,6 +195,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0x58, 0x65, 0xf2, 40),
                 ok: Color32::from_rgb(0x3b, 0xa5, 0x5c),
                 err: Color32::from_rgb(0xed, 0x42, 0x45),
+                warn: Color32::from_rgb(0xf0, 0xb2, 0x32),
+                info: Color32::from_rgb(0x00, 0xa8, 0xfc),
             },
             // slate look: #080807 / #DDDDD5 based, borders = lighter tints of bg
             Theme::Slate => Self {
@@ -204,6 +214,8 @@ impl Palette {
                 accent_dim: Color32::from_rgba_unmultiplied(0xdd, 0xdd, 0xd5, 28),
                 ok: Color32::from_rgb(0x9a, 0xa8, 0x92),
                 err: Color32::from_rgb(0xc2, 0x8a, 0x7c),
+                warn: Color32::from_rgb(0xc8, 0xb0, 0x7a),
+                info: Color32::from_rgb(0x8f, 0xa3, 0xb5),
             },
         }
     }
@@ -356,7 +368,8 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
 
     visuals.widgets.inactive.bg_fill = pal.panel2;
     visuals.widgets.inactive.weak_bg_fill = pal.panel2;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
+    // Also the resting text-field border: `line_br` stays visible on every theme.
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line_br);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
     visuals.widgets.inactive.expansion = 0.0;
@@ -382,6 +395,9 @@ pub fn visuals_for(pal: &Palette) -> egui::Visuals {
     visuals.widgets.open.expansion = 0.0;
 
     visuals.selection.bg_fill = pal.accent_dim;
+    // Focused text fields and selected list entries use the accent instead
+    // of egui's default light blue.
+    visuals.selection.stroke = Stroke::new(1.0_f32, pal.accent);
     visuals.window_stroke = Stroke::new(1.0_f32, pal.line);
     visuals.window_corner_radius = CornerRadius::same(10);
     visuals.menu_corner_radius = CornerRadius::same(8);
@@ -597,6 +613,21 @@ pub fn action_button_full(
     )
 }
 
+/// Names icon-only buttons for screen readers (AccessKit) and shows the same
+/// text as the hover tooltip, so the two never drift apart.
+pub trait IconButtonLabel {
+    fn labeled(self, label: impl Into<String>) -> egui::Response;
+}
+
+impl IconButtonLabel for egui::Response {
+    fn labeled(self, label: impl Into<String>) -> egui::Response {
+        let label = label.into();
+        let enabled = self.enabled();
+        self.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+        self.on_hover_text(label)
+    }
+}
+
 pub fn toolbar_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -617,6 +648,9 @@ pub fn toolbar_button(
         32.0,
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+    });
     let hot = response.hovered() || response.is_pointer_button_down_on() || response.has_focus();
 
     let (fill, stroke, text) = if selected {
@@ -852,6 +886,8 @@ pub fn dock_control(ui: &mut egui::Ui, pal: &Palette, icon: Icon, active: bool) 
 pub fn leave_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
     let size = DOCK_LEAVE_SIZE;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Leave call"));
     let fill = if response.hovered() {
         Color32::from_rgb(0xd1, 0x7c, 0x67)
     } else {

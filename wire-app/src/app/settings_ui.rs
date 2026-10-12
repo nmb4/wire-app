@@ -4,7 +4,7 @@ use super::{
     profile_ui::paint_profile_avatar,
     widgets::{
         floating_dialog_header, floating_panel, floating_panel_frame, floating_panel_width,
-        format_bytes, painted_volume_slider,
+        format_bytes, painted_volume_slider, select_field, settings_toggle,
     },
     AppState, ChatStyle, DEFAULT,
 };
@@ -153,118 +153,60 @@ impl AppState {
                                     ui,
                                     &pal,
                                     "Profile",
-                                    "Your display name and picture, shown to everyone you message or call.",
+                                    "Your display name, picture and name color.",
                                 );
                                 Frame::new()
                                     .fill(pal.panel2)
                                     .stroke(Stroke::new(1.0_f32, pal.line))
                                     .corner_radius(CornerRadius::same(7))
-                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
                                     .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 12.0;
                                             let avatar = self.own_avatar_texture(ctx);
-                                            let preview_name =
-                                                crate::profile::sanitize_display_name(
-                                                    &self.profile_edit_name,
-                                                );
-                                            let preview_name = if preview_name.is_empty() {
-                                                self.own_label()
-                                            } else {
-                                                preview_name
-                                            };
+                                            let name = self.own_label();
                                             let initials =
-                                                crate::profile::display_name_initial(&preview_name)
+                                                crate::profile::display_name_initial(&name)
                                                     .unwrap_or_else(|| "?".to_owned());
-                                            paint_profile_avatar(
-                                                ui, &pal, avatar, &initials, 56.0,
-                                            );
-                                            ui.vertical(|ui| {
-                                                if action_button(
-                                                    ui,
-                                                    &pal,
-                                                    "Choose picture…",
-                                                    ButtonTone::Secondary,
-                                                )
-                                                .on_hover_text(
-                                                    "PNG, JPEG, GIF or WebP up to 8 MiB",
-                                                )
-                                                .clicked()
-                                                {
-                                                    if let Some(path) = rfd::FileDialog::new()
-                                                        .set_title("Choose profile picture")
-                                                        .add_filter(
-                                                            "Images",
-                                                            &[
-                                                                "png", "jpg", "jpeg", "gif",
-                                                                "webp", "bmp",
-                                                            ],
-                                                        )
-                                                        .pick_file()
-                                                    {
-                                                        self.set_own_avatar_from_file(ctx, &path);
-                                                    }
-                                                }
-                                                if self.own_avatar_hash.is_some() {
+                                            paint_profile_avatar(ui, &pal, avatar, &initials, 40.0);
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
                                                     if action_button(
                                                         ui,
                                                         &pal,
-                                                        "Remove",
+                                                        "Edit profile",
                                                         ButtonTone::Secondary,
                                                     )
                                                     .clicked()
                                                     {
-                                                        self.clear_own_avatar();
+                                                        self.open_profile_editor();
                                                     }
-                                                }
-                                            });
-                                        });
-                                        ui.add_space(6.0);
-                                        settings_field_label(ui, &pal, "Display name", None);
-                                        if ui
-                                            .add(
-                                                egui::TextEdit::singleline(
-                                                    &mut self.profile_edit_name,
-                                                )
-                                                .hint_text("e.g. Ada Lovelace")
-                                                .desired_width(f32::INFINITY),
-                                            )
-                                            .changed()
-                                        {
-                                            self.profile_edit_error = None;
-                                        }
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}/32",
-                                                crate::profile::sanitize_display_name(
-                                                    &self.profile_edit_name
-                                                )
-                                                .chars()
-                                                .count()
-                                            ))
-                                            .color(pal.dim)
-                                            .size(ui_font_size(10.5)),
-                                        );
-                                        ui.add_space(6.0);
-                                        self.ui_accent_picker(ui, &pal);
-                                        if let Some(error) = &self.profile_edit_error {
-                                            ui.label(
-                                                RichText::new(error)
-                                                    .color(pal.err)
-                                                    .size(ui_font_size(11.5)),
+                                                    ui.with_layout(
+                                                        Layout::top_down(Align::Min),
+                                                        |ui| {
+                                                            ui.add_space(2.0);
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(&name)
+                                                                        .color(pal.text)
+                                                                        .size(ui_font_size(13.0)),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                            ui.label(
+                                                                RichText::new(
+                                                                    "Shown to everyone you message or call",
+                                                                )
+                                                                .color(pal.dim)
+                                                                .size(ui_font_size(10.5)),
+                                                            );
+                                                        },
+                                                    );
+                                                },
                                             );
-                                        }
-                                        ui.add_space(4.0);
-                                        if action_button(
-                                            ui,
-                                            &pal,
-                                            "Save profile",
-                                            ButtonTone::Primary,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.save_own_profile_edit();
-                                        }
+                                        });
                                     });
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -290,18 +232,8 @@ impl AppState {
                                     .corner_radius(CornerRadius::same(7))
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
-                                        ui.checkbox(
-                                            &mut self.start_with_system,
-                                            RichText::new("Start with system")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
-                                        ui.checkbox(
-                                            &mut self.show_system_usage,
-                                            RichText::new("Show system usage in title bar")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
+                                        settings_toggle(ui, &pal, &mut self.start_with_system, "Start with system");
+                                        settings_toggle(ui, &pal, &mut self.show_system_usage, "Show system usage in title bar");
                                     });
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -312,27 +244,15 @@ impl AppState {
                                 );
 
                                 settings_field_label(ui, &pal, "Theme", None);
-                                egui::ComboBox::from_id_salt("settings-theme")
-                                    .width(ui.available_width())
-                                    .truncate()
-                                    .selected_text(
-                                        RichText::new(self.theme.label())
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for theme in Theme::ALL {
-                                            if ui
-                                                .selectable_label(
-                                                    self.theme == theme,
-                                                    theme.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.theme = theme;
-                                            }
-                                        }
-                                    });
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Theme",
+                                    self.theme.label(),
+                                    Theme::ALL.iter().map(|theme| (self.theme == *theme, theme.label())),
+                                ) {
+                                    self.theme = Theme::ALL[index];
+                                }
                                 ui.add_space(8.0);
 
                                 settings_field_label(ui, &pal, "Window corners", None);
@@ -359,27 +279,17 @@ impl AppState {
                                         .color(pal.dim)
                                         .size(ui_font_size(11.0)),
                                 );
-                                egui::ComboBox::from_id_salt("settings-window-corners")
-                                    .width(ui.available_width())
-                                    .truncate()
-                                    .selected_text(
-                                        RichText::new(self.window_frame_style.label())
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for style in WindowFrameStyle::ALL {
-                                            if ui
-                                                .selectable_label(
-                                                    self.window_frame_style == style,
-                                                    style.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.window_frame_style = style;
-                                            }
-                                        }
-                                    });
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Window corners",
+                                    self.window_frame_style.label(),
+                                    WindowFrameStyle::ALL
+                                        .iter()
+                                        .map(|style| (self.window_frame_style == *style, style.label())),
+                                ) {
+                                    self.window_frame_style = WindowFrameStyle::ALL[index];
+                                }
 
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -396,13 +306,7 @@ impl AppState {
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
                                         let mut compact = self.chat_style == ChatStyle::Compact;
-                                        if ui
-                                            .checkbox(
-                                                &mut compact,
-                                                RichText::new("Compact (Discord-like)")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            )
+                                        if settings_toggle(ui, &pal, &mut compact, "Compact (Discord-like)")
                                             .changed()
                                         {
                                             self.chat_style = if compact {
@@ -413,7 +317,7 @@ impl AppState {
                                         }
                                         ui.label(
                                             RichText::new(
-                                                "Removes bubbles and groups consecutive messages from the same sender within one minute.",
+                                                "Removes bubbles and groups consecutive messages from the same sender within five minutes.",
                                             )
                                             .color(pal.dim)
                                             .size(ui_font_size(10.5)),
@@ -422,31 +326,23 @@ impl AppState {
                                 ui.add_space(8.0);
 
                                 settings_field_label(ui, &pal, "Keep history", None);
-                                egui::ComboBox::from_id_salt("settings-chat-retention")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(self.chat_retention.label())
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for policy in [
-                                            RetentionPolicy::Unlimited,
-                                            RetentionPolicy::Days(7),
-                                            RetentionPolicy::Days(30),
-                                            RetentionPolicy::Days(90),
-                                        ] {
-                                            if ui
-                                                .selectable_label(
-                                                    self.chat_retention == policy,
-                                                    policy.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.chat_retention = policy;
-                                            }
-                                        }
-                                    });
+                                const RETENTION: [RetentionPolicy; 4] = [
+                                    RetentionPolicy::Unlimited,
+                                    RetentionPolicy::Days(7),
+                                    RetentionPolicy::Days(30),
+                                    RetentionPolicy::Days(90),
+                                ];
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Keep history",
+                                    &self.chat_retention.label(),
+                                    RETENTION
+                                        .iter()
+                                        .map(|policy| (self.chat_retention == *policy, policy.label())),
+                                ) {
+                                    self.chat_retention = RETENTION[index];
+                                }
                                 ui.add_space(8.0);
                                 settings_field_label(
                                     ui,
@@ -454,33 +350,30 @@ impl AppState {
                                     "Maximum received image size",
                                     Some("Larger images stay remote and appear as placeholders."),
                                 );
-                                egui::ComboBox::from_id_salt("settings-max-image-bytes")
-                                    .width(ui.available_width())
-                                    .selected_text(image_limit_label(self.max_image_bytes))
-                                    .show_ui(ui, |ui| {
-                                        for limit in [
-                                            Some(1024 * 1024),
-                                            Some(5 * 1024 * 1024),
-                                            Some(10 * 1024 * 1024),
-                                            Some(25 * 1024 * 1024),
-                                            Some(50 * 1024 * 1024),
-                                            Some(100 * 1024 * 1024),
-                                            Some(250 * 1024 * 1024),
-                                            Some(500 * 1024 * 1024),
-                                            Some(1024 * 1024 * 1024),
-                                            None,
-                                        ] {
-                                            if ui
-                                                .selectable_label(
-                                                    self.max_image_bytes == limit,
-                                                    image_limit_label(limit),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.max_image_bytes = limit;
-                                            }
-                                        }
-                                    });
+                                const MIB: u64 = 1024 * 1024;
+                                const IMAGE_LIMITS: [Option<u64>; 10] = [
+                                    Some(MIB),
+                                    Some(5 * MIB),
+                                    Some(10 * MIB),
+                                    Some(25 * MIB),
+                                    Some(50 * MIB),
+                                    Some(100 * MIB),
+                                    Some(250 * MIB),
+                                    Some(500 * MIB),
+                                    Some(1024 * MIB),
+                                    None,
+                                ];
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Maximum received image size",
+                                    &image_limit_label(self.max_image_bytes),
+                                    IMAGE_LIMITS.iter().map(|limit| {
+                                        (self.max_image_bytes == *limit, image_limit_label(*limit))
+                                    }),
+                                ) {
+                                    self.max_image_bytes = IMAGE_LIMITS[index];
+                                }
                                 ui.add_space(8.0);
                                 settings_field_label(
                                     ui,
@@ -516,36 +409,16 @@ impl AppState {
                                 } else {
                                     &self.audio_config.selected_input
                                 };
-                                egui::ComboBox::from_id_salt("settings-microphone")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(input_label)
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.audio_config.selected_input == DEFAULT,
-                                                "System default",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.audio_config.selected_input = DEFAULT.to_string();
-                                        }
-                                        for device in &self.devices.input {
-                                            if ui
-                                                .selectable_label(
-                                                    &self.audio_config.selected_input == device,
-                                                    device,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.audio_config.selected_input =
-                                                    device.to_string();
-                                            }
-                                        }
-                                    });
+                                if let Some(device) = device_select(
+                                    ui,
+                                    &pal,
+                                    "Microphone",
+                                    input_label,
+                                    &self.audio_config.selected_input,
+                                    &self.devices.input,
+                                ) {
+                                    self.audio_config.selected_input = device;
+                                }
                                 ui.add_space(8.0);
 
                                 settings_field_label(ui, &pal, "Speakers", None);
@@ -554,36 +427,16 @@ impl AppState {
                                 } else {
                                     &self.audio_config.selected_output
                                 };
-                                egui::ComboBox::from_id_salt("settings-speakers")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(output_label)
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.audio_config.selected_output == DEFAULT,
-                                                "System default",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.audio_config.selected_output = DEFAULT.to_string();
-                                        }
-                                        for device in &self.devices.output {
-                                            if ui
-                                                .selectable_label(
-                                                    &self.audio_config.selected_output == device,
-                                                    device,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.audio_config.selected_output =
-                                                    device.to_string();
-                                            }
-                                        }
-                                    });
+                                if let Some(device) = device_select(
+                                    ui,
+                                    &pal,
+                                    "Speakers",
+                                    output_label,
+                                    &self.audio_config.selected_output,
+                                    &self.devices.output,
+                                ) {
+                                    self.audio_config.selected_output = device;
+                                }
 
                                 ui.add_space(8.0);
                                 settings_field_label(ui, &pal, "UI sounds", None);
@@ -610,19 +463,9 @@ impl AppState {
                                     .show(ui, |ui| {
                                         #[cfg(feature = "audio-processing")]
                                         {
-                                            ui.checkbox(
-                                                &mut self.audio_config.processing_enabled,
-                                                RichText::new("Echo cancellation")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            );
+                                            settings_toggle(ui, &pal, &mut self.audio_config.processing_enabled, "Echo cancellation");
                                         }
-                                        ui.checkbox(
-                                            &mut self.audio_config.noise_suppression_enabled,
-                                            RichText::new("Noise suppression (RNNoise)")
-                                                .color(pal.text2)
-                                                .size(ui_font_size(12.0)),
-                                        );
+                                        settings_toggle(ui, &pal, &mut self.audio_config.noise_suppression_enabled, "Noise suppression (RNNoise)");
                                     });
 
                                 ui.add_space(8.0);
@@ -632,36 +475,30 @@ impl AppState {
                                     self.audio_config.quality.label(),
                                     self.audio_config.quality.bandwidth_human()
                                 );
-                                egui::ComboBox::from_id_salt("settings-audio-quality")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(selected_quality)
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for quality in &[
-                                            AudioQuality::Low,
-                                            AudioQuality::Medium,
-                                            AudioQuality::High,
-                                            AudioQuality::Ultra,
-                                        ] {
-                                            let label = format!(
+                                const QUALITIES: [AudioQuality; 4] = [
+                                    AudioQuality::Low,
+                                    AudioQuality::Medium,
+                                    AudioQuality::High,
+                                    AudioQuality::Ultra,
+                                ];
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Audio quality",
+                                    &selected_quality,
+                                    QUALITIES.iter().map(|quality| {
+                                        (
+                                            self.audio_config.quality == *quality,
+                                            format!(
                                                 "{} · {}",
                                                 quality.label(),
                                                 quality.bandwidth_human()
-                                            );
-                                            if ui
-                                                .selectable_label(
-                                                    self.audio_config.quality == *quality,
-                                                    &label,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.audio_config.quality = *quality;
-                                            }
-                                        }
-                                    });
+                                            ),
+                                        )
+                                    }),
+                                ) {
+                                    self.audio_config.quality = QUALITIES[index];
+                                }
 
                                 settings_divider(ui);
                                 settings_section_heading(
@@ -677,13 +514,7 @@ impl AppState {
                                     .inner_margin(egui::Margin::symmetric(10, 7))
                                     .show(ui, |ui| {
                                         let mut automatic = self.record_calls_automatically;
-                                        if ui
-                                            .checkbox(
-                                                &mut automatic,
-                                                RichText::new("Record every call automatically")
-                                                    .color(pal.text2)
-                                                    .size(ui_font_size(12.0)),
-                                            )
+                                        if settings_toggle(ui, &pal, &mut automatic, "Record every call automatically")
                                             .on_hover_text(
                                                 "Start recording as soon as a call connects, and \
                                                  stop when the last person leaves",
@@ -736,25 +567,23 @@ impl AppState {
                                     "Stream quality",
                                     Some(&resolution_detail),
                                 );
-                                egui::ComboBox::from_id_salt("settings-stream-quality")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(preset_label)
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for preset in StreamPreset::all() {
-                                            let selected = self.video_config.resolution
-                                                == preset.resolution
-                                                && self.video_config.framerate == preset.framerate;
-                                            if ui.selectable_label(selected, preset.label).clicked()
-                                            {
-                                                self.video_config.resolution = preset.resolution;
-                                                self.video_config.framerate = preset.framerate;
-                                            }
-                                        }
-                                    });
+                                let presets = StreamPreset::all();
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Stream quality",
+                                    preset_label,
+                                    presets.iter().map(|preset| {
+                                        (
+                                            self.video_config.resolution == preset.resolution
+                                                && self.video_config.framerate == preset.framerate,
+                                            preset.label,
+                                        )
+                                    }),
+                                ) {
+                                    self.video_config.resolution = presets[index].resolution;
+                                    self.video_config.framerate = presets[index].framerate;
+                                }
 
                                 ui.add_space(8.0);
                                 let bitrate_label =
@@ -764,35 +593,22 @@ impl AppState {
                                     self.video_config.effective_bitrate() / 1_000_000
                                 );
                                 settings_field_label(ui, &pal, "Bitrate", Some(&bitrate_detail));
-                                egui::ComboBox::from_id_salt("settings-bitrate")
-                                    .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(bitrate_label)
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for preset in BitratePreset::all() {
-                                            let selected =
-                                                BitratePreset::from_config(&self.video_config)
-                                                    == *preset;
-                                            if ui
-                                                .selectable_label(selected, preset.label())
-                                                .clicked()
-                                            {
-                                                self.video_config.bitrate_bps = preset.bps();
-                                            }
-                                        }
-                                    });
+                                let current_bitrate = BitratePreset::from_config(&self.video_config);
+                                let bitrates = BitratePreset::all();
+                                if let Some(index) = select_field(
+                                    ui,
+                                    &pal,
+                                    "Bitrate",
+                                    bitrate_label,
+                                    bitrates
+                                        .iter()
+                                        .map(|preset| (current_bitrate == *preset, preset.label())),
+                                ) {
+                                    self.video_config.bitrate_bps = bitrates[index].bps();
+                                }
 
                                 ui.add_space(10.0);
-                                if ui
-                                    .checkbox(
-                                        &mut self.share_system_audio,
-                                        RichText::new("Also share system audio")
-                                            .color(pal.text2)
-                                            .size(ui_font_size(12.0)),
-                                    )
+                                if settings_toggle(ui, &pal, &mut self.share_system_audio, "Also share system audio")
                                     .on_hover_text(
                                         "When you share a screen, send this computer's sound to the call",
                                     )
@@ -1149,6 +965,27 @@ fn settings_divider(ui: &mut Ui) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
+}
+
+/// Audio device picker: "System default" first, then the detected devices.
+/// Returns the new device name to store.
+fn device_select(
+    ui: &mut Ui,
+    pal: &Palette,
+    name: &str,
+    selected_text: &str,
+    current: &str,
+    devices: &[String],
+) -> Option<String> {
+    let options = std::iter::once((current == DEFAULT, "System default")).chain(
+        devices
+            .iter()
+            .map(|device| (current == device, device.as_str())),
+    );
+    select_field(ui, pal, name, selected_text, options).map(|index| match index {
+        0 => DEFAULT.to_owned(),
+        n => devices[n - 1].clone(),
+    })
 }
 
 fn image_limit_label(limit: Option<u64>) -> String {

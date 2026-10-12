@@ -1,6 +1,8 @@
 //! Shared UI painting and layout helpers.
 
-use crate::theme::{ghost_icon_button, kh_family, lucide, sans, ui_font_size, Palette};
+use crate::theme::{
+    ghost_icon_button, kh_family, lucide, sans, ui_font_size, IconButtonLabel, Palette,
+};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Rect, RichText, Stroke,
     TextureHandle, Ui, Vec2,
@@ -210,6 +212,94 @@ pub(super) fn floating_panel<'a>(
         .frame(floating_panel_frame(pal, 16))
 }
 
+/// Shell for a modal-style floating dialog without egui's native title bar.
+/// Callers draw `floating_dialog_header` first, then `dialog_body`. Returns
+/// the window and the content width to pin with `ui.set_width`.
+pub(super) fn dialog_window<'a>(
+    id: &'a str,
+    pal: &Palette,
+    viewport: Rect,
+    preferred_width: f32,
+) -> (egui::Window<'a>, f32) {
+    let width = floating_panel_width(viewport, preferred_width, 0.0);
+    let window = floating_panel(id, pal, viewport, preferred_width)
+        .title_bar(false)
+        .vscroll(false)
+        .default_width(width)
+        .min_width(width)
+        .max_width(width)
+        .frame(floating_panel_frame(pal, 0));
+    (window, width)
+}
+
+/// Padded body below a `floating_dialog_header`.
+pub(super) fn dialog_body<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 18,
+            top: 14,
+            bottom: 16,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Right-aligned action row closing a dialog. Add the primary action first:
+/// the row lays out right to left, so it ends up rightmost.
+pub(super) fn dialog_footer<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.add_space(14.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 32.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            add_contents(ui)
+        },
+    )
+    .inner
+}
+
+/// Small label above a form field, with an optional muted detail line.
+pub(super) fn form_label(ui: &mut Ui, pal: &Palette, label: &str, detail: Option<&str>) {
+    ui.label(
+        RichText::new(label)
+            .color(pal.text2)
+            .size(ui_font_size(12.0)),
+    );
+    if let Some(detail) = detail {
+        ui.add(
+            egui::Label::new(
+                RichText::new(detail)
+                    .color(pal.dim)
+                    .size(ui_font_size(10.5)),
+            )
+            .wrap(),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+/// Single-line text field with comfortable padding and a visible resting
+/// border. Focus switches the border to the accent (see `visuals_for`).
+pub(super) fn form_text_input(
+    ui: &mut Ui,
+    pal: &Palette,
+    text: &mut String,
+    hint: &str,
+) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(RichText::new(hint).color(pal.dim2))
+            .margin(egui::Margin::symmetric(10, 7))
+            .background_color(pal.panel)
+            .desired_width(ui.available_width()),
+    )
+}
+
 pub(super) fn peer_volume_slider(
     ui: &mut Ui,
     pal: &Palette,
@@ -389,7 +479,7 @@ pub(super) fn chat_surface(pal: &Palette) -> Color32 {
     pal.panel
 }
 
-fn chat_hover_surface(pal: &Palette) -> Color32 {
+pub(super) fn chat_hover_surface(pal: &Palette) -> Color32 {
     mix_color(pal.bg, pal.panel2, 0.62)
 }
 
@@ -441,9 +531,7 @@ pub(super) fn floating_dialog_header(
                 // subtitle wraps below the title instead of pushing it offscreen.
                 if let Some(tooltip) = close_tooltip {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        closed = ghost_icon_button(ui, pal, ph::X)
-                            .on_hover_text(tooltip)
-                            .clicked();
+                        closed = ghost_icon_button(ui, pal, ph::X).labeled(tooltip).clicked();
                         ui.allocate_ui_with_layout(
                             Vec2::new(ui.available_width(), 0.0),
                             Layout::top_down(Align::Min),
@@ -562,7 +650,6 @@ pub(super) fn chat_navigation_button(
     // Every row has the same height and avatar size, with or without a
     // subtitle, so the list reads as one rhythm.
     const ROW_HEIGHT: f32 = 44.0;
-    const AVATAR: f32 = 30.0;
     let height = ROW_HEIGHT;
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(1.0), height),
@@ -582,9 +669,34 @@ pub(super) fn chat_navigation_button(
     } else {
         rect.right() - 10.0
     };
+    let name_color = if selected || hot { pal.text } else { pal.text2 };
+    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    if unseen {
+        ui.painter()
+            .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
+    }
+    response
+}
+
+/// Avatar diameter shared by every 44 px list row.
+const ROW_AVATAR: f32 = 30.0;
+
+/// Avatar plus a name/subtitle block, centered as a unit on a list row.
+/// Shared by sidebar navigation rows and selectable member rows.
+#[allow(clippy::too_many_arguments)]
+fn paint_row_identity(
+    ui: &Ui,
+    pal: &Palette,
+    rect: Rect,
+    label: &str,
+    subtitle: Option<&str>,
+    avatar: Option<SidebarAvatar>,
+    text_right: f32,
+    name_color: Color32,
+) {
     let label_font = FontId::proportional(ui_font_size(12.5));
     let subtitle_font = FontId::proportional(ui_font_size(10.5));
-    let avatar_size = AVATAR;
+    let avatar_size = ROW_AVATAR;
     let text_left = if let Some(avatar) = &avatar {
         let center = egui::pos2(rect.left() + 8.0 + avatar_size * 0.5, rect.center().y);
         let avatar_rect = Rect::from_center_size(center, Vec2::splat(avatar_size));
@@ -613,7 +725,6 @@ pub(super) fn chat_navigation_button(
     // centered on the row as a unit, so one-line and two-line rows share
     // the same optical center.
     let max_text = (text_right - text_left).max(1.0);
-    let name_color = if selected || hot { pal.text } else { pal.text2 };
     let name = truncated_galley(ui, label, label_font, name_color, max_text);
     let sub = subtitle.map(|text| truncated_galley(ui, text, subtitle_font, pal.dim, max_text));
     let block_h = name.size().y + sub.as_ref().map_or(0.0, |g| g.size().y - 2.0);
@@ -624,10 +735,269 @@ pub(super) fn chat_navigation_button(
     if let Some(sub) = sub {
         ui.painter().galley(egui::pos2(text_left, y), sub, pal.dim);
     }
-    if unseen {
-        ui.painter()
-            .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
+}
+
+/// Full-width settings row: label on the left, an on/off switch on the right.
+/// The whole row toggles; `changed()` reports a flip like `ui.checkbox`.
+pub(super) fn settings_toggle(
+    ui: &mut Ui,
+    pal: &Palette,
+    value: &mut bool,
+    label: &str,
+) -> egui::Response {
+    const TRACK: Vec2 = Vec2::new(32.0, 18.0);
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        FontId::proportional(ui_font_size(12.0)),
+        pal.text2,
+        (ui.available_width() - TRACK.x - 12.0).max(40.0),
+    );
+    let height = galley.size().y.max(TRACK.y) + 10.0;
+    let (rect, mut response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *value, label)
+    });
+    let hot = response.hovered() || response.has_focus();
+    let painter = ui.painter();
+    painter.galley(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        if hot { pal.text } else { pal.text2 },
+    );
+    let on = ui.ctx().animate_bool_responsive(response.id, *value);
+    let track = Rect::from_center_size(
+        egui::pos2(rect.right() - TRACK.x * 0.5, rect.center().y),
+        TRACK,
+    );
+    let track_fill = crate::theme::mix_rgb(pal.panel, pal.accent, on);
+    painter.rect(
+        track,
+        CornerRadius::same(9),
+        track_fill,
+        Stroke::new(1.0, if *value { pal.accent } else { pal.line_br }),
+        egui::StrokeKind::Inside,
+    );
+    let knob_x = egui::lerp(track.left() + 9.0..=track.right() - 9.0, on);
+    painter.circle_filled(
+        egui::pos2(knob_x, track.center().y),
+        6.0,
+        if *value { pal.bg } else { pal.dim },
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            track.expand(2.0),
+            CornerRadius::same(11),
+            Stroke::new(1.0, pal.accent),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response
+}
+
+/// A 44 px member row with a trailing check box, for multi-select lists such
+/// as the group editor. The whole row toggles.
+pub(super) fn member_toggle_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    subtitle: Option<&str>,
+    checked: bool,
+    avatar: Option<SidebarAvatar>,
+) -> egui::Response {
+    const ROW_HEIGHT: f32 = 44.0;
+    const CHECK: f32 = 18.0;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hot = response.hovered() || response.has_focus();
+    let fill = if checked {
+        chat_selected_surface(pal)
+    } else if hot {
+        chat_hover_surface(pal)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+    let name_color = if checked || hot { pal.text } else { pal.text2 };
+    let text_right = rect.right() - 12.0 - CHECK - 10.0;
+    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    let check = Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0 - CHECK * 0.5, rect.center().y),
+        Vec2::splat(CHECK),
+    );
+    if checked {
+        ui.painter()
+            .rect_filled(check, CornerRadius::same(5), pal.accent);
+        ui.painter().text(
+            check.center(),
+            Align2::CENTER_CENTER,
+            char::from(Icon::Check),
+            lucide(12.0),
+            pal.bg,
+        );
+    } else {
+        ui.painter().rect_stroke(
+            check,
+            CornerRadius::same(5),
+            Stroke::new(1.25_f32, if hot { pal.text2 } else { pal.line_br }),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, checked, label)
+    });
+    response
+}
+
+/// Drop-down select in the settings style: a 32 px field showing the current
+/// value with a chevron, opening the shared popup menu at the field's width.
+///
+/// `options` yields `(selected, label)` pairs and is only walked while the
+/// menu is open. Returns the index of the option the user picked.
+pub(super) fn select_field<S: AsRef<str>>(
+    ui: &mut Ui,
+    pal: &Palette,
+    name: &str,
+    selected_text: &str,
+    options: impl IntoIterator<Item = (bool, S)>,
+) -> Option<usize> {
+    const RADIUS: u8 = 7;
+    // A persistent id keeps the menu open when rows above it appear or
+    // disappear (update status, device lists).
+    let (_, rect) = ui.allocate_space(Vec2::new(
+        ui.available_width().max(1.0),
+        CHROME_CONTROL_HEIGHT,
+    ));
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("select-field", name)),
+        egui::Sense::click(),
+    );
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    let hot = response.hovered() || response.has_focus();
+    let stroke = if open || response.has_focus() {
+        pal.accent
+    } else if hot {
+        mix_color(pal.line_br, pal.text2, 0.35)
+    } else {
+        pal.line_br
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(RADIUS),
+        if hot {
+            chat_hover_surface(pal)
+        } else {
+            pal.panel
+        },
+        Stroke::new(1.0_f32, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let chevron = if open {
+        Icon::ChevronUp
+    } else {
+        Icon::ChevronDown
+    };
+    painter.text(
+        egui::pos2(rect.right() - 16.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        char::from(chevron),
+        lucide(14.0),
+        if hot || open { pal.text } else { pal.dim },
+    );
+    let text_color = if hot || open { pal.text } else { pal.text2 };
+    let galley = truncated_galley(
+        ui,
+        selected_text,
+        FontId::proportional(ui_font_size(12.0)),
+        text_color,
+        (rect.width() - 10.0 - 32.0).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        text_color,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), name)
+    });
+    let hover_text = (selected_text.chars().count() > 40).then(|| selected_text.to_owned());
+
+    let mut picked = None;
+    let popup_width = rect.width();
+    egui::Popup::menu(&response)
+        .width(popup_width)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(4.0)
+        .show(|ui| {
+            let inner = (popup_width - ui.spacing().menu_margin.sum().x).max(1.0);
+            ui.set_width(inner);
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+            egui::ScrollArea::vertical()
+                .id_salt("select-field-options")
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for (index, (selected, label)) in options.into_iter().enumerate() {
+                        if select_option_row(ui, pal, label.as_ref(), selected).clicked() {
+                            picked = Some(index);
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    if let Some(text) = hover_text {
+        response.on_hover_text(text);
+    }
+    picked
+}
+
+/// One full-width row in a `select_field` menu, with a check on the current
+/// value.
+fn select_option_row(ui: &mut Ui, pal: &Palette, label: &str, selected: bool) -> egui::Response {
+    const HEIGHT: f32 = 28.0;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), HEIGHT),
+        egui::Sense::click(),
+    );
+    let hot = response.hovered() || response.has_focus();
+    if hot {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), chat_hover_surface(pal));
+    }
+    let color = if hot || selected { pal.text } else { pal.text2 };
+    let galley = truncated_galley(
+        ui,
+        label,
+        FontId::proportional(ui_font_size(12.0)),
+        color,
+        (rect.width() - 8.0 - 28.0).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    if selected {
+        ui.painter().text(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            char::from(Icon::Check),
+            lucide(13.0),
+            pal.accent,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+    });
     response
 }
 
