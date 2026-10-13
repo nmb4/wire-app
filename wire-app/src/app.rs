@@ -30,7 +30,6 @@ use crate::{
     },
     client_status::{Availability, GroupCallAnnouncement, StatusUpdate},
     dev_pair::DevPairState,
-    hidden_event_loop,
     host::ServiceClient,
     notifications::{NotificationAction, NotificationService},
     persistence,
@@ -1068,8 +1067,12 @@ impl eframe::App for App {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        ctx.style_mut(|style| style.interaction.selectable_labels = false);
+    /// Background work and lifecycle handling.
+    ///
+    /// eframe also calls `logic` for a hidden or minimized root viewport (via
+    /// [`egui::Context::run_logic`]), so worker events, tray actions and
+    /// activation keep being handled without painting. Do not show UI here.
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.process_tray(ctx);
         if self.state.service.take_activation_request() {
             self.show_window(ctx);
@@ -1124,29 +1127,40 @@ impl eframe::App for App {
                 self.state.start_update_check(ctx);
             }
         }
-        // on android, add some space at the top.
-        #[cfg(target_os = "android")]
-        egui::TopBottomPanel::top("my_panel")
-            .min_height(40.)
-            .show(ctx, |_ui| {});
-
         #[cfg(windows)]
         let parent_hwnd = native_parent_hwnd(frame);
         #[cfg(windows)]
         if let Some(watcher) = self.activation_watcher.as_ref() {
             watcher.set_hwnd(parent_hwnd.map(|hwnd| hwnd.0 as isize));
         }
-        self.state.update(
-            ctx,
-            &mut self.always_on_top,
-            &mut self.viewport_transparent,
-            self.window_visible,
-            #[cfg(windows)]
-            parent_hwnd,
-        );
+        self.state.update_logic(ctx, self.window_visible);
         if self.state.exit_requested {
             self.quit_requested = true;
         }
+    }
+
+    /// Paint the root viewport.
+    ///
+    /// The provided `ui` covers the whole viewport, so panels and other
+    /// containers are added to it directly (windows and areas still use
+    /// [`egui::Context`]).
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        ui.ctx()
+            .global_style_mut(|style| style.interaction.selectable_labels = false);
+        // on android, add some space at the top.
+        #[cfg(target_os = "android")]
+        egui::Panel::top("my_panel")
+            .exact_size(40.0)
+            .show(ui, |_ui| {});
+        #[cfg(windows)]
+        let parent_hwnd = native_parent_hwnd(frame);
+        self.state.update_ui(
+            ui,
+            &mut self.always_on_top,
+            &mut self.viewport_transparent,
+            #[cfg(windows)]
+            parent_hwnd,
+        );
     }
 }
 
@@ -1216,32 +1230,38 @@ impl App {
 }
 
 fn wgpu_surface_error_action(
-    error: eframe::wgpu::SurfaceError,
+    status: &eframe::wgpu::CurrentSurfaceTexture,
 ) -> eframe::egui_wgpu::SurfaceErrorAction {
     use eframe::egui_wgpu::SurfaceErrorAction;
-    use eframe::wgpu::SurfaceError;
+    use eframe::wgpu::CurrentSurfaceTexture;
 
-    match error {
-        SurfaceError::Outdated => {
-            // Windows reports this while a window is minimized. The resize path
-            // configures the surface again once the window has a usable size.
-            debug!("skipping frame for outdated wgpu surface");
-            SurfaceErrorAction::SkipFrame
+    match status {
+        CurrentSurfaceTexture::Outdated => {
+            // The surface needs a fresh configuration before it can be acquired
+            // again (reported on resizes, scale changes and minimized windows).
+            // Skipping would leave it outdated forever.
+            debug!("reconfiguring an outdated wgpu surface");
+            SurfaceErrorAction::Reconfigure
         }
-        SurfaceError::Timeout => {
+        CurrentSurfaceTexture::Timeout => {
             warn!("wgpu surface acquisition timed out; skipping frame");
             SurfaceErrorAction::SkipFrame
         }
-        SurfaceError::Lost => {
-            warn!("wgpu surface was lost; reconfiguring before the next frame");
+        CurrentSurfaceTexture::Lost => {
+            warn!("wgpu surface was lost; recreating it before the next frame");
             SurfaceErrorAction::RecreateSurface
         }
-        SurfaceError::Other => {
-            warn!("wgpu surface acquisition failed; reconfiguring before the next frame");
-            SurfaceErrorAction::RecreateSurface
+        CurrentSurfaceTexture::Occluded => {
+            debug!("skipping frame for an occluded wgpu surface");
+            SurfaceErrorAction::SkipFrame
         }
-        SurfaceError::OutOfMemory => {
-            tracing::error!("wgpu could not acquire a surface texture because GPU memory is exhausted; skipping frame");
+        CurrentSurfaceTexture::Validation => {
+            tracing::error!("wgpu surface validation failed; skipping frame");
+            SurfaceErrorAction::SkipFrame
+        }
+        // These carry a usable texture; eframe only calls this handler for
+        // non-`Success` results, but skipping is the safe answer either way.
+        CurrentSurfaceTexture::Success(_) | CurrentSurfaceTexture::Suboptimal(_) => {
             SurfaceErrorAction::SkipFrame
         }
     }
@@ -1264,29 +1284,29 @@ fn handle_uncaptured_wgpu_error(error: eframe::wgpu::Error) {
 #[cfg(test)]
 mod wgpu_error_tests {
     use super::*;
-    use eframe::{egui_wgpu::SurfaceErrorAction, wgpu::SurfaceError};
+    use eframe::{egui_wgpu::SurfaceErrorAction, wgpu::CurrentSurfaceTexture};
 
     #[test]
     fn reconfigures_surfaces_that_can_recover() {
         assert!(matches!(
-            wgpu_surface_error_action(SurfaceError::Lost),
-            SurfaceErrorAction::RecreateSurface
+            wgpu_surface_error_action(&CurrentSurfaceTexture::Outdated),
+            SurfaceErrorAction::Reconfigure
         ));
         assert!(matches!(
-            wgpu_surface_error_action(SurfaceError::Other),
+            wgpu_surface_error_action(&CurrentSurfaceTexture::Lost),
             SurfaceErrorAction::RecreateSurface
         ));
     }
 
     #[test]
     fn skips_frames_for_transient_or_resource_errors() {
-        for error in [
-            SurfaceError::Outdated,
-            SurfaceError::Timeout,
-            SurfaceError::OutOfMemory,
+        for status in [
+            CurrentSurfaceTexture::Timeout,
+            CurrentSurfaceTexture::Occluded,
+            CurrentSurfaceTexture::Validation,
         ] {
             assert!(matches!(
-                wgpu_surface_error_action(error),
+                wgpu_surface_error_action(&status),
                 SurfaceErrorAction::SkipFrame
             ));
         }
@@ -1314,7 +1334,7 @@ impl App {
         start_hidden: bool,
     ) -> Result<(), eframe::Error> {
         let mut options = options;
-        options.wgpu_options.on_surface_error = Arc::new(wgpu_surface_error_action);
+        options.wgpu_options.on_surface_status = Arc::new(wgpu_surface_error_action);
         let devices = list_audio_devices();
         let saved_settings = load_settings();
         let dev_fixture = std::env::var_os("WIRE_DEV_PAIR_SESSION").is_some()
@@ -1480,7 +1500,16 @@ impl App {
             #[cfg(windows)]
             global_hotkeys: None,
         };
-        hidden_event_loop::run(
+        // Own the winit event loop so that a normal app exit returns here and
+        // `main` can shut the host down. eframe 0.36 runs hidden and minimized
+        // viewports logic-only, throttles their repaints to a sleeping loop and
+        // always restores a future control flow (upstream #8398), so the old
+        // hidden-redraw suppression is no longer needed.
+        let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event()
+            .build()
+            .map_err(eframe::Error::WinitEventLoop)?;
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        let mut eframe_app = eframe::create_native(
             "wire",
             options,
             Box::new(move |cc| {
@@ -1539,8 +1568,11 @@ impl App {
                 }
                 Ok(Box::new(app))
             }),
-            window_hidden,
-        )
+            &event_loop,
+        );
+        event_loop
+            .run_app(&mut eframe_app)
+            .map_err(eframe::Error::WinitEventLoop)
     }
 }
 impl AppState {
@@ -1560,15 +1592,14 @@ impl AppState {
         self.pane_viewport
     }
 
-    fn update(
-        &mut self,
-        ctx: &egui::Context,
-        always_on_top: &mut bool,
-        viewport_transparent: &mut Option<bool>,
-        window_visible: bool,
-        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
-    ) {
-        if self.show_system_usage {
+    /// Background work which must keep running while the window is hidden.
+    ///
+    /// eframe calls `App::logic` for a hidden or minimized viewport too, so this
+    /// must not paint and must be safe without a fresh egui pass. Input-dependent
+    /// work belongs in [`Self::update_ui`], because the input seen while hidden
+    /// is the input of the last shown frame.
+    fn update_logic(&mut self, ctx: &egui::Context, window_visible: bool) {
+        if window_visible && self.show_system_usage {
             // Keep the optional process resource readout current while the rest of the UI is idle.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -1577,17 +1608,11 @@ impl AppState {
             // is idle, otherwise the elapsed time freezes on the last frame.
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        self.track_pane_viewport(ctx);
         #[cfg(windows)]
         self.process_update_events(ctx);
         self.process_autostart_events();
-        let pal = Palette::for_theme(self.theme);
-        ctx.set_visuals(visuals_for(&pal));
-
         self.process_notification_actions(ctx);
         self.process_events(ctx);
-        self.drive_ui_capture(ctx);
-        self.mark_visible_conversation_seen(ctx);
         if self.notifications.take_sound_request() {
             self.play_sound(Sound::Notification);
         }
@@ -1597,11 +1622,31 @@ impl AppState {
                 presenter.mark_unused();
             }
         }
-        self.handle_view_mode_input(ctx);
+    }
+
+    /// Per-frame UI state and painting for the root viewport.
+    ///
+    /// The root `ui` covers the whole viewport. Child viewports (windows and
+    /// areas) keep using [`egui::Context`].
+    fn update_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        always_on_top: &mut bool,
+        viewport_transparent: &mut Option<bool>,
+        #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
+    ) {
+        let ctx = ui.ctx().clone();
+        self.track_pane_viewport(&ctx);
+        let pal = Palette::for_theme(self.theme);
+        ctx.set_visuals(visuals_for(&pal));
+
+        self.drive_ui_capture(&ctx);
+        self.mark_visible_conversation_seen(&ctx);
+        self.handle_view_mode_input(&ctx);
         if (self.app_mode == AppMode::Text || !self.has_active_call())
             && self.stream_view_mode != StreamViewMode::Normal
         {
-            self.set_stream_view_mode(ctx, StreamViewMode::Normal);
+            self.set_stream_view_mode(&ctx, StreamViewMode::Normal);
         }
         if self.app_mode != AppMode::Text {
             if self
@@ -1616,9 +1661,9 @@ impl AppState {
         }
 
         if !self.stream_view_mode.is_fullscreen() {
-            let rounded = window_frame::effective_rounded(ctx, self.window_frame_style);
+            let rounded = window_frame::effective_rounded(&ctx, self.window_frame_style);
             self.ui_with_chrome(
-                ctx,
+                ui,
                 &pal,
                 rounded,
                 always_on_top,
@@ -1628,16 +1673,16 @@ impl AppState {
             );
         } else {
             if *viewport_transparent != Some(false) {
-                window_frame::sync_viewport_transparent(ctx, false);
+                window_frame::sync_viewport_transparent(&ctx, false);
                 *viewport_transparent = Some(false);
                 ctx.request_repaint();
             }
             egui::CentralPanel::default()
                 .frame(Frame::NONE)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     self.ui_stage(
                         ui,
-                        ctx,
+                        &ctx,
                         &pal,
                         #[cfg(windows)]
                         parent_hwnd,
@@ -1646,11 +1691,11 @@ impl AppState {
             egui::Area::new(egui::Id::new("fullscreen-mode-switcher"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(12.0, 12.0))
-                .show(ctx, |ui| self.ui_mode_switcher(ui, &pal));
+                .show(&ctx, |ui| self.ui_mode_switcher(ui, &pal));
             egui::Area::new(egui::Id::new("fullscreen-contacts"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     if ghost_icon_button(ui, &pal, ph::ADDRESS_BOOK)
                         .labeled("Contacts and calling")
                         .clicked()
@@ -1665,7 +1710,7 @@ impl AppState {
         let contacts_visible =
             self.app_mode == AppMode::Calls && self.show_contacts && self.has_visible_call();
         if contacts_visible && !self.show_settings && self.configured {
-            self.ui_contacts_window(ctx);
+            self.ui_contacts_window(&ctx);
         }
         let settings_open = self.show_settings || !self.configured;
         if settings_open && !self.settings_was_open {
@@ -1673,25 +1718,25 @@ impl AppState {
         }
         self.settings_was_open = settings_open;
         if settings_open {
-            self.ui_settings_window(ctx);
+            self.ui_settings_window(&ctx);
         }
         if self.show_capture_picker {
-            self.ui_capture_picker(ctx, &pal);
+            self.ui_capture_picker(&ctx, &pal);
         }
         // Profile editor is a modal overlay available in both Text and Calls
         // modes, independent of the settings / contacts windows. The avatar
         // crop editor sits above it.
-        self.ui_profile_editor(ctx);
-        self.ui_avatar_crop_editor(ctx);
-        self.ui_confirm_dialog(ctx, &pal);
+        self.ui_profile_editor(&ctx);
+        self.ui_avatar_crop_editor(&ctx);
+        self.ui_confirm_dialog(&ctx, &pal);
         #[cfg(windows)]
         if self.show_update_prompt {
-            self.ui_update_prompt(ctx);
+            self.ui_update_prompt(&ctx);
         }
-        self.notifications.show(ctx, self.theme);
+        self.notifications.show(&ctx, self.theme);
         #[cfg(windows)]
         if self.show_peer_update_prompt {
-            self.ui_peer_update_prompt(ctx);
+            self.ui_peer_update_prompt(&ctx);
         }
         #[cfg(windows)]
         {

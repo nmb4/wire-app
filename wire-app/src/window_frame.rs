@@ -3,8 +3,7 @@
 //! Chrome follows the eframe `custom_window_frame` example: a single [`Frame`]
 //! with [`Frame::outer_margin`] keeping the stroke inside the viewport. Fill and
 //! border are painted at explicit geometry (not [`egui::Ui::min_rect`]) so the
-//! right edge is never truncated by nested panel clipping. The clip rect is
-//! expanded by [`egui::style::Visuals::clip_rect_margin`] for anti-aliasing.
+//! right edge is never truncated by nested panel clipping.
 
 use crate::theme::{Palette, WindowFrameStyle};
 use eframe::egui::{
@@ -39,10 +38,11 @@ pub fn corner_radius(rounded: bool) -> CornerRadius {
     }
 }
 
-/// Clip rect for chrome painting, expanded for stroke anti-aliasing.
+/// Clip rect for chrome painting.
 pub fn clip_rect(ctx: &egui::Context) -> Rect {
+    // egui 0.36 removed the effective `Visuals::clip_rect_margin`; the chrome
+    // stroke stays inside `OUTER_MARGIN`, so the exact viewport rect suffices.
     ctx.viewport_rect()
-        .expand(ctx.style().visuals.clip_rect_margin)
 }
 
 /// Layout bounds for chrome children, inset inside the painted fill and corner curve.
