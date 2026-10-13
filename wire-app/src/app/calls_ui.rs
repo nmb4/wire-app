@@ -11,11 +11,11 @@ use super::{
     save_friends,
     widgets::{
         aspect_fit_rect, chat_hairline, chat_hover_surface, chat_selected_surface, chat_surface,
-        copy_to_clipboard, ellipsize, floating_dialog_header, floating_panel, floating_panel_frame,
-        floating_panel_width, fmt_error, fmt_node_id, paint_volume_track, participant_bar_columns,
-        peer_volume_slider, read_clipboard, section_card, truncated_galley, video_display_size,
-        VolumeKnob, CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS,
-        PARTICIPANT_CHIP_HEIGHT, PARTICIPANT_GAP,
+        copy_to_clipboard, dialog_window, ellipsize, floating_dialog_header, floating_panel,
+        fmt_error, fmt_node_id, paint_volume_track, participant_bar_columns, peer_volume_slider,
+        read_clipboard, section_card, truncated_galley, video_display_size, VolumeKnob,
+        CHROME_CONTROL_HEIGHT, CHROME_INNER_RADIUS, CHROME_RADIUS, PARTICIPANT_CHIP_HEIGHT,
+        PARTICIPANT_GAP,
     },
     AppMode, AppState, StreamSource, StreamViewMode, TextureUploadStats, STREAM_GRID_GAP,
 };
@@ -1195,43 +1195,36 @@ impl AppState {
     pub(super) fn ui_contacts_window(&mut self, ctx: &egui::Context) {
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = floating_panel_width(pane_rect, 560.0, 0.0);
         let scroll_height = (pane_rect.height() - 130.0).clamp(1.0, 700.0);
 
-        floating_panel("contacts-dialog", &pal, pane_rect, 560.0)
-            .title_bar(false)
-            .vscroll(false)
-            .default_width(dialog_width)
-            .min_width(dialog_width)
-            .max_width(dialog_width)
-            .frame(floating_panel_frame(&pal, 0))
-            .show(ctx, |ui| {
-                ui.set_width(dialog_width);
-                if floating_dialog_header(
-                    ui,
-                    &pal,
-                    "CONTACTS",
-                    "friends and calling",
-                    Some("Close contacts"),
-                ) {
-                    self.show_contacts = false;
-                }
-                Frame::new()
-                    .inner_margin(egui::Margin::symmetric(18, 16))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        egui::ScrollArea::vertical()
-                            .id_salt("contacts-scroll")
-                            .max_height(scroll_height)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                self.ui_friends_card(ui);
-                                ui.add_space(12.0);
-                                self.ui_call_more_options(ui);
-                            });
-                    });
-            });
+        let (window, dialog_width) = dialog_window("contacts-dialog", &pal, pane_rect, 560.0);
+        window.show(ctx, |ui| {
+            ui.set_width(dialog_width);
+            if floating_dialog_header(
+                ui,
+                &pal,
+                "CONTACTS",
+                "friends and calling",
+                Some("Close contacts"),
+            ) {
+                self.show_contacts = false;
+            }
+            Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 16))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("contacts-scroll")
+                        .max_height(scroll_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.ui_friends_card(ui);
+                            ui.add_space(12.0);
+                            self.ui_call_more_options(ui);
+                        });
+                });
+        });
     }
 
     fn ui_identity_card(&mut self, ui: &mut Ui) {
@@ -1961,6 +1954,11 @@ impl AppState {
     ) {
         let available = ui.available_size();
         let (tile_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        // `Id::with` needs a `Debug + Hash` salt; `StreamSource` has no `Debug`.
+        let source_salt = match source {
+            StreamSource::Local => "local".to_owned(),
+            StreamSource::Remote(node_id) => node_id.to_string(),
+        };
         let corner_radius = if immersive {
             CornerRadius::ZERO
         } else {
@@ -2178,7 +2176,7 @@ impl AppState {
                     ui,
                     pal,
                     focus_rect,
-                    ui.id().with(("stream_tile_focus", source)),
+                    ui.id().with(("stream_tile_focus", source_salt.clone())),
                     focus_icon,
                     focus_tooltip,
                 )
@@ -2195,7 +2193,7 @@ impl AppState {
                         ui,
                         pal,
                         audio_rect,
-                        ui.id().with(("stream_tile_audio", source)),
+                        ui.id().with(("stream_tile_audio", source_salt.clone())),
                         if audio_on {
                             Icon::Volume2
                         } else {
@@ -2219,7 +2217,7 @@ impl AppState {
                         ui,
                         pal,
                         stop_rect,
-                        ui.id().with(("stream_tile_stop", source)),
+                        ui.id().with(("stream_tile_stop", source_salt)),
                         Icon::X,
                         "Stop watching this screen share",
                     )

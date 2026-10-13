@@ -1001,8 +1001,8 @@ mod tests {
     fn two_line_avatar_size_reads_font_metrics_in_frame() {
         let ctx = egui::Context::default();
         let mut measured = None;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 measured = Some(two_line_avatar_size(
                     ui,
                     &FontId::proportional(14.0),
@@ -1010,6 +1010,7 @@ mod tests {
                 ));
             });
         });
+        output.drop_without_applying_deltas();
         let size = measured.expect("avatar size measured during layout");
         assert!(size > 20.0, "avatar should span both text rows, got {size}");
     }

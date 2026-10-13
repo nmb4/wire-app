@@ -307,7 +307,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
 
     ctx.set_fonts(fonts);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles.insert(TextStyle::Heading, sans(18.0));
     style.text_styles.insert(TextStyle::Body, sans(13.0));
     style.text_styles.insert(TextStyle::Button, sans(13.0));
@@ -316,8 +316,16 @@ pub fn setup_fonts(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(14.0, 7.0);
     style.spacing.interact_size.y = 34.0;
+    // egui 0.34 added a fade-out gradient at the edges of scroll areas and
+    // egui 0.35 slowed the default widget animation to 0.2 s. Wire's look and
+    // feel predate both, so keep the flat scroll edges and the 0.1 s timing.
+    style.spacing.scroll.fade = egui::style::ScrollFadeStyle {
+        strength: 0.0,
+        ..Default::default()
+    };
+    style.animation_time = 0.1;
     style.visuals.window_corner_radius = CornerRadius::same(10);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// Linear blend in sRGB channel space (good enough for subtle hover lifts).

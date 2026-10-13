@@ -809,9 +809,9 @@ impl NotificationService {
         ctx.show_viewport_deferred(
             notification_viewport_id(),
             builder,
-            move |overlay_ctx, class| {
+            move |overlay_ui, class| {
                 render_overlay(
-                    overlay_ctx,
+                    overlay_ui,
                     class,
                     &runtime,
                     &active,
@@ -845,7 +845,7 @@ fn platform_top_margin() -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn render_overlay(
-    ctx: &egui::Context,
+    ui: &mut egui::Ui,
     class: ViewportClass,
     runtime: &Arc<Mutex<NotificationRuntime>>,
     active: &Arc<AtomicBool>,
@@ -855,6 +855,7 @@ fn render_overlay(
     action_tx: &mpsc::Sender<NotificationAction>,
     theme: Theme,
 ) {
+    let ctx = ui.ctx().clone();
     let now = Instant::now();
     let pal = Palette::for_theme(theme);
     ctx.set_visuals(visuals_for(&pal));
@@ -902,9 +903,9 @@ fn render_overlay(
     }
 
     let host_height = store.layout(now);
-    if class != ViewportClass::Embedded {
+    if class != ViewportClass::EmbeddedWindow {
         #[cfg(windows)]
-        update_windows_window_region(ctx, store, window_region, now);
+        update_windows_window_region(&ctx, store, window_region, now);
         let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
         let desired_size = Vec2::new(HOST_WIDTH, host_height);
         let target_changed =
@@ -943,7 +944,7 @@ fn render_overlay(
     };
     egui::CentralPanel::default()
         .frame(host_frame)
-        .show(ctx, |_ui| {});
+        .show(ui, |_ui| {});
 
     let mut dismiss = Vec::new();
     for group in &mut store.visible {
@@ -959,7 +960,7 @@ fn render_overlay(
         let area = egui::Area::new(Id::new(("notification-group", group.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(position)
-            .show(ctx, |ui| render_group(ui, group, &pal, opacity, action_tx));
+            .show(&ctx, |ui| render_group(ui, group, &pal, opacity, action_tx));
         let measured_height = area.response.rect.height();
         if measured_height > 1.0 && (group.measured_height - measured_height).abs() > 0.5 {
             group.measured_height = measured_height;
@@ -1449,9 +1450,10 @@ mod tests {
             captured_requests.lock().unwrap().push(request.viewport_id);
         });
 
-        let _ = context.run(egui::RawInput::default(), |ctx| {
-            service.show(ctx, Theme::Amber);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            service.show(ui.ctx(), Theme::Amber);
         });
+        output.drop_without_applying_deltas();
 
         assert!(
             repaint_requests
@@ -1475,9 +1477,10 @@ mod tests {
         service.info("preview", "Notification preview");
         let context = egui::Context::default();
         context.set_embed_viewports(true);
-        let _ = context.run(egui::RawInput::default(), |ctx| {
-            service.show(ctx, Theme::Amber);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            service.show(ui.ctx(), Theme::Amber);
         });
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1572,8 +1575,8 @@ mod tests {
         service.info("first", "First notification");
         let context = egui::Context::default();
         context.set_embed_viewports(false);
-        let output = context.run(egui::RawInput::default(), |ctx| {
-            service.show(ctx, Theme::Amber);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            service.show(ui.ctx(), Theme::Amber);
         });
 
         let viewport = output
@@ -1594,6 +1597,7 @@ mod tests {
                 TITLE_ONLY_HEIGHT + OUTER_PADDING * 2.0
             ))
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1621,9 +1625,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let output = context.run(input, |ctx| {
+        let output = context.run_ui(input, |ui| {
             render_overlay(
-                ctx,
+                ui,
                 ViewportClass::Deferred,
                 &service.runtime,
                 &service.active,
@@ -1653,6 +1657,7 @@ mod tests {
                 .all(|command| !matches!(command, ViewportCommand::Close)),
             "the deferred child must not try to close itself"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]

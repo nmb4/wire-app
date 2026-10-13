@@ -3,8 +3,8 @@
 use super::{
     profile_ui::paint_profile_avatar,
     widgets::{
-        floating_dialog_header, floating_panel, floating_panel_frame, floating_panel_width,
-        format_bytes, painted_volume_slider, select_field, settings_toggle,
+        dialog_window, floating_dialog_header, floating_panel, format_bytes, painted_volume_slider,
+        select_field, settings_toggle,
     },
     AppState, ChatStyle, DEFAULT,
 };
@@ -113,18 +113,11 @@ impl AppState {
         let can_close = self.configured;
         let pal = Palette::for_theme(self.theme);
         let pane_rect = self.pane_constrain_rect();
-        let dialog_width = floating_panel_width(pane_rect, 500.0, 0.0);
         // Reserve enough vertical space for the dialog chrome plus a visible
         // inset above and below the centered window.
         let scroll_height = (pane_rect.height() - 220.0).clamp(1.0, 700.0);
-        floating_panel("settings-dialog", &pal, pane_rect, 500.0)
-            .title_bar(false)
-            .vscroll(false)
-            .default_width(dialog_width)
-            .min_width(dialog_width)
-            .max_width(dialog_width)
-            .frame(floating_panel_frame(&pal, 0))
-            .show(ctx, |ui| {
+        let (window, dialog_width) = dialog_window("settings-dialog", &pal, pane_rect, 500.0);
+        window.show(ctx, |ui| {
                 // Do not reuse an oversized width remembered from a previous
                 // frame: one unwrapped child used to expand the dialog permanently.
                 ui.set_width(dialog_width);
@@ -1006,8 +999,8 @@ mod tests {
     fn long_settings_details_stay_inside_the_dialog_width() {
         let context = egui::Context::default();
         let mut measured = egui::Rect::NOTHING;
-        let _ = context.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.allocate_ui(egui::vec2(320.0, 160.0), |ui| {
                     ui.set_width(320.0);
                     measured = settings_field_label(
@@ -1022,6 +1015,7 @@ mod tests {
                 });
             });
         });
+        output.drop_without_applying_deltas();
 
         assert!(measured.width() <= 320.5, "field widened to {measured:?}");
         assert!(

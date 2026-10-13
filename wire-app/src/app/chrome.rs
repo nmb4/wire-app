@@ -15,24 +15,25 @@ use egui::{CornerRadius, Frame, Stroke, Ui};
 impl AppState {
     pub(super) fn ui_with_chrome(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         pal: &Palette,
         rounded: bool,
         always_on_top: &mut bool,
         viewport_transparent: &mut Option<bool>,
         #[cfg(windows)] parent_hwnd: Option<windows::Win32::Foundation::HWND>,
     ) {
+        let ctx = ui.ctx().clone();
         let transparent = rounded;
         if *viewport_transparent != Some(transparent) {
-            window_frame::sync_viewport_transparent(ctx, transparent);
+            window_frame::sync_viewport_transparent(&ctx, transparent);
             *viewport_transparent = Some(transparent);
             ctx.request_repaint();
         }
 
         egui::CentralPanel::default()
             .frame(Frame::NONE)
-            .show(ctx, |ui| {
-                ui.set_clip_rect(window_frame::clip_rect(ctx));
+            .show(ui, |ui| {
+                ui.set_clip_rect(window_frame::clip_rect(&ctx));
 
                 window_frame::show_panel(ui, pal, rounded, |ui, content_rect| {
                     let app_rect = window_frame::body_rect(content_rect, rounded);
@@ -78,7 +79,7 @@ impl AppState {
                     #[cfg(windows)]
                     if update_clicked {
                         if let Some((peer, _)) = self.peer_update.best_candidate() {
-                            self.begin_peer_update(ctx, peer);
+                            self.begin_peer_update(&ctx, peer);
                         }
                     }
 
@@ -86,7 +87,7 @@ impl AppState {
                     body_rect.min.y = title_bar_rect.max.y;
                     self.ui_chrome_body(
                         ui,
-                        ctx,
+                        &ctx,
                         pal,
                         body_rect,
                         #[cfg(windows)]

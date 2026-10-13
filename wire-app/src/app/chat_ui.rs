@@ -10,7 +10,7 @@ use super::{
         chat_hairline, chat_lucide_icon_button, chat_navigation_button, chat_selected_surface,
         chat_surface, copy_to_clipboard, dialog_body, dialog_footer, dialog_window,
         floating_dialog_header, floating_panel, floating_panel_frame, form_label, form_text_input,
-        format_bytes, member_toggle_row, paint_chat_card, SidebarAvatar,
+        format_bytes, frame_margins, member_toggle_row, paint_chat_card, SidebarAvatar,
     },
     AppMode, AppState, AttachmentTextureCache, ChatStyle, FileTransferUiState, GroupMemberKind,
     ImagePreview, ImagePreviewAction, ImagePreviewMode, KlipyAnimationState,
@@ -972,8 +972,7 @@ impl AppState {
                             .desired_rows(composer_rows)
                             .desired_width(edit_width)
                             .vertical_align(Align::Center)
-                            .margin(egui::Margin::symmetric(2, 4))
-                            .frame(false),
+                            .frame(Frame::NONE.inner_margin(egui::Margin::symmetric(2, 4))),
                     );
                     if self.chat.composer_focused_for.as_deref() != Some(conversation.id.as_str()) {
                         self.chat.composer_focused_for = Some(conversation.id.clone());
@@ -2280,17 +2279,17 @@ impl AppState {
     fn collect_chat_image_input(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         for file in dropped {
-            if let Some(path) = file.path {
-                self.add_chat_file_path(&path);
-            } else if let Some(bytes) = file.bytes {
-                self.add_chat_image_bytes(
-                    if file.name.is_empty() {
-                        "dropped-image".to_owned()
-                    } else {
-                        file.name
-                    },
-                    bytes.to_vec(),
-                );
+            let path = file.path();
+            if path.is_absolute() {
+                self.add_chat_file_path(path);
+            } else if let Ok(bytes) = file.bytes() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("dropped-image")
+                    .to_owned();
+                self.add_chat_image_bytes(name, bytes);
             }
         }
 
@@ -3054,19 +3053,20 @@ impl AppState {
         match preview.mode {
             ImagePreviewMode::Floating => {
                 let mut open = true;
+                let frame = floating_panel_frame(pal, 12);
+                let margins = frame_margins(&frame);
+                let default_size = image_preview_default_size(pane_rect.size());
                 egui::Window::new("Image preview")
                     .id(egui::Id::new("chat-image-preview"))
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(true)
                     .constrain_to(pane_rect)
-                    .min_size(IMAGE_PREVIEW_MIN_SIZE)
-                    .default_size(image_preview_default_size(pane_rect.size()))
-                    .default_pos(
-                        pane_rect.center() - image_preview_default_size(pane_rect.size()) * 0.5,
-                    )
-                    .max_size(pane_rect.size() - Vec2::splat(64.0))
-                    .frame(floating_panel_frame(pal, 12))
+                    .min_size(IMAGE_PREVIEW_MIN_SIZE + margins)
+                    .default_size(default_size + margins)
+                    .default_pos(pane_rect.center() - default_size * 0.5)
+                    .max_size(pane_rect.size() - Vec2::splat(64.0) + margins)
+                    .frame(frame)
                     .show(ctx, |ui| {
                         action = image_preview_panel(
                             ui,
@@ -4241,8 +4241,8 @@ mod tests {
         // actually land so alignment regressions show up as numbers.
         let context = egui::Context::default();
         let mut tops = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let _ = context.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.allocate_ui_with_layout(
@@ -4293,6 +4293,7 @@ mod tests {
                 });
             });
         });
+        output.drop_without_applying_deltas();
         let (avatar_top, name_top, body_top, body_left, name_left, avatar_left) = tops;
         eprintln!("avatar_top={avatar_top} name_top={name_top} body_top={body_top} body_left={body_left} name_left={name_left} avatar_left={avatar_left}");
         assert!(
@@ -4320,8 +4321,8 @@ mod tests {
         let context = egui::Context::default();
         crate::theme::setup_fonts(&context);
         let mut out = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let _ = context.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let name_font = egui::FontId::proportional(crate::theme::ui_font_size(14.0));
                 let time_font = egui::FontId::proportional(crate::theme::ui_font_size(11.0));
                 let name_galley = ui.painter().layout_no_wrap(
@@ -4350,6 +4351,7 @@ mod tests {
                 );
             });
         });
+        output.drop_without_applying_deltas();
         eprintln!(
             "name_box={} time_box={} name_base={} time_base={}",
             out.0, out.1, out.2, out.3

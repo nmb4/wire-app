@@ -189,6 +189,15 @@ pub(super) fn floating_panel_frame(pal: &Palette, padding: i8) -> Frame {
         })
 }
 
+/// Total space this frame adds around its content (margins + stroke).
+///
+/// egui 0.36 sizes a [`egui::Window`] by its *outer* rect, while
+/// [`floating_panel_width`] computes a content width, so window size
+/// constraints add this back and the visible panel keeps its previous size.
+pub(super) fn frame_margins(frame: &Frame) -> Vec2 {
+    frame.total_margin().sum()
+}
+
 /// Content-driven height, bounded to the viewport; long forms and lists scroll.
 /// Pin the current width every frame so remembered geometry cannot fight resize.
 pub(super) fn floating_panel<'a>(
@@ -197,19 +206,22 @@ pub(super) fn floating_panel<'a>(
     viewport: Rect,
     preferred_width: f32,
 ) -> egui::Window<'a> {
+    let frame = floating_panel_frame(pal, 16);
+    let margins = frame_margins(&frame);
     let width = floating_panel_width(viewport, preferred_width, 16.0);
+    let outer_width = width + margins.x;
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .constrain_to(viewport.shrink(16.0))
-        .default_width(width)
-        .min_width(width)
-        .max_width(width)
+        .default_width(outer_width)
+        .min_width(outer_width)
+        .max_width(outer_width)
         .min_height(0.0)
-        .max_height((viewport.height() - 128.0).max(1.0))
+        .max_height((viewport.height() - 128.0).max(1.0) + margins.y)
         .vscroll(true)
-        .frame(floating_panel_frame(pal, 16))
+        .frame(frame)
 }
 
 /// Shell for a modal-style floating dialog without egui's native title bar.
@@ -221,14 +233,16 @@ pub(super) fn dialog_window<'a>(
     viewport: Rect,
     preferred_width: f32,
 ) -> (egui::Window<'a>, f32) {
+    let frame = floating_panel_frame(pal, 0);
     let width = floating_panel_width(viewport, preferred_width, 0.0);
+    let outer_width = width + frame_margins(&frame).x;
     let window = floating_panel(id, pal, viewport, preferred_width)
         .title_bar(false)
         .vscroll(false)
-        .default_width(width)
-        .min_width(width)
-        .max_width(width)
-        .frame(floating_panel_frame(pal, 0));
+        .default_width(outer_width)
+        .min_width(outer_width)
+        .max_width(outer_width)
+        .frame(frame);
     (window, width)
 }
 
@@ -783,7 +797,7 @@ pub(super) fn settings_toggle(
         track,
         CornerRadius::same(9),
         track_fill,
-        Stroke::new(1.0, if *value { pal.accent } else { pal.line_br }),
+        Stroke::new(1.0_f32, if *value { pal.accent } else { pal.line_br }),
         egui::StrokeKind::Inside,
     );
     let knob_x = egui::lerp(track.left() + 9.0..=track.right() - 9.0, on);
@@ -796,7 +810,7 @@ pub(super) fn settings_toggle(
         painter.rect_stroke(
             track.expand(2.0),
             CornerRadius::same(11),
-            Stroke::new(1.0, pal.accent),
+            Stroke::new(1.0_f32, pal.accent),
             egui::StrokeKind::Outside,
         );
     }
@@ -1095,7 +1109,7 @@ mod tests {
                     "expected {expected}, got {:?}",
                     shown.response.rect
                 );
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
             }
         }
     }
@@ -1117,13 +1131,15 @@ mod tests {
                 screen_rect: Some(viewport),
                 ..Default::default()
             });
+            let frame = floating_panel_frame(&pal, 0);
             let width = floating_panel_width(viewport, 500.0, 0.0);
+            let outer_width = width + frame_margins(&frame).x;
             let shown = floating_panel("header test", &pal, viewport, 500.0)
                 .title_bar(false)
                 .vscroll(false)
-                .min_width(width)
-                .max_width(width)
-                .frame(floating_panel_frame(&pal, 0))
+                .min_width(outer_width)
+                .max_width(outer_width)
+                .frame(frame)
                 .show(&ctx, |ui| {
                     ui.set_width(width);
                     floating_dialog_header(
@@ -1140,7 +1156,7 @@ mod tests {
                 "{:?}",
                 shown.response.rect
             );
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -1178,8 +1194,8 @@ mod tests {
         for count in 1..=4 {
             let ctx = egui::Context::default();
             let mut painted = Rect::NOTHING;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for row in 0..count {
                         let chip = egui::Frame::new()
@@ -1197,6 +1213,7 @@ mod tests {
                     }
                 });
             });
+            output.drop_without_applying_deltas();
             let needed = painted.height() + PARTICIPANT_STRIP_PAD_Y;
             let reserved = participant_bar_height(412.0, count, 5000.0);
             assert!(
@@ -1276,6 +1293,12 @@ mod tests {
         let healthy = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0));
         let degenerate = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0));
         let pane_size = Vec2::new(720.0, 560.0);
+        // egui 0.36 sizes windows by their outer rect, so the default size has
+        // to include the default window frame around the intended pane area.
+        let pane_outer_size = pane_size
+            + egui::Frame::window(&ctx.global_style())
+                .total_margin()
+                .sum();
         let pass = |pinned: bool, screen: Rect| {
             let input = egui::RawInput {
                 screen_rect: Some(screen),
@@ -1287,7 +1310,7 @@ mod tests {
                 .id(egui::Id::new("test-pane"))
                 .fixed_pos(egui::Pos2::ZERO)
                 .resizable(false)
-                .default_size(pane_size);
+                .default_size(pane_outer_size);
             if pinned {
                 window = window.constrain_to(healthy);
             }
@@ -1295,7 +1318,7 @@ mod tests {
                 ui.set_min_size(pane_size);
                 shown = Some(ui.clip_rect());
             });
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             shown.unwrap_or(healthy)
         };
 
