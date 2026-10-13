@@ -75,10 +75,9 @@ pub const ACCENT_PRESETS: [&str; 10] = [
 pub fn sanitize_accent_color(raw: &str) -> Option<String> {
     let hex = raw.trim().strip_prefix('#').unwrap_or(raw.trim());
     let expanded = match hex.len() {
-        3 if hex.chars().all(|c| c.is_ascii_hexdigit()) => hex
-            .chars()
-            .flat_map(|c| [c, c])
-            .collect::<String>(),
+        3 if hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+            hex.chars().flat_map(|c| [c, c]).collect::<String>()
+        }
         6 if hex.chars().all(|c| c.is_ascii_hexdigit()) => hex.to_owned(),
         _ => return None,
     };
@@ -327,7 +326,10 @@ pub fn crop_source_rect(
     offset: (f32, f32),
     crop_size: f32,
 ) -> (u32, u32, u32) {
-    let edge = ((crop_size / scale).round() as u32).max(1).min(src_w).min(src_h);
+    let edge = ((crop_size / scale).round() as u32)
+        .max(1)
+        .min(src_w)
+        .min(src_h);
     // Center of the crop square in source pixels.
     let center_x = src_w as f32 / 2.0 - offset.0 / scale;
     let center_y = src_h as f32 / 2.0 - offset.1 / scale;
@@ -595,8 +597,7 @@ pub async fn fetch_profile(endpoint: &Endpoint, peer: NodeId) -> Result<FetchedP
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -706,12 +707,12 @@ mod tests {
 
     #[test]
     fn accent_colors_normalize_and_reject_garbage() {
-        assert_eq!(
-            sanitize_accent_color("#5865f2").as_deref(),
-            Some("#5865F2")
-        );
+        assert_eq!(sanitize_accent_color("#5865f2").as_deref(), Some("#5865F2"));
         assert_eq!(sanitize_accent_color("f27").as_deref(), Some("#FF2277"));
-        assert_eq!(sanitize_accent_color("  #1abc9c ").as_deref(), Some("#1ABC9C"));
+        assert_eq!(
+            sanitize_accent_color("  #1abc9c ").as_deref(),
+            Some("#1ABC9C")
+        );
         assert_eq!(sanitize_accent_color("not a color"), None);
         assert_eq!(sanitize_accent_color("#12345"), None);
         assert_eq!(sanitize_accent_color(""), None);
@@ -792,7 +793,10 @@ mod tests {
         }
         let source = image::DynamicImage::ImageRgba8(raw);
         let (png, hash) = finalize_avatar_image(source).unwrap();
-        assert_eq!((image::load_from_memory(&png).unwrap().width(), 256), (256, 256));
+        assert_eq!(
+            (image::load_from_memory(&png).unwrap().width(), 256),
+            (256, 256)
+        );
         // Even adversarial photo noise must leave headroom under the fetch
         // response cap, or pictures would fail exactly when set.
         assert!(

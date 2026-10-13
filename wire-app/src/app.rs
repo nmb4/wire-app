@@ -45,7 +45,6 @@ use crate::{
 use anyhow::{Context, Result};
 use eframe::NativeOptions;
 use egui::{Frame, Rect, Vec2};
-use widgets::format_duration_ms;
 use egui_phosphor::regular as ph;
 use iroh::{KeyParsingError, NodeId};
 use std::{
@@ -59,6 +58,7 @@ use std::{
     time::Duration,
 };
 use tracing::{debug, info, warn};
+use widgets::format_duration_ms;
 use wire::{
     audio::{AudioConfig, AudioLevelHandle, AudioQuality, VolumeHandle},
     video::VideoConfig,
@@ -430,9 +430,12 @@ impl ChatUiState {
         if expired {
             self.error = None;
         }
-        self.error
-            .as_ref()
-            .map(|(message, raised)| (message.as_str(), CHAT_ERROR_TTL.saturating_sub(raised.elapsed())))
+        self.error.as_ref().map(|(message, raised)| {
+            (
+                message.as_str(),
+                CHAT_ERROR_TTL.saturating_sub(raised.elapsed()),
+            )
+        })
     }
 }
 
@@ -706,7 +709,10 @@ fn decode_chat_image(data: &[u8]) -> Option<(egui::ColorImage, usize)> {
     let size = [decoded.width() as usize, decoded.height() as usize];
     let pixels = decoded.into_raw();
     if pixels.len() > MAX_CACHED_TEXTURE_BYTES {
-        warn!("chat image of {}x{} is too large to display", size[0], size[1]);
+        warn!(
+            "chat image of {}x{} is too large to display",
+            size[0], size[1]
+        );
         return None;
     }
     let texture_bytes = pixels.len();
@@ -2492,8 +2498,11 @@ impl AppState {
                     self.recording_active = false;
                     self.recording_dir = None;
                     self.recording_since = None;
-                    self.notifications
-                        .error("call-recording", "Could not record the call", message);
+                    self.notifications.error(
+                        "call-recording",
+                        "Could not record the call",
+                        message,
+                    );
                 }
                 Event::SystemAudioFailed(message) => {
                     self.system_audio_active = false;
@@ -3036,10 +3045,8 @@ impl AppState {
             return;
         }
         if !self.can_record_call() {
-            self.notifications.info(
-                "call-recording",
-                "Join a call before recording",
-            );
+            self.notifications
+                .info("call-recording", "Join a call before recording");
             return;
         }
         self.play_control_sound(true);
@@ -3066,8 +3073,7 @@ impl AppState {
         let dir = crate::recording::recordings_dir()
             .ok_or_else(|| anyhow::anyhow!("no Wire data directory is available"))?;
         if !dir.exists() {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
         Ok(dir)
     }

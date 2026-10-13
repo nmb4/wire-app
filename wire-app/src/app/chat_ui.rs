@@ -975,8 +975,7 @@ impl AppState {
                             .margin(egui::Margin::symmetric(2, 4))
                             .frame(false),
                     );
-                    if self.chat.composer_focused_for.as_deref() != Some(conversation.id.as_str())
-                    {
+                    if self.chat.composer_focused_for.as_deref() != Some(conversation.id.as_str()) {
                         self.chat.composer_focused_for = Some(conversation.id.clone());
                         edit.request_focus();
                     }
@@ -1639,7 +1638,8 @@ impl AppState {
             return;
         }
         let Some(author) = self.our_node_id else {
-            self.chat.set_error("Chat is still connecting to Iroh.".to_owned());
+            self.chat
+                .set_error("Chat is still connecting to Iroh.".to_owned());
             return;
         };
         self.chat.error = None;
@@ -2358,7 +2358,8 @@ impl AppState {
 
     fn add_chat_file_path(&mut self, path: &Path) {
         let Ok(metadata) = std::fs::metadata(path) else {
-            self.chat.set_error(format!("Could not open {}", path.display()));
+            self.chat
+                .set_error(format!("Could not open {}", path.display()));
             return;
         };
         if !metadata.is_file() || metadata.len() == 0 {
@@ -3146,7 +3147,11 @@ impl AppState {
         let unavailable = self.chat.service_error.clone();
         let has_friends = !self.friends.is_empty();
         let (icon, title, body) = if let Some(error) = unavailable.as_deref() {
-            (Icon::MessageSquareWarning, "Chat is unavailable", error.to_owned())
+            (
+                Icon::MessageSquareWarning,
+                "Chat is unavailable",
+                error.to_owned(),
+            )
         } else if !has_friends {
             (
                 Icon::UserPlus,
@@ -3175,23 +3180,27 @@ impl AppState {
                 Align2::CENTER_CENTER,
                 char::from(icon),
                 lucide(20.0),
-                if unavailable.is_some() { pal.err } else { pal.text2 },
+                if unavailable.is_some() {
+                    pal.err
+                } else {
+                    pal.text2
+                },
             );
             ui.add_space(14.0);
             ui.label(
                 RichText::new(title)
-                    .color(if unavailable.is_some() { pal.err } else { pal.text })
+                    .color(if unavailable.is_some() {
+                        pal.err
+                    } else {
+                        pal.text
+                    })
                     .size(ui_font_size(17.0)),
             );
             ui.add_space(2.0);
             ui.set_max_width(ui.available_width().min(340.0));
             ui.add(
-                egui::Label::new(
-                    RichText::new(body)
-                        .color(pal.dim)
-                        .size(ui_font_size(12.0)),
-                )
-                .wrap(),
+                egui::Label::new(RichText::new(body).color(pal.dim).size(ui_font_size(12.0)))
+                    .wrap(),
             );
             if unavailable.is_some() {
                 return;

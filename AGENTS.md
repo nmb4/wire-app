@@ -78,9 +78,10 @@ same feature combinations, so they carry the policy.
   not swap `unwrap` for `expect` or a panic. `clippy::panic` and
   `clippy::unreachable` are triaged case by case the same way.
 
-Formatting is enforced by CI (`cargo fmt --all -- --check`), but dev carries an
-inherited rustfmt drift of 36 locations under the pinned nightly. Treat those
-as baseline noise: do not fold a workspace-wide `cargo fmt` into feature work.
+Formatting is enforced by CI (`cargo fmt --all -- --check`) under the pinned
+nightly toolchain (`nightly-2026-08-16`, matching `.github/workflows/ci.yml`).
+Run `cargo +nightly fmt --all` before committing, and keep formatting-only
+changes in their own commits so they do not bury review-relevant edits.
 
 ## UI work
 

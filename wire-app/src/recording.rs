@@ -192,8 +192,7 @@ impl RecordingSession {
                 self.dir.display()
             )
         })?;
-        self.speakers
-            .insert(node_id, slot.into_recorder(writer));
+        self.speakers.insert(node_id, slot.into_recorder(writer));
         Ok(())
     }
 
@@ -448,7 +447,10 @@ impl VoiceSource {
         let Ok(mut current) = self.current.lock() else {
             return false;
         };
-        if current.as_ref().is_some_and(|(seen, _)| *seen == generation) {
+        if current
+            .as_ref()
+            .is_some_and(|(seen, _)| *seen == generation)
+        {
             return false;
         }
         *current = Some((generation, track));
@@ -740,7 +742,11 @@ impl WavFile {
             .seek(SeekFrom::Start(4))
             .context("seek to the RIFF size")?;
         self.file
-            .write_all(&u32::try_from(36 + data_bytes).unwrap_or(u32::MAX).to_le_bytes())
+            .write_all(
+                &u32::try_from(36 + data_bytes)
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes(),
+            )
             .context("write the RIFF size")?;
         self.file
             .seek(SeekFrom::Start(40))
@@ -1043,7 +1049,9 @@ mod tests {
             frames[1].iter().filter(|sample| **sample != 0.0).count(),
             FRAME_SAMPLES / 2
         );
-        assert!(frames[1].iter().all(|sample| *sample == 0.0 || *sample == 0.5));
+        assert!(frames[1]
+            .iter()
+            .all(|sample| *sample == 0.0 || *sample == 0.5));
         assert!(frames[2].iter().all(|sample| *sample == 0.0));
     }
 
@@ -1111,7 +1119,10 @@ mod tests {
             u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
             SAMPLE_RATE
         );
-        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 96_000);
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            96_000
+        );
         assert_eq!(u16::from_le_bytes(bytes[32..34].try_into().unwrap()), 2);
         assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 16);
         assert_eq!(&bytes[36..40], b"data");
@@ -1133,9 +1144,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().to_path_buf();
         let (sender, receiver) = sync_channel::<Vec<f32>>(64);
-        let writer = std::thread::spawn(move || {
-            write_loop(receiver, root, "ada.wav".to_owned())
-        });
+        let writer = std::thread::spawn(move || write_loop(receiver, root, "ada.wav".to_owned()));
         // 100 frames, then close: the file must be exactly 100 frames long and
         // readable as plain PCM, with the sizes patched in.
         for _ in 0..100 {
@@ -1286,11 +1295,9 @@ mod tests {
                 .expect("attach");
         }
         // Re-attaching the same peer must not produce a second file.
-        assert!(
-            session
-                .attach_participant(ada, "Ada".to_owned(), 2, silent_track())
-                .is_ok()
-        );
+        assert!(session
+            .attach_participant(ada, "Ada".to_owned(), 2, silent_track())
+            .is_ok());
         assert_eq!(session.speakers.len(), 2);
         assert!(session.has_speaker(alan));
 

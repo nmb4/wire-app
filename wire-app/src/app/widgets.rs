@@ -670,7 +670,9 @@ pub(super) fn chat_navigation_button(
         rect.right() - 10.0
     };
     let name_color = if selected || hot { pal.text } else { pal.text2 };
-    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    paint_row_identity(
+        ui, pal, rect, label, subtitle, avatar, text_right, name_color,
+    );
     if unseen {
         ui.painter()
             .circle_filled(rect.right_center() - Vec2::new(14.0, 0.0), 4.0, pal.accent);
@@ -828,7 +830,9 @@ pub(super) fn member_toggle_row(
     ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     let name_color = if checked || hot { pal.text } else { pal.text2 };
     let text_right = rect.right() - 12.0 - CHECK - 10.0;
-    paint_row_identity(ui, pal, rect, label, subtitle, avatar, text_right, name_color);
+    paint_row_identity(
+        ui, pal, rect, label, subtitle, avatar, text_right, name_color,
+    );
     let check = Rect::from_center_size(
         egui::pos2(rect.right() - 12.0 - CHECK * 0.5, rect.center().y),
         Vec2::splat(CHECK),

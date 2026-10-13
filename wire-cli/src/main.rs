@@ -201,7 +201,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                     let now_ms = unix_millis();
                     for file in &meta.files {
-                        let marker = if file.is_current_process { " (current)" } else { "" };
+                        let marker = if file.is_current_process {
+                            " (current)"
+                        } else {
+                            ""
+                        };
                         let pid = file
                             .pid
                             .map(|pid| format!("pid={pid:<8}"))

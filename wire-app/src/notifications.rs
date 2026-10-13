@@ -670,11 +670,7 @@ impl NotificationService {
     }
 
     /// Report a recording that finished, but not completely.
-    pub(crate) fn recording_incomplete(
-        &self,
-        title: impl Into<String>,
-        body: impl Into<String>,
-    ) {
+    pub(crate) fn recording_incomplete(&self, title: impl Into<String>, body: impl Into<String>) {
         self.push(NotificationSpec {
             group_key: Some("call-recording".to_owned()),
             kind: NotificationKind::Error,

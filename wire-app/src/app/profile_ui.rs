@@ -381,7 +381,8 @@ impl AppState {
             if let Some(image) = decode_avatar_image(&bytes) {
                 let texture =
                     ctx.load_texture(format!("peer-avatar-{peer}"), image, Default::default());
-                self.peer_avatar_textures.insert(peer, Some(texture.clone()));
+                self.peer_avatar_textures
+                    .insert(peer, Some(texture.clone()));
                 return Some(texture);
             }
         }
@@ -439,83 +440,82 @@ impl AppState {
         let mut remove_avatar = false;
         let mut save = false;
         let (window, width) = dialog_window("profile-editor", &pal, pane_rect, 440.0);
-        window
-            .enabled(self.avatar_crop.is_none())
-            .show(ctx, |ui| {
-                ui.set_width(width);
-                cancel |= floating_dialog_header(
-                    ui,
-                    &pal,
-                    "YOUR PROFILE",
-                    "Shown to everyone you message or call",
-                    Some("Close"),
-                );
-                dialog_body(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 14.0;
-                        let avatar = self.own_avatar_texture(ctx);
-                        let preview_name = profile::sanitize_display_name(&self.profile_edit_name);
-                        let preview_name = if preview_name.is_empty() {
-                            "You".to_owned()
-                        } else {
-                            preview_name
-                        };
-                        let initials = profile::display_name_initial(&preview_name)
-                            .unwrap_or_else(|| "?".to_owned());
-                        paint_profile_avatar(ui, &pal, avatar, &initials, 56.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 6.0;
-                            if action_button(ui, &pal, "Choose picture…", ButtonTone::Secondary)
-                                .on_hover_text("PNG, JPEG, GIF or WebP up to 8 MiB")
-                                .clicked()
-                            {
-                                pick_avatar = true;
-                            }
-                            if self.own_avatar_hash.is_some()
-                                && action_button(ui, &pal, "Remove picture", ButtonTone::Secondary)
-                                    .clicked()
-                            {
-                                remove_avatar = true;
-                            }
-                        });
-                    });
-                    ui.add_space(14.0);
-                    let count = profile::sanitize_display_name(&self.profile_edit_name)
-                        .chars()
-                        .count();
-                    form_label(ui, &pal, "Display name", Some(&format!("{count}/32 characters")));
-                    let name = form_text_input(
-                        ui,
-                        &pal,
-                        &mut self.profile_edit_name,
-                        "e.g. Ada Lovelace",
-                    );
-                    if name.changed() {
-                        self.profile_edit_error = None;
-                    }
-                    if name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                        save = true;
-                    }
-                    ui.add_space(12.0);
-                    self.ui_accent_picker(ui, &pal);
-                    if let Some(error) = &self.profile_edit_error {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(error)
-                                .color(pal.err)
-                                .size(ui_font_size(11.5)),
-                        );
-                    }
-                    dialog_footer(ui, |ui| {
-                        if action_button(ui, &pal, "Save", ButtonTone::Primary).clicked() {
-                            save = true;
+        window.enabled(self.avatar_crop.is_none()).show(ctx, |ui| {
+            ui.set_width(width);
+            cancel |= floating_dialog_header(
+                ui,
+                &pal,
+                "YOUR PROFILE",
+                "Shown to everyone you message or call",
+                Some("Close"),
+            );
+            dialog_body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    let avatar = self.own_avatar_texture(ctx);
+                    let preview_name = profile::sanitize_display_name(&self.profile_edit_name);
+                    let preview_name = if preview_name.is_empty() {
+                        "You".to_owned()
+                    } else {
+                        preview_name
+                    };
+                    let initials = profile::display_name_initial(&preview_name)
+                        .unwrap_or_else(|| "?".to_owned());
+                    paint_profile_avatar(ui, &pal, avatar, &initials, 56.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        if action_button(ui, &pal, "Choose picture…", ButtonTone::Secondary)
+                            .on_hover_text("PNG, JPEG, GIF or WebP up to 8 MiB")
+                            .clicked()
+                        {
+                            pick_avatar = true;
                         }
-                        if action_button(ui, &pal, "Cancel", ButtonTone::Secondary).clicked() {
-                            cancel = true;
+                        if self.own_avatar_hash.is_some()
+                            && action_button(ui, &pal, "Remove picture", ButtonTone::Secondary)
+                                .clicked()
+                        {
+                            remove_avatar = true;
                         }
                     });
                 });
+                ui.add_space(14.0);
+                let count = profile::sanitize_display_name(&self.profile_edit_name)
+                    .chars()
+                    .count();
+                form_label(
+                    ui,
+                    &pal,
+                    "Display name",
+                    Some(&format!("{count}/32 characters")),
+                );
+                let name =
+                    form_text_input(ui, &pal, &mut self.profile_edit_name, "e.g. Ada Lovelace");
+                if name.changed() {
+                    self.profile_edit_error = None;
+                }
+                if name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                ui.add_space(12.0);
+                self.ui_accent_picker(ui, &pal);
+                if let Some(error) = &self.profile_edit_error {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(error)
+                            .color(pal.err)
+                            .size(ui_font_size(11.5)),
+                    );
+                }
+                dialog_footer(ui, |ui| {
+                    if action_button(ui, &pal, "Save", ButtonTone::Primary).clicked() {
+                        save = true;
+                    }
+                    if action_button(ui, &pal, "Cancel", ButtonTone::Secondary).clicked() {
+                        cancel = true;
+                    }
+                });
             });
+        });
         if self.avatar_crop.is_none() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             cancel = true;
         }

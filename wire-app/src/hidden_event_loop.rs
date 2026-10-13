@@ -37,8 +37,7 @@ impl ApplicationHandler<UserEvent> for HiddenRedrawApp<'_> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        if self.hidden.load(Ordering::Acquire)
-            && matches!(event, UserEvent::RequestRepaint { .. })
+        if self.hidden.load(Ordering::Acquire) && matches!(event, UserEvent::RequestRepaint { .. })
         {
             return;
         }

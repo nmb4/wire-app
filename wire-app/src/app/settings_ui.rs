@@ -36,8 +36,12 @@ impl AppState {
         // A long path must not widen the dialog, so it is truncated and shows
         // the full value on hover.
         ui.add(
-            egui::Label::new(RichText::new(label.clone()).color(pal.dim).size(ui_font_size(11.0)))
-                .truncate(),
+            egui::Label::new(
+                RichText::new(label.clone())
+                    .color(pal.dim)
+                    .size(ui_font_size(11.0)),
+            )
+            .truncate(),
         )
         .on_hover_text(label);
 

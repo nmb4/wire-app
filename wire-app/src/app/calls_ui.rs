@@ -1177,7 +1177,11 @@ impl AppState {
 
     /// Drop a saved friend by its stored node ID string.
     pub(super) fn remove_friend(&mut self, node_id: &str) {
-        let Some(idx) = self.friends.iter().position(|friend| friend.node_id == node_id) else {
+        let Some(idx) = self
+            .friends
+            .iter()
+            .position(|friend| friend.node_id == node_id)
+        else {
             return;
         };
         if let Ok(peer) = NodeId::from_str(node_id.trim()) {
@@ -1552,7 +1556,8 @@ impl AppState {
                                         ),
                                     );
                                 }
-                                detail.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+                                detail.wrap =
+                                    egui::text::TextWrapping::truncate_at_width(text_width);
                                 let detail_galley = ui.fonts_mut(|fonts| fonts.layout_job(detail));
                                 let block = name_galley.size().y + detail_galley.size().y - 2.0;
                                 let top = text_rect.center().y - block * 0.5;
