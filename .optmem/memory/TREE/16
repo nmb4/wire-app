@@ -1,0 +1,1 @@
+OptMem is repo-local and public: no secrets. dev 993a973 integrates main, trusted UI overhaul and wip; both merges reviewed, 0.7.8, builds/tests pass. Polish hides avatars. Wip rejects 8-channel output; hardware audio untested. Freeze likely fresh startup. Capture via PS.               
