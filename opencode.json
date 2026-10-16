@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "servers": {
+      "egui": {
+        "type": "local",
+        "command": [
+          "egui-mcp"
+        ]
+      }
+    }
+  }
+}

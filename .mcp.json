@@ -1,0 +1,7 @@
+{
+    "mcpServers": {
+        "egui": {
+            "command": "egui-mcp"
+        }
+    }
+}

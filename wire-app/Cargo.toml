@@ -111,6 +111,10 @@ wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
 [features]
 default = ["audio-processing"]
 audio-processing = ["wire/audio-processing"]
+# Opt-in live-app inspection for `egui-mcp` (agent-driven debugging of a running
+# instance). Completely inert unless `EGUI_INSPECTION` is set at runtime;
+# eframe then serves the egui_inspection protocol on 127.0.0.1:5719.
+debug-inspection = ["eframe/inspection"]
 
 # This crate's production `unwrap`/`expect` sites are migrated, so it inherits
 # the full workspace lint policy (see the root `Cargo.toml`).
