@@ -1,1 +1,2 @@
 OptMem is repo-local and public: no secrets. dev 993a973 integrates main, trusted UI overhaul and wip; both merges reviewed, 0.7.8, builds/tests pass. Polish hides avatars. Wip rejects 8-channel output; hardware audio untested. Freeze likely fresh startup. Capture via PS.               
+dev0.7.9 integration/8Clippydenies approved/pushed;nightly fmt+CI cleaned. HiddenWaitfix CPU102->1.4%;startupfreeze unresolved,8ch unsupported,macOS unbuilt. Approved7abd09d egui0.33.3->0.36.2 AFKtests;OpenCode DeepSeek4.1Flash/max baseline active;independent reviews.                   
