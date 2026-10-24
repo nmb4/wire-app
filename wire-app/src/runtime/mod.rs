@@ -197,11 +197,10 @@ impl EventPublisher {
     pub(super) fn publish(&self, event: Event) {
         // A presenter is optional. Publishing must never backpressure or terminate
         // the service when no client is attached or a client has fallen behind.
-        let should_wake_presenter = self.presenter_active.load(Ordering::Acquire)
-            && !matches!(
-                &event,
-                Event::VideoFrame { .. } | Event::PreviewFrame { .. }
-            );
+        // Video arrival drives visible presentation at the source cadence.
+        // Excluding media here made a 60 fps stream paint only on unrelated
+        // UI/audio wakeups. The active flag still suppresses all hidden wakes.
+        let should_wake_presenter = self.presenter_active.load(Ordering::Acquire);
         if let Err(async_channel::TrySendError::Full(_)) = self.sender.try_send(event) {
             let dropped = self.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped <= 5 || dropped.is_power_of_two() {
@@ -508,6 +507,42 @@ mod tests {
         })));
         publisher.publish(Event::InitialChatLoaded);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn media_wakes_visible_presentation_but_never_a_hidden_window() {
+        let (publisher, _receiver) = EventPublisher::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        publisher.set_update_callback(Some(Arc::new(move || {
+            callback_calls.fetch_add(1, Ordering::Relaxed);
+        })));
+        let video = || Event::VideoFrame {
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            generation: 1,
+            frame: crate::video_decode::DecodedFrame {
+                data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(vec![0; 4])),
+                width: 1,
+                height: 1,
+                source_height: 1,
+                source_fps: 60,
+            },
+        };
+        let preview = || Event::PreviewFrame {
+            width: 1,
+            height: 1,
+            data: Arc::new(vec![0; 4]),
+            actual_fps: 5.0,
+            encode_time_ms: 0.0,
+        };
+        publisher.set_presenter_active(false);
+        publisher.publish(video());
+        publisher.publish(preview());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        publisher.set_presenter_active(true);
+        publisher.publish(video());
+        publisher.publish(preview());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

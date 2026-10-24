@@ -8,6 +8,7 @@ mod dev_pair;
 mod global_hotkeys;
 pub mod host;
 mod klipy;
+mod latest_frame;
 mod notifications;
 mod overlay_window;
 #[cfg(windows)]
@@ -48,6 +49,8 @@ pub fn sweep_stale_staged_updates() {
 mod video_decode;
 #[cfg(windows)]
 mod win_capture;
+#[cfg(windows)]
+mod win_frame_clock;
 #[cfg(windows)]
 mod win_gdi_capture;
 #[cfg(windows)]

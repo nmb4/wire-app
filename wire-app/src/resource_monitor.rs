@@ -219,3 +219,10 @@ mod windows_gpu {
         }
     }
 }
+#[cfg(all(test, windows))]
+pub(crate) fn test_process_handle_count() -> windows::core::Result<u32> {
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut count = 0;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }?;
+    Ok(count)
+}

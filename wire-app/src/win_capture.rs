@@ -1,15 +1,14 @@
 //! Direct Windows Graphics Capture path.
 //!
-//! This is intentionally small and conservative. zed-scap's Windows backend always routes frames
-//! through `buffer_crop`, even for full-display capture, which adds avoidable per-frame GPU/CPU
-//! copy work. This path captures the primary monitor directly and reads the raw frame buffer.
+//! Frames stay in a bounded GPU pool. Rate admission before copying follows
+//! IsoCast's capture.rs; see third-party/isocast/README.md (MIT).
 
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
-use tracing::{info, warn};
+use tracing::info;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
@@ -23,16 +22,19 @@ use windows_capture::monitor::Monitor;
 use windows_capture::settings::{ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings};
 use windows_capture::window::Window;
 
+use crate::latest_frame::{self, Receiver, Sender};
 use crate::screen_capture::{CaptureTarget, CaptureTargetKind};
 use crate::win_mf_d3d::{GpuVideoProcessor, GpuVideoProcessorOutput, MfD3d};
 
-const FRAME_QUEUE_DEPTH: usize = 1;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+const FRAME_WAIT: Duration = Duration::from_millis(50);
+const CAPTURE_TEXTURES: usize = 4;
 
 struct GpuSlot {
     texture: ID3D11Texture2D,
 }
 
+#[derive(Clone)]
 pub struct GpuCapturedFrame {
     slot: Arc<GpuSlot>,
     pub device: ID3D11Device,
@@ -168,12 +170,13 @@ impl GpuPreviewScaler {
 
     pub fn matches(&self, frame: &GpuCapturedFrame, width: u32, height: u32) -> bool {
         self.source_width == frame.width
+            && self.d3d.device == frame.device
             && self.source_height == frame.height
             && self.output_width == width
             && self.output_height == height
     }
 
-    pub fn read_bgra(&self, frame: &GpuCapturedFrame) -> Result<Vec<u8>> {
+    pub fn read_bgra(&mut self, frame: &GpuCapturedFrame) -> Result<Vec<u8>> {
         self.processor
             .convert(frame.texture(), &self.target)
             .context("downscaling local preview on the GPU")?;
@@ -213,9 +216,18 @@ pub struct WindowsCapturer {
 }
 
 impl WindowsCapturer {
-    pub fn try_new(target_w: u32, target_h: u32, target: Option<&CaptureTarget>) -> Result<Self> {
-        let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
-        let flags = CaptureFlags { tx };
+    pub fn try_new(
+        target_w: u32,
+        target_h: u32,
+        framerate: u32,
+        target: Option<&CaptureTarget>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=240).contains(&framerate),
+            "capture frame rate must be in 1..=240"
+        );
+        let (tx, rx) = latest_frame::channel();
+        let flags = CaptureFlags { tx, framerate };
         let control = match target {
             Some(target) => match target.kind {
                 CaptureTargetKind::Display => {
@@ -284,15 +296,32 @@ impl WindowsCapturer {
         })
     }
 
-    pub fn capture_gpu(&mut self) -> Result<GpuCapturedFrame> {
+    pub fn capture_gpu(&mut self) -> Result<Option<GpuCapturedFrame>> {
         if let Some(frame) = self.pending.take() {
-            return Ok(frame);
+            return Ok(Some(frame));
         }
 
-        let frame = self
-            .rx
-            .recv()
-            .context("direct WGC capture channel closed")?;
+        // WGC may deliver nothing for a static/minimized desktop. Bound the
+        // wait so stopping sharing never depends on another desktop update.
+        let frame = match self.rx.recv_timeout(FRAME_WAIT) {
+            Ok(frame) => frame,
+            Err(RecvTimeoutError::Timeout) => {
+                if self
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| control.is_finished())
+                {
+                    if let Some(control) = self.control.take() {
+                        control
+                            .wait()
+                            .map_err(|error| anyhow!("WGC worker failed: {error}"))?;
+                    }
+                    anyhow::bail!("the captured display or window closed");
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error).context("direct WGC capture channel closed"),
+        };
         if frame.width != self.src_w || frame.height != self.src_h {
             info!(
                 "direct WGC target resized from {}x{} to {}x{}",
@@ -301,7 +330,7 @@ impl WindowsCapturer {
             self.src_w = frame.width;
             self.src_h = frame.height;
         }
-        Ok(frame)
+        Ok(Some(frame))
     }
 }
 
@@ -313,13 +342,52 @@ impl Drop for WindowsCapturer {
     }
 }
 
-#[derive(Clone)]
 struct CaptureFlags {
-    tx: SyncSender<GpuCapturedFrame>,
+    tx: Sender<GpuCapturedFrame>,
+    framerate: u32,
+}
+
+/// Keep a phase deadline rather than timing from the last accepted picture:
+/// a 144 Hz source must produce 60 fps, not fall to 48 fps. WGC time is 100 ns.
+struct CaptureRate {
+    interval: i64,
+    next: Option<i64>,
+    previous: Option<i64>,
+}
+
+impl CaptureRate {
+    fn new(framerate: u32) -> Self {
+        Self {
+            interval: 10_000_000 / i64::from(framerate.max(1)),
+            next: None,
+            previous: None,
+        }
+    }
+
+    fn admit(&mut self, at: i64) -> bool {
+        if self.previous.is_some_and(|previous| at < previous) {
+            self.next = None;
+        }
+        self.previous = Some(at);
+        let next = self.next.unwrap_or(at);
+        // IsoCast allows 1 ms jitter in the WGC timestamp. Preserve the phase
+        // across normal ticks; after a stall start fresh, never burst to catch up.
+        if at.saturating_add(10_000) < next {
+            return false;
+        }
+        self.next = Some(if at.saturating_sub(next) >= self.interval {
+            at.saturating_add(self.interval)
+        } else {
+            next.saturating_add(self.interval)
+        });
+        true
+    }
 }
 
 struct CaptureHandler {
-    tx: SyncSender<GpuCapturedFrame>,
+    tx: Sender<GpuCapturedFrame>,
+    rate: CaptureRate,
+    rate_skipped: u64,
     dropped: u64,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -337,6 +405,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             tx: ctx.flags.tx,
+            rate: CaptureRate::new(ctx.flags.framerate),
+            rate_skipped: 0,
             dropped: 0,
             device: ctx.device,
             context: ctx.device_context,
@@ -351,8 +421,13 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     fn on_frame_arrived(
         &mut self,
         frame: &mut Frame,
-        _: InternalCaptureControl,
+        control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        // Skip BEFORE acquiring/copying a full-resolution surface.
+        if !self.rate.admit(frame.timespan().Duration) {
+            self.rate_skipped += 1;
+            return Ok(());
+        }
         let copy_started = Instant::now();
         let width = frame.width();
         let height = frame.height();
@@ -371,7 +446,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             unsafe { source.GetDesc(&mut desc) };
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.CPUAccessFlags = 0;
-            for _ in 0..3 {
+            for _ in 0..CAPTURE_TEXTURES {
                 let mut texture = None;
                 unsafe {
                     self.device
@@ -381,7 +456,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                     texture: texture.context("WGC GPU ring texture was null")?,
                 }));
             }
-            info!("direct WGC GPU texture ring ready ({width}x{height}, 3 slots)");
+            info!("direct WGC GPU texture ring ready ({width}x{height}, {CAPTURE_TEXTURES} slots)");
         }
         let Some(slot) = self
             .slots
@@ -405,34 +480,26 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             let p95 =
                 self.copy_samples[((self.copy_samples.len() - 1) as f64 * 0.95).round() as usize];
             info!(
-                "direct WGC GPU copy: {:.1} fps, {:.2} ms avg / {:.2} ms p95, {} ring drops",
+                "direct WGC GPU copy: {:.1} fps, {:.2} ms avg / {:.2} ms p95, {} replaced/pool drops, {} skipped before copy",
                 self.copied as f64 / elapsed,
                 avg,
                 p95,
-                self.dropped
+                self.dropped,
+                self.rate_skipped
             );
             self.copy_samples.clear();
             self.copied = 0;
             self.last_stats_log = Instant::now();
         }
-        match self.tx.try_send(GpuCapturedFrame {
+        match self.tx.send(GpuCapturedFrame {
             width,
             height,
             slot,
             device: self.device.clone(),
             context: self.context.clone(),
         }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.dropped += 1;
-                if self.dropped <= 5 || self.dropped.is_multiple_of(120) {
-                    warn!(
-                        "direct WGC capture queue full, dropped {} frame(s)",
-                        self.dropped
-                    );
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => {}
+            Ok(replaced) => self.dropped += u64::from(replaced),
+            Err(_) => control.stop(),
         }
         Ok(())
     }
@@ -447,6 +514,26 @@ mod tests {
     use super::WindowsCapturer;
     use std::time::Duration;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    #[test]
+    fn rate_admission_preserves_sixty_fps_on_fast_and_fractional_displays() {
+        for refresh in [60, 75, 120, 144, 165, 240] {
+            let mut rate = super::CaptureRate::new(60);
+            let accepted = (0..refresh * 10)
+                .filter(|index| rate.admit(i64::from(*index) * 10_000_000 / i64::from(refresh)))
+                .count();
+            assert!(
+                (599..=601).contains(&accepted),
+                "{refresh} Hz: {accepted} copies in 10 s"
+            );
+        }
+        let mut rate = super::CaptureRate::new(30);
+        assert!(rate.admit(0));
+        assert!(!rate.admit(10_000));
+        assert!(rate.admit(100_000_000)); // long static interval
+        assert!(!rate.admit(100_010_000)); // no catch-up burst
+        assert!(rate.admit(0)); // new timestamp origin
+    }
 
     fn working_set_bytes() -> u64 {
         let pid = Pid::from_u32(std::process::id());
@@ -465,15 +552,18 @@ mod tests {
     #[ignore = "requires an interactive Windows desktop"]
     fn repeated_wgc_start_stop_reaches_a_memory_plateau() {
         let mut stopped_memory = Vec::new();
+        let mut stopped_handles = Vec::new();
         for _ in 0..8 {
-            let mut capture = WindowsCapturer::try_new(1920, 1080, None).unwrap();
+            let mut capture = WindowsCapturer::try_new(1920, 1080, 30, None).unwrap();
             for _ in 0..30 {
                 drop(capture.capture_gpu().unwrap());
             }
             drop(capture);
             std::thread::sleep(Duration::from_millis(750));
             stopped_memory.push(working_set_bytes());
+            stopped_handles.push(crate::resource_monitor::test_process_handle_count().unwrap());
         }
+        println!("WGC post-stop handles: {stopped_handles:?}");
         println!(
             "WGC-only post-stop working sets (MiB): {:?}",
             stopped_memory

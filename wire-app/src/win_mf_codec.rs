@@ -359,12 +359,12 @@ fn create_video_media_type(
     Ok(media_type)
 }
 
-fn enumerate_transforms(
+fn enumerate_mft_activations(
     category: windows::core::GUID,
     input: windows::core::GUID,
     output: windows::core::GUID,
     flags: MFT_ENUM_FLAG,
-) -> Result<Vec<IMFTransform>> {
+) -> Result<Vec<IMFActivate>> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: input,
@@ -387,27 +387,50 @@ fn enumerate_transforms(
         )?;
     }
 
-    if count == 0 {
+    // MFTEnumEx transfers both the array and one COM reference per entry.
+    // Freeing only the array leaks every activation, including unused MFTs.
+    let _release = scopeguard::guard((activates, count), |(activates, count)| {
+        if !activates.is_null() {
+            unsafe {
+                std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                    activates,
+                    count as usize,
+                ));
+                CoTaskMemFree(Some(activates.cast()));
+            }
+        }
+    });
+
+    if count == 0 || activates.is_null() {
         return Err(anyhow!("no Media Foundation transform found"));
     }
 
-    let mut transforms = Vec::with_capacity(count as usize);
-    for i in 0..count {
+    unsafe { std::slice::from_raw_parts(activates, count as usize) }
+        .iter()
+        .map(|activate| activate.clone().context("null MFT activate"))
+        .collect()
+}
+
+fn enumerate_transforms(
+    category: windows::core::GUID,
+    input: windows::core::GUID,
+    output: windows::core::GUID,
+    flags: MFT_ENUM_FLAG,
+) -> Result<Vec<IMFTransform>> {
+    let mut transforms = Vec::new();
+    for (i, activate) in enumerate_mft_activations(category, input, output, flags)?
+        .into_iter()
+        .enumerate()
+    {
         let transform = unsafe {
-            let activate = (*activates.add(i as usize))
-                .as_ref()
-                .ok_or_else(|| anyhow!("null MFT activate"))?;
             info!(
                 "found MFT candidate #{}: {}",
                 i + 1,
-                read_mft_name(activate)
+                read_mft_name(&activate)
             );
             activate.ActivateObject::<IMFTransform>()
         }?;
         transforms.push(transform);
-    }
-    unsafe {
-        CoTaskMemFree(Some(activates as *const _ as *mut _));
     }
     Ok(transforms)
 }
@@ -479,40 +502,19 @@ fn enumerate_video_encoders(prefer_hardware: bool) -> Result<Vec<MftCandidate>> 
         MFT_ENUM_FLAG(base.0 | MFT_ENUM_FLAG_SYNCMFT.0)
     };
 
-    let input_info = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_NV12,
-    };
-    let output_info = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
-    };
-
-    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-    let mut count = 0u32;
-    unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            flags,
-            Some(&input_info),
-            Some(&output_info),
-            &mut activates,
-            &mut count,
-        )?;
-    }
-
-    if count == 0 {
-        return Err(anyhow!("no Media Foundation transform found"));
-    }
-
-    let mut candidates = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let candidate = unsafe {
-            let activate = (*activates.add(i as usize))
-                .as_ref()
-                .ok_or_else(|| anyhow!("null MFT activate"))?;
-            let name = read_mft_name(activate);
-            let adapter_luid = read_adapter_luid(activate);
+    let mut candidates = Vec::new();
+    for (i, activate) in enumerate_mft_activations(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        MFVideoFormat_NV12,
+        MFVideoFormat_H264,
+        flags,
+    )?
+    .into_iter()
+    .enumerate()
+    {
+        let candidate = {
+            let name = read_mft_name(&activate);
+            let adapter_luid = read_adapter_luid(&activate);
             info!(
                 "found MFT candidate #{}: {name}{}",
                 i + 1,
@@ -521,15 +523,12 @@ fn enumerate_video_encoders(prefer_hardware: bool) -> Result<Vec<MftCandidate>> 
                     .unwrap_or_default()
             );
             MftCandidate {
-                activate: activate.clone(),
+                activate,
                 adapter_luid,
                 name,
             }
         };
         candidates.push(candidate);
-    }
-    unsafe {
-        CoTaskMemFree(Some(activates as *const _ as *mut _));
     }
     Ok(candidates)
 }
@@ -955,17 +954,33 @@ fn create_output_sample(
     }
 }
 
+fn owned_output_buffer(
+    output_stream_id: u32,
+    sample: Option<IMFSample>,
+) -> impl std::ops::DerefMut<Target = MFT_OUTPUT_DATA_BUFFER> {
+    scopeguard::guard(
+        MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: output_stream_id,
+            pSample: std::mem::ManuallyDrop::new(sample),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        },
+        |mut buffer| unsafe {
+            // ProcessOutput may return a sample/events even on an error. The
+            // generated ABI struct has ManuallyDrop fields, so it owns no
+            // automatic cleanup. Successful callers take the sample first.
+            std::mem::ManuallyDrop::drop(&mut buffer.pSample);
+            std::mem::ManuallyDrop::drop(&mut buffer.pEvents);
+        },
+    )
+}
+
 fn process_output_once(transform: &IMFTransform, output_stream_id: u32) -> Result<Option<Vec<u8>>> {
     let output_sample = create_output_sample(transform, output_stream_id)?;
-    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-        dwStreamID: output_stream_id,
-        pSample: std::mem::ManuallyDrop::new(output_sample),
-        dwStatus: 0,
-        pEvents: std::mem::ManuallyDrop::new(None),
-    };
+    let mut buffer = owned_output_buffer(output_stream_id, output_sample);
     let mut status = 0u32;
     let result =
-        unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut *buffer), &mut status) };
     match result {
         Ok(()) => {
             let sample = buffer
@@ -1005,14 +1020,9 @@ fn process_output_once_sample(
     output_stream_id: u32,
 ) -> Result<Option<IMFSample>> {
     let output_sample = create_output_sample(transform, output_stream_id)?;
-    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-        dwStreamID: output_stream_id,
-        pSample: std::mem::ManuallyDrop::new(output_sample),
-        dwStatus: 0,
-        pEvents: std::mem::ManuallyDrop::new(None),
-    };
+    let mut buffer = owned_output_buffer(output_stream_id, output_sample);
     let mut status = 0u32;
-    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) } {
+    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut *buffer), &mut status) } {
         Ok(()) => {
             let sample = buffer
                 .pSample
@@ -1036,14 +1046,9 @@ fn process_decoder_output_once(
     output_stream_id: u32,
 ) -> Result<DecoderOutput> {
     let output_sample = create_output_sample(transform, output_stream_id)?;
-    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-        dwStreamID: output_stream_id,
-        pSample: std::mem::ManuallyDrop::new(output_sample),
-        dwStatus: 0,
-        pEvents: std::mem::ManuallyDrop::new(None),
-    };
+    let mut buffer = owned_output_buffer(output_stream_id, output_sample);
     let mut status = 0u32;
-    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) } {
+    match unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut *buffer), &mut status) } {
         Ok(()) => Ok(DecoderOutput::Sample(
             buffer
                 .pSample
@@ -1173,15 +1178,9 @@ fn shutdown_transform(transform: &IMFTransform, detach_d3d: bool) {
 }
 
 fn force_keyframe(transform: &IMFTransform) {
-    unsafe {
-        if let Ok(api) = transform.cast::<ICodecAPI>() {
-            let mut variant = VARIANT::default();
-            let inner = &mut *variant.Anonymous.Anonymous;
-            inner.vt = VT_BOOL;
-            inner.Anonymous.boolVal = VARIANT_TRUE;
-            let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant);
-            let _ = VariantClear(&mut variant);
-        }
+    if let Ok(api) = transform.cast::<ICodecAPI>() {
+        // Like IsoCast's mf.rs: ForceKeyFrame is VT_UI4, not VT_BOOL.
+        set_codecapi_u32(&api, &CODECAPI_AVEncVideoForceKeyFrame, 1);
     }
 }
 
@@ -1258,8 +1257,79 @@ impl Drop for MfColorConverter {
     }
 }
 
+struct GpuEncoderProcessor {
+    width: u32,
+    height: u32,
+    processor: GpuVideoProcessor,
+    copy_target: Option<ID3D11Texture2D>,
+}
+
+/// IsoCast's MF activation ownership: releasing IMFTransform alone does not
+/// shut down a hardware encoder's workers/events. Also resets a rejected
+/// candidate before attempting another device or input path.
+struct EncoderActivation(IMFActivate);
+
+impl Drop for EncoderActivation {
+    fn drop(&mut self) {
+        let _ = unsafe { self.0.ShutdownObject() };
+    }
+}
+
+/// Compare paths on the actual device/driver/workload. Rendering straight
+/// into an MF input may introduce a driver synchronization cost greater than
+/// the copy it removes. Interleave samples, excluding initial warmup, and
+/// prefer the proven copy path unless direct rendering wins by at least 5%.
+struct GpuSurfaceSelection {
+    direct_ms: Vec<f64>,
+    copy_ms: Vec<f64>,
+    frames: u32,
+    preferred: Option<bool>,
+}
+
+impl GpuSurfaceSelection {
+    fn new() -> Self {
+        Self {
+            direct_ms: Vec::with_capacity(16),
+            copy_ms: Vec::with_capacity(16),
+            frames: 0,
+            preferred: None,
+        }
+    }
+
+    fn use_direct(&self) -> bool {
+        self.preferred.unwrap_or(!self.frames.is_multiple_of(2))
+    }
+
+    fn record(&mut self, direct: bool, elapsed_ms: f64) -> Option<(bool, f64, f64)> {
+        if self.preferred.is_some() {
+            return None;
+        }
+        self.frames += 1;
+        if self.frames <= 8 {
+            return None;
+        }
+        let samples = if direct {
+            &mut self.direct_ms
+        } else {
+            &mut self.copy_ms
+        };
+        samples.push(elapsed_ms);
+        if self.direct_ms.len() < 16 || self.copy_ms.len() < 16 {
+            return None;
+        }
+        self.direct_ms.sort_by(f64::total_cmp);
+        self.copy_ms.sort_by(f64::total_cmp);
+        let direct_ms = self.direct_ms[self.direct_ms.len() / 2];
+        let copy_ms = self.copy_ms[self.copy_ms.len() / 2];
+        let prefer_direct = direct_ms < copy_ms * 0.95;
+        self.preferred = Some(prefer_direct);
+        Some((prefer_direct, direct_ms, copy_ms))
+    }
+}
+
 pub struct MfH264Encoder {
     transform: IMFTransform,
+    activation: Option<EncoderActivation>,
     input_stream_id: u32,
     output_stream_id: u32,
     width: u32,
@@ -1274,10 +1344,11 @@ pub struct MfH264Encoder {
     pending_input: u32,
     d3d: Option<Rc<MfD3d>>,
     gpu_nv12: Option<GpuNv12Frames>,
-    // The MF allocator's textures are encoder inputs and are not guaranteed to have
-    // D3D11_BIND_RENDER_TARGET. Render into our own NV12 target, then copy into the
-    // allocator surface at the frame boundary.
-    gpu_processor: Option<(u32, u32, GpuVideoProcessor, ID3D11Texture2D)>,
+    // Render directly into compatible allocator surfaces; keep a lazily created
+    // intermediate target for drivers requiring the older GPU copy path.
+    gpu_processor: Option<GpuEncoderProcessor>,
+    gpu_direct_render: bool,
+    gpu_surface_selection: Option<GpuSurfaceSelection>,
 }
 
 fn read_sample_topdown_into(
@@ -1348,9 +1419,6 @@ fn read_sample_topdown_into(
 impl MfH264Encoder {
     pub fn try_new_on_device(config: &VideoConfig, device: &ID3D11Device) -> Result<Self> {
         ensure_media_foundation()?;
-        let width = config.resolution.width();
-        let height = config.resolution.height();
-        let bitrate = config.effective_bitrate();
         let d3d = Rc::new(MfD3d::from_device(device)?);
         let mut last_err = None;
         for candidate in enumerate_video_encoders(true)? {
@@ -1366,11 +1434,9 @@ impl MfH264Encoder {
             };
             match Self::build_with_d3d(
                 transform,
+                candidate.activate.clone(),
                 Some(d3d.clone()),
                 config,
-                width,
-                height,
-                bitrate,
                 true,
             ) {
                 Ok(encoder) => {
@@ -1388,9 +1454,6 @@ impl MfH264Encoder {
 
     pub fn try_new(config: &VideoConfig) -> Result<Self> {
         ensure_media_foundation()?;
-        let width = config.resolution.width();
-        let height = config.resolution.height();
-        let bitrate = config.effective_bitrate();
         let mut last_err = None;
 
         for (prefer_hardware, label) in [(true, "hardware"), (false, "software")] {
@@ -1408,6 +1471,7 @@ impl MfH264Encoder {
                     continue;
                 }
                 if !prefer_hardware {
+                    let _activation = EncoderActivation(candidate.activate.clone());
                     let transform = activate_transform(&candidate.activate)?;
                     if is_async_transform(&transform).unwrap_or(false) {
                         info!(
@@ -1443,11 +1507,9 @@ impl MfH264Encoder {
                                 };
                                 match Self::build_with_d3d(
                                     transform,
+                                    candidate.activate.clone(),
                                     Some(d3d),
                                     config,
-                                    width,
-                                    height,
-                                    bitrate,
                                     true,
                                 ) {
                                     Ok(enc) => return Ok(enc),
@@ -1466,7 +1528,13 @@ impl MfH264Encoder {
                         }
                     }
                     match activate_transform(&candidate.activate).and_then(|transform| {
-                        Self::build_with_d3d(transform, None, config, width, height, bitrate, true)
+                        Self::build_with_d3d(
+                            transform,
+                            candidate.activate.clone(),
+                            None,
+                            config,
+                            true,
+                        )
                     }) {
                         Ok(enc) => return Ok(enc),
                         Err(e) => {
@@ -1481,7 +1549,11 @@ impl MfH264Encoder {
                 } else {
                     let transform = activate_transform(&candidate.activate)?;
                     match Self::build_with_d3d(
-                        transform, None, config, width, height, bitrate, false,
+                        transform,
+                        candidate.activate.clone(),
+                        None,
+                        config,
+                        false,
                     ) {
                         Ok(enc) => return Ok(enc),
                         Err(e) => {
@@ -1498,13 +1570,15 @@ impl MfH264Encoder {
 
     fn build_with_d3d(
         transform: IMFTransform,
+        activation: IMFActivate,
         d3d: Option<Rc<MfD3d>>,
         config: &VideoConfig,
-        width: u32,
-        height: u32,
-        bitrate: u32,
         hardware: bool,
     ) -> Result<Self> {
+        let activation = EncoderActivation(activation);
+        let width = config.resolution.width();
+        let height = config.resolution.height();
+        let bitrate = config.effective_bitrate();
         let async_mode = is_async_transform(&transform)?;
 
         let (input_stream_id, output_stream_id) = configure_encoder(
@@ -1554,6 +1628,7 @@ impl MfH264Encoder {
 
         let mut encoder = Self {
             transform,
+            activation: Some(activation),
             input_stream_id,
             output_stream_id,
             width,
@@ -1569,6 +1644,8 @@ impl MfH264Encoder {
             d3d,
             gpu_nv12,
             gpu_processor: None,
+            gpu_direct_render: true,
+            gpu_surface_selection: Some(GpuSurfaceSelection::new()),
         };
 
         let probe = vec![0u8; (width * height * 4) as usize];
@@ -1645,6 +1722,7 @@ impl MfH264Encoder {
         src_width: u32,
         src_height: u32,
     ) -> Result<Vec<u8>> {
+        let started = std::time::Instant::now();
         let timestamp = self.frame_index * self.frame_duration;
         let d3d = self
             .d3d
@@ -1657,7 +1735,7 @@ impl MfH264Encoder {
         let recreate = self
             .gpu_processor
             .as_ref()
-            .map(|(w, h, _, _)| *w != src_width || *h != src_height)
+            .map(|processor| processor.width != src_width || processor.height != src_height)
             .unwrap_or(true);
         if recreate {
             let processor = GpuVideoProcessor::new(
@@ -1669,48 +1747,90 @@ impl MfH264Encoder {
                 (10_000_000i64 / self.frame_duration.max(1)) as u32,
                 GpuVideoProcessorOutput::Nv12StudioRange,
             )?;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: self.width,
-                Height: self.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let mut target = None;
-            unsafe {
-                d3d.device
-                    .CreateTexture2D(&desc, None, Some(&mut target))
-                    .context("creating GPU-native NV12 render target")?;
-            }
-            self.gpu_processor = Some((
-                src_width,
-                src_height,
+            self.gpu_processor = Some(GpuEncoderProcessor {
+                width: src_width,
+                height: src_height,
                 processor,
-                target.context("GPU-native NV12 render target was null")?,
-            ));
+                copy_target: None,
+            });
         }
         let sample = gpu.allocate_sample(timestamp, self.frame_duration)?;
         let output_texture = GpuNv12Frames::sample_texture(&sample)?;
-        let (_, _, processor, render_target) = self
+        let GpuEncoderProcessor {
+            processor,
+            copy_target,
+            ..
+        } = self
             .gpu_processor
-            .as_ref()
+            .as_mut()
             .context("GPU NV12 processor was not initialized")?;
-        processor
-            .convert(texture, render_target)
-            .context("D3D11 BGRA-to-NV12 video processing")?;
-        unsafe {
-            d3d.context.CopyResource(&output_texture, render_target);
+        let mut direct = self.gpu_direct_render
+            && self
+                .gpu_surface_selection
+                .as_ref()
+                .is_none_or(GpuSurfaceSelection::use_direct);
+        if direct {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { output_texture.GetDesc(&mut desc) };
+            if desc.BindFlags & D3D11_BIND_RENDER_TARGET.0 as u32 == 0 {
+                self.gpu_direct_render = false;
+            } else if let Err(error) = processor.convert(texture, &output_texture) {
+                warn!(
+                    "direct MF surface conversion unavailable; retaining GPU copy path: {error:#}"
+                );
+                self.gpu_direct_render = false;
+            }
+            direct = self.gpu_direct_render;
+            if !direct {
+                self.gpu_surface_selection = None;
+            }
+        }
+        if !direct {
+            if copy_target.is_none() {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: self.width,
+                    Height: self.height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_NV12,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut target = None;
+                unsafe {
+                    d3d.device
+                        .CreateTexture2D(&desc, None, Some(&mut target))
+                        .context("creating GPU-native NV12 render target")?;
+                }
+                *copy_target = Some(target.context("GPU-native NV12 render target was null")?);
+            }
+            let render_target = copy_target.as_ref().context("NV12 copy target was null")?;
+            processor
+                .convert(texture, render_target)
+                .context("D3D11 BGRA-to-NV12 video processing")?;
+            unsafe {
+                d3d.context.CopyResource(&output_texture, render_target);
+            }
         }
         self.frame_index += 1;
-        self.process_sample(&sample)
+        let result = self.process_sample(&sample);
+        if result.is_ok() {
+            if let Some((prefer_direct, direct_ms, copy_ms)) =
+                self.gpu_surface_selection.as_mut().and_then(|selection| {
+                    selection.record(direct, started.elapsed().as_secs_f64() * 1000.0)
+                })
+            {
+                info!("MF GPU input selected: {} (median direct {direct_ms:.2} ms, copy {copy_ms:.2} ms)",
+                    if prefer_direct { "direct render" } else { "GPU copy" });
+            }
+        }
+        result
     }
 
     fn pack_nv12_for_encoder(
@@ -1815,6 +1935,7 @@ impl MfH264Encoder {
 impl Drop for MfH264Encoder {
     fn drop(&mut self) {
         shutdown_transform(&self.transform, self.d3d.is_some());
+        self.activation = None;
         self.gpu_processor = None;
         self.gpu_nv12 = None;
         self.bgra_to_nv12 = None;
@@ -2197,6 +2318,167 @@ use windows::Win32::System::Com::CoTaskMemFree;
 mod tests {
     use super::*;
 
+    /// Synthetic GPU workload; no desktop pixels or peer connections are used.
+    #[test]
+    #[ignore = "requires Windows Media Foundation hardware; performance probe"]
+    fn gpu_screen_share_encode_probe() {
+        gpu_encode_probe(Some(false));
+    }
+
+    #[test]
+    #[ignore = "requires Windows Media Foundation hardware; GPU copy fallback probe"]
+    fn gpu_screen_share_copy_fallback_probe() {
+        gpu_encode_probe(Some(true));
+    }
+
+    #[test]
+    #[ignore = "requires Windows Media Foundation hardware; automatic surface selection probe"]
+    fn gpu_screen_share_auto_probe() {
+        gpu_encode_probe(None);
+    }
+
+    #[test]
+    fn gpu_surface_selection_requires_a_clear_win_after_warmup() {
+        for (direct_ms, copy_ms, expected) in
+            [(2.0, 4.0, true), (4.0, 2.0, false), (3.9, 4.0, false)]
+        {
+            let mut selection = GpuSurfaceSelection::new();
+            for index in 0..100 {
+                let direct = selection.use_direct();
+                selection.record(
+                    direct,
+                    if index < 8 {
+                        100.0
+                    } else if direct {
+                        direct_ms
+                    } else {
+                        copy_ms
+                    },
+                );
+            }
+            assert_eq!(selection.preferred, Some(expected));
+            assert_eq!(selection.direct_ms.len() + selection.copy_ms.len(), 32);
+        }
+    }
+
+    fn gpu_encode_probe(forced_copy: Option<bool>) {
+        use std::time::Instant;
+        use wire::video::{bitstream::contains_idr, VideoResolution};
+
+        ensure_media_foundation().unwrap();
+        let d3d = MfD3d::try_new(None).unwrap();
+        let config = VideoConfig {
+            resolution: VideoResolution::P1080,
+            framerate: 60,
+            bitrate_bps: None,
+            sharing_enabled: true,
+        };
+        let mut encoder = MfH264Encoder::try_new_on_device(&config, &d3d.device).unwrap();
+        assert!(encoder.is_hardware());
+        if let Some(force_copy) = forced_copy {
+            encoder.gpu_direct_render = !force_copy;
+            encoder.gpu_surface_selection = None;
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 3840,
+            Height: 2160,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            ..Default::default()
+        };
+        // Four different pooled inputs exercise view reuse and changing pictures.
+        let mut textures = Vec::new();
+        let colors = [
+            [20u8, 80, 180, 255],
+            [180, 80, 20, 255],
+            [40, 150, 60, 255],
+            [90, 40, 130, 255],
+        ];
+        for color in colors {
+            let pixels = color.repeat((desc.Width * desc.Height) as usize);
+            let data = windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixels.as_ptr().cast(),
+                SysMemPitch: desc.Width * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                d3d.device
+                    .CreateTexture2D(&desc, Some(&data), Some(&mut texture))
+            }
+            .unwrap();
+            textures.push(texture.unwrap());
+        }
+        let mut decoder = MfH264Decoder::try_new().unwrap();
+        let mut times = Vec::new();
+        let mut packets = 0;
+        let mut decoded = 0;
+        let mut keyframes = 0;
+        for index in 0..360 {
+            if index % 120 == 0 {
+                encoder.force_keyframe();
+            }
+            let started = Instant::now();
+            let bytes = encoder
+                .encode_texture_bgra(&textures[index % textures.len()], 3840, 2160)
+                .unwrap();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if index >= 60 {
+                times.push(elapsed);
+            }
+            if !bytes.is_empty() {
+                packets += 1;
+                keyframes += usize::from(contains_idr(&bytes));
+                for frame in decoder.decode(&bytes).unwrap() {
+                    assert_eq!((frame.width, frame.height), (1920, 1080));
+                    if index % 120 == 0 {
+                        let rgba = match frame.data {
+                            crate::video_decode::DecodedFrameData::D3d11(frame) => {
+                                frame.to_rgba().unwrap()
+                            }
+                            crate::video_decode::DecodedFrameData::Rgba(data) => {
+                                data.as_ref().clone()
+                            }
+                        };
+                        let center = ((540 * 1920 + 960) * 4) as usize;
+                        let color = colors[index % colors.len()];
+                        for (actual, expected) in rgba[center..center + 3]
+                            .iter()
+                            .zip([color[2], color[1], color[0]])
+                        {
+                            assert!(
+                                actual.abs_diff(expected) < 12,
+                                "stale picture or incorrect GPU color conversion"
+                            );
+                        }
+                    }
+                    decoded += 1;
+                }
+            }
+            // Let the asynchronous decoder complete between 60 Hz inputs;
+            // unpaced input otherwise exercises presentation-pool dropping.
+            std::thread::sleep(
+                std::time::Duration::from_nanos(16_666_667).saturating_sub(started.elapsed()),
+            );
+        }
+        let average = times.iter().sum::<f64>() / times.len() as f64;
+        times.sort_by(f64::total_cmp);
+        let direct = encoder.gpu_direct_render
+            && encoder
+                .gpu_surface_selection
+                .as_ref()
+                .is_none_or(GpuSurfaceSelection::use_direct);
+        println!("GPU 4K->1080p60: avg={average:.3}ms p95={:.3}ms packets={packets} decoded={decoded} keyframes={keyframes} direct_render={direct} automatic={}", times[times.len() * 95 / 100], forced_copy.is_none());
+        assert!(packets >= 350 && decoded >= 345 && keyframes >= 3);
+    }
+
     #[test]
     fn crops_macroblock_padding_from_rgba_frames() {
         let width = 4u32;
@@ -2239,11 +2521,14 @@ mod tests {
         }
 
         let mut stopped_memory = Vec::new();
+        let mut stopped_handles = Vec::new();
         for _ in 0..8 {
             drop(MfH264Encoder::try_new(&VideoConfig::default()).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(750));
             stopped_memory.push(working_set_bytes());
+            stopped_handles.push(crate::resource_monitor::test_process_handle_count().unwrap());
         }
+        println!("encoder post-stop handles: {stopped_handles:?}");
         println!(
             "encoder-only post-stop working sets (MiB): {:?}",
             stopped_memory

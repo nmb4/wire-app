@@ -64,6 +64,27 @@ impl DevPairState {
         self.peer_index
     }
 
+    /// Optional synthetic-window target for repeatable local video tests.
+    /// A requested window must resolve: never silently share the desktop if
+    /// the fixture disappeared or its handle was malformed.
+    pub fn capture_target(&self) -> Result<Option<crate::screen_capture::CaptureTarget>> {
+        let Some(value) = std::env::var_os("WIRE_DEV_CAPTURE_WINDOW") else {
+            return Ok(None);
+        };
+        let id: u32 = value
+            .to_str()
+            .context("dev capture window handle is not UTF-8")?
+            .parse()
+            .context("dev capture window handle must be a u32")?;
+        crate::screen_capture::list_capture_targets()?
+            .into_iter()
+            .find(|target| {
+                target.kind == crate::screen_capture::CaptureTargetKind::Window && target.id == id
+            })
+            .map(Some)
+            .context("requested dev capture window is no longer available")
+    }
+
     /// Registers this instance and returns every earlier participant. Connecting
     /// each new participant to all lower indexes produces one full-mesh call
     /// without duplicate connections between any pair.

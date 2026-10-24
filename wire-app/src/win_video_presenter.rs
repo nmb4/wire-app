@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 use windows::core::{w, Interface};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1,
     ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, D3D11_TEX2D_VPIV,
@@ -31,9 +31,15 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+use windows::Win32::Graphics::Gdi::{
+    CombineRgn, CreateEllipticRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
+    RGN_ERROR,
+};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPSIBLINGS,
+    CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, HTTRANSPARENT, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WM_NCDESTROY, WM_NCHITTEST,
+    WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 use crate::win_mf_codec::D3d11VideoFrame;
@@ -44,6 +50,36 @@ pub(crate) struct PhysicalVideoRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Physical-pixel cutouts leave egui's tile border and owner avatar visible
+/// above the native video child. Applied only when geometry/DPI changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeVideoClip {
+    pub corner_radius: i32,
+    pub border: i32,
+    pub avatar: Option<(i32, i32, i32)>,
+}
+
+unsafe extern "system" fn video_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    if message == WM_NCHITTEST {
+        // The child is a display surface. Keep mouse/hover events on egui's
+        // parent so moving over GPU video can reveal its existing controls.
+        return LRESULT(HTTRANSPARENT as isize);
+    }
+    unsafe {
+        if message == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(hwnd, Some(video_window_proc), id);
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
 }
 
 struct VideoProcessorState {
@@ -86,6 +122,7 @@ pub(crate) struct NativeVideoPresenter {
     visible: bool,
     last_generation: u64,
     stats: PresentStats,
+    clip: Option<NativeVideoClip>,
 }
 
 impl NativeVideoPresenter {
@@ -129,6 +166,8 @@ impl NativeVideoPresenter {
         frame: &D3d11VideoFrame,
         rect: PhysicalVideoRect,
     ) -> Result<Self> {
+        unsafe { SetWindowSubclass(child, Some(video_window_proc), 1, 0).ok() }
+            .context("forwarding native video mouse input to egui")?;
         let device = frame.device().clone();
         let context = unsafe { device.GetImmediateContext()? };
         let video_device: ID3D11VideoDevice = device.cast()?;
@@ -174,6 +213,7 @@ impl NativeVideoPresenter {
             visible: false,
             last_generation: u64::MAX,
             stats: PresentStats::default(),
+            clip: None,
         })
     }
 
@@ -204,6 +244,7 @@ impl NativeVideoPresenter {
         frame: &D3d11VideoFrame,
         rect: PhysicalVideoRect,
         generation: u64,
+        clip: NativeVideoClip,
     ) -> Result<()> {
         self.used_this_frame = true;
         if rect.width == 0 || rect.height == 0 {
@@ -239,6 +280,10 @@ impl NativeVideoPresenter {
             }
             self.last_generation = u64::MAX;
         }
+        if resized || self.clip != Some(clip) {
+            Self::apply_clip(self.child, rect.width, rect.height, clip)?;
+            self.clip = Some(clip);
+        }
         if !self.visible {
             unsafe {
                 let _ = ShowWindow(self.child, SW_SHOWNA);
@@ -268,6 +313,49 @@ impl NativeVideoPresenter {
                 .push(started.elapsed().as_secs_f64() * 1000.0);
         }
         self.log_stats();
+        Ok(())
+    }
+
+    fn apply_clip(hwnd: HWND, width: u32, height: u32, clip: NativeVideoClip) -> Result<()> {
+        let region = unsafe {
+            CreateRoundRectRgn(
+                clip.border,
+                clip.border,
+                width as i32 - clip.border + 1,
+                height as i32 - clip.border + 1,
+                clip.corner_radius * 2,
+                clip.corner_radius * 2,
+            )
+        };
+        anyhow::ensure!(
+            !region.0.is_null(),
+            "creating native video clip region failed"
+        );
+        let region = scopeguard::guard(region, |region| {
+            let _ = unsafe { DeleteObject(region.into()) };
+        });
+        if let Some((x, y, radius)) = clip.avatar {
+            let avatar = unsafe {
+                CreateEllipticRgn(x - radius, y - radius, x + radius + 1, y + radius + 1)
+            };
+            anyhow::ensure!(
+                !avatar.0.is_null(),
+                "creating native video avatar cutout failed"
+            );
+            let result =
+                unsafe { CombineRgn(Some(*region), Some(*region), Some(avatar), RGN_DIFF) };
+            let _ = unsafe { DeleteObject(avatar.into()) };
+            anyhow::ensure!(
+                result != RGN_ERROR,
+                "subtracting native video avatar cutout failed"
+            );
+        }
+        anyhow::ensure!(
+            unsafe { SetWindowRgn(hwnd, Some(*region), true) } != 0,
+            "applying native video clip region failed"
+        );
+        // Windows owns the region after SetWindowRgn succeeds.
+        let _ = scopeguard::ScopeGuard::into_inner(region);
         Ok(())
     }
 
@@ -443,6 +531,82 @@ impl Drop for NativeVideoPresenter {
                 warn!("failed to destroy native video child window: {error}");
                 error
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, GetWindowRgn, PtInRegion};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WS_OVERLAPPEDWINDOW};
+
+    #[test]
+    fn native_surface_preserves_avatar_border_and_parent_mouse_input() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Wire native video test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                300,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let parent = scopeguard::guard(parent, |hwnd| {
+                let _ = DestroyWindow(hwnd);
+            });
+            let child = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_CHILD,
+                0,
+                0,
+                160,
+                100,
+                Some(*parent),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetWindowSubclass(child, Some(video_window_proc), 1, 0)
+                .ok()
+                .unwrap();
+            assert_eq!(
+                SendMessageW(child, WM_NCHITTEST, Some(WPARAM(0)), Some(LPARAM(0))).0,
+                HTTRANSPARENT as isize
+            );
+            NativeVideoPresenter::apply_clip(
+                child,
+                160,
+                100,
+                NativeVideoClip {
+                    corner_radius: 12,
+                    border: 2,
+                    avatar: Some((10, -2, 17)),
+                },
+            )
+            .unwrap();
+            let region = CreateRectRgn(0, 0, 0, 0);
+            let region = scopeguard::guard(region, |region| {
+                let _ = DeleteObject(region.into());
+            });
+            assert_ne!(GetWindowRgn(child, *region), RGN_ERROR);
+            assert!(PtInRegion(*region, 80, 50).as_bool());
+            assert!(!PtInRegion(*region, 80, 0).as_bool());
+            assert!(!PtInRegion(*region, 2, 2).as_bool());
+            assert!(!PtInRegion(*region, 10, 5).as_bool());
+            NativeVideoPresenter::apply_clip(child, 160, 100, NativeVideoClip::default()).unwrap();
+            assert_ne!(GetWindowRgn(child, *region), RGN_ERROR);
+            assert!(PtInRegion(*region, 10, 5).as_bool());
         }
     }
 }

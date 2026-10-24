@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
     D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_WRITE, D3D11_SDK_VERSION,
     D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA,
@@ -30,8 +31,8 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFTransform, IMFVideoSampleAllocatorEx, MFCreateDXGIDeviceManager,
-    MFCreateVideoSampleAllocatorEx, MFT_MESSAGE_SET_D3D_MANAGER,
+    IMFTransform, IMFVideoSampleAllocatorEx, MFCreateAttributes, MFCreateDXGIDeviceManager,
+    MFCreateVideoSampleAllocatorEx, MFT_MESSAGE_SET_D3D_MANAGER, MF_SA_D3D11_BINDFLAGS,
 };
 
 pub struct MfD3d {
@@ -201,7 +202,20 @@ impl GpuNv12Frames {
         };
         unsafe {
             allocator.SetDirectXManager(&d3d.manager)?;
-            allocator.InitializeSampleAllocator(4, input_type)?;
+            // IsoCast converts straight into reusable encoder inputs. Ask MF
+            // for renderable surfaces too, retaining the legacy copy path on
+            // drivers/allocators that cannot satisfy that binding.
+            let mut attributes = None;
+            MFCreateAttributes(&mut attributes, 1)?;
+            let attributes = attributes.context("NV12 allocator attributes were null")?;
+            attributes.SetUINT32(&MF_SA_D3D11_BINDFLAGS, D3D11_BIND_RENDER_TARGET.0 as u32)?;
+            if allocator
+                .InitializeSampleAllocatorEx(4, 4, &attributes, input_type)
+                .is_err()
+            {
+                let _ = allocator.UninitializeSampleAllocator();
+                allocator.InitializeSampleAllocator(4, input_type)?;
+            }
         }
 
         let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -413,6 +427,10 @@ pub struct GpuVideoProcessor {
     src_rect: RECT,
     output_rect: RECT,
     dst_rect: RECT,
+    // Each view retains its texture, preventing pointer reuse. Bound both
+    // caches so resolution changes or a rotating allocator cannot grow VRAM.
+    input_views: Vec<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
+    output_views: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,11 +494,13 @@ impl GpuVideoProcessor {
         );
         let offset_x = (dst_width - fit_width) / 2;
         let offset_y = (dst_height - fit_height) / 2;
-        Ok(Self {
+        let result = Self {
             video_device,
             video_context,
             enumerator,
             processor,
+            input_views: Vec::with_capacity(8),
+            output_views: Vec::with_capacity(8),
             src_rect: RECT {
                 left: 0,
                 top: 0,
@@ -499,45 +519,13 @@ impl GpuVideoProcessor {
                 right: (offset_x + fit_width) as i32,
                 bottom: (offset_y + fit_height) as i32,
             },
-        })
+        };
+        result.configure_rects();
+        Ok(result)
     }
 
-    pub fn convert(&self, source: &ID3D11Texture2D, destination: &ID3D11Texture2D) -> Result<()> {
-        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: 0,
-                },
-            },
-        };
-        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
-        };
-        let mut input_view = None;
-        let mut output_view = None;
+    fn configure_rects(&self) {
         unsafe {
-            self.video_device
-                .CreateVideoProcessorInputView(
-                    source,
-                    &self.enumerator,
-                    &input_desc,
-                    Some(&mut input_view),
-                )
-                .context("creating video processor input view")?;
-            self.video_device
-                .CreateVideoProcessorOutputView(
-                    destination,
-                    &self.enumerator,
-                    &output_desc,
-                    Some(&mut output_view),
-                )
-                .context("creating video processor output view")?;
             self.video_context.VideoProcessorSetStreamSourceRect(
                 &self.processor,
                 0,
@@ -570,12 +558,82 @@ impl GpuVideoProcessor {
                 false,
                 &black,
             );
+        }
+    }
+
+    pub fn convert(
+        &mut self,
+        source: &ID3D11Texture2D,
+        destination: &ID3D11Texture2D,
+    ) -> Result<()> {
+        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        unsafe {
+            let input_view = if let Some((_, view)) = self
+                .input_views
+                .iter()
+                .find(|(texture, _)| texture == source)
+            {
+                view.clone()
+            } else {
+                let mut view = None;
+                self.video_device
+                    .CreateVideoProcessorInputView(
+                        source,
+                        &self.enumerator,
+                        &input_desc,
+                        Some(&mut view),
+                    )
+                    .context("creating video processor input view")?;
+                let view = view.context("video processor input view was null")?;
+                if self.input_views.len() == 8 {
+                    self.input_views.remove(0);
+                }
+                self.input_views.push((source.clone(), view.clone()));
+                view
+            };
+            let output_view = if let Some((_, view)) = self
+                .output_views
+                .iter()
+                .find(|(texture, _)| texture == destination)
+            {
+                view.clone()
+            } else {
+                let mut view = None;
+                self.video_device
+                    .CreateVideoProcessorOutputView(
+                        destination,
+                        &self.enumerator,
+                        &output_desc,
+                        Some(&mut view),
+                    )
+                    .context("creating video processor output view")?;
+                let view = view.context("video processor output view was null")?;
+                if self.output_views.len() == 8 {
+                    self.output_views.remove(0);
+                }
+                self.output_views.push((destination.clone(), view.clone()));
+                view
+            };
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
-                pInputSurface: std::mem::ManuallyDrop::new(input_view),
+                pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
                 ..Default::default()
             };
-            let output_view = output_view.context("video processor output view was null")?;
             let result = self.video_context.VideoProcessorBlt(
                 &self.processor,
                 &output_view,

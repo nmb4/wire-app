@@ -315,6 +315,7 @@ fn reset_scene_state(state: &mut AppState) {
     state.chat.error = None;
     state.pending_confirm = None;
     state.calls.clear();
+    state.video_frames.clear();
     state.local_group_call = None;
     state.chat.selected = state
         .our_node_id
@@ -356,12 +357,59 @@ fn in_call(state: &mut AppState) {
     });
 }
 
+fn video_stream(state: &mut AppState) {
+    in_call(state);
+    state.calls.remove(&fixture_peer(2));
+    let (width, height) = (1280u32, 720u32);
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = ((y * width + x) * 4) as usize;
+            pixels[offset..offset + 4].copy_from_slice(&[
+                30 + (x * 120 / width) as u8,
+                45 + (y * 90 / height) as u8,
+                95,
+                255,
+            ]);
+        }
+    }
+    state.video_frames.insert(
+        fixture_peer(1),
+        super::VideoFrameState {
+            width,
+            height,
+            stream_generation: 1,
+            generation: 1,
+            source_height: 1080,
+            source_fps: 60,
+            data: crate::video_decode::DecodedFrameData::Rgba(Arc::new(pixels)),
+            texture: None,
+            uploaded_generation: 0,
+            upload_stats: Default::default(),
+            #[cfg(windows)]
+            presenter: None,
+            #[cfg(windows)]
+            native_present_failed: false,
+        },
+    );
+}
+
 const DEFAULT: [f32; 2] = [1100.0, 720.0];
 const MEDIUM: [f32; 2] = [780.0, 600.0];
 const MINIMUM: [f32; 2] = [460.0, 500.0];
 const LARGE: [f32; 2] = [1600.0, 1000.0];
 
 const SCENES: &[Scene] = &[
+    Scene {
+        name: "video-stream",
+        size: DEFAULT,
+        apply: video_stream,
+    },
+    Scene {
+        name: "video-stream-minimum",
+        size: MINIMUM,
+        apply: video_stream,
+    },
     Scene {
         name: "text-default",
         size: DEFAULT,

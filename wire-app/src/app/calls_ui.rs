@@ -1966,6 +1966,35 @@ impl AppState {
         };
         ui.painter()
             .rect_filled(tile_rect, corner_radius, Color32::BLACK);
+        // An HWND video child cannot sit underneath egui overlays. Keep idle
+        // Windows viewing on the GPU and reveal the existing overlays on hover.
+        // Other platforms keep their existing composition behavior.
+        #[cfg(windows)]
+        let native_candidate = match source {
+            StreamSource::Remote(node_id) => self.video_frames.get(&node_id).is_some_and(|frame| {
+                !frame.native_present_failed
+                    && (matches!(frame.data, DecodedFrameData::D3d11(_))
+                        || frame.presenter.is_some())
+            }),
+            StreamSource::Local => false,
+        };
+        #[cfg(windows)]
+        let show_overlays = tile_rect.width() >= 90.0
+            && tile_rect.height() >= 44.0
+            && (!native_candidate
+                || ctx
+                    .pointer_hover_pos()
+                    .is_some_and(|position| tile_rect.expand(20.0).contains(position))
+                || egui::Popup::is_any_open(ctx)
+                || ctx.dragged_id().is_some()
+                || ctx.memory(|memory| {
+                    memory.layer_ids().any(|layer| {
+                        layer.order == egui::Order::Tooltip && memory.areas().is_visible(&layer)
+                    })
+                }));
+        #[cfg(windows)]
+        let compose_in_egui = self.native_video_needs_egui_composition();
+        #[cfg(not(windows))]
         let show_overlays = tile_rect.width() >= 90.0 && tile_rect.height() >= 44.0;
         let label = self.stream_label(source);
         let content_rect = tile_rect;
@@ -2022,10 +2051,7 @@ impl AppState {
                     return;
                 };
                 #[cfg(windows)]
-                let use_native = !show_overlays
-                    && self.configured
-                    && !self.show_settings
-                    && !self.show_update_prompt;
+                let use_native = !show_overlays && !compose_in_egui;
                 #[cfg(windows)]
                 if !use_native {
                     let rgba = match &frame.data {
@@ -2049,7 +2075,25 @@ impl AppState {
                     }
                 } else if matches!(&frame.data, DecodedFrameData::D3d11(_)) {
                     let rect = physical_video_rect(image_rect, ui.ctx().pixels_per_point());
-                    match present_native_video(frame, parent_hwnd, rect) {
+                    let scale = ui.ctx().pixels_per_point();
+                    let clip = crate::win_video_presenter::NativeVideoClip {
+                        corner_radius: if immersive {
+                            0
+                        } else {
+                            (12.0 * scale).round() as i32
+                        },
+                        border: if immersive {
+                            0
+                        } else {
+                            (1.25 * scale).ceil() as i32
+                        },
+                        avatar: Some((
+                            (10.0 * scale).round() as i32,
+                            (-2.0 * scale).round() as i32,
+                            (17.0 * scale).ceil() as i32,
+                        )),
+                    };
+                    match present_native_video(frame, parent_hwnd, rect, clip) {
                         Ok(presented) => native_presented = presented,
                         Err(error) => warn!("native video fallback failed: {error:#}"),
                     }
@@ -2107,7 +2151,9 @@ impl AppState {
         if show_overlays {
             let overlay_fill =
                 Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), 190);
-            let hovered = ui.rect_contains_pointer(tile_rect);
+            let hovered = ui.rect_contains_pointer(tile_rect)
+                || matches!(source, StreamSource::Remote(node_id)
+                    if ctx.dragged_id() == Some(ui.id().with(("stream_volume", node_id))));
             // Stream owners render in their accent color, matching chat and
             // call chips; the quality badge stays dim.
             let name_color = match source {
@@ -2607,6 +2653,7 @@ fn present_native_video(
     frame: &mut VideoFrameState,
     parent: Option<windows::Win32::Foundation::HWND>,
     rect: crate::win_video_presenter::PhysicalVideoRect,
+    clip: crate::win_video_presenter::NativeVideoClip,
 ) -> Result<bool> {
     let was_disabled = frame.native_present_failed;
     let present_result: Result<()> = (|| {
@@ -2634,7 +2681,7 @@ fn present_native_video(
             .presenter
             .as_mut()
             .context("native presenter was not created")?
-            .present(gpu_frame, rect, frame.generation)
+            .present(gpu_frame, rect, frame.generation, clip)
     })();
 
     match present_result {

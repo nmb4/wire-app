@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_channel::Sender;
+#[cfg(not(windows))]
 use spin_sleep::SpinSleeper;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -15,6 +16,7 @@ use wire::video::{
 
 use fast_image_resize::{images::Image, PixelType, Resizer};
 
+use crate::latest_frame;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::scap_capture::ScapCapturer;
 #[cfg(windows)]
@@ -22,9 +24,7 @@ use crate::win_capture::{GpuCapturedFrame, GpuPreviewScaler, WindowsCapturer};
 #[cfg(windows)]
 use crate::win_mf_codec::MfH264Encoder;
 
-const FRAME_CHANNEL_DEPTH: usize = 1;
 const PREVIEW_DIVISOR: u32 = 3;
-const PREVIEW_CHANNEL_DEPTH: usize = 1;
 const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,8 +152,7 @@ pub struct CapturePipeline {
 }
 
 struct PreviewInput {
-    data: Vec<u8>,
-    bgra: bool,
+    frame: CaptureFrame,
     width: u32,
     height: u32,
     output_width: u32,
@@ -260,10 +259,17 @@ impl FrameEncoder {
     }
 }
 
+#[derive(Clone)]
 enum CaptureFrame {
-    Cpu(Vec<u8>),
+    Cpu(Arc<Vec<u8>>),
     #[cfg(windows)]
     Gpu(GpuCapturedFrame),
+}
+
+impl CaptureFrame {
+    fn cpu(data: Vec<u8>) -> Self {
+        Self::Cpu(Arc::new(data))
+    }
 }
 
 /// Runs capture+resize and encode in parallel threads.
@@ -275,6 +281,10 @@ pub fn start(
     preview_tx: Sender<PreviewUpdate>,
     keyframe_tx: broadcast::Sender<()>,
 ) -> Result<CapturePipeline> {
+    anyhow::ensure!(
+        (1..=240).contains(&config.framerate),
+        "screen sharing frame rate must be in 1..=240"
+    );
     let target_w = config.resolution.width();
     let target_h = config.resolution.height();
     let target_interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
@@ -283,9 +293,8 @@ pub fn start(
     let (failure_tx, failure_rx) = async_channel::bounded(1);
 
     let handle = thread::spawn(move || {
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<CaptureFrame>(FRAME_CHANNEL_DEPTH);
-        let (preview_input_tx, preview_input_rx) =
-            mpsc::sync_channel::<PreviewInput>(PREVIEW_CHANNEL_DEPTH);
+        let (frame_tx, frame_rx) = latest_frame::channel::<CaptureFrame>();
+        let (preview_input_tx, preview_input_rx) = latest_frame::channel::<PreviewInput>();
 
         let preview_handle = thread::spawn(move || {
             run_preview_loop(preview_input_rx, preview_tx);
@@ -326,11 +335,12 @@ pub fn start(
             info!("encode thread stopped: {error:?}");
         }
 
+        let was_stopping = stop_flag.swap(true, Ordering::Relaxed);
         let capture_result = capture_handle
             .join()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("screen capture thread panicked")));
         let _ = preview_handle.join();
-        if !stop_flag.load(Ordering::Relaxed) {
+        if !was_stopping {
             if let Some(error) = capture_result.err().or_else(|| encode_result.err()) {
                 let _ = failure_tx.send_blocking(format!("{error:#}"));
             }
@@ -419,7 +429,7 @@ fn init_capture_source(
     {
         // Prefer the direct Windows Graphics Capture path: it avoids zed-scap's unconditional
         // full-frame buffer_crop call for display capture.
-        match WindowsCapturer::try_new(target_w, target_h, target) {
+        match WindowsCapturer::try_new(target_w, target_h, framerate, target) {
             Ok(capturer) => return Ok(CaptureSource::Windows(capturer)),
             Err(error) if target.is_some() => {
                 return Err(error).context("direct capture of the selected target failed");
@@ -501,23 +511,30 @@ fn init_xcap_source(
     }
 }
 
-fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Result<CaptureFrame> {
+fn capture_frame(
+    source: &mut CaptureSource,
+    target_w: u32,
+    target_h: u32,
+) -> Result<Option<CaptureFrame>> {
     #[cfg(not(windows))]
     let _ = (target_w, target_h);
 
     match source {
         #[cfg(windows)]
-        CaptureSource::Windows(capturer) => capturer.capture_gpu().map(CaptureFrame::Gpu),
+        CaptureSource::Windows(capturer) => capturer
+            .capture_gpu()
+            .map(|frame| frame.map(CaptureFrame::Gpu)),
         #[cfg(windows)]
-        CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::Cpu),
+        CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::cpu).map(Some),
         #[cfg(target_os = "macos")]
-        CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::Cpu),
+        CaptureSource::Scap(scap) => scap.capture_bgra().map(CaptureFrame::cpu).map(Some),
         #[cfg(windows)]
         CaptureSource::Gdi { x, y, src_w, src_h } => {
             crate::win_gdi_capture::capture_monitor_scaled(
                 *x, *y, *src_w, *src_h, target_w, target_h,
             )
-            .map(CaptureFrame::Cpu)
+            .map(CaptureFrame::cpu)
+            .map(Some)
         }
         #[cfg(not(windows))]
         CaptureSource::Xcap {
@@ -528,7 +545,7 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
             let img = monitor
                 .capture_image()
                 .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
-            resize_xcap_frame(img, resizer, dst)
+            resize_xcap_frame(img, resizer, dst).map(Some)
         }
         #[cfg(not(windows))]
         CaptureSource::XcapWindow {
@@ -539,7 +556,7 @@ fn capture_frame(source: &mut CaptureSource, target_w: u32, target_h: u32) -> Re
             let img = window
                 .capture_image()
                 .map_err(|e| anyhow::anyhow!("capture error: {e}"))?;
-            resize_xcap_frame(img, resizer, dst)
+            resize_xcap_frame(img, resizer, dst).map(Some)
         }
     }
 }
@@ -563,7 +580,7 @@ fn resize_xcap_frame(
     for pixel in data.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Ok(CaptureFrame::Cpu(data))
+    Ok(CaptureFrame::cpu(data))
 }
 
 pub(crate) fn resize_with_letterbox(
@@ -644,7 +661,7 @@ fn run_capture_loop(
     target_interval: Duration,
     framerate: u32,
     target: Option<&CaptureTarget>,
-    frame_tx: &mpsc::SyncSender<CaptureFrame>,
+    frame_tx: &latest_frame::Sender<CaptureFrame>,
     startup_tx: &mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let mut source = init_capture_source(target_w, target_h, framerate, target)?;
@@ -653,7 +670,15 @@ fn run_capture_loop(
     #[cfg(all(not(windows), not(target_os = "macos")))]
     let needs_explicit_pacing = true;
     let mut startup_pending = true;
+    #[cfg(not(windows))]
     let sleeper = SpinSleeper::default();
+    #[cfg(windows)]
+    let clock = crate::win_frame_clock::FrameClock::new()
+        .inspect_err(|error| {
+            warn!("high-resolution capture timer unavailable, using OS sleep: {error:#}");
+        })
+        .ok();
+    let mut next_frame = Instant::now();
     let mut window_captured = 0u64;
     let mut window_dropped = 0u64;
     let mut dropped_count = 0u64;
@@ -663,7 +688,9 @@ fn run_capture_loop(
     while !stop_flag.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
 
-        let frame = capture_frame(&mut source, target_w, target_h)?;
+        let Some(frame) = capture_frame(&mut source, target_w, target_h)? else {
+            continue;
+        };
         if matches!(&frame, CaptureFrame::Cpu(data) if data.is_empty()) {
             continue;
         }
@@ -671,15 +698,13 @@ fn run_capture_loop(
             let _ = startup_tx.send(Ok(()));
             startup_pending = false;
         }
-        match frame_tx.try_send(frame) {
-            Ok(()) => {
+        match frame_tx.send(frame) {
+            Ok(replaced) => {
                 window_captured += 1;
+                dropped_count += u64::from(replaced);
+                window_dropped += u64::from(replaced);
             }
-            Err(TrySendError::Full(_)) => {
-                dropped_count += 1;
-                window_dropped += 1;
-            }
-            Err(TrySendError::Disconnected(_)) => break,
+            Err(_) => break,
         }
 
         let elapsed = frame_start.elapsed();
@@ -705,8 +730,21 @@ fn run_capture_loop(
             window_captured = 0;
             window_dropped = 0;
         }
-        if needs_explicit_pacing && elapsed < target_interval {
-            sleeper.sleep(target_interval - elapsed);
+        if needs_explicit_pacing {
+            // Absolute deadlines avoid accumulating work-time and wake jitter.
+            // Missed deadlines reset once; never burst frames to catch up.
+            next_frame += target_interval;
+            if next_frame < Instant::now() {
+                next_frame = Instant::now();
+            }
+            #[cfg(windows)]
+            if let Some(clock) = &clock {
+                clock.sleep_until(next_frame)?;
+            } else {
+                thread::sleep(next_frame.saturating_duration_since(Instant::now()));
+            }
+            #[cfg(not(windows))]
+            sleeper.sleep(next_frame.saturating_duration_since(Instant::now()));
         }
     }
     Ok(())
@@ -718,9 +756,9 @@ fn run_encode_loop(
     config: VideoConfig,
     target_w: u32,
     target_h: u32,
-    frame_rx: mpsc::Receiver<CaptureFrame>,
+    frame_rx: latest_frame::Receiver<CaptureFrame>,
     encoded_tx: broadcast::Sender<Arc<EncodedVideoFrame>>,
-    preview_input_tx: mpsc::SyncSender<PreviewInput>,
+    preview_input_tx: latest_frame::Sender<PreviewInput>,
     keyframe_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     // Encoder creation is deliberately lazy. Local preview needs no encoder, and
@@ -751,29 +789,32 @@ fn run_encode_loop(
     let mut cpu_resizer = Resizer::new();
     #[cfg(windows)]
     let mut cpu_resize_dst = Image::new(target_w, target_h, PixelType::U8x4);
-    #[cfg(windows)]
-    let mut gpu_preview_scaler: Option<GpuPreviewScaler> = None;
+    let mut last_frame: Option<CaptureFrame> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
+        if encoded_tx.receiver_count() == 0 {
+            had_subscribers = false;
+        }
         while keyframe_rx.try_recv().is_ok() {
             force_keyframe_pending = true;
         }
-        if force_keyframe_pending {
-            if let Some(encoder) = &mut encoder {
-                encoder.force_keyframe();
-                force_keyframe_pending = false;
-            }
-        }
-
-        let mut frame = match frame_rx.recv_timeout(Duration::from_millis(50)) {
+        let frame = match frame_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(frame) => frame,
+            // WGC is change-driven. A late joiner/keyframe request on a static
+            // desktop still needs an IDR; retain just one raw picture for it.
+            Err(RecvTimeoutError::Timeout)
+                if encoded_tx.receiver_count() != 0
+                    && (force_keyframe_pending || !had_subscribers)
+                    && last_frame.is_some() =>
+            {
+                match &last_frame {
+                    Some(frame) => frame.clone(),
+                    None => continue,
+                }
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-
-        while let Ok(newer) = frame_rx.try_recv() {
-            frame = newer;
-        }
 
         frame_count += 1;
         window_input += 1;
@@ -978,85 +1019,87 @@ fn run_encode_loop(
             preview_dropped = 0;
         }
 
-        if frame_count.is_multiple_of(preview_interval) {
-            #[cfg(windows)]
-            let preview_source = match frame {
-                CaptureFrame::Cpu(data) => Some((data, target_w, target_h)),
-                CaptureFrame::Gpu(gpu) => {
-                    let output_width = (target_w / PREVIEW_DIVISOR).max(1);
-                    let output_height = (target_h / PREVIEW_DIVISOR).max(1);
-                    let recreate = gpu_preview_scaler
-                        .as_ref()
-                        .map(|scaler| !scaler.matches(&gpu, output_width, output_height))
-                        .unwrap_or(true);
-                    if recreate {
-                        gpu_preview_scaler =
-                            match GpuPreviewScaler::new(&gpu, output_width, output_height) {
-                                Ok(scaler) => Some(scaler),
-                                Err(e) => {
-                                    warn!("GPU preview scaler unavailable: {e:#}");
-                                    None
-                                }
-                            };
-                    }
-                    match gpu_preview_scaler
-                        .as_ref()
-                        .map(|scaler| scaler.read_bgra(&gpu))
-                    {
-                        Some(Ok(data)) => Some((data, output_width, output_height)),
-                        Some(Err(e)) => {
-                            warn!("downscaled GPU preview readback failed: {e:#}");
-                            gpu_preview_scaler = None;
-                            None
-                        }
-                        None => match gpu.read_bgra() {
-                            Ok(data) => Some((data, gpu.width, gpu.height)),
-                            Err(e) => {
-                                warn!("GPU preview readback failed: {e:#}");
-                                None
-                            }
-                        },
-                    }
-                }
+        if frame_count == 1 || frame_count.is_multiple_of(preview_interval) {
+            let input = PreviewInput {
+                frame: frame.clone(),
+                width: target_w,
+                height: target_h,
+                output_width: (target_w / PREVIEW_DIVISOR).max(1),
+                output_height: (target_h / PREVIEW_DIVISOR).max(1),
+                actual_fps,
+                encode_time_ms: encode_time.as_secs_f64() * 1000.0,
             };
-            #[cfg(not(windows))]
-            let preview_source = match frame {
-                CaptureFrame::Cpu(data) => Some((data, target_w, target_h)),
-            };
-            if let Some((data, width, height)) = preview_source {
-                let input = PreviewInput {
-                    data,
-                    bgra: cfg!(any(windows, target_os = "macos")),
-                    width,
-                    height,
-                    output_width: (target_w / PREVIEW_DIVISOR).max(1),
-                    output_height: (target_h / PREVIEW_DIVISOR).max(1),
-                    actual_fps,
-                    encode_time_ms: encode_time.as_secs_f64() * 1000.0,
-                };
-                if preview_input_tx.try_send(input).is_err() {
-                    preview_dropped += 1;
-                }
+            if let Ok(replaced) = preview_input_tx.send(input) {
+                preview_dropped += u64::from(replaced);
             }
         }
+        last_frame = Some(frame);
     }
     Ok(())
 }
 
-fn run_preview_loop(preview_rx: mpsc::Receiver<PreviewInput>, preview_tx: Sender<PreviewUpdate>) {
+fn run_preview_loop(
+    preview_rx: latest_frame::Receiver<PreviewInput>,
+    preview_tx: Sender<PreviewUpdate>,
+) {
     let mut samples = Vec::with_capacity(32);
     let mut generated = 0u64;
     let mut dropped = 0u64;
     let mut last_log = Instant::now();
-    while let Ok(input) = preview_rx.recv() {
+    #[cfg(windows)]
+    let mut gpu_preview_scaler: Option<GpuPreviewScaler> = None;
+    loop {
+        let input = match preview_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(input) => input,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let started = Instant::now();
+        let (pixels, width, height) = match input.frame {
+            CaptureFrame::Cpu(data) => (data, input.width, input.height),
+            #[cfg(windows)]
+            CaptureFrame::Gpu(gpu) => {
+                let recreate = gpu_preview_scaler.as_ref().is_none_or(|scaler| {
+                    !scaler.matches(&gpu, input.output_width, input.output_height)
+                });
+                if recreate {
+                    gpu_preview_scaler = match GpuPreviewScaler::new(
+                        &gpu,
+                        input.output_width,
+                        input.output_height,
+                    ) {
+                        Ok(scaler) => Some(scaler),
+                        Err(error) => {
+                            warn!("GPU preview scaler unavailable: {error:#}");
+                            None
+                        }
+                    };
+                }
+                let readback = match &mut gpu_preview_scaler {
+                    Some(scaler) => scaler
+                        .read_bgra(&gpu)
+                        .map(|data| (Arc::new(data), input.output_width, input.output_height)),
+                    None => gpu
+                        .read_bgra()
+                        .map(|data| (Arc::new(data), gpu.width, gpu.height)),
+                };
+                match readback {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        warn!("GPU preview readback failed: {error:#}");
+                        gpu_preview_scaler = None;
+                        continue;
+                    }
+                }
+            }
+        };
         let data = make_preview(
-            &input.data,
-            input.width,
-            input.height,
+            &pixels,
+            width,
+            height,
             input.output_width,
             input.output_height,
-            input.bgra,
+            cfg!(any(windows, target_os = "macos")),
         );
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         generated += 1;
@@ -1143,6 +1186,113 @@ fn resize_bgra(
 
 #[cfg(test)]
 mod preview_tests {
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; run in a fresh process"]
+    fn idle_gpu_preview_starts_without_encoder_and_stops() {
+        use super::*;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (encoded_tx, encoded_rx) = broadcast::channel(4);
+        drop(encoded_rx);
+        let (keyframes, _) = broadcast::channel(4);
+        let (preview_tx, preview_rx) = async_channel::bounded(1);
+        let pipeline = start(
+            VideoConfig::default(),
+            None,
+            stop.clone(),
+            encoded_tx,
+            preview_tx,
+            keyframes,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let preview = loop {
+            if let Ok(preview) = preview_rx.try_recv() {
+                break preview;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "GPU preview did not start without an encoder"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            preview.data.len(),
+            (preview.width * preview.height * 4) as usize
+        );
+        let stopped = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        pipeline.thread.join().unwrap();
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows Media Foundation; synthetic static-frame lifecycle"]
+    fn static_frame_serves_late_joiners_and_keyframe_requests() {
+        use super::*;
+        use wire::video::VideoResolution;
+
+        fn next(rx: &mut broadcast::Receiver<Arc<EncodedVideoFrame>>) -> Arc<EncodedVideoFrame> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(frame) = rx.try_recv() {
+                    return frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "static picture did not produce a recovery keyframe"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let config = VideoConfig {
+            resolution: VideoResolution::P720,
+            framerate: 30,
+            ..VideoConfig::default()
+        };
+        let (raw_tx, raw_rx) = latest_frame::channel();
+        let (preview_tx, preview_rx) = latest_frame::channel();
+        let (encoded_tx, rx) = broadcast::channel(16);
+        drop(rx);
+        let worker_tx = encoded_tx.clone();
+        let (keyframes, _) = broadcast::channel(4);
+        let worker_keyframes = keyframes.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            run_encode_loop(
+                &worker_stop,
+                config,
+                1280,
+                720,
+                raw_rx,
+                worker_tx,
+                preview_tx,
+                worker_keyframes,
+            )
+        });
+        assert!(raw_tx
+            .send(CaptureFrame::cpu([40, 80, 120, 255].repeat(1280 * 720)))
+            .is_ok());
+        // No receiver at capture time: preview must work without opening an encoder.
+        preview_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut first_peer = encoded_tx.subscribe();
+        let first = next(&mut first_peer);
+        assert!(first.keyframe);
+        keyframes.send(()).unwrap();
+        assert!(next(&mut first_peer).keyframe);
+        drop(first_peer);
+        thread::sleep(Duration::from_millis(150));
+        let mut late_peer = encoded_tx.subscribe();
+        assert!(next(&mut late_peer).keyframe);
+        let stopped = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+    }
     use fast_image_resize::{images::Image, PixelType, Resizer};
 
     use super::{
@@ -1256,7 +1406,9 @@ mod preview_tests {
             pid: window.pid().ok(),
         };
         let mut source = super::init_xcap_source(640, 360, Some(&target)).unwrap();
-        let frame = super::capture_frame(&mut source, 640, 360).unwrap();
+        let frame = super::capture_frame(&mut source, 640, 360)
+            .unwrap()
+            .unwrap();
         match frame {
             super::CaptureFrame::Cpu(data) => assert_eq!(data.len(), 640 * 360 * 4),
         }
@@ -1294,6 +1446,7 @@ mod preview_tests {
             sharing_enabled: true,
         };
         let mut stopped_memory = Vec::new();
+        let mut stopped_handles = Vec::new();
         for _ in 0..8 {
             let stop = Arc::new(AtomicBool::new(false));
             let (encoded_tx, encoded_rx) = broadcast::channel(32);
@@ -1319,7 +1472,9 @@ mod preview_tests {
             drop(_receivers);
             std::thread::sleep(Duration::from_millis(750));
             stopped_memory.push(working_set_bytes());
+            stopped_handles.push(crate::resource_monitor::test_process_handle_count().unwrap());
         }
+        println!("capture pipeline post-stop handles: {stopped_handles:?}");
 
         let first = stopped_memory[0];
         let last = *stopped_memory.last().unwrap();

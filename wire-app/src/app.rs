@@ -1078,6 +1078,9 @@ impl eframe::App for App {
             self.show_window(ctx);
         }
         self.handle_close_request(ctx);
+        self.state.service.set_presenter_active(
+            self.window_visible && !ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+        );
         #[cfg(windows)]
         while let Some(action) = self
             .global_hotkeys
@@ -1740,25 +1743,30 @@ impl AppState {
         }
         #[cfg(windows)]
         {
-            let force_hide = self.show_settings
-                || !self.configured
-                || self.show_update_prompt
-                || self.show_peer_update_prompt
-                || contacts_visible
-                || self.show_capture_picker
-                || self.show_profile_editor
-                || self.avatar_crop.is_some()
-                || self.chat.show_group_editor
-                || self.chat.show_group_members
-                || self.chat.friend_candidate.is_some()
-                || self.pending_confirm.is_some()
-                || self.chat.image_preview.is_some();
+            let force_hide = self.native_video_needs_egui_composition() || contacts_visible;
             for frame in self.video_frames.values_mut() {
                 if let Some(presenter) = &mut frame.presenter {
                     presenter.hide_if_unused(force_hide);
                 }
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn native_video_needs_egui_composition(&self) -> bool {
+        self.show_settings
+            || !self.configured
+            || self.show_update_prompt
+            || self.show_peer_update_prompt
+            || self.show_contacts
+            || self.show_capture_picker
+            || self.show_profile_editor
+            || self.avatar_crop.is_some()
+            || self.chat.show_group_editor
+            || self.chat.show_group_members
+            || self.chat.friend_candidate.is_some()
+            || self.pending_confirm.is_some()
+            || self.chat.image_preview.is_some()
     }
 
     /// Keep the peer-update candidate set in step with presence.
@@ -2089,6 +2097,10 @@ impl AppState {
             match event {
                 Event::EndpointBound(node_id) => {
                     self.our_node_id = Some(node_id);
+                    if self.dev_pair.is_some() && std::env::var_os("WIRE_DEV_CALLS_VIEW").is_some()
+                    {
+                        self.app_mode = AppMode::Calls;
+                    }
                     self.chat.service_error = None;
                     // Worker starts with disk state, but re-assert the UI's
                     // copy so an edit made while offline still propagates.
@@ -2274,10 +2286,23 @@ impl AppState {
                         });
                     }
                     if auto_share {
+                        let target = match self
+                            .dev_pair
+                            .as_ref()
+                            .map(DevPairState::capture_target)
+                            .transpose()
+                        {
+                            Ok(target) => target.flatten(),
+                            Err(error) => {
+                                warn!("dev capture target unavailable: {error:#}");
+                                self.dev_auto_share = false;
+                                continue;
+                            }
+                        };
                         info!("dev call automatically starting the explicit test share");
                         self.cmd(Command::ToggleSharing {
                             enabled: true,
-                            target: None,
+                            target: target.clone(),
                             share_system_audio: self.share_system_audio,
                         });
                         if let Some(cycles) = std::env::var("WIRE_DEV_SHARE_TOGGLE_CYCLES")
@@ -2286,6 +2311,7 @@ impl AppState {
                             .filter(|cycles| *cycles > 0)
                         {
                             let command_tx = self.service.command_sender().clone();
+                            let share_system_audio = self.share_system_audio;
                             std::thread::spawn(move || {
                                 for cycle in 0..cycles {
                                     std::thread::sleep(Duration::from_secs(2));
@@ -2304,8 +2330,8 @@ impl AppState {
                                         if command_tx
                                             .send_blocking(Command::ToggleSharing {
                                                 enabled: true,
-                                                target: None,
-                                                share_system_audio: true,
+                                                target: target.clone(),
+                                                share_system_audio,
                                             })
                                             .is_err()
                                         {
